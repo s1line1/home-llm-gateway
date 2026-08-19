@@ -22,7 +22,7 @@ use hyper_util::rt::TokioIo;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::TlsAcceptor;
 use tower::Service as TowerService;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::{keystore::KeyStore, metrics::Metrics, ratelimit::RateLimiter, registry::Registry};
 
@@ -93,6 +93,7 @@ impl Gateway {
         let mut tasks = Vec::new();
         match cfg.tls {
             Some(tls) => {
+                info!(addr = %cfg.http_bind, "https public entry enabled");
                 tasks.push(tokio::spawn(async move {
                     if let Err(e) = serve_https(listener, app, tls).await {
                         warn!("https server stopped: {e}");
@@ -100,6 +101,7 @@ impl Gateway {
                 }));
             }
             None => {
+                info!(addr = %cfg.http_bind, "http public entry enabled");
                 tasks.push(tokio::spawn(async move {
                     if let Err(e) = axum::serve(listener, app).await {
                         warn!("http server stopped: {e}");

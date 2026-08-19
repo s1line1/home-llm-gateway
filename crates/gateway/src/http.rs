@@ -18,7 +18,7 @@ use proto::{io::{read_frame, write_frame}, Frame};
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::keystore::KeyStore;
 use crate::metrics::Metrics;
@@ -90,10 +90,19 @@ async fn metrics_middleware(State(state): State<AppState>, req: Request, next: N
     if req.uri().path() == "/metrics" {
         return next.run(req).await;
     }
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
     let start = state.metrics.record_start();
     let resp = next.run(req).await;
     let status = resp.status().as_u16();
     state.metrics.record_end(start, status);
+    info!(
+        method = %method,
+        path = %path,
+        status,
+        duration_ms = start.elapsed().as_millis() as u64,
+        "request handled"
+    );
     resp
 }
 

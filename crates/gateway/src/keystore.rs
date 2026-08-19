@@ -99,6 +99,7 @@ impl KeyStore {
             .unwrap()
             .insert(record.id.clone(), record.clone());
         self.save();
+        tracing::info!(id = %record.id, name = %record.name, "api key created");
         record
     }
 
@@ -114,6 +115,7 @@ impl KeyStore {
         let removed = self.inner.runtime.write().unwrap().remove(id).is_some();
         if removed {
             self.save();
+            tracing::info!(id = %id, "api key revoked");
         }
         removed
     }

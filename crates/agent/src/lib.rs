@@ -84,6 +84,12 @@ async fn connect_once(cfg: &AgentConfig, client_config: quinn::ClientConfig) -> 
     info!("connected to cloud gateway at {}", cfg.cloud_addr);
 
     register(&conn, cfg).await?;
+    info!(
+        agent_id = %cfg.agent_id,
+        models = ?cfg.models,
+        max_concurrency = cfg.max_concurrency,
+        "registered with cloud gateway"
+    );
 
     let hb = tokio::spawn(heartbeat_loop(
         conn.clone(),

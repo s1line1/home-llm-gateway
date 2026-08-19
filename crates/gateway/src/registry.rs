@@ -10,6 +10,7 @@ use std::{
 };
 
 use quinn::Connection;
+use tracing::{info, warn};
 
 #[derive(Clone, Default)]
 pub struct Registry {
@@ -34,6 +35,7 @@ impl Registry {
         let mut inner = self.inner.lock().unwrap();
         if let Some(old) = inner.get(&agent_id) {
             if old.stable_id != stable_id {
+                warn!(agent = %agent_id, "duplicate agent connection, closing old one");
                 let _ = old.conn.close(0u32.into(), b"duplicate agent");
             }
         }
@@ -62,6 +64,7 @@ impl Registry {
         if let Some(e) = inner.get(agent_id) {
             if e.stable_id == stable_id {
                 inner.remove(agent_id);
+                info!(agent = %agent_id, "agent removed (connection closed)");
             }
         }
     }
