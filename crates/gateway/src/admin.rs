@@ -123,6 +123,10 @@ const ADMIN_PAGE: &str = r#"<!doctype html>
   .msg { color: #0a7; }
   .err { color: #c33; }
   .muted { color: #888; font-size: 12px; }
+  .ok { color: #0a7; font-weight: 600; }
+  .bad { color: #c33; font-weight: 600; }
+  button.danger { background: #c33; border: 1px solid #c33; color: #fff; }
+  button.danger:hover { background: #a22; }
 </style>
 </head>
 <body>
@@ -206,8 +210,9 @@ async function refresh() {
     for (const k of keys) {
       const tr = document.createElement("tr");
       const when = new Date(k.created_at * 1000).toLocaleString();
-      tr.innerHTML = "<td>" + escapeHtml(k.name) + "</td><td><code>" + k.id + "</code></td><td><code>" + k.prefix + "</code></td><td>" + when + "</td><td>" + (k.enabled ? "启用" : "禁用") + "</td>" +
-        "<td><button data-id=\"" + k.id + "\" data-name=\"" + escapeHtml(k.name) + "\">吊销</button></td>";
+      tr.innerHTML = "<td>" + escapeHtml(k.name) + "</td><td><code>" + k.id + "</code></td><td><code>" + k.prefix + "</code></td><td>" + when + "</td>" +
+        "<td class=\"" + (k.enabled ? "ok" : "bad") + "\">" + (k.enabled ? "启用" : "禁用") + "</td>" +
+        "<td><button class=\"danger\" data-id=\"" + k.id + "\" data-name=\"" + escapeHtml(k.name) + "\">吊销</button></td>";
       rows.appendChild(tr);
     }
     rows.querySelectorAll("button").forEach(b => b.onclick = () => revoke(b.dataset.id, b.dataset.name));
