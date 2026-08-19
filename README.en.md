@@ -44,6 +44,8 @@ scripts/        multi-platform release packaging script
 
 ## Quick Start (fully local, no real LLM required)
 
+> `cargo run` below is only for local development convenience (debug builds). **For production, run the compiled release binaries directly** — no Rust toolchain needed on the server, see [`DEPLOY.md`](DEPLOY.md).
+
 ### Prerequisites
 
 - Rust stable (1.75+ recommended)

@@ -44,6 +44,8 @@ scripts/        多平台 release 打包脚本
 
 ## 快速开始（全部本机即可跑通，无需真实 LLM）
 
+> 以下用 `cargo run` 仅为本地开发方便（debug 构建）；**生产部署直接用编译好的 release 二进制**，服务器无需安装 Rust，见 [`DEPLOY.md`](DEPLOY.md)。
+
 ### 环境
 
 - Rust stable（建议 1.75+）
