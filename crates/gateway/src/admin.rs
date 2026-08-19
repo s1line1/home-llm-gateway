@@ -239,3 +239,66 @@ refresh();
 </script>
 </body>
 </html>"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    use crate::{
+        http::AppState,
+        keystore::KeyStore,
+        metrics::Metrics,
+        registry::Registry,
+    };
+
+    fn test_state() -> AppState {
+        AppState {
+            registry: Registry::default(),
+            key_store: KeyStore::new(vec!["static-1".into()], None),
+            admin_token: Some("admin-token".into()),
+            timeout: Duration::from_secs(10),
+            agent_stale_after: Duration::from_secs(10),
+            rate_limiter: None,
+            metrics: Metrics::default(),
+        }
+    }
+
+    async fn body_json(resp: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn create_key_rejects_overlong_name() {
+        let state = test_state();
+        let resp = create_key(
+            State(state),
+            Json(serde_json::json!({ "name": "x".repeat(65) })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn create_and_list_masks_secret() {
+        let state = test_state();
+        let resp = create_key(
+            State(state.clone()),
+            Json(serde_json::json!({ "name": "my-key" })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let created = body_json(resp).await;
+        let full_key = created["key"].as_str().unwrap().to_string();
+        assert!(full_key.starts_with("sk-"));
+
+        // 列表脱敏：含名称/前缀，不暴露明文
+        let listed = list_keys(State(state)).await;
+        let text = listed.0.to_string();
+        assert!(text.contains("my-key"));
+        assert!(!text.contains(&full_key), "list must not leak plaintext key");
+    }
+}

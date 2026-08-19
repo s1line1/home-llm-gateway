@@ -111,4 +111,49 @@ mod tests {
         let mut empty: &[u8] = &[];
         assert!(read_frame(&mut empty).await.unwrap().is_none());
     }
+
+    #[tokio::test]
+    async fn oversized_len_prefix_rejected() {
+        // 长度前缀超过 MAX_FRAME → 直接拒绝，不分配大块内存
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&u32::MAX.to_be_bytes());
+        let err = read_frame(&mut buf.as_slice()).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("too large"), "err: {err}");
+    }
+
+    #[tokio::test]
+    async fn invalid_postcard_payload_rejected() {
+        // 长度合法但字节不是合法 postcard → 反序列化错误
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&4u32.to_be_bytes());
+        buf.extend_from_slice(&[0xff, 0xff, 0xff, 0xff]);
+        let err = read_frame(&mut buf.as_slice()).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn truncated_frame_errors_not_none() {
+        // 声明 10 字节只给了 3 字节：中途 EOF 应报错（区别于干净 EOF 的 None）
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&10u32.to_be_bytes());
+        buf.extend_from_slice(&[1, 2, 3]);
+        let err = read_frame(&mut buf.as_slice()).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[tokio::test]
+    async fn large_body_roundtrip() {
+        // 64KiB body 跨长度前缀正确编解码
+        let frame = Frame::ProxyResponseBody {
+            request_id: 7,
+            chunk: vec![0xabu8; 64 * 1024],
+        };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &frame).await.unwrap();
+        assert!(buf.len() > 64 * 1024, "serialized size should exceed body size");
+        let mut reader = buf.as_slice();
+        let got = read_frame(&mut reader).await.unwrap().unwrap();
+        assert_eq!(got, frame);
+    }
 }

@@ -9,7 +9,8 @@ use std::{
 };
 
 use agent::{Agent, AgentConfig};
-use gateway::{Gateway, GatewayConfig};
+use gateway::{Gateway, GatewayConfig, TlsPem};
+use proto::{io::{read_frame, write_frame}, Frame};
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
     KeyUsagePurpose, SanType,
@@ -69,6 +70,59 @@ fn gen_certs() -> (
     let client_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(client_key.serialize_der()));
 
     (ca_cert.der().clone(), server_cert, server_key, client_cert, client_key)
+}
+
+/// 生成同一套证书的 PEM 文本（HTTPS 公网入口需要 PEM 字节）。
+fn gen_certs_pem() -> (String, String, String, String, String) {
+    let ca_key = KeyPair::generate().unwrap();
+    let mut ca_params = CertificateParams::default();
+    ca_params
+        .distinguished_name
+        .push(DnType::CommonName, "e2e CA");
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+    let server_key = KeyPair::generate().unwrap();
+    let mut srv = CertificateParams::default();
+    srv.distinguished_name.push(DnType::CommonName, "gateway");
+    srv.subject_alt_names = vec![
+        SanType::DnsName("localhost".try_into().unwrap()),
+        SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+    ];
+    srv.is_ca = IsCa::NoCa;
+    srv.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    srv.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    let server_cert = srv.signed_by(&server_key, &ca_cert, &ca_key).unwrap();
+
+    let client_key = KeyPair::generate().unwrap();
+    let mut cli = CertificateParams::default();
+    cli.distinguished_name
+        .push(DnType::CommonName, "test-agent");
+    cli.is_ca = IsCa::NoCa;
+    cli.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    cli.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    let client_cert = cli.signed_by(&client_key, &ca_cert, &ca_key).unwrap();
+
+    (
+        ca_cert.pem(),
+        server_cert.pem(),
+        server_key.serialize_pem(),
+        client_cert.pem(),
+        client_key.serialize_pem(),
+    )
+}
+
+fn parse_certs_pem(pem: &str) -> Vec<CertificateDer<'static>> {
+    rustls_pemfile::certs(&mut std::io::Cursor::new(pem.as_bytes()))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+fn parse_key_pem(pem: &str) -> PrivateKeyDer<'static> {
+    rustls_pemfile::private_key(&mut std::io::Cursor::new(pem.as_bytes()))
+        .unwrap()
+        .unwrap()
 }
 
 async fn start_mock_llm(name: &str) -> SocketAddr {
@@ -544,5 +598,159 @@ async fn e2e_admin_api_keys() {
     assert_eq!(resp.status(), 404);
 
     agent.shutdown().await;
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_https_public_entry() {
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    let (ca_pem, srv_pem, srv_key_pem, cli_pem, cli_key_pem) = gen_certs_pem();
+    let mock_addr = start_mock_llm("mock-llm").await;
+
+    let gw = Gateway::start(GatewayConfig {
+        http_bind: "127.0.0.1:0".parse().unwrap(),
+        quic_bind: "127.0.0.1:0".parse().unwrap(),
+        ca_cert: parse_certs_pem(&ca_pem),
+        server_cert: parse_certs_pem(&srv_pem),
+        server_key: parse_key_pem(&srv_key_pem),
+        api_keys: vec!["test-key".into()],
+        admin_token: None,
+        keys_file: None,
+        request_timeout: Duration::from_secs(10),
+        agent_stale_after: Duration::from_secs(10),
+        rate_limit_per_min: 0,
+        tls: Some(TlsPem {
+            cert: srv_pem.clone().into_bytes(),
+            key: srv_key_pem.clone().into_bytes(),
+        }),
+    })
+    .await
+    .unwrap();
+
+    let agent = Agent::start(AgentConfig {
+        cloud_addr: gw.quic_addr,
+        server_name: "localhost".into(),
+        ca_cert: parse_certs_pem(&ca_pem),
+        client_cert: parse_certs_pem(&cli_pem),
+        client_key: parse_key_pem(&cli_key_pem),
+        agent_id: "test-agent".into(),
+        models: vec!["mock-llm".into()],
+        max_concurrency: 4,
+        upstream_base: format!("http://{mock_addr}"),
+        heartbeat_interval: Duration::from_millis(200),
+    })
+    .unwrap();
+    wait_for_agents(&gw, 1, Duration::from_secs(10)).await;
+
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap();
+    let base = format!("https://{}", gw.http_addr);
+
+    // healthz 与根路径（管理页）走 HTTPS
+    let resp = client.get(format!("{base}/healthz")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let resp = client.get(format!("{base}/")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // 无 key → 401
+    let resp = client.get(format!("{base}/v1/models")).send().await.unwrap();
+    assert_eq!(resp.status(), 401);
+
+    // 认证请求穿透到 mock
+    let resp = client
+        .get(format!("{base}/v1/models"))
+        .header("Authorization", "Bearer test-key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let models: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(models["data"][0]["id"], "mock-llm");
+
+    // SSE 流式同样走 HTTPS
+    let resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key")
+        .json(&serde_json::json!({
+            "model": "mock-llm",
+            "stream": true,
+            "messages": [{"role": "user", "content": "https 流式"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let text = resp.text().await.unwrap();
+    assert!(text.contains("data: [DONE]"), "missing [DONE]: {text}");
+
+    agent.shutdown().await;
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_quic_control_stream_edge_frames() {
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    let (ca, server_cert, server_key, client_cert, client_key) = gen_certs();
+
+    let gw = Gateway::start(GatewayConfig {
+        http_bind: "127.0.0.1:0".parse().unwrap(),
+        quic_bind: "127.0.0.1:0".parse().unwrap(),
+        ca_cert: vec![ca.clone()],
+        server_cert: vec![server_cert.clone()],
+        server_key,
+        api_keys: vec!["test-key".into()],
+        admin_token: None,
+        keys_file: None,
+        request_timeout: Duration::from_secs(10),
+        agent_stale_after: Duration::from_secs(10),
+        rate_limit_per_min: 0,
+        tls: None,
+    })
+    .await
+    .unwrap();
+
+    // 裸 quinn 客户端（复用 agent 的 mTLS 配置），不走 agent crate 逻辑
+    let client_config =
+        agent::tls::client_config(&[ca.clone()], vec![client_cert.clone()], client_key.clone_key())
+            .unwrap();
+    let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    endpoint.set_default_client_config(client_config);
+    let conn = endpoint
+        .connect(gw.quic_addr, "localhost")
+        .unwrap()
+        .await
+        .unwrap();
+
+    // 控制流上发非预期帧（Cancel）→ 服务端走 "unexpected frame" 分支，连接不受影响
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    write_frame(&mut send, &Frame::Cancel { request_id: 1 })
+        .await
+        .unwrap();
+    send.finish().unwrap();
+    let _ = read_frame(&mut recv).await; // 等服务端 finish
+
+    // 立即结束的空流 → 服务端走干净 EOF 分支
+    let (mut send2, _recv2) = conn.open_bi().await.unwrap();
+    send2.finish().unwrap();
+
+    // 未注册 agent 的心跳 → registry 无害忽略
+    let (mut send3, mut recv3) = conn.open_bi().await.unwrap();
+    write_frame(
+        &mut send3,
+        &Frame::Heartbeat {
+            agent_id: "ghost".into(),
+            inflight: 0,
+        },
+    )
+    .await
+    .unwrap();
+    send3.finish().unwrap();
+    let _ = read_frame(&mut recv3).await;
+
+    // 给服务端处理留时间；裸连接未发 Register，不应进入注册表
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(gw.agent_count(), 0, "unregistered connection must not register");
     gw.shutdown().await;
 }

@@ -301,3 +301,31 @@ fn filter_headers(headers: &HeaderMap) -> Vec<(String, String)> {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn filter_headers_strips_hop_by_hop() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("example.com"));
+        headers.insert("connection", HeaderValue::from_static("keep-alive"));
+        headers.insert("transfer-encoding", HeaderValue::from_static("chunked"));
+        headers.insert("content-length", HeaderValue::from_static("42"));
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        headers.insert("authorization", HeaderValue::from_static("Bearer sk-test"));
+
+        let out = filter_headers(&headers);
+        let names: Vec<&str> = out.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(names.contains(&"content-type"));
+        assert!(names.contains(&"authorization"));
+        for hop in HOP_BY_HOP {
+            assert!(!names.contains(hop), "hop-by-hop header leaked: {hop}");
+        }
+        // 值原样保留
+        let auth = out.iter().find(|(k, _)| k == "authorization").unwrap();
+        assert_eq!(auth.1, "Bearer sk-test");
+    }
+}
