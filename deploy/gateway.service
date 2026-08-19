@@ -1,0 +1,28 @@
+# cloud-gateway systemd 单元（部署在中转云服务器）
+# 安装：
+#   1. 把二进制放到 /usr/local/bin/gateway
+#   2. 把证书放到 /etc/home-llm-gateway/（server.crt/server.key/ca.crt）
+#   3. 修改下面 ExecStart 中的 --api-keys 与限流参数
+#   4. sudo cp deploy/gateway.service /etc/systemd/system/ && sudo systemctl enable --now gateway
+[Unit]
+Description=Home LLM Gateway (cloud relay)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/gateway \
+  --listen-addr 0.0.0.0:8443 \
+  --quic-addr 0.0.0.0:4433 \
+  --cert /etc/home-llm-gateway/server.crt \
+  --key /etc/home-llm-gateway/server.key \
+  --ca /etc/home-llm-gateway/ca.crt \
+  --api-keys CHANGE_ME \
+  --tls-cert /etc/home-llm-gateway/server.crt \
+  --tls-key /etc/home-llm-gateway/server.key \
+  --rate-limit-per-min 60
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

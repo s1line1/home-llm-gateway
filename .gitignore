@@ -1,0 +1,11 @@
+# 构建产物
+/target/
+/dist/
+/.cargo-home/
+/.tmp/
+
+# 生成的证书（含私钥，绝不提交；用 certs/gen-dev.sh 重新生成）
+/certs/out/
+
+# 系统/编辑器杂项
+.DS_Store

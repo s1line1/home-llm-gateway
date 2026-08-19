@@ -1,0 +1,28 @@
+# home-agent systemd 单元（部署在 LLM 所在机器，家里或云上）
+# 安装：
+#   1. 把二进制放到 /usr/local/bin/agent
+#   2. 把证书放到 /etc/home-llm-gateway/（ca.crt / agent 自己的 client.crt/client.key）
+#   3. 修改 ExecStart：--cloud-addr 填网关公网 IP:4433，--server-name 填证书 SAN 域名，
+#      --upstream 填本地 LLM 的 OpenAI 兼容地址
+#   4. sudo cp deploy/agent.service /etc/systemd/system/ && sudo systemctl enable --now agent
+[Unit]
+Description=Home LLM Agent (QUIC tunnel client)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/agent \
+  --cloud-addr 1.2.3.4:4433 \
+  --server-name llm.example.com \
+  --ca /etc/home-llm-gateway/ca.crt \
+  --cert /etc/home-llm-gateway/client.crt \
+  --key /etc/home-llm-gateway/client.key \
+  --agent-id home-1 \
+  --upstream http://127.0.0.1:11434 \
+  --max-concurrency 2
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

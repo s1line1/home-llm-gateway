@@ -1,0 +1,9 @@
+[package]
+name = "proto"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+postcard = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
