@@ -193,7 +193,8 @@ systemd 单元：`deploy/gateway.service`（云服务器）、`deploy/agent.serv
 
 网关内置轻量管理接口，可**运行时签发 / 吊销 key，无需重启网关**：
 
-- 启动参数 `--admin-token <token>`：管理口令（与 API Key 相互独立），提供后启用 `/admin/*`
+- **网页管理页**：浏览器打开 `http://<网关地址>/` 即进入管理界面——输入 admin token 后可直接**创建 / 吊销 / 列出 key**
+- 启动参数 `--admin-token <token>`：管理口令（与 API Key 相互独立），提供后启用 `/admin/*` 与页面中的管理功能
 - `--keys-file <path>`：动态 key 持久化文件（默认 `keys.json`），重启后依然有效
 - `--api-keys` 里的静态 key 不受 Admin API 影响，二者都可用来调用 `/v1/*`
 

@@ -55,6 +55,7 @@ pub struct AppState {
 
 pub fn app(state: AppState) -> Router {
     let mut router = Router::new()
+        .route("/", get(crate::admin::admin_page))
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics_route))
         .route(

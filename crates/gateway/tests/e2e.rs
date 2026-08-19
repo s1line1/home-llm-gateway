@@ -154,6 +154,14 @@ async fn e2e_chain_with_mock_llm() {
     let resp = client.get(format!("{base}/healthz")).send().await.unwrap();
     assert_eq!(resp.status(), 200);
 
+    // 根路径返回管理页 HTML（含创建 API Key 的 UI）
+    let resp = client.get(format!("{base}/")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let page = resp.text().await.unwrap();
+    assert!(page.contains("Home LLM Gateway"), "root should serve the admin page");
+    assert!(page.contains("创建 Key"), "admin page should expose key creation UI");
+    assert!(page.starts_with("<!doctype html>"), "admin page should be HTML");
+
     // 认证后 /v1/models 穿透到 mock
     let resp = client
         .get(format!("{base}/v1/models"))

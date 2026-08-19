@@ -193,7 +193,8 @@ systemd units: `deploy/gateway.service` (cloud server) and `deploy/agent.service
 
 The gateway ships a lightweight admin interface to **issue / revoke keys at runtime — no restart needed**:
 
-- `--admin-token <token>`: admin password (independent of API keys); enables `/admin/*` when provided
+- **Web admin page**: open `http://<gateway-addr>/` in a browser — enter the admin token and **create / revoke / list keys** right from the page
+- `--admin-token <token>`: admin password (independent of API keys); enables `/admin/*` and the page's management features when provided
 - `--keys-file <path>`: persistence file for dynamic keys (default `keys.json`); keys survive restarts
 - Static keys from `--api-keys` are not affected by the Admin API; both kinds work on `/v1/*`
 
