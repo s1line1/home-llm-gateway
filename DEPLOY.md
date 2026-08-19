@@ -136,8 +136,21 @@ sudo journalctl -u gateway -f
 --quic-addr   0.0.0.0:4433      # QUIC 隧道（UDP）
 --tls-cert/--tls-key            # 公网 HTTPS 证书（server.crt/server.key）
 --cert/--key/--ca               # QUIC 隧道证书（同 server 证书 + ca.crt）
---api-keys <你的强随机key>       # 客户端 Bearer Key
+--api-keys <你的强随机key>       # 静态 Bearer Key（逗号分隔）
+--admin-token <另一个强随机串>   # Admin API 口令（可选；启用后可用 /admin/keys 运行时签发/吊销 key）
+--keys-file /etc/home-llm-gateway/keys.json   # 动态 key 持久化文件（默认 keys.json）
 --rate-limit-per-min 60         # 每个 Key 每分钟上限
+```
+
+**运行时签发 API Key**（不用重启网关）：
+
+```bash
+curl -X POST http://127.0.0.1:8443/admin/keys \
+  -H "Authorization: Bearer <admin-token>" -H "Content-Type: application/json" \
+  -d '{"name":"dsh-client"}'
+# 返回 {"id":...,"key":"sk-...","name":...}，key 只显示这一次，记下来
+curl http://127.0.0.1:8443/admin/keys -H "Authorization: Bearer <admin-token>"   # 列出（脱敏）
+curl -X DELETE http://127.0.0.1:8443/admin/keys/<id> -H "Authorization: Bearer <admin-token>"  # 吊销
 ```
 
 **本机自检**：
@@ -204,7 +217,8 @@ curl -N -k -H "Authorization: Bearer <你的key>" \
 
 - [ ] `ca.key` 只在本地，未上传到任何服务器
 - [ ] API Key 用 `openssl rand -hex 32` 生成，未用弱密码
+- [ ] `--admin-token` 用独立强随机串；`/admin/*` 在安全组中仅对管理网段开放
 - [ ] 安全组仅放行所需端口（22 限制来源 IP）
 - [ ] `/metrics` 未加认证：安全组中仅对监控网段放行，或后续给 metrics 加鉴权
-- [ ] server.key / client.key 权限 `chmod 600`
+- [ ] server.key / client.key / keys.json 权限 `chmod 600`
 - [ ] 证书到期前重签轮换（825 天），记录到期时间

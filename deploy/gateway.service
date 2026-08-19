@@ -18,6 +18,7 @@ ExecStart=/usr/local/bin/gateway \
   --key /etc/home-llm-gateway/server.key \
   --ca /etc/home-llm-gateway/ca.crt \
   --api-keys CHANGE_ME \
+  --admin-token CHANGE_ME_TOO \
   --tls-cert /etc/home-llm-gateway/server.crt \
   --tls-key /etc/home-llm-gateway/server.key \
   --rate-limit-per-min 60

@@ -189,6 +189,30 @@ Cross-compilation notes (macOS → Linux) are in the script header; musl targets
 
 systemd units: `deploy/gateway.service` (cloud server) and `deploy/agent.service` (LLM machine). Adjust the parameters, then `systemctl enable --now` for auto-start on boot.
 
+## API Key Management (Admin API)
+
+The gateway ships a lightweight admin interface to **issue / revoke keys at runtime — no restart needed**:
+
+- `--admin-token <token>`: admin password (independent of API keys); enables `/admin/*` when provided
+- `--keys-file <path>`: persistence file for dynamic keys (default `keys.json`); keys survive restarts
+- Static keys from `--api-keys` are not affected by the Admin API; both kinds work on `/v1/*`
+
+```bash
+# Create a key (returns the plaintext secret, shown only once)
+curl -X POST http://127.0.0.1:8080/admin/keys \
+  -H "Authorization: Bearer <admin-token>" -H "Content-Type: application/json" \
+  -d '{"name":"dsh-client"}'
+# → {"id":"ab99de40","key":"sk-…","name":"dsh-client","created_at":…,"enabled":true}
+
+# List keys (masked — only a prefix, never the full secret)
+curl http://127.0.0.1:8080/admin/keys -H "Authorization: Bearer <admin-token>"
+
+# Revoke a key (takes effect immediately)
+curl -X DELETE http://127.0.0.1:8080/admin/keys/<id> -H "Authorization: Bearer <admin-token>"
+```
+
+> Security: use a strong random value for `--admin-token` (`openssl rand -hex 32`); `keys.json` holds plaintext secrets and is git-ignored; in production, restrict `/admin/*` to your management network via the security group.
+
 ## Security Model
 
 | Surface | Measure |

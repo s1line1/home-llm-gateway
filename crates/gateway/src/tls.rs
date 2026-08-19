@@ -1,6 +1,6 @@
 //! TLS 配置构造与 PEM 加载。
 
-use std::{fs::File, io::{BufReader, Cursor}, path::Path, sync::Arc};
+use std::{fs::File, io::{BufReader, Cursor}, path::Path, sync::Arc, time::Duration};
 
 use quinn::crypto::rustls::QuicServerConfig;
 use rustls::{
@@ -28,7 +28,12 @@ pub fn server_config(
         .with_single_cert(cert, key)?;
     tls.alpn_protocols = vec![ALPN.to_vec()];
     let quic = QuicServerConfig::try_from(tls)?;
-    Ok(quinn::ServerConfig::with_crypto(Arc::new(quic)))
+    let mut cfg = quinn::ServerConfig::with_crypto(Arc::new(quic));
+    // 空闲超时：agent 失联（掉线/断电）后及时释放连接；agent 侧 keepalive 会维持存活
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_idle_timeout(Some(Duration::from_secs(20).try_into()?));
+    cfg.transport_config(Arc::new(transport));
+    Ok(cfg)
 }
 
 /// 从 PEM 文件加载证书链。

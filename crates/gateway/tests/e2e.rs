@@ -4,6 +4,7 @@
 
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    path::PathBuf,
     time::Duration,
 };
 
@@ -92,10 +93,13 @@ async fn wait_for_agents(gw: &Gateway, count: usize, timeout: Duration) {
 }
 
 /// 拉起一整套栈（mock-llm + gateway + agent），返回 (gw, agent, http base)。
+#[allow(clippy::too_many_arguments)]
 async fn start_stack(
     request_timeout: Duration,
     rate_limit_per_min: u32,
     max_concurrency: u32,
+    admin_token: Option<&str>,
+    keys_file: Option<PathBuf>,
 ) -> (Gateway, Agent, String) {
     let (ca, server_cert, server_key, client_cert, client_key) = gen_certs();
     let mock_addr = start_mock_llm("mock-llm").await;
@@ -107,6 +111,8 @@ async fn start_stack(
         server_cert: vec![server_cert.clone()],
         server_key,
         api_keys: vec!["test-key".into()],
+        admin_token: admin_token.map(|s| s.to_string()),
+        keys_file,
         request_timeout,
         agent_stale_after: Duration::from_secs(10),
         rate_limit_per_min,
@@ -137,7 +143,7 @@ async fn start_stack(
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_chain_with_mock_llm() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
-    let (gw, agent, base) = start_stack(Duration::from_secs(10), 0, 4).await;
+    let (gw, agent, base) = start_stack(Duration::from_secs(10), 0, 4, None, None).await;
     let client = reqwest::Client::new();
 
     // 无认证 → 401
@@ -197,7 +203,7 @@ async fn e2e_chain_with_mock_llm() {
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_sse_streaming_passthrough() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
-    let (gw, agent, base) = start_stack(Duration::from_secs(10), 0, 4).await;
+    let (gw, agent, base) = start_stack(Duration::from_secs(10), 0, 4, None, None).await;
     let client = reqwest::Client::new();
 
     let resp = client
@@ -242,7 +248,7 @@ async fn e2e_sse_streaming_passthrough() {
 async fn e2e_gateway_timeout_cancels_upstream() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     // 网关空闲超时 150ms，而 mock 的 /v1/slow 要睡 800ms 才响应 → 应触发超时 + Cancel
-    let (gw, agent, base) = start_stack(Duration::from_millis(150), 0, 4).await;
+    let (gw, agent, base) = start_stack(Duration::from_millis(150), 0, 4, None, None).await;
     let client = reqwest::Client::new();
 
     let resp = client
@@ -271,7 +277,7 @@ async fn e2e_gateway_timeout_cancels_upstream() {
 async fn e2e_rate_limit_per_key() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     // 每分钟 5 次：前 5 个请求放行，第 6 个 429
-    let (gw, agent, base) = start_stack(Duration::from_secs(10), 5, 4).await;
+    let (gw, agent, base) = start_stack(Duration::from_secs(10), 5, 4, None, None).await;
     let client = reqwest::Client::new();
 
     for i in 0..5 {
@@ -303,7 +309,7 @@ async fn e2e_rate_limit_per_key() {
 async fn e2e_admission_control() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     // agent max_concurrency=1：两个并发慢请求，一个 200、一个 429；完成后槽位释放
-    let (gw, agent, base) = start_stack(Duration::from_secs(10), 0, 1).await;
+    let (gw, agent, base) = start_stack(Duration::from_secs(10), 0, 1, None, None).await;
     let client = reqwest::Client::new();
     let url = format!("{base}/v1/slow");
     let req = || {
@@ -352,6 +358,8 @@ async fn e2e_multi_agent_least_loaded() {
         server_cert: vec![server_cert.clone()],
         server_key,
         api_keys: vec!["test-key".into()],
+        admin_token: None,
+        keys_file: None,
         request_timeout: Duration::from_secs(10),
         agent_stale_after: Duration::from_secs(10),
         rate_limit_per_min: 0,
@@ -417,7 +425,7 @@ async fn e2e_multi_agent_least_loaded() {
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_metrics_endpoint() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
-    let (gw, agent, base) = start_stack(Duration::from_secs(10), 0, 4).await;
+    let (gw, agent, base) = start_stack(Duration::from_secs(10), 0, 4, None, None).await;
     let client = reqwest::Client::new();
 
     // 先发两个请求（一个 401、一个 200），让计数器有值
@@ -436,6 +444,96 @@ async fn e2e_metrics_endpoint() {
     assert!(text.contains("hlmg_requests_total{status=\"200\"} 1"), "missing 200 counter: {text}");
     assert!(text.contains("hlmg_agents 1"), "missing agents gauge: {text}");
     assert!(text.contains("hlmg_bytes_out "), "missing bytes counter: {text}");
+
+    agent.shutdown().await;
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_admin_api_keys() {
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    let (gw, agent, base) = start_stack(Duration::from_secs(10), 0, 4, Some("admin-token"), None).await;
+    let client = reqwest::Client::new();
+
+    // 无 admin token → 401；普通 API key 也不行
+    let resp = client
+        .post(format!("{base}/admin/keys"))
+        .json(&serde_json::json!({"name": "x"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "admin endpoints require admin token");
+    let resp = client
+        .post(format!("{base}/admin/keys"))
+        .header("Authorization", "Bearer test-key")
+        .json(&serde_json::json!({"name": "x"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "API keys must not unlock admin endpoints");
+
+    // 创建 key
+    let resp = client
+        .post(format!("{base}/admin/keys"))
+        .header("Authorization", "Bearer admin-token")
+        .json(&serde_json::json!({"name": "dsh-client"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let created: serde_json::Value = resp.json().await.unwrap();
+    let new_key = created["key"].as_str().unwrap().to_string();
+    let new_id = created["id"].as_str().unwrap().to_string();
+    assert!(new_key.starts_with("sk-"), "generated key should have sk- prefix");
+
+    // 新 key 立即生效（运行时创建，无需重启）
+    let resp = client
+        .get(format!("{base}/v1/models"))
+        .header("Authorization", format!("Bearer {new_key}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "runtime-created key should work immediately");
+
+    // 列表包含刚创建的 key（且不暴露明文）
+    let resp = client
+        .get(format!("{base}/admin/keys"))
+        .header("Authorization", "Bearer admin-token")
+        .send()
+        .await
+        .unwrap();
+    let list: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        list.as_array().unwrap().iter().any(|k| k["name"] == "dsh-client" && k["id"] == new_id),
+        "list should contain the created key"
+    );
+    let list_text = serde_json::to_string(&list).unwrap();
+    assert!(!list_text.contains(&new_key), "list must not leak full key secrets");
+
+    // 吊销 → 204，之后该 key 立即失效
+    let resp = client
+        .delete(format!("{base}/admin/keys/{new_id}"))
+        .header("Authorization", "Bearer admin-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+    let resp = client
+        .get(format!("{base}/v1/models"))
+        .header("Authorization", format!("Bearer {new_key}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "revoked key must be rejected");
+
+    // 删除不存在的 key → 404
+    let resp = client
+        .delete(format!("{base}/admin/keys/{new_id}"))
+        .header("Authorization", "Bearer admin-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
 
     agent.shutdown().await;
     gw.shutdown().await;

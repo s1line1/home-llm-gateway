@@ -22,9 +22,15 @@ struct Args {
     /// 签发 agent 客户端证书的 CA PEM
     #[arg(long)]
     ca: PathBuf,
-    /// 允许的 API Key（逗号分隔）
+    /// 允许的 API Key（逗号分隔，静态）
     #[arg(long, value_delimiter = ',')]
     api_keys: Vec<String>,
+    /// Admin token（提供后启用 /admin/keys 管理接口）
+    #[arg(long)]
+    admin_token: Option<String>,
+    /// 动态 API Key 持久化文件
+    #[arg(long, default_value = "keys.json")]
+    keys_file: PathBuf,
     /// 单次转发空闲超时秒数（逐帧，SSE 长流不受影响）
     #[arg(long, default_value = "120")]
     timeout_secs: u64,
@@ -65,6 +71,8 @@ async fn main() -> anyhow::Result<()> {
         server_cert: gateway::tls::load_certs(&args.cert)?,
         server_key: gateway::tls::load_key(&args.key)?,
         api_keys: args.api_keys,
+        admin_token: args.admin_token,
+        keys_file: Some(args.keys_file),
         request_timeout: Duration::from_secs(args.timeout_secs),
         agent_stale_after: Duration::from_secs(args.agent_stale_secs),
         rate_limit_per_min: args.rate_limit_per_min,

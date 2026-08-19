@@ -7,5 +7,9 @@
 # 生成的证书（含私钥，绝不提交；用 certs/gen-dev.sh 重新生成）
 /certs/out/
 
+# 运行时动态 API Key（Admin API 签发，含明文密钥）
+/keys.json
+/keys.json.tmp
+
 # 系统/编辑器杂项
 .DS_Store

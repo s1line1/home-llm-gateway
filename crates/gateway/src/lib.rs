@@ -1,6 +1,8 @@
 //! cloud-gateway：公网 OpenAI 兼容入口（可选 HTTPS）+ QUIC 隧道服务端。
 
+pub mod admin;
 pub mod http;
+pub mod keystore;
 pub mod metrics;
 pub mod quic;
 pub mod ratelimit;
@@ -9,6 +11,7 @@ pub mod tls;
 
 use std::{
     net::SocketAddr,
+    path::PathBuf,
     sync::Arc,
     time::Duration,
 };
@@ -21,7 +24,7 @@ use tokio_rustls::TlsAcceptor;
 use tower::Service as TowerService;
 use tracing::warn;
 
-use crate::{metrics::Metrics, ratelimit::RateLimiter, registry::Registry};
+use crate::{keystore::KeyStore, metrics::Metrics, ratelimit::RateLimiter, registry::Registry};
 
 /// HTTPS 证书 PEM 内容。
 pub struct TlsPem {
@@ -38,8 +41,12 @@ pub struct GatewayConfig {
     pub ca_cert: Vec<CertificateDer<'static>>,
     pub server_cert: Vec<CertificateDer<'static>>,
     pub server_key: PrivateKeyDer<'static>,
-    /// 允许的 API Key（Bearer）。
+    /// 允许的静态 API Key（Bearer，启动时配置）。
     pub api_keys: Vec<String>,
+    /// Admin token；提供后启用 /admin/keys 管理接口。
+    pub admin_token: Option<String>,
+    /// 动态 API Key 持久化文件（None = 仅内存）。
+    pub keys_file: Option<PathBuf>,
     /// 单次请求转发空闲超时（逐帧）。
     pub request_timeout: Duration,
     /// 超过该时长未心跳的 agent 视为失联。
@@ -74,7 +81,8 @@ impl Gateway {
 
         let state = http::AppState {
             registry: registry.clone(),
-            api_keys: cfg.api_keys,
+            key_store: KeyStore::new(cfg.api_keys, cfg.keys_file.clone()),
+            admin_token: cfg.admin_token,
             timeout: cfg.request_timeout,
             agent_stale_after: cfg.agent_stale_after,
             rate_limiter: RateLimiter::new(cfg.rate_limit_per_min),

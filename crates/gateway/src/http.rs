@@ -20,6 +20,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, warn};
 
+use crate::keystore::KeyStore;
 use crate::metrics::Metrics;
 use crate::ratelimit::RateLimiter;
 use crate::registry::{AcquireError, Registry};
@@ -43,7 +44,9 @@ const HOP_BY_HOP: &[&str] = &[
 #[derive(Clone)]
 pub struct AppState {
     pub registry: Registry,
-    pub api_keys: Vec<String>,
+    pub key_store: KeyStore,
+    /// Admin token（None 表示不启用 /admin/*）。
+    pub admin_token: Option<String>,
     pub timeout: Duration,
     pub agent_stale_after: Duration,
     pub rate_limiter: Option<RateLimiter>,
@@ -51,13 +54,21 @@ pub struct AppState {
 }
 
 pub fn app(state: AppState) -> Router {
-    Router::new()
+    let mut router = Router::new()
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics_route))
         .route(
             "/v1/{*rest}",
             get(proxy).post(proxy).put(proxy).delete(proxy).patch(proxy),
-        )
+        );
+    if state.admin_token.is_some() {
+        let admin = Router::new()
+            .route("/keys", get(crate::admin::list_keys).post(crate::admin::create_key))
+            .route("/keys/{id}", axum::routing::delete(crate::admin::delete_key))
+            .route_layer(middleware::from_fn_with_state(state.clone(), crate::admin::admin_auth));
+        router = router.nest("/admin", admin);
+    }
+    router
         .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
         .layer(middleware::from_fn_with_state(state.clone(), metrics_middleware))
         .layer(tower_http::trace::TraceLayer::new_for_http())
@@ -93,26 +104,11 @@ fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
         .into_response()
 }
 
-/// 校验 Bearer API Key；通过时返回原始 token（用作限流 key）。
+/// 校验 Bearer API Key（静态或动态 key）；通过时返回原始 token（用作限流 key）。
 fn api_key<'a>(state: &AppState, headers: &'a HeaderMap) -> Option<&'a str> {
     let value = headers.get(axum::http::header::AUTHORIZATION)?;
     let token = value.to_str().ok()?.strip_prefix("Bearer ")?;
-    state
-        .api_keys
-        .iter()
-        .any(|k| constant_time_eq(k.as_bytes(), token.as_bytes()))
-        .then_some(token)
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    state.key_store.authorize(token).then_some(token)
 }
 
 async fn proxy(

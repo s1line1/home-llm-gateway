@@ -189,6 +189,30 @@ macOS 交叉编译到 Linux 的说明见脚本头部注释；推荐 musl 目标�
 
 systemd 单元：`deploy/gateway.service`（云服务器）、`deploy/agent.service`（LLM 机器），改好参数后 `systemctl enable --now` 即可开机自启。
 
+## API Key 管理（Admin API）
+
+网关内置轻量管理接口，可**运行时签发 / 吊销 key，无需重启网关**：
+
+- 启动参数 `--admin-token <token>`：管理口令（与 API Key 相互独立），提供后启用 `/admin/*`
+- `--keys-file <path>`：动态 key 持久化文件（默认 `keys.json`），重启后依然有效
+- `--api-keys` 里的静态 key 不受 Admin API 影响，二者都可用来调用 `/v1/*`
+
+```bash
+# 创建 key（返回明文，仅此一次展示）
+curl -X POST http://127.0.0.1:8080/admin/keys \
+  -H "Authorization: Bearer <admin-token>" -H "Content-Type: application/json" \
+  -d '{"name":"dsh-client"}'
+# → {"id":"ab99de40","key":"sk-…","name":"dsh-client","created_at":…,"enabled":true}
+
+# 列出（脱敏，只显示前缀，不暴露明文）
+curl http://127.0.0.1:8080/admin/keys -H "Authorization: Bearer <admin-token>"
+
+# 吊销（立即生效）
+curl -X DELETE http://127.0.0.1:8080/admin/keys/<id> -H "Authorization: Bearer <admin-token>"
+```
+
+> 安全：`--admin-token` 务必用强随机值（`openssl rand -hex 32`）；`keys.json` 含明文密钥，已加入 `.gitignore`；生产环境建议在安全组中仅对管理网段开放 `/admin/*`。
+
 ## 安全模型
 
 | 面 | 措施 |
