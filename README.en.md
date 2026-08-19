@@ -122,6 +122,8 @@ Point the agent's `--upstream` at your real service — nothing else changes:
 
 ## Production Deployment (Alibaba Cloud / public Internet)
 
+> Full step-by-step deployment guide (certificates, security groups, systemd, verification, troubleshooting): [`DEPLOY.md`](DEPLOY.md). Key points below.
+
 1. **Gateway on a public server**: open **UDP 4433** (QUIC tunnel) and **TCP 8443** (HTTPS API) in the security group / firewall. The gateway speaks HTTPS natively — no reverse proxy required (a reverse proxy couldn't handle the QUIC tunnel anyway, since it is a private frame protocol). If you later want a domain + automatic certificate renewal, add caddy (nginx needs `proxy_buffering off` or SSE streaming breaks).
 2. **Agent next to the LLM**: `--cloud-addr <PUBLIC_IP>:4433`, and set `--server-name` to a domain present in the certificate SAN (a domain + DNS SAN certificate is recommended so an IP change never breaks the connection).
 3. **mTLS is the key security line**: keep the CA private key yourself; issue a separate client certificate for every agent.

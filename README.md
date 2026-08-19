@@ -122,6 +122,8 @@ cargo test    # proto roundtrip + 端到端集成测试（内存生成证书，�
 
 ## 生产部署（阿里云 / 公网）
 
+> 完整 step-by-step 部署清单（证书签发、安全组、systemd、验证、排障）见 [`DEPLOY.md`](DEPLOY.md)。以下为要点。
+
 1. **中转网关放公网服务器**：安全组/防火墙放行 **UDP 4433**（QUIC 隧道）与 **TCP 8443**（HTTPS API）。网关自带 HTTPS，无需反代——QUIC 隧道是私有帧协议，反代本来也代理不了。日后若需域名 + 证书自动续期可加 caddy（nginx 需 `proxy_buffering off`，否则破坏 SSE 流式）。
 2. **agent 放 LLM 所在机器**：`--cloud-addr <公网IP>:4433`，`--server-name` 填证书 SAN 中的域名（推荐域名 + DNS SAN 证书，避免 IP 变更）。
 3. **mTLS 是关键安全线**：CA 私钥自己保管，每个 agent 单独签发客户端证书。
