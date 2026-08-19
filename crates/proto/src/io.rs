@@ -156,4 +156,29 @@ mod tests {
         let got = read_frame(&mut reader).await.unwrap().unwrap();
         assert_eq!(got, frame);
     }
+
+    /// 总是返回错误的读取器，用于触发非 EOF 的读错误分支。
+    struct ErrReader;
+
+    impl tokio::io::AsyncRead for ErrReader {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "boom",
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn non_eof_read_error_propagates() {
+        // 非 EOF 的底层读错误应直接向上传播（区别于干净 EOF 的 None）
+        let mut reader = ErrReader;
+        let err = read_frame(&mut reader).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert_eq!(err.to_string(), "boom");
+    }
 }

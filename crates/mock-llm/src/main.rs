@@ -13,15 +13,37 @@ struct Args {
     name: String,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
+/// 启动 mock 服务（独立函数，便于单元测试覆盖启动逻辑）。
+async fn run(args: Args) -> anyhow::Result<()> {
+    let _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
-        .init();
+        .try_init();
 
-    let args = Args::parse();
     let listener = tokio::net::TcpListener::bind(args.addr).await?;
     tracing::info!(name = %args.name, "mock-llm listening on {}", listener.local_addr()?);
     axum::serve(listener, mock_llm::router(&args.name)).await?;
     Ok(())
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    run(Args::parse()).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn run_binds_and_serves() {
+        // 用 127.0.0.1:0 随机端口启动，短暂运行后中止，验证启动路径可执行
+        let task = tokio::spawn(run(Args::parse_from([
+            "mock-llm",
+            "--addr", "127.0.0.1:0",
+            "--name", "test-instance",
+        ])));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!task.is_finished(), "mock server should keep serving");
+        task.abort();
+    }
 }

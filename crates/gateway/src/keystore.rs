@@ -198,4 +198,39 @@ mod tests {
         assert!(!store.authorize(&rec.key), "revoked key must be rejected");
         assert!(!store.delete(&rec.id), "deleting twice returns false");
     }
+
+    #[test]
+    fn corrupt_keys_file_ignored() {
+        // 文件存在但内容不是合法 JSON → 警告并当作空库
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keys.json");
+        std::fs::write(&path, "{ not valid json !!!").unwrap();
+        let store = KeyStore::new(vec!["static-1".into()], Some(path.clone()));
+        assert!(!store.authorize("anything"));
+        // 静态 key 不受影响
+        assert!(store.authorize("static-1"));
+    }
+
+    #[test]
+    fn unreadable_keys_file_ignored() {
+        // 路径存在但无法读取（是目录）→ 警告并当作空库
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keys.json");
+        std::fs::create_dir(&path).unwrap();
+        let store = KeyStore::new(vec![], Some(path.clone()));
+        assert!(!store.authorize("anything"));
+    }
+
+    #[test]
+    fn save_write_failure_keeps_runtime_keys() {
+        // keys.json.tmp 已存在且是目录 → save 写入失败 → 仅警告，内存中的 key 仍有效
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keys.json");
+        std::fs::create_dir(dir.path().join("keys.json.tmp")).unwrap();
+        let store = KeyStore::new(vec![], Some(path.clone()));
+        let rec = store.create("y".into());
+        // 写入失败被吞掉，但动态 key 仍在内存生效
+        assert!(store.authorize(&rec.key));
+        assert_eq!(store.list().len(), 1);
+    }
 }

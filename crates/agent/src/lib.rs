@@ -244,3 +244,234 @@ async fn send_cancelled(send: &mut quinn::SendStream, request_id: u64) -> anyhow
     let _ = send.finish();
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
+    use rcgen::{
+        BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+        KeyUsagePurpose, SanType,
+    };
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use std::sync::Arc;
+
+    /// 生成 (CA, 服务端证书, 服务端私钥, 客户端证书, 客户端私钥) 的 DER。
+    fn gen_pki() -> (
+        CertificateDer<'static>,
+        CertificateDer<'static>,
+        PrivateKeyDer<'static>,
+        CertificateDer<'static>,
+        PrivateKeyDer<'static>,
+    ) {
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::default();
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "test ca");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let srv_key = KeyPair::generate().unwrap();
+        let mut srv = CertificateParams::default();
+        srv.distinguished_name.push(DnType::CommonName, "gw");
+        srv.subject_alt_names = vec![SanType::DnsName("localhost".try_into().unwrap())];
+        srv.is_ca = IsCa::NoCa;
+        srv.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        srv.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        let srv_cert = srv.signed_by(&srv_key, &ca_cert, &ca_key).unwrap();
+
+        let cli_key = KeyPair::generate().unwrap();
+        let mut cli = CertificateParams::default();
+        cli.distinguished_name
+            .push(DnType::CommonName, "agent");
+        cli.is_ca = IsCa::NoCa;
+        cli.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        cli.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        let cli_cert = cli.signed_by(&cli_key, &ca_cert, &ca_key).unwrap();
+
+        (
+            ca_cert.der().clone(),
+            srv_cert.der().clone(),
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(srv_key.serialize_der())),
+            cli_cert.der().clone(),
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cli_key.serialize_der())),
+        )
+    }
+
+    /// 建立一对本地 QUIC 端点并返回客户端连接（无 mTLS）。
+    async fn test_connection() -> Connection {
+        let key = KeyPair::generate().unwrap();
+        let cert = CertificateParams::new(vec!["localhost".to_string()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let cert_der = CertificateDer::from(cert.der().clone());
+        let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
+
+        let tls = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key_der)
+            .unwrap();
+        let quic = QuicServerConfig::try_from(tls).unwrap();
+        let mut scfg = quinn::ServerConfig::with_crypto(Arc::new(quic));
+        let mut transport = quinn::TransportConfig::default();
+        transport.max_idle_timeout(Some(Duration::from_secs(10).try_into().unwrap()));
+        scfg.transport_config(Arc::new(transport));
+        let server = quinn::Endpoint::server(scfg, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let server_addr = server.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Some(incoming) = server.accept().await {
+                tokio::spawn(async move {
+                    // 保持连接存活到测试结束，避免服务端 drop 导致连接提前关闭
+                    if let Ok(conn) = incoming.await {
+                        conn.closed().await;
+                    }
+                });
+            }
+        });
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert_der).unwrap();
+        let client_tls = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let client_cfg =
+            quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(client_tls).unwrap()));
+        let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client.set_default_client_config(client_cfg);
+        client
+            .connect(server_addr, "localhost")
+            .unwrap()
+            .await
+            .unwrap()
+    }
+
+    /// 用 CA 签发的服务端证书建 mTLS QUIC server，把接到的连接发给测试。
+    async fn test_server(
+        ca: &CertificateDer<'static>,
+        cert: CertificateDer<'static>,
+        key: PrivateKeyDer<'static>,
+    ) -> (SocketAddr, tokio::sync::mpsc::Receiver<Connection>) {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca.clone()).unwrap();
+        let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+            .build()
+            .unwrap();
+        let mut tls = rustls::ServerConfig::builder()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(vec![cert], key)
+            .unwrap();
+        tls.alpn_protocols = vec![b"h3".to_vec()]; // 与 agent 客户端 ALPN 匹配
+        let quic = QuicServerConfig::try_from(tls).unwrap();
+        let mut scfg = quinn::ServerConfig::with_crypto(Arc::new(quic));
+        let mut transport = quinn::TransportConfig::default();
+        transport.max_idle_timeout(Some(Duration::from_secs(10).try_into().unwrap()));
+        scfg.transport_config(Arc::new(transport));
+        let server = quinn::Endpoint::server(scfg, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = server.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tokio::spawn(async move {
+            while let Some(incoming) = server.accept().await {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    if let Ok(conn) = incoming.await {
+                        let _ = tx.send(conn.clone()).await;
+                        conn.closed().await;
+                    }
+                });
+            }
+        });
+        (addr, rx)
+    }
+
+    fn test_agent_config(
+        cloud_addr: SocketAddr,
+        ca: CertificateDer<'static>,
+        cert: CertificateDer<'static>,
+        key: PrivateKeyDer<'static>,
+    ) -> AgentConfig {
+        AgentConfig {
+            cloud_addr,
+            server_name: "localhost".into(),
+            ca_cert: vec![ca],
+            client_cert: vec![cert],
+            client_key: key,
+            agent_id: "t".into(),
+            models: vec!["m".into()],
+            max_concurrency: 2,
+            upstream_base: "http://127.0.0.1:1".into(),
+            heartbeat_interval: Duration::from_millis(50),
+        }
+    }
+
+    #[tokio::test]
+    async fn heartbeat_loop_breaks_when_connection_closed() {
+        let conn = test_connection().await;
+        // 显式关闭连接：之后 open_bi 必然失败 → 心跳循环 break 退出
+        conn.close(0u32.into(), b"test close");
+        heartbeat_loop(conn, "agent-x".into(), Duration::from_millis(10)).await;
+    }
+
+    #[tokio::test]
+    async fn heartbeat_loop_sends_frames_on_live_connection() {
+        let conn = test_connection().await;
+        // 间隔 20ms、运行 100ms：应至少成功发送几次心跳（写帧 + 读 EOF）
+        let task = tokio::spawn(heartbeat_loop(
+            conn.clone(),
+            "agent-y".into(),
+            Duration::from_millis(20),
+        ));
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        // 连接仍存活（未被心跳逻辑破坏）
+        assert!(conn.open_bi().await.is_ok());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn run_loop_retries_when_connect_fails() {
+        let (ca, _srv_cert, _srv_key, cli_cert, cli_key) = gen_pki();
+        let cfg = test_agent_config(
+            SocketAddr::from(([127, 0, 0, 1], 1)), // 必然连接失败
+            ca,
+            cli_cert,
+            cli_key,
+        );
+        let cc = tls::client_config(
+            &cfg.ca_cert,
+            cfg.client_cert.clone(),
+            cfg.client_key.clone_key(),
+        )
+        .unwrap();
+        let task = tokio::spawn(run(cfg, cc));
+        // 第一次连接失败 → Err 分支 → 退避重试（覆盖 71/73-74 行）
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert!(!task.is_finished(), "run loop should keep retrying");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn run_loop_handles_clean_disconnect() {
+        let (ca, srv_cert, srv_key, cli_cert, cli_key) = gen_pki();
+        let (addr, mut rx) = test_server(&ca, srv_cert, srv_key).await;
+        let cfg = test_agent_config(addr, ca.clone(), cli_cert, cli_key);
+        let cc = tls::client_config(
+            &cfg.ca_cert,
+            cfg.client_cert.clone(),
+            cfg.client_key.clone_key(),
+        )
+        .unwrap();
+        let task = tokio::spawn(run(cfg, cc));
+        // 等 agent 连上
+        let server_conn = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("agent should connect")
+            .unwrap();
+        // 服务端主动关闭连接 → agent 干净断开（Ok 分支）→ 退避重连
+        server_conn.close(0u32.into(), b"bye");
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert!(!task.is_finished(), "run loop should keep running after disconnect");
+        task.abort();
+    }
+}

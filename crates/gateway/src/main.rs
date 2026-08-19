@@ -75,13 +75,12 @@ fn config_from_args(args: Args) -> anyhow::Result<GatewayConfig> {
     })
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
+/// 启动网关主循环（独立函数，便于单元测试覆盖启动路径）。
+async fn run(args: Args) -> anyhow::Result<()> {
+    let _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
-        .init();
+        .try_init();
 
-    let args = Args::parse();
     let cfg = config_from_args(args)?;
 
     let gw = Gateway::start(cfg).await?;
@@ -90,6 +89,11 @@ async fn main() -> anyhow::Result<()> {
 
     std::future::pending::<()>().await;
     Ok(())
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    run(Args::parse()).await
 }
 
 #[cfg(test)]
@@ -186,5 +190,25 @@ mod tests {
         let cfg = config_from_args(args).unwrap();
         let tls = cfg.tls.expect("tls pair should be loaded");
         assert!(!tls.cert.is_empty() && !tls.key.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_starts_gateway() {
+        // 用随机端口 + 临时证书启动网关，主循环挂起在 pending
+        let dir = tempfile::tempdir().unwrap();
+        let (ca, cert, key) = gen_cert_files(dir.path());
+        let args = Args::parse_from([
+            "gateway",
+            "--listen-addr", "127.0.0.1:0",
+            "--quic-addr", "127.0.0.1:0",
+            "--cert", cert.to_str().unwrap(),
+            "--key", key.to_str().unwrap(),
+            "--ca", ca.to_str().unwrap(),
+            "--api-keys", "test-key",
+        ]);
+        let task = tokio::spawn(run(args));
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!task.is_finished(), "gateway loop should stay running");
+        task.abort();
     }
 }

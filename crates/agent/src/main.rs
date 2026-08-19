@@ -55,18 +55,22 @@ fn agent_config_from_args(args: Args) -> anyhow::Result<AgentConfig> {
     })
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
+/// 启动 agent 主循环（独立函数，便于单元测试覆盖启动路径）。
+async fn run(args: Args) -> anyhow::Result<()> {
+    let _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
-        .init();
+        .try_init();
 
-    let args = Args::parse();
     let cfg = agent_config_from_args(args)?;
 
     let _agent = Agent::start(cfg)?;
     std::future::pending::<()>().await;
     Ok(())
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    run(Args::parse()).await
 }
 
 #[cfg(test)]
@@ -147,5 +151,24 @@ mod tests {
         assert_eq!(cfg.heartbeat_interval, Duration::from_secs(5));
         assert_eq!(cfg.models, vec!["*".to_string()]);
         assert_eq!(cfg.max_concurrency, 4);
+    }
+
+    #[tokio::test]
+    async fn run_starts_agent_loop() {
+        // 云端地址不可达：Agent::start 在后台重试，主循环挂起在 pending
+        let dir = tempfile::tempdir().unwrap();
+        let (ca, cert, key) = gen_cert_files(dir.path());
+        let args = Args::parse_from([
+            "agent",
+            "--cloud-addr", "127.0.0.1:1", // 必然连接失败
+            "--ca", ca.to_str().unwrap(),
+            "--cert", cert.to_str().unwrap(),
+            "--key", key.to_str().unwrap(),
+            "--heartbeat-secs", "1",
+        ]);
+        let task = tokio::spawn(run(args));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!task.is_finished(), "agent loop should stay running");
+        task.abort();
     }
 }

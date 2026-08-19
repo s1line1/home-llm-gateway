@@ -26,6 +26,7 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 agent = { path = "../agent" }
+futures-util = { workspace = true }
 mock-llm = { path = "../mock-llm" }
 rcgen = { workspace = true }
 reqwest = { workspace = true }
