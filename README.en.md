@@ -13,7 +13,7 @@ Client (anywhere)
 cloud-gateway (public)     axum entry: API-key auth → rate limit → routing → tunnel frames
    │  QUIC (UDP, mTLS, multiplexed single connection, no head-of-line blocking)
    ▼
-home-agent (LLM host)      dials out + heartbeat + auto-reconnect, proxies to local LLM
+edge-agent (LLM host)      dials out + heartbeat + auto-reconnect, proxies to local LLM
    │  HTTP
    ▼
 Local LLM (Ollama / vLLM / llama.cpp / mock-llm)
@@ -35,7 +35,7 @@ Local LLM (Ollama / vLLM / llama.cpp / mock-llm)
 crates/
 ├── proto/      tunnel frame protocol (Register/Heartbeat/ProxyRequest/Response*/Cancel/Error)
 ├── gateway/    cloud-gateway binary (axum + quinn server)
-├── agent/      home-agent binary (quinn client + reqwest)
+├── agent/      edge-agent binary (quinn client + reqwest)
 └── mock-llm/   fake OpenAI-compatible LLM (to bring up the full chain without a real model)
 certs/          dev certificate script
 deploy/         systemd units (gateway.service / agent.service)
@@ -63,7 +63,7 @@ certs/gen-dev.sh        # outputs to certs/out/ (CA + server + client)
 cargo run -p mock-llm -- --addr 127.0.0.1:11435
 ```
 
-### 3. Start home-agent (on the machine next to your LLM)
+### 3. Start edge-agent (on the machine next to your LLM)
 
 ```bash
 cargo run -p agent -- \

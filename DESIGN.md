@@ -25,10 +25,10 @@
 │  · QUIC Server（隧道端）   │
 └──────────┬───────────────┘
            │ QUIC（UDP 443，mTLS，一条连接多路复用）
-           │ ← 家端主动拨出的长连接，云端永不主动连家
+           │ ← 边缘端主动拨出的长连接，云端永不主动连对端
            ▼
 ┌──────────────────────────┐
-│  home-agent（家里）        │  常驻进程
+│  edge-agent（家里）        │  常驻进程
 │  · QUIC Client（拨号/心跳）│  解码帧 → 转发本地 LLM
 │  · 本地 LLM 转发/进程管理  │  流式回传 + 取消传播
 └──────────┬───────────────┘
@@ -48,7 +48,7 @@
 | 能力 | 对本场景的价值 |
 |---|---|
 | **多路复用、无队头阻塞** | 一条隧道并发承载多个请求流。LLM 的 SSE 响应是"慢流"，TCP 上一个大响应会阻塞后续请求；QUIC 每个流独立 |
-| **连接迁移（Connection ID）** | 家端 agent 网络切换（WiFi ↔ 蜂窝、IP 变化）时连接不中断，无需重连 |
+| **连接迁移（Connection ID）** | 边缘端 agent 网络切换（WiFi ↔ 蜂窝、IP 变化）时连接不中断，无需重连 |
 | **0-RTT / 快速重连** | 断线重连开销小，心跳丢失后恢复快 |
 | **内建 TLS 1.3 + mTLS** | 隧道加密和双向认证开箱即用，无需自己拼 TLS-over-TCP 栈 |
 | **Rust 生态成熟** | `quinn` 是生产级实现（Tokio 官方维护），API 稳定 |
@@ -60,7 +60,7 @@
 ### 4.1 传输层
 
 - `quinn` 建立 QUIC 连接（UDP 443）。
-- **双向认证（mTLS）**：云端自建 CA，为每个 home-agent 签发客户端证书；云端只接受持有有效证书的连接。防止任何人伪装成"家里的 agent"接走流量。
+- **双向认证（mTLS）**：云端自建 CA，为每个 edge-agent 签发客户端证书；云端只接受持有有效证书的连接。防止任何人伪装成"边缘端 agent"接走流量。
 - 一个 QUIC 连接承载 N 个双向 **stream**；每个隧道帧独占一个 stream 发送（stream 天然有序、流式，天然适配"一个请求一条流"）。
 
 ### 4.2 帧协议（自定义轻量二进制帧，bincode/postcard 序列化）
@@ -103,11 +103,11 @@
 2. **认证**：Bearer API Key（恒定时间比较，防时序侧信道）；可选 IP 白名单。
 3. **限流**：token bucket 按 Key 限流；按 agent 并发上限 admission control（429）。
 4. **Agent 路由**：维护 agent 注册表（agent_id → 当前 QUIC 连接 + 健康状态）；多 agent 时按"最少并发"或"轮询"选择；无健康 agent 时返回 503。
-5. **QUIC Server**：接受家端连接，校验 mTLS 证书，处理 Register/Heartbeat，更新注册表，踢掉同一 agent_id 的旧连接（防重复拨号）。
+5. **QUIC Server**：接受边缘端连接，校验 mTLS 证书，处理 Register/Heartbeat，更新注册表，踢掉同一 agent_id 的旧连接（防重复拨号）。
 6. **请求转发**：HTTP → `ProxyRequest` 帧 → 等 `ProxyResponse*` 帧流式回写；超时（空闲超时 + 总超时）→ `Cancel`。
 7. **可观测性**：`tracing` 结构化日志 + `metrics`（请求数、延迟、token 量、在线 agent 数）。
 
-## 6. 家端（home-agent）设计
+## 6. 边缘端（edge-agent）设计
 
 **技术栈**：`quinn` + `reqwest` + `tokio` + `clap` + `tracing` + `serde`
 
@@ -131,12 +131,12 @@
 
 - **云端**：编译为单二进制，`systemd` 或 Docker 运行；证书由自家 CA 签发脚本管理。
 - **家里**：单二进制，支持 Linux / macOS / Windows / WSL2（家里机器可能什么系统都有）。
-- **配置**：`config.toml`（云端：监听地址、CA、限流参数；家端：云端地址、agent_id、证书路径、本地 LLM 地址）。
-- **开机自启**：家端注册为 systemd/launchd 服务。
+- **配置**：`config.toml`（云端：监听地址、CA、限流参数；边缘端：云端地址、agent_id、证书路径、本地 LLM 地址）。
+- **开机自启**：边缘端注册为 systemd/launchd 服务。
 
 ## 9. 里程碑
 
-- **M1 最小链路** ✅：cloud-gateway 公网 HTTP + QUIC server；home-agent 拨号 + mTLS + 心跳；非流式请求转发。
+- **M1 最小链路** ✅：cloud-gateway 公网 HTTP + QUIC server；edge-agent 拨号 + mTLS + 心跳；非流式请求转发。
 - **M2 流式** ✅：SSE 透传（agent 逐块转发、网关流式回写）+ `Cancel` 传播（客户端断开/超时即取消上游）。
 - **M3 加固** ✅：公网 HTTPS（rustls 原生，无需反代）、按 API Key 令牌桶限流、按 agent `max_concurrency` 的 admission control。
 - **M4 完善** ✅：多 agent 最少负载路由（在途最少者优先，原子占位）、`/metrics` Prometheus 指标、`--version`、多平台打包脚本（`scripts/build-release.sh`）与 systemd 单元（`deploy/`）。待办：健康上报驱动的更精细路由、Grafana 仪表盘模板。
@@ -159,7 +159,7 @@ home-llm-gateway/
 ├── DESIGN.md             # 本文档
 ├── crates/
 │   ├── gateway/          # cloud-gateway 二进制（axum + quinn server）
-│   ├── agent/            # home-agent 二进制（quinn client + reqwest）
+│   ├── agent/            # edge-agent 二进制（quinn client + reqwest）
 │   └── proto/            # 共享 crate：帧类型、序列化、错误码
 │       └── tests/        # 帧编解码 roundtrip 测试
 └── certs/                # 自建 CA 与签发脚本（脚本而非仓库内私钥）

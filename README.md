@@ -13,7 +13,7 @@ Rust 实现，零外部依赖组件（不依赖 frp/ngrok/nginx）。隧道协�
 cloud-gateway（公网）      axum 入口：API Key 认证 → 限流 → 路由 → 隧道帧
    │  QUIC（UDP，mTLS，一条连接多路复用，无队头阻塞）
    ▼
-home-agent（LLM 所在机器）  主动拨号 + 心跳 + 断线重连，转发本地 LLM
+edge-agent（LLM 所在机器）  主动拨号 + 心跳 + 断线重连，转发本地 LLM
    │  HTTP
    ▼
 本地 LLM（Ollama / vLLM / llama.cpp / mock-llm）
@@ -21,7 +21,7 @@ home-agent（LLM 所在机器）  主动拨号 + 心跳 + 断线重连，转发�
 
 ## 特性
 
-- **QUIC 隧道 + mTLS**：家端主动向外拨长连接，天然穿透 NAT / 动态 IP；双向证书认证，未注册 agent 无法接入
+- **QUIC 隧道 + mTLS**：边缘端主动向外拨长连接，天然穿透 NAT / 动态 IP；双向证书认证，未注册 agent 无法接入
 - **流式优先**：SSE 逐块透传（打字机效果）；客户端断开/超时自动 `Cancel` 上游，不白算 token；逐帧空闲超时，不误杀长流
 - **公网 HTTPS 原生支持**：rustls 直接监听 443，无需 nginx/caddy
 - **安全与治理**：API Key 认证（恒定时间比较）、按 Key 令牌桶限流、按 agent 并发上限的 admission control（超限 429）
@@ -35,7 +35,7 @@ home-agent（LLM 所在机器）  主动拨号 + 心跳 + 断线重连，转发�
 crates/
 ├── proto/      隧道帧协议（Register/Heartbeat/ProxyRequest/Response*/Cancel/Error）
 ├── gateway/    cloud-gateway 二进制（axum + quinn server）
-├── agent/      home-agent 二进制（quinn client + reqwest）
+├── agent/      edge-agent 二进制（quinn client + reqwest）
 └── mock-llm/   模拟 OpenAI 兼容接口的假 LLM（无真实模型时打通链路用）
 certs/          证书生成脚本（开发用）
 deploy/         systemd 单元（gateway.service / agent.service）
@@ -63,7 +63,7 @@ certs/gen-dev.sh        # 输出到 certs/out/（CA + 服务端 + 客户端）
 cargo run -p mock-llm -- --addr 127.0.0.1:11435
 ```
 
-### 3. 起 home-agent（家里那台机器）
+### 3. 起 edge-agent（家里那台机器）
 
 ```bash
 cargo run -p agent -- \
