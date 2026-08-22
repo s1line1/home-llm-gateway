@@ -146,17 +146,29 @@ async fn wait_for_agents(gw: &Gateway, count: usize, timeout: Duration) {
     panic!("expected {count} agents, got {}", gw.agent_count());
 }
 
-/// 拉起一整套栈（mock-llm + gateway + agent），返回 (gw, agent, http base)。
+/// 建一个临时 SQLite 库并种入一个测试 key，返回 (库路径, key)。
+/// 临时目录被 forget 保活，避免网关持有连接时库文件被清理。
+fn seed_keys_db() -> (PathBuf, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("keys.db");
+    let store = gateway::keystore::KeyStore::new(Some(path.clone()));
+    let rec = store.create("e2e".into());
+    std::mem::forget(dir);
+    (path, rec.key)
+}
+
+/// 拉起一整套栈（mock-llm + gateway + agent），返回 (gw, agent, http base, api key)。
+/// key 通过 SQLite 种入（模拟 Admin API 创建后的持久化 key）。
 #[allow(clippy::too_many_arguments)]
 async fn start_stack(
     request_timeout: Duration,
     rate_limit_per_min: u32,
     max_concurrency: u32,
     admin_token: Option<&str>,
-    keys_file: Option<PathBuf>,
-) -> (Gateway, Agent, String) {
+) -> (Gateway, Agent, String, String) {
     let (ca, server_cert, server_key, client_cert, client_key) = gen_certs();
     let mock_addr = start_mock_llm("mock-llm").await;
+    let (keys_path, test_key) = seed_keys_db();
 
     let gw = Gateway::start(GatewayConfig {
         http_bind: "127.0.0.1:0".parse().unwrap(),
@@ -164,9 +176,8 @@ async fn start_stack(
         ca_cert: vec![ca.clone()],
         server_cert: vec![server_cert.clone()],
         server_key,
-        api_keys: vec!["test-key".into()],
         admin_token: admin_token.map(|s| s.to_string()),
-        keys_file,
+        keys_file: Some(keys_path),
         request_timeout,
         agent_stale_after: Duration::from_secs(10),
         rate_limit_per_min,
@@ -191,13 +202,13 @@ async fn start_stack(
 
     wait_for_agents(&gw, 1, Duration::from_secs(10)).await;
     let base = format!("http://{}", gw.http_addr);
-    (gw, agent, base)
+    (gw, agent, base, test_key)
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_chain_with_mock_llm() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
-    let (gw, agent, base) = start_stack(Duration::from_secs(10), 0, 4, None, None).await;
+    let (gw, agent, base, key) = start_stack(Duration::from_secs(10), 0, 4, None).await;
     let client = reqwest::Client::new();
 
     // 无认证 → 401
@@ -219,7 +230,7 @@ async fn e2e_chain_with_mock_llm() {
     // 认证后 /v1/models 穿透到 mock
     let resp = client
         .get(format!("{base}/v1/models"))
-        .header("Authorization", "Bearer test-key")
+        .header("Authorization", format!("Bearer {key}"))
         .send()
         .await
         .unwrap();
@@ -230,7 +241,7 @@ async fn e2e_chain_with_mock_llm() {
     // chat completions 全链路（非流式）
     let resp = client
         .post(format!("{base}/v1/chat/completions"))
-        .header("Authorization", "Bearer test-key")
+        .header("Authorization", format!("Bearer {key}"))
         .json(&serde_json::json!({
             "model": "mock-llm",
             "messages": [{"role": "user", "content": "hello from e2e"}]
@@ -249,7 +260,7 @@ async fn e2e_chain_with_mock_llm() {
     // embeddings 也走通
     let resp = client
         .post(format!("{base}/v1/embeddings"))
-        .header("Authorization", "Bearer test-key")
+        .header("Authorization", format!("Bearer {key}"))
         .json(&serde_json::json!({"model": "mock-llm", "input": "x"}))
         .send()
         .await
@@ -265,12 +276,12 @@ async fn e2e_chain_with_mock_llm() {
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_sse_streaming_passthrough() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
-    let (gw, agent, base) = start_stack(Duration::from_secs(10), 0, 4, None, None).await;
+    let (gw, agent, base, key) = start_stack(Duration::from_secs(10), 0, 4, None).await;
     let client = reqwest::Client::new();
 
     let resp = client
         .post(format!("{base}/v1/chat/completions"))
-        .header("Authorization", "Bearer test-key")
+        .header("Authorization", format!("Bearer {key}"))
         .json(&serde_json::json!({
             "model": "mock-llm",
             "stream": true,
@@ -310,12 +321,12 @@ async fn e2e_sse_streaming_passthrough() {
 async fn e2e_gateway_timeout_cancels_upstream() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     // 网关空闲超时 150ms，而 mock 的 /v1/slow 要睡 800ms 才响应 → 应触发超时 + Cancel
-    let (gw, agent, base) = start_stack(Duration::from_millis(150), 0, 4, None, None).await;
+    let (gw, agent, base, key) = start_stack(Duration::from_millis(150), 0, 4, None).await;
     let client = reqwest::Client::new();
 
     let resp = client
         .post(format!("{base}/v1/slow"))
-        .header("Authorization", "Bearer test-key")
+        .header("Authorization", format!("Bearer {key}"))
         .json(&serde_json::json!({}))
         .send()
         .await
@@ -325,7 +336,7 @@ async fn e2e_gateway_timeout_cancels_upstream() {
     // Cancel 不应影响 agent 连接本身，之后仍能正常服务
     let resp = client
         .get(format!("{base}/v1/models"))
-        .header("Authorization", "Bearer test-key")
+        .header("Authorization", format!("Bearer {key}"))
         .send()
         .await
         .unwrap();
@@ -339,13 +350,13 @@ async fn e2e_gateway_timeout_cancels_upstream() {
 async fn e2e_rate_limit_per_key() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     // 每分钟 5 次：前 5 个请求放行，第 6 个 429
-    let (gw, agent, base) = start_stack(Duration::from_secs(10), 5, 4, None, None).await;
+    let (gw, agent, base, key) = start_stack(Duration::from_secs(10), 5, 4, None).await;
     let client = reqwest::Client::new();
 
     for i in 0..5 {
         let resp = client
             .get(format!("{base}/v1/models"))
-            .header("Authorization", "Bearer test-key")
+            .header("Authorization", format!("Bearer {key}"))
             .send()
             .await
             .unwrap();
@@ -353,7 +364,7 @@ async fn e2e_rate_limit_per_key() {
     }
     let resp = client
         .get(format!("{base}/v1/models"))
-        .header("Authorization", "Bearer test-key")
+        .header("Authorization", format!("Bearer {key}"))
         .send()
         .await
         .unwrap();
@@ -371,13 +382,13 @@ async fn e2e_rate_limit_per_key() {
 async fn e2e_admission_control() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     // agent max_concurrency=1：两个并发慢请求，一个 200、一个 429；完成后槽位释放
-    let (gw, agent, base) = start_stack(Duration::from_secs(10), 0, 1, None, None).await;
+    let (gw, agent, base, key) = start_stack(Duration::from_secs(10), 0, 1, None).await;
     let client = reqwest::Client::new();
     let url = format!("{base}/v1/slow");
     let req = || {
         client
             .post(&url)
-            .header("Authorization", "Bearer test-key")
+            .header("Authorization", format!("Bearer {key}"))
             .json(&serde_json::json!({}))
     };
 
@@ -412,6 +423,7 @@ async fn e2e_multi_agent_least_loaded() {
     let (ca, server_cert, server_key, client_cert, client_key) = gen_certs();
     let mock_a = start_mock_llm("mock-a").await;
     let mock_b = start_mock_llm("mock-b").await;
+    let (keys_path, key) = seed_keys_db();
 
     let gw = Gateway::start(GatewayConfig {
         http_bind: "127.0.0.1:0".parse().unwrap(),
@@ -419,9 +431,8 @@ async fn e2e_multi_agent_least_loaded() {
         ca_cert: vec![ca.clone()],
         server_cert: vec![server_cert.clone()],
         server_key,
-        api_keys: vec!["test-key".into()],
         admin_token: None,
-        keys_file: None,
+        keys_file: Some(keys_path),
         request_timeout: Duration::from_secs(10),
         agent_stale_after: Duration::from_secs(10),
         rate_limit_per_min: 0,
@@ -454,7 +465,7 @@ async fn e2e_multi_agent_least_loaded() {
     let req = || {
         client
             .post(&url)
-            .header("Authorization", "Bearer test-key")
+            .header("Authorization", format!("Bearer {key}"))
             .json(&serde_json::json!({}))
     };
 
@@ -487,14 +498,14 @@ async fn e2e_multi_agent_least_loaded() {
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_metrics_endpoint() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
-    let (gw, agent, base) = start_stack(Duration::from_secs(10), 0, 4, None, None).await;
+    let (gw, agent, base, key) = start_stack(Duration::from_secs(10), 0, 4, None).await;
     let client = reqwest::Client::new();
 
     // 先发两个请求（一个 401、一个 200），让计数器有值
     let _ = client.get(format!("{base}/v1/models")).send().await.unwrap();
     let _ = client
         .get(format!("{base}/v1/models"))
-        .header("Authorization", "Bearer test-key")
+        .header("Authorization", format!("Bearer {key}"))
         .send()
         .await
         .unwrap();
@@ -514,7 +525,7 @@ async fn e2e_metrics_endpoint() {
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_admin_api_keys() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
-    let (gw, agent, base) = start_stack(Duration::from_secs(10), 0, 4, Some("admin-token"), None).await;
+    let (gw, agent, base, key) = start_stack(Duration::from_secs(10), 0, 4, Some("admin-token")).await;
     let client = reqwest::Client::new();
 
     // 无 admin token → 401；普通 API key 也不行
@@ -527,7 +538,7 @@ async fn e2e_admin_api_keys() {
     assert_eq!(resp.status(), 401, "admin endpoints require admin token");
     let resp = client
         .post(format!("{base}/admin/keys"))
-        .header("Authorization", "Bearer test-key")
+        .header("Authorization", format!("Bearer {key}"))
         .json(&serde_json::json!({"name": "x"}))
         .send()
         .await
@@ -606,6 +617,7 @@ async fn e2e_https_public_entry() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     let (ca_pem, srv_pem, srv_key_pem, cli_pem, cli_key_pem) = gen_certs_pem();
     let mock_addr = start_mock_llm("mock-llm").await;
+    let (keys_path, key) = seed_keys_db();
 
     let gw = Gateway::start(GatewayConfig {
         http_bind: "127.0.0.1:0".parse().unwrap(),
@@ -613,9 +625,8 @@ async fn e2e_https_public_entry() {
         ca_cert: parse_certs_pem(&ca_pem),
         server_cert: parse_certs_pem(&srv_pem),
         server_key: parse_key_pem(&srv_key_pem),
-        api_keys: vec!["test-key".into()],
         admin_token: None,
-        keys_file: None,
+        keys_file: Some(keys_path),
         request_timeout: Duration::from_secs(10),
         agent_stale_after: Duration::from_secs(10),
         rate_limit_per_min: 0,
@@ -661,7 +672,7 @@ async fn e2e_https_public_entry() {
     // 认证请求穿透到 mock
     let resp = client
         .get(format!("{base}/v1/models"))
-        .header("Authorization", "Bearer test-key")
+        .header("Authorization", format!("Bearer {key}"))
         .send()
         .await
         .unwrap();
@@ -672,7 +683,7 @@ async fn e2e_https_public_entry() {
     // SSE 流式同样走 HTTPS
     let resp = client
         .post(format!("{base}/v1/chat/completions"))
-        .header("Authorization", "Bearer test-key")
+        .header("Authorization", format!("Bearer {key}"))
         .json(&serde_json::json!({
             "model": "mock-llm",
             "stream": true,
@@ -712,7 +723,6 @@ async fn e2e_quic_control_stream_edge_frames() {
         ca_cert: vec![ca.clone()],
         server_cert: vec![server_cert.clone()],
         server_key,
-        api_keys: vec!["test-key".into()],
         admin_token: None,
         keys_file: None,
         request_timeout: Duration::from_secs(10),
@@ -844,6 +854,7 @@ async fn e2e_proxy_protocol_edge_cases() {
 
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     let (ca, server_cert, server_key, client_cert, client_key) = gen_certs();
+    let (keys_path, key) = seed_keys_db();
 
     // 短转发空闲超时（200ms），用于触发 body 空闲超时场景
     let gw = Gateway::start(GatewayConfig {
@@ -852,9 +863,8 @@ async fn e2e_proxy_protocol_edge_cases() {
         ca_cert: vec![ca.clone()],
         server_cert: vec![server_cert.clone()],
         server_key,
-        api_keys: vec!["test-key".into()],
         admin_token: None,
-        keys_file: None,
+        keys_file: Some(keys_path),
         request_timeout: Duration::from_millis(200),
         agent_stale_after: Duration::from_secs(10),
         rate_limit_per_min: 0,
@@ -1079,7 +1089,7 @@ async fn e2e_proxy_protocol_edge_cases() {
     let get = |p: &str| {
         client
             .get(url(p))
-            .header("Authorization", "Bearer test-key")
+            .header("Authorization", format!("Bearer {key}"))
     };
 
     // 0: Error 帧作响应头 → 503
@@ -1132,13 +1142,13 @@ async fn e2e_client_disconnect_cancels_upstream() {
     use futures_util::StreamExt;
 
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
-    let (gw, agent, base) = start_stack(Duration::from_secs(10), 0, 4, None, None).await;
+    let (gw, agent, base, key) = start_stack(Duration::from_secs(10), 0, 4, None).await;
     let client = reqwest::Client::new();
 
     // 发起 SSE 流式请求，读到一个 chunk 后直接丢弃响应（模拟客户端断开）
     let resp = client
         .post(format!("{base}/v1/chat/completions"))
-        .header("Authorization", "Bearer test-key")
+        .header("Authorization", format!("Bearer {key}"))
         .json(&serde_json::json!({
             "model": "mock-llm",
             "stream": true,
@@ -1161,7 +1171,7 @@ async fn e2e_client_disconnect_cancels_upstream() {
     // 网关仍可用
     let r = client
         .get(format!("{base}/v1/models"))
-        .header("Authorization", "Bearer test-key")
+        .header("Authorization", format!("Bearer {key}"))
         .send()
         .await
         .unwrap();

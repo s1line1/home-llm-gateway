@@ -86,12 +86,23 @@ quic_addr: "0.0.0.0:4433"
 cert: certs/out/server.crt
 key: certs/out/server.key
 ca: certs/out/ca.crt
-api_keys: [dev-key]
+admin_token: dev-admin   # admin password, used to create the first API key
 EOF
 cargo run -p gateway -- --config config.yml
 ```
 
+The gateway has **no static keys** — every API key is created at runtime through the Admin API and stored in SQLite. Create the first key after startup:
+
+```bash
+curl -X POST http://127.0.0.1:8080/admin/keys \
+  -H "Authorization: Bearer dev-admin" -H "Content-Type: application/json" \
+  -d '{"name":"dev"}'
+# → {"id":"...","key":"sk-...","name":"dev",...}  the returned sk-... is "dev-key" below
+```
+
 ### 5. Access from "anywhere"
+
+> `dev-key` below refers to the plaintext key returned by the Admin API in step 4.
 
 ```bash
 curl -H "Authorization: Bearer dev-key" http://127.0.0.1:8080/v1/models
@@ -145,7 +156,7 @@ quic_addr: "0.0.0.0:4433"
 cert: certs/out/server.crt
 key: certs/out/server.key
 ca: certs/out/ca.crt
-api_keys: [dev-key]
+admin_token: dev-admin
 tls_cert: certs/out/server.crt   # enables HTTPS on the public entry
 tls_key: certs/out/server.key
 rate_limit_per_min: 60            # per API key per minute (0 = unlimited)
@@ -207,7 +218,7 @@ The gateway ships a lightweight admin interface to **issue / revoke keys at runt
 - **Web admin page**: open `http://<gateway-addr>/` in a browser — enter the admin token and **create / revoke / list keys** right from the page
 - Config `admin_token` (`config.yml`): admin password (independent of API keys); enables `/admin/*` and the page's management features when provided
 - Config `keys_file`: SQLite database file for dynamic keys (default `keys.db`); keys survive restarts
-- Static keys from `api_keys` are not affected by the Admin API; both kinds work on `/v1/*`
+- The gateway has no static keys — all keys are created through the Admin API (persisted in SQLite) and are used uniformly on `/v1/*`
 
 ```bash
 # Create a key (returns the plaintext secret, shown only once)

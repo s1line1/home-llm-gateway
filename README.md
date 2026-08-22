@@ -87,12 +87,23 @@ quic_addr: "0.0.0.0:4433"
 cert: certs/out/server.crt
 key: certs/out/server.key
 ca: certs/out/ca.crt
-api_keys: [dev-key]
+admin_token: dev-admin   # 管理口令，用于创建第一个 API key
 EOF
 cargo run -p gateway -- --config config.yml
 ```
 
+网关**没有静态 key**——所有 API key 都通过 Admin API 运行时创建并存入 SQLite。启动后先创建第一个 key：
+
+```bash
+curl -X POST http://127.0.0.1:8080/admin/keys \
+  -H "Authorization: Bearer dev-admin" -H "Content-Type: application/json" \
+  -d '{"name":"dev"}'
+# → {"id":"...","key":"sk-...","name":"dev",...}  记下返回的 sk-... 即下文 dev-key
+```
+
 ### 5. 从"任何地方"访问
+
+> 下文的 `dev-key` 指上一步 Admin API 返回的明文 key。
 
 ```bash
 curl -H "Authorization: Bearer dev-key" http://127.0.0.1:8080/v1/models
@@ -146,7 +157,7 @@ quic_addr: "0.0.0.0:4433"
 cert: certs/out/server.crt
 key: certs/out/server.key
 ca: certs/out/ca.crt
-api_keys: [dev-key]
+admin_token: dev-admin
 tls_cert: certs/out/server.crt   # 提供后公网入口启用 HTTPS
 tls_key: certs/out/server.key
 rate_limit_per_min: 60            # 每个 API Key 每分钟上限（0 = 不限）
@@ -208,7 +219,7 @@ systemd 单元：`deploy/gateway.service`（云服务器）、`deploy/agent.serv
 - **网页管理页**：浏览器打开 `http://<网关地址>/` 即进入管理界面——输入 admin token 后可直接**创建 / 吊销 / 列出 key**
 - 配置项 `admin_token`（`config.yml`）：管理口令（与 API Key 相互独立），提供后启用 `/admin/*` 与页面中的管理功能
 - 配置项 `keys_file`：动态 key 持久化数据库文件（SQLite，默认 `keys.db`），重启后依然有效
-- `api_keys` 里的静态 key 不受 Admin API 影响，二者都可用来调用 `/v1/*`
+- 网关没有静态 key——所有 key 都由 Admin API 创建（全部持久化在 SQLite），统一用于调用 `/v1/*`
 
 ```bash
 # 创建 key（返回明文，仅此一次展示）
