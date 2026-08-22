@@ -114,13 +114,15 @@ sudo chmod 600 /opt/home-llm-gateway/certs/server.key
 ## 5. 部署网关（中转服务器）
 
 ```bash
-# 1) 生成强随机 API Key
-openssl rand -hex 32        # 例如 9f3c...（记下来，客户端要用）
+# 1) 生成强随机 API Key 与 Admin Token
+openssl rand -hex 32        # API Key（记下来，客户端要用）
+openssl rand -hex 32        # Admin Token
 
-# 2) 编辑 systemd 单元：改 --api-keys 和限流参数
-sudo vi deploy/gateway.service
+# 2) 基于模板生成网关配置（所有参数都在这里）
+sudo cp config.example.yml /etc/home-llm-gateway/config.yml
+sudo vi /etc/home-llm-gateway/config.yml
 
-# 3) 安装并启动
+# 3) 安装并启动（systemd 单元只负责 --config 指向配置文件）
 sudo cp deploy/gateway.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now gateway
@@ -129,17 +131,17 @@ sudo systemctl enable --now gateway
 sudo journalctl -u gateway -f
 ```
 
-`gateway.service` 关键参数（按需修改）：
+`config.yml` 关键参数（按需修改，完整示例见 `config.example.yml`）：
 
-```
---listen-addr 0.0.0.0:8443      # HTTPS API 入口
---quic-addr   0.0.0.0:4433      # QUIC 隧道（UDP）
---tls-cert/--tls-key            # 公网 HTTPS 证书（server.crt/server.key）
---cert/--key/--ca               # QUIC 隧道证书（同 server 证书 + ca.crt）
---api-keys <你的强随机key>       # 静态 Bearer Key（逗号分隔）
---admin-token <另一个强随机串>   # Admin API 口令（可选；启用后可用 /admin/keys 运行时签发/吊销 key）
---keys-file /etc/home-llm-gateway/keys.db   # 动态 key 持久化数据库（SQLite，默认 keys.db）
---rate-limit-per-min 60         # 每个 Key 每分钟上限
+```yaml
+listen_addr: "0.0.0.0:8443"        # HTTPS API 入口
+quic_addr: "0.0.0.0:4433"          # QUIC 隧道（UDP）
+tls_cert / tls_key                 # 公网 HTTPS 证书（server.crt/server.key）
+cert / key / ca                    # QUIC 隧道证书（同 server 证书 + ca.crt）
+api_keys: [<你的强随机key>]          # 静态 Bearer Key
+admin_token: <另一个强随机串>        # Admin API 口令（可选；启用后可用 /admin/keys 运行时签发/吊销 key）
+keys_file: /etc/home-llm-gateway/keys.db   # 动态 key 持久化数据库（SQLite，默认 keys.db）
+rate_limit_per_min: 60             # 每个 Key 每分钟上限
 ```
 
 **运行时签发 API Key**（不用重启网关）：

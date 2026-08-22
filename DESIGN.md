@@ -131,7 +131,7 @@
 
 - **云端**：编译为单二进制，`systemd` 或 Docker 运行；证书由自家 CA 签发脚本管理。
 - **家里**：单二进制，支持 Linux / macOS / Windows / WSL2（家里机器可能什么系统都有）。
-- **配置**：`config.toml`（云端：监听地址、CA、限流参数；边缘端：云端地址、agent_id、证书路径、本地 LLM 地址）。
+- **配置**：网关侧 `config.yml`（YAML：监听地址、证书、API Key、限流参数等，见 `config.example.yml`）；边缘端仍为 CLI 参数（云端地址、agent_id、证书路径、本地 LLM 地址）。
 - **开机自启**：边缘端注册为 systemd/launchd 服务。
 
 ## 9. 里程碑

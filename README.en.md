@@ -77,14 +77,18 @@ cargo run -p agent -- \
 
 ### 4. Start cloud-gateway (on the cloud server)
 
+All gateway settings live in a **YAML config file** (`gateway --config config.yml`, see `config.example.yml`). A minimal dev config:
+
 ```bash
-cargo run -p gateway -- \
-  --listen-addr 0.0.0.0:8080 \
-  --quic-addr 0.0.0.0:4433 \
-  --cert certs/out/server.crt \
-  --key certs/out/server.key \
-  --ca certs/out/ca.crt \
-  --api-keys dev-key
+cat > config.yml <<'EOF'
+listen_addr: "0.0.0.0:8080"
+quic_addr: "0.0.0.0:4433"
+cert: certs/out/server.crt
+key: certs/out/server.key
+ca: certs/out/ca.crt
+api_keys: [dev-key]
+EOF
+cargo run -p gateway -- --config config.yml
 ```
 
 ### 5. Access from "anywhere"
@@ -133,15 +137,22 @@ Point the agent's `--upstream` at your real service — nothing else changes:
 
 ### Enabling HTTPS + rate limiting
 
+Enable TLS and rate limiting in `config.yml`:
+
+```yaml
+listen_addr: "0.0.0.0:8443"
+quic_addr: "0.0.0.0:4433"
+cert: certs/out/server.crt
+key: certs/out/server.key
+ca: certs/out/ca.crt
+api_keys: [dev-key]
+tls_cert: certs/out/server.crt   # enables HTTPS on the public entry
+tls_key: certs/out/server.key
+rate_limit_per_min: 60            # per API key per minute (0 = unlimited)
+```
+
 ```bash
-cargo run -p gateway -- \
-  --listen-addr 0.0.0.0:8443 \
-  --quic-addr 0.0.0.0:4433 \
-  --cert certs/out/server.crt --key certs/out/server.key \
-  --ca certs/out/ca.crt \
-  --api-keys dev-key \
-  --tls-cert certs/out/server.crt --tls-key certs/out/server.key \
-  --rate-limit-per-min 60        # per API key per minute (0 = unlimited)
+cargo run -p gateway -- --config config.yml
 ```
 
 Clients now use `https://`; for self-signed certificates either install `ca.crt` into the system trust store (or temporarily use `curl -k`).
@@ -194,9 +205,9 @@ systemd units: `deploy/gateway.service` (cloud server) and `deploy/agent.service
 The gateway ships a lightweight admin interface to **issue / revoke keys at runtime — no restart needed**:
 
 - **Web admin page**: open `http://<gateway-addr>/` in a browser — enter the admin token and **create / revoke / list keys** right from the page
-- `--admin-token <token>`: admin password (independent of API keys); enables `/admin/*` and the page's management features when provided
-- `--keys-file <path>`: SQLite database file for dynamic keys (default `keys.db`); keys survive restarts
-- Static keys from `--api-keys` are not affected by the Admin API; both kinds work on `/v1/*`
+- Config `admin_token` (`config.yml`): admin password (independent of API keys); enables `/admin/*` and the page's management features when provided
+- Config `keys_file`: SQLite database file for dynamic keys (default `keys.db`); keys survive restarts
+- Static keys from `api_keys` are not affected by the Admin API; both kinds work on `/v1/*`
 
 ```bash
 # Create a key (returns the plaintext secret, shown only once)
@@ -212,7 +223,7 @@ curl http://127.0.0.1:8080/admin/keys -H "Authorization: Bearer <admin-token>"
 curl -X DELETE http://127.0.0.1:8080/admin/keys/<id> -H "Authorization: Bearer <admin-token>"
 ```
 
-> Security: use a strong random value for `--admin-token` (`openssl rand -hex 32`); `keys.db` (SQLite) holds plaintext secrets and is git-ignored; in production, restrict `/admin/*` to your management network via the security group.
+> Security: use a strong random value for `admin_token` (`openssl rand -hex 32`); `keys.db` (SQLite) holds plaintext secrets and is git-ignored; in production, restrict `/admin/*` to your management network via the security group.
 
 ## Security Model
 

@@ -1,0 +1,41 @@
+# home-llm-gateway 网关配置示例
+# 使用：cp config.example.yml config.yml，按需修改后
+#       gateway --config config.yml
+# 所有字段都有默认值；cert / key / ca 为必填。
+
+# HTTP(S) 公网入口监听地址（客户端连接入口，TCP）
+listen_addr: "0.0.0.0:8443"
+
+# QUIC 隧道监听地址（agent 拨入入口，UDP）
+quic_addr: "0.0.0.0:4433"
+
+# QUIC 隧道证书（服务端证书 + 私钥 + 签发 agent 客户端证书的 CA）— 必填
+cert: /etc/home-llm-gateway/server.crt
+key: /etc/home-llm-gateway/server.key
+ca: /etc/home-llm-gateway/ca.crt
+
+# 静态 API Key（Bearer 认证，逗号/列表均可）
+api_keys:
+  - CHANGE_ME_static_key_1
+  # - key2
+
+# Admin token（提供后启用 /admin/keys 管理接口与网页管理页）
+# 生成：openssl rand -hex 32
+admin_token: CHANGE_ME_admin_token
+
+# 动态 API Key 持久化数据库（SQLite；null = 仅内存）
+keys_file: /etc/home-llm-gateway/keys.db
+
+# 单次转发空闲超时秒数（逐帧；SSE 长流不受影响）
+timeout_secs: 120
+
+# agent 超过该秒数未心跳视为失联
+agent_stale_secs: 15
+
+# 每个 API Key 每分钟请求上限（0 = 不限流）
+rate_limit_per_min: 60
+
+# 公网入口 HTTPS 证书（提供后公网入口启用 TLS，客户端用 https:// 访问；
+# 与 tls_key 成对，去掉即明文 HTTP）
+# tls_cert: /etc/home-llm-gateway/server.crt
+# tls_key: /etc/home-llm-gateway/server.key
