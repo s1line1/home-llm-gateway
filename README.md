@@ -38,6 +38,7 @@ crates/
 ├── agent/      edge-agent 二进制（quinn client + reqwest）
 └── mock-llm/   模拟 OpenAI 兼容接口的假 LLM（无真实模型时打通链路用）
 certs/          证书生成脚本（开发用）
+config.example.yml  网关配置模板（所有参数，YAML）
 deploy/         systemd 单元（gateway.service / agent.service）
 scripts/        多平台 release 打包脚本
 ```
@@ -77,14 +78,18 @@ cargo run -p agent -- \
 
 ### 4. 起 cloud-gateway（云服务器）
 
+网关所有参数都在 **YAML 配置文件**里（`gateway --config config.yml`，参考 `config.example.yml`）。本地开发写一份最小配置：
+
 ```bash
-cargo run -p gateway -- \
-  --listen-addr 0.0.0.0:8080 \
-  --quic-addr 0.0.0.0:4433 \
-  --cert certs/out/server.crt \
-  --key certs/out/server.key \
-  --ca certs/out/ca.crt \
-  --api-keys dev-key
+cat > config.yml <<'EOF'
+listen_addr: "0.0.0.0:8080"
+quic_addr: "0.0.0.0:4433"
+cert: certs/out/server.crt
+key: certs/out/server.key
+ca: certs/out/ca.crt
+api_keys: [dev-key]
+EOF
+cargo run -p gateway -- --config config.yml
 ```
 
 ### 5. 从"任何地方"访问
@@ -133,15 +138,22 @@ cargo test    # proto roundtrip + 端到端集成测试（内存生成证书，�
 
 ### 启用 HTTPS + 限流
 
+在 `config.yml` 中启用 TLS 与限流：
+
+```yaml
+listen_addr: "0.0.0.0:8443"
+quic_addr: "0.0.0.0:4433"
+cert: certs/out/server.crt
+key: certs/out/server.key
+ca: certs/out/ca.crt
+api_keys: [dev-key]
+tls_cert: certs/out/server.crt   # 提供后公网入口启用 HTTPS
+tls_key: certs/out/server.key
+rate_limit_per_min: 60            # 每个 API Key 每分钟上限（0 = 不限）
+```
+
 ```bash
-cargo run -p gateway -- \
-  --listen-addr 0.0.0.0:8443 \
-  --quic-addr 0.0.0.0:4433 \
-  --cert certs/out/server.crt --key certs/out/server.key \
-  --ca certs/out/ca.crt \
-  --api-keys dev-key \
-  --tls-cert certs/out/server.crt --tls-key certs/out/server.key \
-  --rate-limit-per-min 60        # 每个 API Key 每分钟上限（0 = 不限）
+cargo run -p gateway -- --config config.yml
 ```
 
 客户端改用 `https://` 访问；自签证书可把 `ca.crt` 装进系统信任库（或临时 `curl -k`）。
@@ -194,9 +206,9 @@ systemd 单元：`deploy/gateway.service`（云服务器）、`deploy/agent.serv
 网关内置轻量管理接口，可**运行时签发 / 吊销 key，无需重启网关**：
 
 - **网页管理页**：浏览器打开 `http://<网关地址>/` 即进入管理界面——输入 admin token 后可直接**创建 / 吊销 / 列出 key**
-- 启动参数 `--admin-token <token>`：管理口令（与 API Key 相互独立），提供后启用 `/admin/*` 与页面中的管理功能
-- `--keys-file <path>`：动态 key 持久化数据库文件（SQLite，默认 `keys.db`），重启后依然有效
-- `--api-keys` 里的静态 key 不受 Admin API 影响，二者都可用来调用 `/v1/*`
+- 配置项 `admin_token`（`config.yml`）：管理口令（与 API Key 相互独立），提供后启用 `/admin/*` 与页面中的管理功能
+- 配置项 `keys_file`：动态 key 持久化数据库文件（SQLite，默认 `keys.db`），重启后依然有效
+- `api_keys` 里的静态 key 不受 Admin API 影响，二者都可用来调用 `/v1/*`
 
 ```bash
 # 创建 key（返回明文，仅此一次展示）
@@ -212,7 +224,7 @@ curl http://127.0.0.1:8080/admin/keys -H "Authorization: Bearer <admin-token>"
 curl -X DELETE http://127.0.0.1:8080/admin/keys/<id> -H "Authorization: Bearer <admin-token>"
 ```
 
-> 安全：`--admin-token` 务必用强随机值（`openssl rand -hex 32`）；`keys.db`（SQLite）含明文密钥，已加入 `.gitignore`；生产环境建议在安全组中仅对管理网段开放 `/admin/*`。
+> 安全：`admin_token` 务必用强随机值（`openssl rand -hex 32`）；`keys.db`（SQLite）含明文密钥，已加入 `.gitignore`；生产环境建议在安全组中仅对管理网段开放 `/admin/*`。
 
 ## 安全模型
 
