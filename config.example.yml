@@ -14,13 +14,8 @@ cert: /etc/home-llm-gateway/server.crt
 key: /etc/home-llm-gateway/server.key
 ca: /etc/home-llm-gateway/ca.crt
 
-# 静态 API Key（Bearer 认证，逗号/列表均可）
-api_keys:
-  - CHANGE_ME_static_key_1
-  # - key2
-
-# Admin token（提供后启用 /admin/keys 管理接口与网页管理页）
-# 生成：openssl rand -hex 32
+# Admin token（必须配置：所有 API Key 都通过 Admin API 运行时创建并存入 SQLite，
+# 首次启动用它创建第一个 key。生成：openssl rand -hex 32）
 admin_token: CHANGE_ME_admin_token
 
 # 动态 API Key 持久化数据库（SQLite；null = 仅内存）

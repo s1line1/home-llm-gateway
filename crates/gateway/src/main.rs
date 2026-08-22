@@ -34,9 +34,6 @@ struct ConfigFile {
     /// 签发 agent 客户端证书的 CA PEM — 必填
     #[serde(default)]
     ca: PathBuf,
-    /// 允许的 API Key（静态，Bearer）
-    #[serde(default)]
-    api_keys: Vec<String>,
     /// Admin token（提供后启用 /admin/keys 管理接口）
     #[serde(default)]
     admin_token: Option<String>,
@@ -83,8 +80,10 @@ fn config_from_file(cfg: ConfigFile) -> anyhow::Result<GatewayConfig> {
     }
     let tls = match (&cfg.tls_cert, &cfg.tls_key) {
         (Some(c), Some(k)) => Some(TlsPem {
-            cert: std::fs::read(c)?,
-            key: std::fs::read(k)?,
+            cert: std::fs::read(c)
+                .with_context(|| format!("config: cannot read tls_cert {}", c.display()))?,
+            key: std::fs::read(k)
+                .with_context(|| format!("config: cannot read tls_key {}", k.display()))?,
         }),
         (None, None) => None,
         _ => anyhow::bail!("config: tls_cert and tls_key must be provided together"),
@@ -99,10 +98,12 @@ fn config_from_file(cfg: ConfigFile) -> anyhow::Result<GatewayConfig> {
             .quic_addr
             .parse::<SocketAddr>()
             .with_context(|| format!("config: invalid quic_addr {:?}", cfg.quic_addr))?,
-        ca_cert: gateway::tls::load_certs(&cfg.ca)?,
-        server_cert: gateway::tls::load_certs(&cfg.cert)?,
-        server_key: gateway::tls::load_key(&cfg.key)?,
-        api_keys: cfg.api_keys,
+        ca_cert: gateway::tls::load_certs(&cfg.ca)
+            .with_context(|| format!("config: cannot load ca cert {}", cfg.ca.display()))?,
+        server_cert: gateway::tls::load_certs(&cfg.cert)
+            .with_context(|| format!("config: cannot load cert {}", cfg.cert.display()))?,
+        server_key: gateway::tls::load_key(&cfg.key)
+            .with_context(|| format!("config: cannot load key {}", cfg.key.display()))?,
         admin_token: cfg.admin_token,
         keys_file: cfg.keys_file,
         request_timeout: Duration::from_secs(cfg.timeout_secs),
@@ -184,7 +185,6 @@ quic_addr: "0.0.0.0:4433"
 cert: {}
 key: {}
 ca: {}
-api_keys: [k1, k2]
 admin_token: admin
 keys_file: {}
 timeout_secs: 30
@@ -199,7 +199,6 @@ rate_limit_per_min: 60
         let cfg = config_from_file(parse_yaml(&yaml)).unwrap();
         assert_eq!(cfg.http_bind.to_string(), "0.0.0.0:8443");
         assert_eq!(cfg.quic_bind.to_string(), "0.0.0.0:4433");
-        assert_eq!(cfg.api_keys, vec!["k1".to_string(), "k2".to_string()]);
         assert_eq!(cfg.admin_token.as_deref(), Some("admin"));
         assert_eq!(cfg.keys_file, Some(dir.path().join("keys.db")));
         assert_eq!(cfg.request_timeout, Duration::from_secs(30));
@@ -224,7 +223,7 @@ rate_limit_per_min: 60
         assert_eq!(cfg.request_timeout, Duration::from_secs(120));
         assert_eq!(cfg.agent_stale_after, Duration::from_secs(15));
         assert_eq!(cfg.rate_limit_per_min, 0);
-        assert!(cfg.api_keys.is_empty());
+        assert!(cfg.admin_token.is_none());
         assert_eq!(cfg.keys_file, Some(PathBuf::from("keys.db")));
         assert!(cfg.tls.is_none());
     }
@@ -292,7 +291,6 @@ quic_addr: "127.0.0.1:0"
 cert: {}
 key: {}
 ca: {}
-api_keys: [test-key]
 keys_file: {}
 "#,
             cert.to_str().unwrap(),

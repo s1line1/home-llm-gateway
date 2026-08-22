@@ -41,8 +41,6 @@ pub struct GatewayConfig {
     pub ca_cert: Vec<CertificateDer<'static>>,
     pub server_cert: Vec<CertificateDer<'static>>,
     pub server_key: PrivateKeyDer<'static>,
-    /// 允许的静态 API Key（Bearer，启动时配置）。
-    pub api_keys: Vec<String>,
     /// Admin token；提供后启用 /admin/keys 管理接口。
     pub admin_token: Option<String>,
     /// 动态 API Key 持久化文件（None = 仅内存）。
@@ -81,7 +79,7 @@ impl Gateway {
 
         let state = http::AppState {
             registry: registry.clone(),
-            key_store: KeyStore::new(cfg.api_keys, cfg.keys_file.clone()),
+            key_store: KeyStore::new(cfg.keys_file.clone()),
             admin_token: cfg.admin_token,
             timeout: cfg.request_timeout,
             agent_stale_after: cfg.agent_stale_after,

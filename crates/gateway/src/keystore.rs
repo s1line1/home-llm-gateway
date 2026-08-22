@@ -1,5 +1,5 @@
-//! API Key 存储：静态 key（`--api-keys`）+ 运行时动态 key（SQLite 持久化）。
-//! 动态 key 通过 Admin API 创建/吊销，立即生效，无需重启网关。
+//! API Key 存储：所有动态 key 持久化在 SQLite（无静态 key 列表）。
+//! key 通过 Admin API 创建/吊销，立即生效，无需重启网关。
 //!
 //! 架构：内存索引（`runtime` HashMap）保证 `authorize()` 热路径零 IO；
 //! SQLite 负责持久化，创建/吊销时写穿（write-through）。
@@ -20,8 +20,6 @@ pub struct KeyStore {
 }
 
 struct KeyStoreInner {
-    /// 静态 key（启动参数 --api-keys），不可运行时修改。
-    static_keys: Vec<String>,
     /// 动态 key（Admin API 管理），id → 记录（内存索引）。
     runtime: RwLock<HashMap<String, KeyRecord>>,
     /// SQLite 持久化连接（None = 仅内存，如 db 打开失败时降级）。
@@ -47,7 +45,7 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS api_keys (
 )";
 
 impl KeyStore {
-    pub fn new(static_keys: Vec<String>, file: Option<PathBuf>) -> Self {
+    pub fn new(file: Option<PathBuf>) -> Self {
         let db = match &file {
             Some(path) => match Connection::open(path) {
                 Ok(conn) => match conn.execute_batch(SCHEMA) {
@@ -76,23 +74,14 @@ impl KeyStore {
         };
         Self {
             inner: Arc::new(KeyStoreInner {
-                static_keys,
                 runtime: RwLock::new(runtime),
                 db: Mutex::new(db),
             }),
         }
     }
 
-    /// 校验 token 是否为有效 key（静态或动态、启用中）。
+    /// 校验 token 是否为启用中的动态 key。
     pub fn authorize(&self, token: &str) -> bool {
-        if self
-            .inner
-            .static_keys
-            .iter()
-            .any(|k| constant_time_eq(k.as_bytes(), token.as_bytes()))
-        {
-            return true;
-        }
         let runtime = self.inner.runtime.read().unwrap();
         runtime
             .values()
@@ -211,23 +200,21 @@ mod tests {
     fn persist_roundtrip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("keys.db");
-        let store = KeyStore::new(vec!["static-1".into()], Some(path.clone()));
+        let store = KeyStore::new(Some(path.clone()));
         let rec = store.create("dsh".into());
         assert!(store.authorize(&rec.key), "new key should authorize");
-        assert!(store.authorize("static-1"), "static key should authorize");
         assert!(!store.authorize("nope"));
         drop(store);
 
-        let reloaded = KeyStore::new(vec![], Some(path.clone()));
+        let reloaded = KeyStore::new(Some(path.clone()));
         assert!(reloaded.authorize(&rec.key), "persisted key should survive reload");
-        assert!(!reloaded.authorize("static-1"), "static keys are not persisted");
     }
 
     #[test]
     fn delete_revokes_and_persists() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("keys.db");
-        let store = KeyStore::new(vec![], Some(path.clone()));
+        let store = KeyStore::new(Some(path.clone()));
         let rec = store.create("x".into());
         assert!(store.authorize(&rec.key));
         assert!(store.delete(&rec.id));
@@ -235,7 +222,7 @@ mod tests {
         assert!(!store.delete(&rec.id), "deleting twice returns false");
 
         // 吊销同样持久化：重载后 key 依然失效
-        let reloaded = KeyStore::new(vec![], Some(path.clone()));
+        let reloaded = KeyStore::new(Some(path.clone()));
         assert!(!reloaded.authorize(&rec.key), "revocation should survive reload");
     }
 
@@ -245,10 +232,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("keys.db");
         std::fs::write(&path, "{ not a sqlite database !!!").unwrap();
-        let store = KeyStore::new(vec!["static-1".into()], Some(path.clone()));
+        let store = KeyStore::new(Some(path.clone()));
         assert!(!store.authorize("anything"));
-        // 静态 key 不受影响
-        assert!(store.authorize("static-1"));
     }
 
     #[test]
@@ -257,7 +242,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("keys.db");
         std::fs::create_dir(&path).unwrap();
-        let store = KeyStore::new(vec![], Some(path.clone()));
+        let store = KeyStore::new(Some(path.clone()));
         assert!(!store.authorize("anything"));
         // 降级为仅内存后，动态 key 仍可用
         let rec = store.create("mem".into());
@@ -268,7 +253,7 @@ mod tests {
     fn creates_sqlite_db_and_schema() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("keys.db");
-        let store = KeyStore::new(vec![], Some(path.clone()));
+        let store = KeyStore::new(Some(path.clone()));
         let rec = store.create("y".into());
         assert!(store.authorize(&rec.key));
         assert_eq!(store.list().len(), 1);

@@ -255,7 +255,7 @@ mod tests {
     fn test_state() -> AppState {
         AppState {
             registry: Registry::default(),
-            key_store: KeyStore::new(vec!["static-1".into()], None),
+            key_store: KeyStore::new(None),
             admin_token: Some("admin-token".into()),
             timeout: Duration::from_secs(10),
             agent_stale_after: Duration::from_secs(10),

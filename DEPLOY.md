@@ -138,11 +138,12 @@ listen_addr: "0.0.0.0:8443"        # HTTPS API 入口
 quic_addr: "0.0.0.0:4433"          # QUIC 隧道（UDP）
 tls_cert / tls_key                 # 公网 HTTPS 证书（server.crt/server.key）
 cert / key / ca                    # QUIC 隧道证书（同 server 证书 + ca.crt）
-api_keys: [<你的强随机key>]          # 静态 Bearer Key
-admin_token: <另一个强随机串>        # Admin API 口令（可选；启用后可用 /admin/keys 运行时签发/吊销 key）
+admin_token: <强随机串>             # Admin API 口令（必配；用它创建第一个 API key）
 keys_file: /etc/home-llm-gateway/keys.db   # 动态 key 持久化数据库（SQLite，默认 keys.db）
 rate_limit_per_min: 60             # 每个 Key 每分钟上限
 ```
+
+> 网关**没有静态 key**——所有 API key 都通过 Admin API 运行时创建并存入 SQLite（首次启动先用 `admin_token` 创建第一个 key）。
 
 **运行时签发 API Key**（不用重启网关）：
 
