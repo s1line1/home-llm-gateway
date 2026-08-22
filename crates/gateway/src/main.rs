@@ -80,8 +80,10 @@ fn config_from_file(cfg: ConfigFile) -> anyhow::Result<GatewayConfig> {
     }
     let tls = match (&cfg.tls_cert, &cfg.tls_key) {
         (Some(c), Some(k)) => Some(TlsPem {
-            cert: std::fs::read(c)?,
-            key: std::fs::read(k)?,
+            cert: std::fs::read(c)
+                .with_context(|| format!("config: cannot read tls_cert {}", c.display()))?,
+            key: std::fs::read(k)
+                .with_context(|| format!("config: cannot read tls_key {}", k.display()))?,
         }),
         (None, None) => None,
         _ => anyhow::bail!("config: tls_cert and tls_key must be provided together"),
@@ -96,9 +98,12 @@ fn config_from_file(cfg: ConfigFile) -> anyhow::Result<GatewayConfig> {
             .quic_addr
             .parse::<SocketAddr>()
             .with_context(|| format!("config: invalid quic_addr {:?}", cfg.quic_addr))?,
-        ca_cert: gateway::tls::load_certs(&cfg.ca)?,
-        server_cert: gateway::tls::load_certs(&cfg.cert)?,
-        server_key: gateway::tls::load_key(&cfg.key)?,
+        ca_cert: gateway::tls::load_certs(&cfg.ca)
+            .with_context(|| format!("config: cannot load ca cert {}", cfg.ca.display()))?,
+        server_cert: gateway::tls::load_certs(&cfg.cert)
+            .with_context(|| format!("config: cannot load cert {}", cfg.cert.display()))?,
+        server_key: gateway::tls::load_key(&cfg.key)
+            .with_context(|| format!("config: cannot load key {}", cfg.key.display()))?,
         admin_token: cfg.admin_token,
         keys_file: cfg.keys_file,
         request_timeout: Duration::from_secs(cfg.timeout_secs),
