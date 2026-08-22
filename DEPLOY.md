@@ -138,7 +138,7 @@ sudo journalctl -u gateway -f
 --cert/--key/--ca               # QUIC 隧道证书（同 server 证书 + ca.crt）
 --api-keys <你的强随机key>       # 静态 Bearer Key（逗号分隔）
 --admin-token <另一个强随机串>   # Admin API 口令（可选；启用后可用 /admin/keys 运行时签发/吊销 key）
---keys-file /etc/home-llm-gateway/keys.json   # 动态 key 持久化文件（默认 keys.json）
+--keys-file /etc/home-llm-gateway/keys.db   # 动态 key 持久化数据库（SQLite，默认 keys.db）
 --rate-limit-per-min 60         # 每个 Key 每分钟上限
 ```
 
@@ -220,5 +220,5 @@ curl -N -k -H "Authorization: Bearer <你的key>" \
 - [ ] `--admin-token` 用独立强随机串；`/admin/*` 在安全组中仅对管理网段开放
 - [ ] 安全组仅放行所需端口（22 限制来源 IP）
 - [ ] `/metrics` 未加认证：安全组中仅对监控网段放行，或后续给 metrics 加鉴权
-- [ ] server.key / client.key / keys.json 权限 `chmod 600`
+- [ ] server.key / client.key / keys.db 权限 `chmod 600`
 - [ ] 证书到期前重签轮换（825 天），记录到期时间

@@ -195,7 +195,7 @@ The gateway ships a lightweight admin interface to **issue / revoke keys at runt
 
 - **Web admin page**: open `http://<gateway-addr>/` in a browser — enter the admin token and **create / revoke / list keys** right from the page
 - `--admin-token <token>`: admin password (independent of API keys); enables `/admin/*` and the page's management features when provided
-- `--keys-file <path>`: persistence file for dynamic keys (default `keys.json`); keys survive restarts
+- `--keys-file <path>`: SQLite database file for dynamic keys (default `keys.db`); keys survive restarts
 - Static keys from `--api-keys` are not affected by the Admin API; both kinds work on `/v1/*`
 
 ```bash
@@ -212,7 +212,7 @@ curl http://127.0.0.1:8080/admin/keys -H "Authorization: Bearer <admin-token>"
 curl -X DELETE http://127.0.0.1:8080/admin/keys/<id> -H "Authorization: Bearer <admin-token>"
 ```
 
-> Security: use a strong random value for `--admin-token` (`openssl rand -hex 32`); `keys.json` holds plaintext secrets and is git-ignored; in production, restrict `/admin/*` to your management network via the security group.
+> Security: use a strong random value for `--admin-token` (`openssl rand -hex 32`); `keys.db` (SQLite) holds plaintext secrets and is git-ignored; in production, restrict `/admin/*` to your management network via the security group.
 
 ## Security Model
 

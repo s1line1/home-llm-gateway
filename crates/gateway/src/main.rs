@@ -28,8 +28,8 @@ struct Args {
     /// Admin token（提供后启用 /admin/keys 管理接口）
     #[arg(long)]
     admin_token: Option<String>,
-    /// 动态 API Key 持久化文件
-    #[arg(long, default_value = "keys.json")]
+    /// 动态 API Key 持久化数据库文件（SQLite）
+    #[arg(long, default_value = "keys.db")]
     keys_file: PathBuf,
     /// 单次转发空闲超时秒数（逐帧，SSE 长流不受影响）
     #[arg(long, default_value = "120")]
