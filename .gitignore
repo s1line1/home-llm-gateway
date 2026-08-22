@@ -10,6 +10,9 @@
 # 运行时动态 API Key（Admin API 签发，含明文密钥）
 /keys.json
 /keys.json.tmp
+/keys.db
+/keys.db-wal
+/keys.db-shm
 
 # 系统/编辑器杂项
 .DS_Store
