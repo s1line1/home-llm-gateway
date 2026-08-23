@@ -119,14 +119,14 @@ async fn run(args: Args) -> anyhow::Result<()> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .try_init();
 
-    let text = std::fs::read_to_string(&args.config)
+    let path = std::fs::read_to_string(&args.config)
         .with_context(|| format!("cannot read config file {}", args.config.display()))?;
-    let file_cfg: ConfigFile = serde_yaml_ng::from_str(&text)
+    let file_cfg: ConfigFile = serde_yaml_ng::from_str(&path)
         .with_context(|| format!("invalid config file {}", args.config.display()))?;
     let cfg = config_from_file(file_cfg)?;
 
     let gw = Gateway::start(cfg).await?;
-    tracing::info!(http = %gw.http_addr, quic = %gw.quic_addr, "gateway ready");
+    tracing::info!(http = %gw.http_addr, quic = %gw.quic_addr, "Gateway ready");
     let _gw = gw;
 
     std::future::pending::<()>().await;
