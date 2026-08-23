@@ -77,7 +77,7 @@ cargo run -p agent -- \
 
 ### 4. Start cloud-gateway (on the cloud server)
 
-All gateway settings live in a **YAML config file** (`gateway --config config.yml`, see `config.example.yml`). A minimal dev config:
+All gateway settings live in a **YAML config file** (`gateway --config config.yml`, see `gateway_config.example.yml`). A minimal dev config:
 
 ```bash
 cat > config.yml <<'EOF'

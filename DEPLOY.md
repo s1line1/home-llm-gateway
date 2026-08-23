@@ -119,7 +119,7 @@ openssl rand -hex 32        # API Key（记下来，客户端要用）
 openssl rand -hex 32        # Admin Token
 
 # 2) 基于模板生成网关配置（所有参数都在这里）
-sudo cp config.example.yml /etc/home-llm-gateway/config.yml
+sudo cp gateway_config.example.yml /etc/home-llm-gateway/config.yml
 sudo vi /etc/home-llm-gateway/config.yml
 
 # 3) 安装并启动（systemd 单元只负责 --config 指向配置文件）
@@ -131,7 +131,7 @@ sudo systemctl enable --now gateway
 sudo journalctl -u gateway -f
 ```
 
-`config.yml` 关键参数（按需修改，完整示例见 `config.example.yml`）：
+`config.yml` 关键参数（按需修改，完整示例见 `gateway_config.example.yml`）：
 
 ```yaml
 listen_addr: "0.0.0.0:8443"        # HTTPS API 入口

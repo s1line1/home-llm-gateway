@@ -38,7 +38,7 @@ crates/
 ├── agent/      edge-agent 二进制（quinn client + reqwest）
 └── mock-llm/   模拟 OpenAI 兼容接口的假 LLM（无真实模型时打通链路用）
 certs/          证书生成脚本（开发用）
-config.example.yml  网关配置模板（所有参数，YAML）
+gateway_config.example.yml  网关配置模板（所有参数，YAML）
 deploy/         systemd 单元（gateway.service / agent.service）
 scripts/        多平台 release 打包脚本
 ```
@@ -78,7 +78,7 @@ cargo run -p agent -- \
 
 ### 4. 起 cloud-gateway（云服务器）
 
-网关所有参数都在 **YAML 配置文件**里（`gateway --config config.yml`，参考 `config.example.yml`）。本地开发写一份最小配置：
+网关所有参数都在 **YAML 配置文件**里（`gateway --config config.yml`，参考 `gateway_config.example.yml`）。本地开发写一份最小配置：
 
 ```bash
 cat > config.yml <<'EOF'
