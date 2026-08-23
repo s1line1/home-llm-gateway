@@ -126,7 +126,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let cfg = config_from_file(file_cfg)?;
 
     let gw = Gateway::start(cfg).await?;
-    tracing::info!(http = %gw.http_addr, quic = %gw.quic_addr, "gateway ready");
+    tracing::info!(http = %gw.http_addr, quic = %gw.quic_addr, "Gateway ready");
     let _gw = gw;
 
     std::future::pending::<()>().await;
