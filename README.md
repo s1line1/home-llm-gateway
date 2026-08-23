@@ -38,7 +38,7 @@ crates/
 ├── agent/      edge-agent 二进制（quinn client + reqwest）
 └── mock-llm/   模拟 OpenAI 兼容接口的假 LLM（无真实模型时打通链路用）
 certs/          证书生成脚本（开发用）
-config.example.yml  网关配置模板（所有参数，YAML）
+gateway_config.example.yml  网关配置模板（所有参数，YAML）
 deploy/         systemd 单元（gateway.service / agent.service）
 scripts/        多平台 release 打包脚本
 ```
@@ -66,19 +66,23 @@ cargo run -p mock-llm -- --addr 127.0.0.1:11435
 
 ### 3. 起 edge-agent（家里那台机器）
 
+agent 同样用 YAML 配置（`agent --config config.yml`，参考 `crates/agent/config.example.yml`）：
+
 ```bash
-cargo run -p agent -- \
-  --cloud-addr 127.0.0.1:4433 \
-  --ca certs/out/ca.crt \
-  --cert certs/out/client.crt \
-  --key certs/out/client.key \
-  --agent-id home-1 \
-  --upstream http://127.0.0.1:11435
+cat > config.yml <<'EOF'
+cloud_addr: "127.0.0.1:4433"
+ca: certs/out/ca.crt
+cert: certs/out/client.crt
+key: certs/out/client.key
+agent_id: home-1
+upstream: "http://127.0.0.1:11435"
+EOF
+cargo run -p agent -- --config config.yml
 ```
 
 ### 4. 起 cloud-gateway（云服务器）
 
-网关所有参数都在 **YAML 配置文件**里（`gateway --config config.yml`，参考 `config.example.yml`）。本地开发写一份最小配置：
+网关所有参数都在 **YAML 配置文件**里（`gateway --config config.yml`，参考 `gateway_config.example.yml`）。本地开发写一份最小配置：
 
 ```bash
 cat > config.yml <<'EOF'
@@ -130,20 +134,20 @@ cargo test    # proto roundtrip + 端到端集成测试（内存生成证书，�
 
 ## 接入真实 LLM
 
-把 agent 的 `--upstream` 指向真实服务即可，其余不变：
+把 agent 配置里的 `upstream` 指向真实服务即可，其余不变：
 
-| 本地服务 | 命令 |
+| 本地服务 | `upstream` 值 |
 |---|---|
-| Ollama | `--upstream http://127.0.0.1:11434` |
-| vLLM | `--upstream http://127.0.0.1:8000` |
-| llama.cpp server | `--upstream http://127.0.0.1:8080` |
+| Ollama | `http://127.0.0.1:11434` |
+| vLLM | `http://127.0.0.1:8000` |
+| llama.cpp server | `http://127.0.0.1:8000` |
 
 ## 生产部署（阿里云 / 公网）
 
 > 完整 step-by-step 部署清单（证书签发、安全组、systemd、验证、排障）见 [`DEPLOY.md`](DEPLOY.md)。以下为要点。
 
 1. **中转网关放公网服务器**：安全组/防火墙放行 **UDP 4433**（QUIC 隧道）与 **TCP 8443**（HTTPS API）。网关自带 HTTPS，无需反代——QUIC 隧道是私有帧协议，反代本来也代理不了。日后若需域名 + 证书自动续期可加 caddy（nginx 需 `proxy_buffering off`，否则破坏 SSE 流式）。
-2. **agent 放 LLM 所在机器**：`--cloud-addr <公网IP>:4433`，`--server-name` 填证书 SAN 中的域名（推荐域名 + DNS SAN 证书，避免 IP 变更）。
+2. **agent 放 LLM 所在机器**：agent 配置里 `cloud_addr` 填 `<公网IP>:4433`，`server_name` 填证书 SAN 中的域名（推荐域名 + DNS SAN 证书，避免 IP 变更）。
 3. **mTLS 是关键安全线**：CA 私钥自己保管，每个 agent 单独签发客户端证书。
 4. **UDP 注意**：QUIC 走 UDP，若被封需要放行；极端情况可降级 TCP+TLS（帧协议不变，见 `DESIGN.md` §10）。
 
@@ -171,25 +175,32 @@ cargo run -p gateway -- --config config.yml
 
 ### agent 并发上限（admission control）
 
-```bash
-cargo run -p agent -- ... --max-concurrency 2   # 声明最多 2 个并发请求
-```
+agent 配置里 `max_concurrency: 2`（声明最多 2 个并发请求）。
 
 网关按 agent 声明的上限做并发占位，超限回 429，避免把家里 GPU 打爆。
 
 ### 多 agent（多台 LLM 机器）
 
-多个 agent 指向同一个网关即可，网关按**最少负载**（在途请求最少者优先）自动路由：
+多个 agent 指向同一个网关即可，网关按**最少负载**（在途请求最少者优先）自动路由（每台机器各自一份 agent 配置）：
 
-```bash
-# 机器 1（家里）
-cargo run -p agent -- ... --agent-id home-1 --upstream http://127.0.0.1:11434 --max-concurrency 2
-# 机器 2（另一台 / 云上）
-cargo run -p agent -- ... --agent-id home-2 --upstream http://127.0.0.1:8000 --max-concurrency 4
+```yaml
+# 机器 1（家里）agent-config.yml
+cloud_addr: "<网关>:4433"
+ca/cert/key: /etc/home-llm-gateway/*.crt
+agent_id: home-1
+upstream: "http://127.0.0.1:11434"
+max_concurrency: 2
+
+# 机器 2（另一台 / 云上）agent-config.yml
+cloud_addr: "<网关>:4433"
+ca/cert/key: /etc/home-llm-gateway/*.crt
+agent_id: home-2
+upstream: "http://127.0.0.1:8000"
+max_concurrency: 4
 ```
 
 - 每个 agent 单独签发客户端证书，`agent_id` 用于区分
-- 超过 `--agent-stale-secs`（默认 15s）未心跳的 agent 自动摘除
+- 超过 `agent_stale_secs`（网关配置，默认 15s）未心跳的 agent 自动摘除
 - 全部占满时返回 429
 
 ### 可观测性

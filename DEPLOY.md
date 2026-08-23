@@ -119,7 +119,7 @@ openssl rand -hex 32        # API Key（记下来，客户端要用）
 openssl rand -hex 32        # Admin Token
 
 # 2) 基于模板生成网关配置（所有参数都在这里）
-sudo cp config.example.yml /etc/home-llm-gateway/config.yml
+sudo cp gateway_config.example.yml /etc/home-llm-gateway/config.yml
 sudo vi /etc/home-llm-gateway/config.yml
 
 # 3) 安装并启动（systemd 单元只负责 --config 指向配置文件）
@@ -131,7 +131,7 @@ sudo systemctl enable --now gateway
 sudo journalctl -u gateway -f
 ```
 
-`config.yml` 关键参数（按需修改，完整示例见 `config.example.yml`）：
+`config.yml` 关键参数（按需修改，完整示例见 `gateway_config.example.yml`）：
 
 ```yaml
 listen_addr: "0.0.0.0:8443"        # HTTPS API 入口
@@ -178,15 +178,19 @@ sudo mkdir -p /opt/home-llm-gateway/certs
 sudo cp agent ca.crt client-home1.crt client-home1.key /opt/home-llm-gateway/certs/
 # 目录里只有 agent 二进制 + 证书
 
-# 编辑 deploy/agent.service：
-#   --cloud-addr  <公网IP>:4433
-#   --server-name <与网关 server 证书 SAN 一致的域名或 IP>   ← 关键！不一致会 TLS 握手失败
-#   --upstream    http://127.0.0.1:11434
+# 基于 crates/agent/config.example.yml 生成 agent 配置：
+#   cloud_addr: <公网IP>:4433
+#   server_name: <与网关 server 证书 SAN 一致的域名或 IP>   ← 关键！不一致会 TLS 握手失败
+#   upstream: http://127.0.0.1:11434
+sudo cp crates/agent/config.example.yml /etc/home-llm-gateway/agent-config.yml
+sudo vi /etc/home-llm-gateway/agent-config.yml
+
+# deploy/agent.service 只负责 --config 指向配置文件
 sudo cp deploy/agent.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now agent
 
-# 看到 connected to cloud gateway 即成功
+# 看到 connected to cloud gateway / registered with cloud gateway 即成功
 sudo journalctl -u agent -f
 ```
 

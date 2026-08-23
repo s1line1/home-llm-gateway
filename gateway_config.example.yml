@@ -1,5 +1,5 @@
 # home-llm-gateway 网关配置示例
-# 使用：cp config.example.yml config.yml，按需修改后
+# 使用：cp gateway_config.example.yml config.yml，按需修改后
 #       gateway --config config.yml
 # 所有字段都有默认值；cert / key / ca 为必填。
 
