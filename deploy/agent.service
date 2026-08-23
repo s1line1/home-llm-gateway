@@ -1,10 +1,9 @@
 # edge-agent systemd 单元（部署在 LLM 所在机器，家里或云上）
 # 安装：
 #   1. 把二进制放到 /usr/local/bin/agent
-#   2. 把证书放到 /etc/home-llm-gateway/（ca.crt / agent 自己的 client.crt/client.key）
-#   3. 修改 ExecStart：--cloud-addr 填网关公网 IP:4433，--server-name 填证书 SAN 域名，
-#      --upstream 填本地 LLM 的 OpenAI 兼容地址
-#   4. sudo cp deploy/agent.service /etc/systemd/system/ && sudo systemctl enable --now agent
+#   2. 把证书与 agent 配置放到 /etc/home-llm-gateway/
+#      （基于 crates/agent/config.example.yml 修改：cloud_addr、证书路径、upstream 等）
+#   3. sudo cp deploy/agent.service /etc/systemd/system/ && sudo systemctl enable --now agent
 [Unit]
 Description=Edge LLM Agent (QUIC tunnel client)
 After=network-online.target
@@ -12,15 +11,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/agent \
-  --cloud-addr 1.2.3.4:4433 \
-  --server-name llm.example.com \
-  --ca /etc/home-llm-gateway/ca.crt \
-  --cert /etc/home-llm-gateway/client.crt \
-  --key /etc/home-llm-gateway/client.key \
-  --agent-id home-1 \
-  --upstream http://127.0.0.1:11434 \
-  --max-concurrency 2
+# 所有参数都在 /etc/home-llm-gateway/agent-config.yml 中配置（见 crates/agent/config.example.yml）
+ExecStart=/usr/local/bin/agent --config /etc/home-llm-gateway/agent-config.yml
 Restart=always
 RestartSec=3
 

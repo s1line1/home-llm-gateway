@@ -1,0 +1,31 @@
+# home-llm-gateway 边缘端 agent 配置示例
+# 使用：cp crates/agent/config.example.yml config.yml，按需修改后
+#       agent --config config.yml
+# 所有字段都有默认值；cloud_addr / ca / cert / key 为必填。
+
+# 云端网关 QUIC 地址（IP:端口）— 必填（同地域可用内网 IP）
+cloud_addr: "1.2.3.4:4433"
+
+# 证书校验服务器名（须与网关证书 SAN 匹配）
+server_name: "llm.example.com"
+
+# 证书 — 必填（CA 单独为每台 agent 签发 client 证书）
+ca: /etc/home-llm-gateway/ca.crt
+cert: /etc/home-llm-gateway/client.crt
+key: /etc/home-llm-gateway/client.key
+
+# agent 标识（多台机器区分用）
+agent_id: "home-1"
+
+# 本地 LLM 的 OpenAI 兼容地址
+upstream: "http://127.0.0.1:8000"
+
+# 心跳间隔秒数
+heartbeat_secs: 5
+
+# 声明的模型列表（* = 全部；多 agent 路由用）
+models:
+  - qwen2.5
+
+# 声明的最大并发请求数（网关据此做 admission control）
+max_concurrency: 2

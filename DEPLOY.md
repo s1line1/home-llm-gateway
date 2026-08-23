@@ -178,15 +178,19 @@ sudo mkdir -p /opt/home-llm-gateway/certs
 sudo cp agent ca.crt client-home1.crt client-home1.key /opt/home-llm-gateway/certs/
 # 目录里只有 agent 二进制 + 证书
 
-# 编辑 deploy/agent.service：
-#   --cloud-addr  <公网IP>:4433
-#   --server-name <与网关 server 证书 SAN 一致的域名或 IP>   ← 关键！不一致会 TLS 握手失败
-#   --upstream    http://127.0.0.1:11434
+# 基于 crates/agent/config.example.yml 生成 agent 配置：
+#   cloud_addr: <公网IP>:4433
+#   server_name: <与网关 server 证书 SAN 一致的域名或 IP>   ← 关键！不一致会 TLS 握手失败
+#   upstream: http://127.0.0.1:11434
+sudo cp crates/agent/config.example.yml /etc/home-llm-gateway/agent-config.yml
+sudo vi /etc/home-llm-gateway/agent-config.yml
+
+# deploy/agent.service 只负责 --config 指向配置文件
 sudo cp deploy/agent.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now agent
 
-# 看到 connected to cloud gateway 即成功
+# 看到 connected to cloud gateway / registered with cloud gateway 即成功
 sudo journalctl -u agent -f
 ```
 
