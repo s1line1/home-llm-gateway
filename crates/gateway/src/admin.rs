@@ -193,11 +193,31 @@ document.getElementById("create").onsubmit = async (e) => {
   const name = document.getElementById("name").value.trim() || "unnamed";
   try {
     const rec = await api("/admin/keys", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name }) });
-    createdEl.innerHTML = "已创建 <code>" + rec.key + "</code> <button onclick='navigator.clipboard.writeText(\"" + rec.key + "\")'>复制</button> <span class=\"muted\">（仅显示这一次）</span>";
+    createdEl.innerHTML = "已创建 <code>" + rec.key + "</code> <button onclick='copyText(\"" + rec.key + "\")'>复制</button> <span class=\"muted\">（仅显示这一次）</span>";
     document.getElementById("name").value = "";
     refresh();
   } catch (err) { show(createdEl, err.message, true); }
 };
+
+// 复制到剪贴板：navigator.clipboard 仅在 HTTPS/localhost 可用，
+// 明文 HTTP 的公网地址（如 http://IP:9090）下回退到 execCommand。
+function copyText(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).catch(() => fallbackCopy(text));
+  } else {
+    fallbackCopy(text);
+  }
+}
+function fallbackCopy(text) {
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.style.position = "fixed";
+  ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.select();
+  try { document.execCommand("copy"); } catch (e) {}
+  document.body.removeChild(ta);
+}
 
 document.getElementById("refresh").onclick = refresh;
 
