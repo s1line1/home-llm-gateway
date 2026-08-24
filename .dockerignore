@@ -1,0 +1,9 @@
+target
+.cargo-home
+dist
+.git
+keys.db
+keys.db-wal
+keys.db-shm
+config.yml
+**/config.yml
