@@ -36,7 +36,7 @@ pub async fn admin_auth(
         .into_response()
 }
 
-/// 列出所有动态 key（只展示前缀，不暴露明文）。
+/// 列出所有动态 key（不暴露明文；明文不落盘后无法显示真实前缀，用固定掩码）。
 pub async fn list_keys(State(state): State<AppState>) -> Json<serde_json::Value> {
     let out: Vec<serde_json::Value> = state
         .key_store
@@ -48,14 +48,14 @@ pub async fn list_keys(State(state): State<AppState>) -> Json<serde_json::Value>
                 "name": r.name,
                 "created_at": r.created_at,
                 "enabled": r.enabled,
-                "prefix": format!("{}…", &r.key[..r.key.len().min(12)]),
+                "prefix": "sk-••••",
             })
         })
         .collect();
     Json(json!(out))
 }
 
-/// 创建 key，返回明文（仅此一次展示）。
+/// 创建 key，返回明文（仅此一次展示；此后只存 argon2 哈希）。
 pub async fn create_key(
     State(state): State<AppState>,
     Json(body): Json<serde_json::Value>,
@@ -72,15 +72,15 @@ pub async fn create_key(
         )
             .into_response();
     }
-    let rec = state.key_store.create(name);
+    let created = state.key_store.create(name);
     (
         StatusCode::CREATED,
         Json(json!({
-            "id": rec.id,
-            "key": rec.key,
-            "name": rec.name,
-            "created_at": rec.created_at,
-            "enabled": rec.enabled,
+            "id": created.record.id,
+            "key": created.plaintext,
+            "name": created.record.name,
+            "created_at": created.record.created_at,
+            "enabled": created.record.enabled,
         })),
     )
         .into_response()
@@ -315,10 +315,11 @@ mod tests {
         let full_key = created["key"].as_str().unwrap().to_string();
         assert!(full_key.starts_with("sk-"));
 
-        // 列表脱敏：含名称/前缀，不暴露明文
+        // 列表脱敏：含名称与固定掩码，不暴露明文，也不暴露 argon2 哈希
         let listed = list_keys(State(state)).await;
         let text = listed.0.to_string();
         assert!(text.contains("my-key"));
         assert!(!text.contains(&full_key), "list must not leak plaintext key");
+        assert!(!text.contains("$argon2id$"), "list must not leak key hash");
     }
 }

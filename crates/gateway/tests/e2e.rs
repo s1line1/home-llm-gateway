@@ -152,9 +152,9 @@ fn seed_keys_db() -> (PathBuf, String) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("keys.db");
     let store = gateway::keystore::KeyStore::new(Some(path.clone()));
-    let rec = store.create("e2e".into());
+    let created = store.create("e2e".into());
     std::mem::forget(dir);
-    (path, rec.key)
+    (path, created.plaintext)
 }
 
 /// 拉起一整套栈（mock-llm + gateway + agent），返回 (gw, agent, http base, api key)。

@@ -229,7 +229,7 @@ systemd 单元：`deploy/gateway.service`（云服务器）、`deploy/agent.serv
 
 - **网页管理页**：浏览器打开 `http://<网关地址>/` 即进入管理界面——输入 admin token 后可直接**创建 / 吊销 / 列出 key**
 - 配置项 `admin_token`（`config.yml`）：管理口令（与 API Key 相互独立），提供后启用 `/admin/*` 与页面中的管理功能
-- 配置项 `keys_file`：动态 key 持久化数据库文件（SQLite，默认 `keys.db`），重启后依然有效
+- 配置项 `keys_file`：动态 key 持久化数据库文件（SQLite，默认 `keys.db`），重启后依然有效；**只存 argon2 哈希，明文仅创建时返回一次**
 - 网关没有静态 key——所有 key 都由 Admin API 创建（全部持久化在 SQLite），统一用于调用 `/v1/*`
 
 ```bash
@@ -239,14 +239,14 @@ curl -X POST http://127.0.0.1:8080/admin/keys \
   -d '{"name":"dsh-client"}'
 # → {"id":"ab99de40","key":"sk-…","name":"dsh-client","created_at":…,"enabled":true}
 
-# 列出（脱敏，只显示前缀，不暴露明文）
+# 列出（脱敏；明文不落盘，前缀为固定掩码，不暴露任何凭据信息）
 curl http://127.0.0.1:8080/admin/keys -H "Authorization: Bearer <admin-token>"
 
 # 吊销（立即生效）
 curl -X DELETE http://127.0.0.1:8080/admin/keys/<id> -H "Authorization: Bearer <admin-token>"
 ```
 
-> 安全：`admin_token` 务必用强随机值（`openssl rand -hex 32`）；`keys.db`（SQLite）含明文密钥，已加入 `.gitignore`；生产环境建议在安全组中仅对管理网段开放 `/admin/*`。
+> 安全：`admin_token` 务必用强随机值（`openssl rand -hex 32`）；`keys.db`（SQLite）只存 argon2 哈希、不含明文密钥，已加入 `.gitignore`；生产环境建议在安全组中仅对管理网段开放 `/admin/*`。
 
 ## 安全模型
 
