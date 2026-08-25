@@ -1,6 +1,10 @@
 //! 端到端集成测试：内存生成 CA/服务端/客户端证书，
 //! 在单进程内拉起 mock-llm + gateway + agent，验证完整链路。
 //! 无需真实 LLM 或真实服务器。
+//!
+//! 注意：这些测试必须**串行**运行（`#[serial]`）——每个测试都启动独立的
+//! 多线程 runtime + QUIC 连接 + 时序敏感断言（超时/断开取消），默认并行会互相
+//! 争抢 CPU 把时序场景饿成几十秒甚至"看起来像挂起"。串行下全套 18 秒跑完。
 
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -16,6 +20,7 @@ use rcgen::{
     KeyUsagePurpose, SanType,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use serial_test::serial;
 
 /// 生成 (CA, 服务端证书, 服务端私钥, 客户端证书, 客户端私钥)。
 fn gen_certs() -> (
@@ -206,6 +211,7 @@ async fn start_stack(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn e2e_chain_with_mock_llm() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     let (gw, agent, base, key) = start_stack(Duration::from_secs(10), 0, 4, None).await;
@@ -274,6 +280,7 @@ async fn e2e_chain_with_mock_llm() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn e2e_sse_streaming_passthrough() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     let (gw, agent, base, key) = start_stack(Duration::from_secs(10), 0, 4, None).await;
@@ -318,6 +325,7 @@ async fn e2e_sse_streaming_passthrough() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn e2e_gateway_timeout_cancels_upstream() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     // 网关空闲超时 150ms，而 mock 的 /v1/slow 要睡 800ms 才响应 → 应触发超时 + Cancel
@@ -347,6 +355,7 @@ async fn e2e_gateway_timeout_cancels_upstream() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn e2e_rate_limit_per_key() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     // 每分钟 5 次：前 5 个请求放行，第 6 个 429
@@ -379,6 +388,7 @@ async fn e2e_rate_limit_per_key() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn e2e_admission_control() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     // agent max_concurrency=1：两个并发慢请求，一个 200、一个 429；完成后槽位释放
@@ -418,6 +428,7 @@ async fn e2e_admission_control() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn e2e_multi_agent_least_loaded() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     let (ca, server_cert, server_key, client_cert, client_key) = gen_certs();
@@ -496,6 +507,7 @@ async fn e2e_multi_agent_least_loaded() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn e2e_metrics_endpoint() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     let (gw, agent, base, key) = start_stack(Duration::from_secs(10), 0, 4, None).await;
@@ -523,6 +535,7 @@ async fn e2e_metrics_endpoint() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn e2e_admin_api_keys() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     let (gw, agent, base, key) = start_stack(Duration::from_secs(10), 0, 4, Some("admin-token")).await;
@@ -613,6 +626,7 @@ async fn e2e_admin_api_keys() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn e2e_https_public_entry() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     let (ca_pem, srv_pem, srv_key_pem, cli_pem, cli_key_pem) = gen_certs_pem();
@@ -712,6 +726,7 @@ async fn e2e_https_public_entry() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn e2e_quic_control_stream_edge_frames() {
 
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
@@ -850,6 +865,7 @@ async fn e2e_quic_control_stream_edge_frames() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn e2e_proxy_protocol_edge_cases() {
 
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
@@ -1138,6 +1154,7 @@ async fn e2e_proxy_protocol_edge_cases() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn e2e_client_disconnect_cancels_upstream() {
     use futures_util::StreamExt;
 
