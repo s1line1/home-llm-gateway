@@ -35,4 +35,5 @@ mock-llm = { path = "../mock-llm" }
 rcgen = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
+serial_test = "0.10"
 tempfile = "3"
