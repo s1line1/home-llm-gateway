@@ -14,10 +14,10 @@ keys.db
 keys.db-wal
 keys.db-shm
 
-# 本地网关配置（含 API Key / admin token 明文；模板见 config.example.yml）
+# 本地配置（含 API Key / admin token 明文；模板见 gateway_config.example.yml / agent_config.example.yml）
+/gateway-config.yml
+/agent-config.yml
 /config.yml
-/crates/gateway/config.yml
-/crates/agent/config.yml
 
 # 系统/编辑器杂项
 .DS_Store

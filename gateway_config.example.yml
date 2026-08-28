@@ -1,6 +1,6 @@
 # home-llm-gateway 网关配置示例
-# 使用：cp gateway_config.example.yml config.yml，按需修改后
-#       gateway --config config.yml
+# 使用：cp gateway_config.example.yml gateway-config.yml，按需修改后
+#       gateway --config gateway-config.yml
 # 所有字段都有默认值；cert / key / ca 为必填。
 
 # HTTP(S) 公网入口监听地址（客户端连接入口，TCP）
@@ -34,3 +34,8 @@ rate_limit_per_min: 60
 # 与 tls_key 成对，去掉即明文 HTTP）
 # tls_cert: /etc/home-llm-gateway/server.crt
 # tls_key: /etc/home-llm-gateway/server.key
+
+# React Web UI 静态目录（含 index.html；浏览器打开网关地址 `/` 即管理面板）。
+# 默认 web/dist（相对工作目录）；目录不存在时 `/` 显示构建提示页。
+# 构建前端：cd web && pnpm install && pnpm build
+ui_dir: web/dist

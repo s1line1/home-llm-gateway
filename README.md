@@ -37,15 +37,33 @@ crates/
 ├── gateway/    cloud-gateway 二进制（axum + quinn server）
 ├── agent/      edge-agent 二进制（quinn client + reqwest）
 └── mock-llm/   模拟 OpenAI 兼容接口的假 LLM（无真实模型时打通链路用）
+web/            React + TS 管理面板（Dashboard；网关启动即托管，见下）
 certs/          证书生成脚本（开发用）
 gateway_config.example.yml  网关配置模板（所有参数，YAML）
+agent_config.example.yml    edge-agent 配置模板（所有参数，YAML）
 deploy/         systemd 单元（gateway.service / agent.service）
 scripts/        多平台 release 打包脚本
 ```
 
+> 配置文件命名：**网关固定 `gateway-config.yml`，agent 固定 `agent-config.yml`**（本地/生产一致；
+> 均含密钥类信息，已 gitignore，不提交）。
+
+## Web 管理面板（React + TS）
+
+`web/` 是独立前端工程（Vite + React + Tailwind），提供总览、API Keys、Agents、指标四个页面。
+**网关内置静态托管**：构建前端（`cd web && pnpm install && pnpm build`）后，网关配置
+`ui_dir`（默认 `web/dist`）指向产物即可，**启动 gateway 浏览器打开 `/` 就是 Dashboard**
+（前端路由自动 fallback，单进程单端口，无需 nginx）。`ui_dir` 缺失时 `/` 显示构建提示页
+（网关不再内嵌管理页）。开发时也可 `cd web && pnpm dev` 用 Vite 代理联调
+（`GATEWAY_PROXY` 可覆盖网关地址）。
+
 ## 快速开始（全部本机即可跑通，无需真实 LLM）
 
 > 以下用 `cargo run` 仅为本地开发方便（debug 构建）；**生产部署直接用编译好的 release 二进制**，服务器无需安装 Rust，见 [`DEPLOY.md`](DEPLOY.md)。
+
+> 💡 常用命令已收进 `Makefile`：`make help` 查看全部；`make setup`（证书+前端依赖）、
+> `make dev`（一键起 mock-llm+gateway+agent 全栈）、`make dev-ui`（先构建前端再起全栈）、
+> `make stop`（停全栈）、`make test` / `make build` / `make release`。
 
 ### 环境
 
@@ -66,10 +84,10 @@ cargo run -p mock-llm -- --addr 127.0.0.1:11435
 
 ### 3. 起 edge-agent（家里那台机器）
 
-agent 同样用 YAML 配置（`agent --config config.yml`，参考 `crates/agent/config.example.yml`）：
+agent 同样用 YAML 配置（`agent --config agent-config.yml`，参考 `agent_config.example.yml`）：
 
 ```bash
-cat > config.yml <<'EOF'
+cat > agent-config.yml <<'EOF'
 cloud_addr: "127.0.0.1:4433"
 ca: certs/out/ca.crt
 cert: certs/out/client.crt
@@ -77,15 +95,15 @@ key: certs/out/client.key
 agent_id: home-1
 upstream: "http://127.0.0.1:11435"
 EOF
-cargo run -p agent -- --config config.yml
+cargo run -p agent -- --config agent-config.yml
 ```
 
 ### 4. 起 cloud-gateway（云服务器）
 
-网关所有参数都在 **YAML 配置文件**里（`gateway --config config.yml`，参考 `gateway_config.example.yml`）。本地开发写一份最小配置：
+网关所有参数都在 **YAML 配置文件**里（`gateway --config gateway-config.yml`，参考 `gateway_config.example.yml`）。本地开发写一份最小配置：
 
 ```bash
-cat > config.yml <<'EOF'
+cat > gateway-config.yml <<'EOF'
 listen_addr: "0.0.0.0:8080"
 quic_addr: "0.0.0.0:4433"
 cert: certs/out/server.crt
@@ -93,7 +111,7 @@ key: certs/out/server.key
 ca: certs/out/ca.crt
 admin_token: dev-admin   # 管理口令，用于创建第一个 API key
 EOF
-cargo run -p gateway -- --config config.yml
+cargo run -p gateway -- --config gateway-config.yml
 ```
 
 网关**没有静态 key**——所有 API key 都通过 Admin API 运行时创建并存入 SQLite。启动后先创建第一个 key：
@@ -153,7 +171,7 @@ cargo test    # proto roundtrip + 端到端集成测试（内存生成证书，�
 
 ### 启用 HTTPS + 限流
 
-在 `config.yml` 中启用 TLS 与限流：
+在 `gateway-config.yml` 中启用 TLS 与限流：
 
 ```yaml
 listen_addr: "0.0.0.0:8443"
@@ -168,7 +186,7 @@ rate_limit_per_min: 60            # 每个 API Key 每分钟上限（0 = 不限�
 ```
 
 ```bash
-cargo run -p gateway -- --config config.yml
+cargo run -p gateway -- --config gateway-config.yml
 ```
 
 客户端改用 `https://` 访问；自签证书可把 `ca.crt` 装进系统信任库（或临时 `curl -k`）。
@@ -228,7 +246,7 @@ systemd 单元：`deploy/gateway.service`（云服务器）、`deploy/agent.serv
 网关内置轻量管理接口，可**运行时签发 / 吊销 key，无需重启网关**：
 
 - **网页管理页**：浏览器打开 `http://<网关地址>/` 即进入管理界面——输入 admin token 后可直接**创建 / 吊销 / 列出 key**
-- 配置项 `admin_token`（`config.yml`）：管理口令（与 API Key 相互独立），提供后启用 `/admin/*` 与页面中的管理功能
+- 配置项 `admin_token`（`gateway-config.yml`）：管理口令（与 API Key 相互独立），提供后启用 `/admin/*` 与页面中的管理功能
 - 配置项 `keys_file`：动态 key 持久化数据库文件（SQLite，默认 `keys.db`），重启后依然有效；**只存 argon2 哈希，明文仅创建时返回一次**
 - 网关没有静态 key——所有 key 都由 Admin API 创建（全部持久化在 SQLite），统一用于调用 `/v1/*`
 

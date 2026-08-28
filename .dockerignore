@@ -5,5 +5,8 @@ dist
 keys.db
 keys.db-wal
 keys.db-shm
-config.yml
+gateway-config.yml
+agent-config.yml
 **/config.yml
+**/gateway-config.yml
+**/agent-config.yml

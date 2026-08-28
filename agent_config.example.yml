@@ -1,6 +1,6 @@
 # home-llm-gateway 边缘端 agent 配置示例
-# 使用：cp crates/agent/config.example.yml config.yml，按需修改后
-#       agent --config config.yml
+# 使用：cp agent_config.example.yml agent-config.yml，按需修改后
+#       agent --config agent-config.yml
 # 所有字段都有默认值；cloud_addr / ca / cert / key 为必填。
 
 # 云端网关 QUIC 地址（IP:端口）— 必填（同地域可用内网 IP）
