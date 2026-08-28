@@ -2,7 +2,7 @@
 # 安装：
 #   1. 把二进制放到 /usr/local/bin/agent
 #   2. 把证书与 agent 配置放到 /etc/home-llm-gateway/
-#      （基于 crates/agent/config.example.yml 修改：cloud_addr、证书路径、upstream 等）
+#      （基于 agent_config.example.yml 修改：cloud_addr、证书路径、upstream 等）
 #   3. sudo cp deploy/agent.service /etc/systemd/system/ && sudo systemctl enable --now agent
 [Unit]
 Description=Edge LLM Agent (QUIC tunnel client)
@@ -11,7 +11,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# 所有参数都在 /etc/home-llm-gateway/agent-config.yml 中配置（见 crates/agent/config.example.yml）
+# 所有参数都在 /etc/home-llm-gateway/agent-config.yml 中配置（见 agent_config.example.yml）
 ExecStart=/usr/local/bin/agent --config /etc/home-llm-gateway/agent-config.yml
 Restart=always
 RestartSec=3

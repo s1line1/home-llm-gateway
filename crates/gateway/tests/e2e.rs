@@ -187,6 +187,7 @@ async fn start_stack(
         agent_stale_after: Duration::from_secs(10),
         rate_limit_per_min,
         tls: None,
+        ui_dir: None,
     })
     .await
     .unwrap();
@@ -225,13 +226,13 @@ async fn e2e_chain_with_mock_llm() {
     let resp = client.get(format!("{base}/healthz")).send().await.unwrap();
     assert_eq!(resp.status(), 200);
 
-    // 根路径返回管理页 HTML（含创建 API Key 的 UI）
+    // 根路径：未配置 ui_dir 时返回 UI 构建提示页（HTML，不再内嵌管理页）
     let resp = client.get(format!("{base}/")).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     let page = resp.text().await.unwrap();
-    assert!(page.contains("Home LLM Gateway"), "root should serve the admin page");
-    assert!(page.contains("创建 Key"), "admin page should expose key creation UI");
-    assert!(page.starts_with("<!doctype html>"), "admin page should be HTML");
+    assert!(page.contains("Home LLM Gateway"), "root should serve the UI placeholder");
+    assert!(page.contains("尚未构建"), "placeholder should mention building the UI");
+    assert!(page.starts_with("<!doctype html>"), "placeholder should be HTML");
 
     // 认证后 /v1/models 穿透到 mock
     let resp = client
@@ -448,6 +449,7 @@ async fn e2e_multi_agent_least_loaded() {
         agent_stale_after: Duration::from_secs(10),
         rate_limit_per_min: 0,
         tls: None,
+        ui_dir: None,
     })
     .await
     .unwrap();
@@ -648,6 +650,7 @@ async fn e2e_https_public_entry() {
             cert: srv_pem.clone().into_bytes(),
             key: srv_key_pem.clone().into_bytes(),
         }),
+        ui_dir: None,
     })
     .await
     .unwrap();
@@ -744,6 +747,7 @@ async fn e2e_quic_control_stream_edge_frames() {
         agent_stale_after: Duration::from_secs(10),
         rate_limit_per_min: 0,
         tls: None,
+        ui_dir: None,
     })
     .await
     .unwrap();
@@ -885,6 +889,7 @@ async fn e2e_proxy_protocol_edge_cases() {
         agent_stale_after: Duration::from_secs(10),
         rate_limit_per_min: 0,
         tls: None,
+        ui_dir: None,
     })
     .await
     .unwrap();

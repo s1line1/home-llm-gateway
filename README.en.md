@@ -65,10 +65,10 @@ cargo run -p mock-llm -- --addr 127.0.0.1:11435
 
 ### 3. Start edge-agent (on the machine next to your LLM)
 
-The agent also uses a YAML config file (`agent --config config.yml`, see `crates/agent/config.example.yml`):
+The agent also uses a YAML config file (`agent --config agent-config.yml`, see `agent_config.example.yml`):
 
 ```bash
-cat > config.yml <<'EOF'
+cat > agent-config.yml <<'EOF'
 cloud_addr: "127.0.0.1:4433"
 ca: certs/out/ca.crt
 cert: certs/out/client.crt
@@ -76,15 +76,15 @@ key: certs/out/client.key
 agent_id: home-1
 upstream: "http://127.0.0.1:11435"
 EOF
-cargo run -p agent -- --config config.yml
+cargo run -p agent -- --config agent-config.yml
 ```
 
 ### 4. Start cloud-gateway (on the cloud server)
 
-All gateway settings live in a **YAML config file** (`gateway --config config.yml`, see `gateway_config.example.yml`). A minimal dev config:
+All gateway settings live in a **YAML config file** (`gateway --config gateway-config.yml`, see `gateway_config.example.yml`). A minimal dev config:
 
 ```bash
-cat > config.yml <<'EOF'
+cat > gateway-config.yml <<'EOF'
 listen_addr: "0.0.0.0:8080"
 quic_addr: "0.0.0.0:4433"
 cert: certs/out/server.crt
@@ -92,7 +92,7 @@ key: certs/out/server.key
 ca: certs/out/ca.crt
 admin_token: dev-admin   # admin password, used to create the first API key
 EOF
-cargo run -p gateway -- --config config.yml
+cargo run -p gateway -- --config gateway-config.yml
 ```
 
 The gateway has **no static keys** — every API key is created at runtime through the Admin API and stored in SQLite. Create the first key after startup:
@@ -152,7 +152,7 @@ Point the agent config's `upstream` at your real service — nothing else change
 
 ### Enabling HTTPS + rate limiting
 
-Enable TLS and rate limiting in `config.yml`:
+Enable TLS and rate limiting in `gateway-config.yml`:
 
 ```yaml
 listen_addr: "0.0.0.0:8443"
@@ -167,7 +167,7 @@ rate_limit_per_min: 60            # per API key per minute (0 = unlimited)
 ```
 
 ```bash
-cargo run -p gateway -- --config config.yml
+cargo run -p gateway -- --config gateway-config.yml
 ```
 
 Clients now use `https://`; for self-signed certificates either install `ca.crt` into the system trust store (or temporarily use `curl -k`).
@@ -227,7 +227,7 @@ systemd units: `deploy/gateway.service` (cloud server) and `deploy/agent.service
 The gateway ships a lightweight admin interface to **issue / revoke keys at runtime — no restart needed**:
 
 - **Web admin page**: open `http://<gateway-addr>/` in a browser — enter the admin token and **create / revoke / list keys** right from the page
-- Config `admin_token` (`config.yml`): admin password (independent of API keys); enables `/admin/*` and the page's management features when provided
+- Config `admin_token` (`gateway-config.yml`): admin password (independent of API keys); enables `/admin/*` and the page's management features when provided
 - Config `keys_file`: SQLite database file for dynamic keys (default `keys.db`); keys survive restarts
 - The gateway has no static keys — all keys are created through the Admin API (persisted in SQLite) and are used uniformly on `/v1/*`
 

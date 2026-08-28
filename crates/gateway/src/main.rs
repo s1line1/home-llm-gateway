@@ -11,7 +11,7 @@ use tracing_subscriber::EnvFilter;
 #[command(version, about = "cloud-gateway: 家庭 LLM 远程访问网关（公网入口 + QUIC 隧道服务端）")]
 struct Args {
     /// 配置文件路径（YAML），所有参数都在其中配置
-    #[arg(long, default_value = "config.yml")]
+    #[arg(long, default_value = "gateway-config.yml")]
     config: PathBuf,
 }
 
@@ -55,6 +55,9 @@ struct ConfigFile {
     /// 公网入口 HTTPS 私钥 PEM（与 tls_cert 成对）
     #[serde(default)]
     tls_key: Option<PathBuf>,
+    /// React UI 静态目录（含 index.html；默认 web/dist，不存在时 `/` 显示构建提示页）
+    #[serde(default = "default_ui_dir")]
+    ui_dir: Option<PathBuf>,
 }
 
 fn default_listen_addr() -> String {
@@ -65,6 +68,9 @@ fn default_quic_addr() -> String {
 }
 fn default_keys_file() -> Option<PathBuf> {
     Some(PathBuf::from("keys.db"))
+}
+fn default_ui_dir() -> Option<PathBuf> {
+    Some(PathBuf::from("web/dist"))
 }
 fn default_timeout_secs() -> u64 {
     120
@@ -110,6 +116,7 @@ fn config_from_file(cfg: ConfigFile) -> anyhow::Result<GatewayConfig> {
         agent_stale_after: Duration::from_secs(cfg.agent_stale_secs),
         rate_limit_per_min: cfg.rate_limit_per_min,
         tls,
+        ui_dir: cfg.ui_dir,
     })
 }
 

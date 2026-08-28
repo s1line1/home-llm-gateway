@@ -11,7 +11,7 @@ use tracing_subscriber::EnvFilter;
 #[command(version, about = "home-agent: 常驻 LLM 所在机器，通过 QUIC 隧道接入云端网关")]
 struct Args {
     /// 配置文件路径（YAML），所有参数都在其中配置
-    #[arg(long, default_value = "config.yml")]
+    #[arg(long, default_value = "agent-config.yml")]
     config: PathBuf,
 }
 

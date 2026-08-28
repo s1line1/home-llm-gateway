@@ -9,7 +9,7 @@
 # 运行网关（云服务器）：
 #   docker run -d --name gateway --restart unless-stopped \
 #     -v /etc/home-llm-gateway:/config -p 8443:8443 -p 4433:4433/udp \
-#     home-llm-gateway gateway --config /config/config.yml
+#     home-llm-gateway gateway --config /config/gateway-config.yml
 #
 # 运行 agent（LLM 机器）：
 #   docker run -d --name agent --restart always --network host \
@@ -37,4 +37,4 @@ COPY --from=builder /build/target/release/gateway /usr/local/bin/gateway
 COPY --from=builder /build/target/release/agent /usr/local/bin/agent
 COPY --from=builder /build/target/release/mock-llm /usr/local/bin/mock-llm
 ENTRYPOINT ["/usr/local/bin/gateway"]
-CMD ["--config", "/config/config.yml"]
+CMD ["--config", "/config/gateway-config.yml"]

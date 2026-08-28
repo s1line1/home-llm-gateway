@@ -4,7 +4,7 @@
 use axum::{
     extract::{Path, State},
     http::{header::AUTHORIZATION, StatusCode},
-    response::{Html, IntoResponse, Response},
+    response::{IntoResponse, Response},
     Json,
 };
 use serde_json::json;
@@ -99,166 +99,6 @@ pub async fn delete_key(State(state): State<AppState>, Path(id): Path<String>) -
     }
 }
 
-/// 管理页面（GET /）：浏览器打开网关地址即可管理 API Key。
-/// 页面本身不鉴权，所有数据操作经由带 admin token 的 /admin/keys API。
-pub async fn admin_page() -> Html<&'static str> {
-    Html(ADMIN_PAGE)
-}
-
-const ADMIN_PAGE: &str = r#"<!doctype html>
-<html lang="zh">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Home LLM Gateway</title>
-<style>
-  :root { color-scheme: light dark; }
-  body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; max-width: 720px; margin: 40px auto; padding: 0 16px; line-height: 1.6; }
-  h1 { font-size: 1.4rem; }
-  input, button { font-size: 14px; padding: 6px 10px; margin: 4px 0; }
-  input[type=password], input[type=text] { width: 260px; }
-  table { width: 100%; border-collapse: collapse; margin-top: 8px; }
-  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #ddd; font-size: 13px; }
-  code { background: rgba(128,128,128,.15); padding: 1px 5px; border-radius: 4px; word-break: break-all; }
-  .msg { color: #0a7; }
-  .err { color: #c33; }
-  .muted { color: #888; font-size: 12px; }
-  .ok { color: #0a7; font-weight: 600; }
-  .bad { color: #c33; font-weight: 600; }
-  button.danger { background: #c33; border: 1px solid #c33; color: #fff; }
-  button.danger:hover { background: #a22; }
-</style>
-</head>
-<body>
-<h1>Home LLM Gateway</h1>
-<p id="health" class="muted">加载中…</p>
-
-<section>
-  <h2>管理员登录</h2>
-  <p class="muted">输入启动网关时的 <code>--admin-token</code>，保存在本浏览器（localStorage）。</p>
-  <input id="token" type="password" placeholder="Admin Token">
-  <button id="save">保存并加载</button>
-</section>
-
-<section>
-  <h2>API Keys</h2>
-  <form id="create">
-    <input id="name" type="text" placeholder="用途，如 dsh-client" maxlength="64">
-    <button type="submit">创建 Key</button>
-  </form>
-  <div id="created"></div>
-  <h3>已有 Keys <button id="refresh">刷新</button></h3>
-  <table>
-    <thead><tr><th>名称</th><th>ID</th><th>前缀</th><th>创建时间</th><th>状态</th><th></th></tr></thead>
-    <tbody id="rows"></tbody>
-  </table>
-</section>
-
-<script>
-const TOKEN_KEY = "hlmg.admin.token";
-let token = localStorage.getItem(TOKEN_KEY) || "";
-document.getElementById("token").value = token;
-
-const healthEl = document.getElementById("health");
-fetch("/healthz").then(r => r.text()).then(t => {
-  healthEl.textContent = "网关状态: " + t + " · " + new Date().toLocaleString();
-}).catch(() => { healthEl.textContent = "网关状态: 无法连接"; });
-
-function show(el, text, isErr) {
-  el.textContent = text;
-  el.className = isErr ? "err" : "msg";
-}
-
-async function api(path, opts) {
-  opts = opts || {};
-  opts.headers = Object.assign({ "Authorization": "Bearer " + token }, opts.headers || {});
-  const r = await fetch(path, opts);
-  if (!r.ok) {
-    let msg = "HTTP " + r.status;
-    try { msg = (await r.json()).error.message || msg; } catch (e) {}
-    throw new Error(msg);
-  }
-  return r.status === 204 ? null : r.json();
-}
-
-document.getElementById("save").onclick = () => {
-  token = document.getElementById("token").value.trim();
-  localStorage.setItem(TOKEN_KEY, token);
-  refresh();
-};
-
-const createdEl = document.getElementById("created");
-document.getElementById("create").onsubmit = async (e) => {
-  e.preventDefault();
-  const name = document.getElementById("name").value.trim() || "unnamed";
-  try {
-    const rec = await api("/admin/keys", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name }) });
-    createdEl.innerHTML = "已创建 <code>" + rec.key + "</code> <button onclick='copyText(\"" + rec.key + "\")'>复制</button> <span class=\"muted\">（仅显示这一次）</span>";
-    document.getElementById("name").value = "";
-    refresh();
-  } catch (err) { show(createdEl, err.message, true); }
-};
-
-// 复制到剪贴板：navigator.clipboard 仅在 HTTPS/localhost 可用，
-// 明文 HTTP 的公网地址（如 http://IP:9090）下回退到 execCommand。
-function copyText(text) {
-  if (navigator.clipboard && window.isSecureContext) {
-    navigator.clipboard.writeText(text).catch(() => fallbackCopy(text));
-  } else {
-    fallbackCopy(text);
-  }
-}
-function fallbackCopy(text) {
-  const ta = document.createElement("textarea");
-  ta.value = text;
-  ta.style.position = "fixed";
-  ta.style.opacity = "0";
-  document.body.appendChild(ta);
-  ta.select();
-  try { document.execCommand("copy"); } catch (e) {}
-  document.body.removeChild(ta);
-}
-
-document.getElementById("refresh").onclick = refresh;
-
-async function refresh() {
-  const rows = document.getElementById("rows");
-  rows.innerHTML = "";
-  try {
-    const keys = await api("/admin/keys");
-    if (!keys.length) { rows.innerHTML = "<tr><td colspan='6' class='muted'>暂无动态 key（静态 key 在 --api-keys 中配置）</td></tr>"; return; }
-    for (const k of keys) {
-      const tr = document.createElement("tr");
-      const when = new Date(k.created_at * 1000).toLocaleString();
-      tr.innerHTML = "<td>" + escapeHtml(k.name) + "</td><td><code>" + k.id + "</code></td><td><code>" + k.prefix + "</code></td><td>" + when + "</td>" +
-        "<td class=\"" + (k.enabled ? "ok" : "bad") + "\">" + (k.enabled ? "启用" : "禁用") + "</td>" +
-        "<td><button class=\"danger\" data-id=\"" + k.id + "\" data-name=\"" + escapeHtml(k.name) + "\">吊销</button></td>";
-      rows.appendChild(tr);
-    }
-    rows.querySelectorAll("button").forEach(b => b.onclick = () => revoke(b.dataset.id, b.dataset.name));
-  } catch (err) {
-    rows.innerHTML = "<tr><td colspan='6' class='err'>" + escapeHtml(err.message) + "</td></tr>";
-  }
-}
-
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" }[c]));
-}
-
-async function revoke(id, name) {
-  if (!confirm("吊销 key: " + name + " (" + id + ")？立即生效，不可恢复。")) return;
-  try {
-    await api("/admin/keys/" + id, { method: "DELETE" });
-    refresh();
-  } catch (err) {
-    alert(err.message);
-  }
-}
-
-refresh();
-</script>
-</body>
-</html>"#;
 
 #[cfg(test)]
 mod tests {
@@ -281,6 +121,7 @@ mod tests {
             agent_stale_after: Duration::from_secs(10),
             rate_limiter: None,
             metrics: Metrics::default(),
+            ui: None,
         }
     }
 

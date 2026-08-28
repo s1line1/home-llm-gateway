@@ -53,6 +53,8 @@ pub struct GatewayConfig {
     pub rate_limit_per_min: u32,
     /// 提供后，公网入口启用 HTTPS（rustls）。
     pub tls: Option<TlsPem>,
+    /// React UI 静态目录（含 index.html；存在时 `/` 托管 Dashboard，否则显示构建提示页）。
+    pub ui_dir: Option<PathBuf>,
 }
 
 pub struct Gateway {
@@ -77,6 +79,16 @@ impl Gateway {
         let listener = tokio::net::TcpListener::bind(cfg.http_bind).await?;
         let http_addr = listener.local_addr()?;
 
+        // UI 静态目录：仅当目录内存在 index.html 时启用（否则 `/` 显示构建提示页）
+        let ui = cfg.ui_dir.as_ref().and_then(|p| {
+            if p.join("index.html").is_file() {
+                Some(p.clone())
+            } else {
+                warn!(path = %p.display(), "ui_dir set but index.html not found; GET / will show a placeholder");
+                None
+            }
+        });
+
         let state = http::AppState {
             registry: registry.clone(),
             key_store: KeyStore::new(cfg.keys_file.clone()),
@@ -85,6 +97,7 @@ impl Gateway {
             agent_stale_after: cfg.agent_stale_after,
             rate_limiter: RateLimiter::new(cfg.rate_limit_per_min),
             metrics: Metrics::default(),
+            ui,
         };
         let app = http::app(state);
 
