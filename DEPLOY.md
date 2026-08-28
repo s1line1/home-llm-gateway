@@ -103,12 +103,15 @@ cargo build --release            # 产出 target/release/{gateway,agent,mock-llm
 ## 4. 目录规划（中转服务器）
 
 ```bash
-sudo mkdir -p /opt/home-llm-gateway/certs
+sudo mkdir -p /etc/home-llm-gateway/certs
 # 二进制（方案 A 构建后在 home-llm-gateway/target/release/ 下，方案 B 解包 dist/）
-sudo cp target/release/gateway /opt/home-llm-gateway/
+sudo cp target/release/gateway /usr/local/bin/gateway
 # 证书
-sudo cp server.crt server.key ca.crt /opt/home-llm-gateway/certs/
-sudo chmod 600 /opt/home-llm-gateway/certs/server.key
+sudo cp server.crt server.key ca.crt /etc/home-llm-gateway/certs/
+sudo chmod 600 /etc/home-llm-gateway/certs/server.key
+# Web UI（可选）：本机构建后把产物整个上传（含 index.html + assets/）
+#   cd web && pnpm install && pnpm build
+#   scp -r web/dist <服务器>:/etc/home-llm-gateway/web
 ```
 
 ## 5. 部署网关（中转服务器）
@@ -119,8 +122,8 @@ openssl rand -hex 32        # API Key（记下来，客户端要用）
 openssl rand -hex 32        # Admin Token
 
 # 2) 基于模板生成网关配置（所有参数都在这里）
-sudo cp gateway_config.example.yml /etc/home-llm-gateway/config.yml
-sudo vi /etc/home-llm-gateway/config.yml
+sudo cp gateway_config.example.yml /etc/home-llm-gateway/gateway-config.yml
+sudo vi /etc/home-llm-gateway/gateway-config.yml
 
 # 3) 安装并启动（systemd 单元只负责 --config 指向配置文件）
 sudo cp deploy/gateway.service /etc/systemd/system/
@@ -131,7 +134,7 @@ sudo systemctl enable --now gateway
 sudo journalctl -u gateway -f
 ```
 
-`config.yml` 关键参数（按需修改，完整示例见 `gateway_config.example.yml`）：
+`gateway-config.yml` 关键参数（按需修改，完整示例见 `gateway_config.example.yml`）：
 
 ```yaml
 listen_addr: "0.0.0.0:8443"        # HTTPS API 入口
@@ -141,6 +144,8 @@ cert / key / ca                    # QUIC 隧道证书（同 server 证书 + ca.
 admin_token: <强随机串>             # Admin API 口令（必配；用它创建第一个 API key）
 keys_file: /etc/home-llm-gateway/keys.db   # 动态 key 持久化数据库（SQLite，默认 keys.db）
 rate_limit_per_min: 60             # 每个 Key 每分钟上限
+ui_dir: web                        # Web UI 目录（§4 上传的 web/dist；相对 WorkingDirectory，
+                                   # 省略 = `/` 显示构建提示页，API 不受影响）
 ```
 
 > 网关**没有静态 key**——所有 API key 都通过 Admin API 运行时创建并存入 SQLite（首次启动先用 `admin_token` 创建第一个 key）。
@@ -178,11 +183,11 @@ sudo mkdir -p /opt/home-llm-gateway/certs
 sudo cp agent ca.crt client-home1.crt client-home1.key /opt/home-llm-gateway/certs/
 # 目录里只有 agent 二进制 + 证书
 
-# 基于 crates/agent/config.example.yml 生成 agent 配置：
+# 基于 agent_config.example.yml 生成 agent 配置：
 #   cloud_addr: <公网IP>:4433
 #   server_name: <与网关 server 证书 SAN 一致的域名或 IP>   ← 关键！不一致会 TLS 握手失败
 #   upstream: http://127.0.0.1:11434
-sudo cp crates/agent/config.example.yml /etc/home-llm-gateway/agent-config.yml
+sudo cp agent_config.example.yml /etc/home-llm-gateway/agent-config.yml
 sudo vi /etc/home-llm-gateway/agent-config.yml
 
 # deploy/agent.service 只负责 --config 指向配置文件
@@ -204,6 +209,9 @@ curl -k -H "Authorization: Bearer <你的key>" https://<公网IP>:8443/v1/models
 curl -N -k -H "Authorization: Bearer <你的key>" \
   https://<公网IP>:8443/v1/chat/completions \
   -d '{"model":"<模型名>","stream":true,"messages":[{"role":"user","content":"你好"}]}'
+
+# Web 管理面板（§4 已上传 web/dist 时）：浏览器打开 https://<公网IP>:8443/
+# 用 admin_token 登录后即可创建 / 吊销 API Key、查看 agent 状态与指标
 ```
 
 想要免 `-k`：把 `ca.crt` 装进客户端系统信任库（macOS 钥匙串 / 浏览器 / `SSL_CERT_FILE` 环境变量）。
@@ -218,6 +226,7 @@ curl -N -k -H "Authorization: Bearer <你的key>" \
 | curl 返回 401 | API Key 不对或没带 `Authorization: Bearer` |
 | curl 返回 503 | 网关没注册到健康 agent（看网关/agent 日志） |
 | curl 返回 429 | 限流超了（等下一分钟）或 agent 并发占满 |
+| 浏览器打开 8443 显示"尚未构建"提示页 | 未上传 web/dist（§4）或 gateway-config.yml 未配 `ui_dir`；API 不受影响，可后补 UI 再 `systemctl restart gateway` |
 | 家里 IP 变了连不上 | 用域名 SAN 证书 + `--server-name` 填域名，配 DDNS 指向新 IP |
 
 ## 9. 部署后安全清单（必做）
@@ -229,3 +238,24 @@ curl -N -k -H "Authorization: Bearer <你的key>" \
 - [ ] `/metrics` 未加认证：安全组中仅对监控网段放行，或后续给 metrics 加鉴权
 - [ ] server.key / client.key / keys.db 权限 `chmod 600`
 - [ ] 证书到期前重签轮换（825 天），记录到期时间
+
+## 10. 升级说明（旧版 keys.db 自动迁移）
+
+**适用场景**：个人 / 小团队 / key 数量小（个位到几十个），且不介意极端情况下重新签发 key 的部署。
+从早期版本（argon2 哈希改造 `6691b5d` 之前，API key 以**明文**存在 SQLite）升级时，
+网关启动会自动把旧库迁移到 argon2 哈希存储，**无需手工操作**：
+
+1. 启动时检测到表缺 `lookup` 列（旧 schema）即触发迁移
+2. 读取旧明文 key → 重新计算 `lookup`（sha256）+ `key_hash`（argon2）
+3. 事务内重建新 schema 表 → 删除旧表 → `VACUUM` 重写文件，清除磁盘上旧明文残留
+4. 迁移成功日志：`migrated legacy plaintext keys to argon2 hashes count=N`；
+   旧 key 迁移后**继续可用，无需重新签发**；已是新 schema 的库零开销跳过
+
+**边界与风险（重要）**：
+
+- 迁移是**同步执行**的，耗时与 key 数量成正比（每个 key 的 argon2 约 10-30ms）——海量 key 会阻塞网关启动
+- 迁移一次性读入全部旧记录，并使用单一大事务——数据量极大时内存峰值高、失败整体回滚
+- 因此**该自动迁移仅适合小数据量 / 个人 / 小团队、不介意极端情况下重新发 key 的场景**；
+  大规模生产升级请先备份 `keys.db`，改用离线迁移工具（演进方案见 `TODO.md` P1「keys.db 迁移规模化」），
+  不要依赖启动时的自动迁移
+- 无论量级，升级前都建议 `cp keys.db keys.db.bak` 备份；迁移是幂等的，失败后可安全重试
