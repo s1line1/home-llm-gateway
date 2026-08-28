@@ -1,6 +1,7 @@
 //! 公网 HTTP 入口：认证 → 路由 → 编码为隧道帧转发。
 
 use std::{
+    path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
@@ -10,7 +11,7 @@ use axum::{
     extract::{DefaultBodyLimit, Request, State},
     http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri},
     middleware::{self, Next},
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
     routing::get,
     Json, Router,
 };
@@ -18,6 +19,7 @@ use proto::{io::{read_frame, write_frame}, Frame};
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+use tower_http::services::{ServeDir, ServeFile};
 use tracing::{debug, info, warn};
 
 use crate::keystore::KeyStore;
@@ -51,11 +53,12 @@ pub struct AppState {
     pub agent_stale_after: Duration,
     pub rate_limiter: Option<RateLimiter>,
     pub metrics: Metrics,
+    /// React UI 静态目录（None = `/` 显示构建提示页）。
+    pub ui: Option<PathBuf>,
 }
 
 pub fn app(state: AppState) -> Router {
     let mut router = Router::new()
-        .route("/", get(crate::admin::admin_page))
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics_route))
         .route(
@@ -69,12 +72,51 @@ pub fn app(state: AppState) -> Router {
             .route_layer(middleware::from_fn_with_state(state.clone(), crate::admin::admin_auth));
         router = router.nest("/admin", admin);
     }
+    // React UI 静态托管：存在时 `/` 返回 Dashboard，未命中的路径（SPA 前端路由，
+    // 如 /keys、/metrics 的浏览器直接访问/刷新）fallback 到 index.html。
+    // API 路由（/v1/*、/admin/*、/healthz、/metrics）已在上方注册，优先级更高。
+    match &state.ui {
+        Some(dir) => {
+            let ui = ServeDir::new(dir)
+                .append_index_html_on_directories(true)
+                .fallback(ServeFile::new(dir.join("index.html")));
+            router = router.fallback_service(ui);
+            info!(path = %dir.display(), "serving web UI from disk");
+        }
+        None => {
+            router = router.route("/", get(ui_missing));
+        }
+    }
     router
         .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
         .layer(middleware::from_fn_with_state(state.clone(), metrics_middleware))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)
 }
+
+/// UI 未构建（ui_dir 缺失）时的占位提示页——不再内嵌任何管理功能。
+async fn ui_missing() -> Html<&'static str> {
+    Html(UI_MISSING)
+}
+
+const UI_MISSING: &str = r#"<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Home LLM Gateway</title>
+<style>
+  body { font-family: system-ui, -apple-system, "PingFang SC", sans-serif; max-width: 640px; margin: 64px auto; padding: 0 16px; line-height: 1.6; color: #1f2937; }
+  code { background: #f1f5f9; padding: 1px 6px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<h1>Home LLM Gateway</h1>
+<p>Web 管理面板尚未构建。构建前端后配置 <code>ui_dir</code> 并重启网关：</p>
+<pre>cd web &amp;&amp; pnpm install &amp;&amp; pnpm build</pre>
+<p>API 端点（<code>/v1/*</code>、<code>/admin/*</code>、<code>/metrics</code>、<code>/healthz</code>）不受影响。</p>
+</body>
+</html>"#;
 
 async fn healthz() -> &'static str {
     "ok"

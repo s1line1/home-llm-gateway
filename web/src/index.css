@@ -1,0 +1,10 @@
+@import "tailwindcss";
+
+/* 细滚动条，保持深色面板观感统一 */
+* {
+  scrollbar-width: thin;
+}
+
+body {
+  @apply bg-slate-100 text-slate-900 antialiased;
+}

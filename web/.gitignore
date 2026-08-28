@@ -1,0 +1,11 @@
+# 依赖与构建产物
+node_modules/
+dist/
+*.tsbuildinfo
+
+# 本地环境
+.env.local
+.env.*.local
+
+# 系统/编辑器
+.DS_Store
