@@ -9,11 +9,16 @@ GATEWAY_BIN  := target/debug/gateway
 AGENT_BIN    := target/debug/agent
 MOCK_BIN     := target/debug/mock-llm
 
-.PHONY: help setup certs web-install web-build web-dev build test release \
+# k6 宏观压测参数（make bench-k6 KEY=sk-xxx VUS=20 DUR=30s）
+KEY ?= sk-missing
+VUS ?= 20
+DUR ?= 30s
+
+.PHONY: help setup certs web-install web-build web-dev build test bench bench-k6 release \
         run-gateway run-agent run-mock dev dev-ui logs stop clean
 
 help: ## 显示所有命令
-	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-14s %s\n", $$1, $$2}'
+	@grep -E '^[-a-zA-Z0-9_]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-14s %s\n", $$1, $$2}'
 
 ## ---------- 一次性准备 ----------
 
@@ -41,6 +46,12 @@ build: ## 编译 release 二进制（target/release/）
 
 test: ## 运行全部 Rust 测试（含 e2e）
 	cargo test
+
+bench: ## 基准测试（Criterion）：make bench BENCH="-p proto -p gateway"
+	cargo bench $(BENCH)
+
+bench-k6: ## k6 宏观压测（SSE 长流）：make bench-k6 KEY=sk-xxx VUS=20 DUR=30s
+	k6 run -e GATEWAY_URL=$${GATEWAY_URL:-http://127.0.0.1:8080} -e GATEWAY_KEY=$(KEY) -e VUS=$(VUS) -e DURATION=$(DUR) scripts/bench-k6/sse.js
 
 release: ## 多平台打包到 dist/（见 scripts/build-release.sh）
 	bash scripts/build-release.sh

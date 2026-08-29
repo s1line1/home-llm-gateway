@@ -7,3 +7,10 @@ edition.workspace = true
 postcard = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "frame"
+harness = false
