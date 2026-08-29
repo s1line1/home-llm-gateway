@@ -150,6 +150,43 @@ curl -N -H "Authorization: Bearer dev-key" \
 cargo test    # proto roundtrip + 端到端集成测试（内存生成证书，无需任何外部服务）
 ```
 
+### 7. 基准测试（Criterion）
+
+函数级微基准（`cargo bench`），聚焦**真的可能变慢且有影响的路径**：
+协议帧编解码 + keystore 安全热路径（argon2）：
+
+```bash
+cargo bench                          # 全部
+cargo bench -p proto                 # 帧编解码（roundtrip/序列化吞吐）
+cargo bench -p gateway --bench keystore   # argon2 哈希/校验、authorize 命中与 O(1) 未命中
+make bench                           # 等价（可带 BENCH="-p proto"）
+```
+
+> 注意：keystore 基准里 argon2 默认参数（m=19456/t=2）单次约 10-30ms，跑完耗时较长属预期。
+> 限流器与指标渲染为纳秒级无风险路径，不设基准（避免基准噪音）。
+
+### 8. 宏观压测（系统级）
+
+- **快速验证**（一条命令，无需安装脚本）：`oha`（`cargo install oha` / `brew install oha`）
+- **可断言 / 进 CI**：`k6` 脚本模板在 `scripts/bench-k6/`（SSE 长流 + 非流式吞吐两个场景，
+  内置成功率 / 延迟分位断言），用法见该目录 README：
+
+```bash
+make dev                                        # 起全栈
+KEY=$(curl -s -X POST http://127.0.0.1:8080/admin/keys \
+  -H "Authorization: Bearer dev-admin" -H "Content-Type: application/json" \
+  -d '{"name":"k6"}' | python3 -c "import sys,json;print(json.load(sys.stdin)['key'])")
+
+make bench-k6 KEY=$KEY VUS=20 DUR=30s           # k6 SSE 长流压测
+oha -z 30s -c 50 -m POST -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"mock-llm","messages":[{"role":"user","content":"hi"}]}' \
+  http://127.0.0.1:8080/v1/chat/completions     # oha 快速吞吐
+```
+
+> 压测前建议 `cargo build --release` 用 release 二进制（debug 构建性能差一个数量级）；
+> 压纯吞吐时调大 `agent-config.yml` 的 `max_concurrency`，否则高并发会被 admission control 返回 429（设计行为）。
+
 ## 接入真实 LLM
 
 把 agent 配置里的 `upstream` 指向真实服务即可，其余不变：
