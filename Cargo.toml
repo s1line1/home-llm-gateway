@@ -27,3 +27,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 tokio-stream = { version = "0.1", features = ["sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[workspace.dependencies.criterion]
+version = "0.8"
+features = ["html_reports"]
