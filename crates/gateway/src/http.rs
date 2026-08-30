@@ -19,6 +19,7 @@ use proto::{io::{read_frame, write_frame}, Frame};
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+use tower::ServiceExt;
 use tower_http::services::{ServeDir, ServeFile};
 use tracing::{debug, info, warn};
 
@@ -74,13 +75,11 @@ pub fn app(state: AppState) -> Router {
     }
     // React UI 静态托管：存在时 `/` 返回 Dashboard，未命中的路径（SPA 前端路由，
     // 如 /keys、/metrics 的浏览器直接访问/刷新）fallback 到 index.html。
-    // API 路由（/v1/*、/admin/*、/healthz、/metrics）已在上方注册，优先级更高。
+    // 注意：API 类未注册路径（无 Accept: text/html、无文件扩展名）返回真 404，
+    //       不能被 SPA fallback 吞成 index.html（否则前端拿到的不是合法 JSON）。
     match &state.ui {
         Some(dir) => {
-            let ui = ServeDir::new(dir)
-                .append_index_html_on_directories(true)
-                .fallback(ServeFile::new(dir.join("index.html")));
-            router = router.fallback_service(ui);
+            router = router.fallback(ui_fallback);
             info!(path = %dir.display(), "serving web UI from disk");
         }
         None => {
@@ -92,6 +91,55 @@ pub fn app(state: AppState) -> Router {
         .layer(middleware::from_fn_with_state(state.clone(), metrics_middleware))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)
+}
+
+/// SPA fallback：浏览器导航（Accept: text/html）→ index.html；静态资源
+/// （带扩展名路径，如 /assets/*.js）→ 文件；其余（API 类未注册路径）→ 404。
+async fn ui_fallback(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    let Some(dir) = &state.ui else {
+        return (StatusCode::NOT_FOUND, Json(json!({ "error": { "message": "not found", "type": "not_found" } }))).into_response();
+    };
+    let wants_html = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(|a| a.contains("text/html"))
+        .unwrap_or(false);
+    let has_extension = uri
+        .path()
+        .rsplit('/')
+        .next()
+        .map(|seg| seg.contains('.'))
+        .unwrap_or(false);
+    if !wants_html && !has_extension {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": { "message": "not found", "type": "not_found" } })),
+        )
+            .into_response();
+    }
+    let req = axum::extract::Request::builder()
+        .uri(uri)
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let service = ServeDir::new(dir)
+        .append_index_html_on_directories(true)
+        .fallback(ServeFile::new(dir.join("index.html")));
+    match service.oneshot(req).await {
+        Ok(resp) => {
+            // ServeDir 的 body 是 UnsyncBoxBody，收集成 Bytes 后重包为 axum Body
+            let (parts, body) = resp.into_parts();
+            let bytes = http_body_util::BodyExt::collect(body)
+                .await
+                .map(|c| c.to_bytes())
+                .unwrap_or_default();
+            Response::from_parts(parts, axum::body::Body::from(bytes))
+        }
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
 }
 
 /// UI 未构建（ui_dir 缺失）时的占位提示页——不再内嵌任何管理功能。
@@ -453,5 +501,43 @@ mod tests {
         let text = body_str(resp).await;
         assert!(text.contains("# TYPE hlmg_requests_total counter"));
         assert!(text.contains("hlmg_agents"));
+    }
+
+    /// 构造 ui_fallback 的请求并返回响应。
+    async fn call_ui_fallback(state: AppState, path: &str, accept: Option<&str>) -> Response {
+        let mut builder = axum::extract::Request::builder().uri(path);
+        if let Some(a) = accept {
+            builder = builder.header(axum::http::header::ACCEPT, a);
+        }
+        let req = builder.body(axum::body::Body::empty()).unwrap();
+        // 从请求提取 headers 和 uri 后调用 handler
+        let (parts, _) = req.into_parts();
+        let headers = parts.headers.clone();
+        let uri = parts.uri.clone();
+        ui_fallback(State(state), headers, uri).await
+    }
+
+    #[tokio::test]
+    async fn ui_fallback_serves_spa_to_browser_but_404_to_api() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "<div id=\"root\">ui</div>").unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+        std::fs::write(dir.path().join("assets/app.js"), "console.log(1)").unwrap();
+        let state = test_state(Some(dir.path().to_path_buf()));
+
+        // 浏览器导航（Accept: text/html）→ SPA index.html
+        let resp = call_ui_fallback(state.clone(), "/keys", Some("text/html")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(body_str(resp).await.contains("id=\"root\""));
+
+        // 静态资源（带扩展名，Accept: */*）→ 文件
+        let resp = call_ui_fallback(state.clone(), "/assets/app.js", Some("*/*")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(body_str(resp).await.contains("console.log"));
+
+        // API 类未注册路径（Accept: */*、无扩展名）→ 404，绝不能返回 index.html
+        let resp = call_ui_fallback(state.clone(), "/admin/agents", Some("*/*")).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(!body_str(resp).await.contains("id=\"root\""), "API paths must not get SPA");
     }
 }
