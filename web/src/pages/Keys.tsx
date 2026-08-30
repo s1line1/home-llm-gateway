@@ -1,60 +1,24 @@
-// API Keys 管理页：admin token 登录 → 创建 / 列表 / 吊销 / 复制明文。
+// API Keys 管理页：创建 / 列表 / 吊销 / 复制明文（登录由全局 RequireAuth 保证）。
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { createKey, deleteKey, listKeys } from "../api/client";
 import type { CreatedKey } from "../api/types";
-import { useAdminToken, useSetAdminToken } from "../hooks/useAdminToken";
+import { useAdminToken } from "../hooks/useAdminToken";
 import { Button, Card, EmptyState } from "../components/ui";
-
-const TOKEN_INPUT_ID = "admin-token-input";
-
-function TokenGate({ onAuthed }: { onAuthed: () => void }) {
-  const token = useAdminToken();
-  const setToken = useSetAdminToken();
-  const [draft, setDraft] = useState(token);
-
-  useEffect(() => {
-    if (token) onAuthed();
-  }, [token, onAuthed]);
-
-  return (
-    <Card title="管理员登录" subtitle="输入启动网关时配置的 admin_token（保存在本浏览器 localStorage）">
-      <div className="flex max-w-md gap-2">
-        <input
-          id={TOKEN_INPUT_ID}
-          type="password"
-          value={draft}
-          onChange={(e) => setDraft(e.target.value)}
-          placeholder="Admin Token"
-          className="flex-1 rounded-lg border border-slate-300 px-3 py-1.5 text-sm focus:border-slate-500 focus:outline-none"
-          autoComplete="current-password"
-        />
-        <Button onClick={() => setToken(draft)} disabled={!draft.trim()}>
-          保存并加载
-        </Button>
-      </div>
-      <p className="mt-3 text-xs text-slate-500">
-        令牌仅用于调用 <code className="rounded bg-slate-100 px-1">/admin/*</code> 接口；可随时在左下角清除。
-      </p>
-    </Card>
-  );
-}
 
 export default function Keys() {
   const token = useAdminToken();
-  const setToken = useSetAdminToken();
   const queryClient = useQueryClient();
 
-  const [authed, setAuthed] = useState(!!token);
   const [name, setName] = useState("");
   const [created, setCreated] = useState<CreatedKey | null>(null);
 
   const keysQuery = useQuery({
     queryKey: ["admin", "keys"],
     queryFn: () => listKeys(token),
-    enabled: authed && !!token,
+    enabled: !!token,
     refetchInterval: 10_000,
   });
 
@@ -72,8 +36,6 @@ export default function Keys() {
     onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["admin", "keys"] }),
   });
 
-  const onAuthed = useCallback(() => setAuthed(true), []);
-
   const copy = useCallback(async (text: string) => {
     try {
       await navigator.clipboard.writeText(text);
@@ -83,30 +45,13 @@ export default function Keys() {
     }
   }, []);
 
-  if (!authed || !token) {
-    return (
-      <div className="space-y-6">
-        <div>
-          <h2 className="text-lg font-semibold">API Keys 管理</h2>
-          <p className="text-sm text-slate-500">运行时签发 / 吊销访问 <code>/v1/*</code> 的 API Key</p>
-        </div>
-        <TokenGate onAuthed={onAuthed} />
-      </div>
-    );
-  }
-
   return (
     <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <div>
-          <h2 className="text-lg font-semibold">API Keys 管理</h2>
-          <p className="text-sm text-slate-500">
-            所有 Key 持久化在网关 SQLite，仅存 argon2 哈希；明文只在创建时返回一次
-          </p>
-        </div>
-        <Button variant="ghost" onClick={() => { setToken(""); setAuthed(false); }}>
-          清除登录
-        </Button>
+      <div>
+        <h2 className="text-lg font-semibold">API Keys 管理</h2>
+        <p className="text-sm text-slate-500">
+          所有 Key 持久化在网关 SQLite，仅存 argon2 哈希；明文只在创建时返回一次
+        </p>
       </div>
 
       <Card title="创建新 Key" subtitle="为每个客户端（DSH / Codex / 脚本）单独创建">
