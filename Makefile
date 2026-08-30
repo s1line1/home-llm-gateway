@@ -14,7 +14,7 @@ KEY ?= sk-missing
 VUS ?= 20
 DUR ?= 30s
 
-.PHONY: help setup certs web-install web-build web-dev build test bench bench-k6 release \
+.PHONY: help setup certs certs-required web-install web-build web-dev build test bench bench-k6 release \
         run-gateway run-agent run-mock dev dev-ui logs stop clean
 
 help: ## 显示所有命令
@@ -69,7 +69,6 @@ run-agent: $(AGENT_CONFIG) ## debug 运行 edge-agent（连本地网关，转发
 
 dev: gateway-config.yml $(AGENT_CONFIG) ## 一键起全栈（mock-llm + gateway + agent，后台，日志在 .tmp/logs/）
 	@mkdir -p $(LOGDIR)
-	@if [ ! -f certs/out/ca.crt ]; then echo "✖ 缺少证书，先执行 make certs"; exit 1; fi
 	@echo "== 启动 mock-llm (11435) =="
 	@nohup $(MOCK_BIN) --addr 127.0.0.1:11435 --name mock-llm > $(LOGDIR)/mock-llm.log 2>&1 & echo $$! > .tmp/mock-llm.pid
 	@sleep 0.5
@@ -105,10 +104,18 @@ clean: ## 清理构建产物（Rust + 前端）
 
 ## ---------- 配置文件生成（本地开发默认值） ----------
 
-gateway-config.yml:
+# 证书存在性检查：certs/out/ 是 gitignored 的，新 clone 的项目没有，
+# 配置里引用的证书路径必须先生成（make certs / make setup）
+certs-required:
+	@if [ ! -f certs/out/ca.crt ] || [ ! -f certs/out/server.crt ] || [ ! -f certs/out/client.crt ]; then \
+		echo "✖ 缺少开发证书（certs/out/），先执行: make certs"; \
+		exit 1; \
+	fi
+
+gateway-config.yml: certs-required
 	@echo "生成本地开发 gateway-config.yml（admin_token: dev-admin）..."
 	@printf 'listen_addr: "0.0.0.0:8080"\nquic_addr: "0.0.0.0:4433"\ncert: certs/out/server.crt\nkey: certs/out/server.key\nca: certs/out/ca.crt\nadmin_token: dev-admin\nkeys_file: keys.db\n' > gateway-config.yml
 
-$(AGENT_CONFIG):
+$(AGENT_CONFIG): certs-required
 	@echo "生成本地 agent 配置 $(AGENT_CONFIG)..."
 	@printf 'cloud_addr: "127.0.0.1:4433"\nca: certs/out/ca.crt\ncert: certs/out/client.crt\nkey: certs/out/client.key\nagent_id: "home-1"\nupstream: "http://127.0.0.1:11435"\nmax_concurrency: 4\n' > $(AGENT_CONFIG)
