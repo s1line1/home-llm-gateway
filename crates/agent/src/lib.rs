@@ -159,6 +159,8 @@ async fn handle_stream(
     let Some(Frame::ProxyRequest { request_id, method, path, headers, body }) = read_frame(&mut recv).await? else {
         anyhow::bail!("expected ProxyRequest frame");
     };
+    let started = std::time::Instant::now();
+    info!(request_id, method = %method, path = %path, body_bytes = body.len(), "proxy request received");
 
     let url = format!("{upstream}{path}");
     let mut rb = http.request(reqwest::Method::from_bytes(method.as_bytes())?, &url);
@@ -180,7 +182,7 @@ async fn handle_stream(
             f = read_frame(&mut recv) => {
                 match f? {
                     Some(Frame::Cancel { .. }) | None => {
-                        return send_cancelled(&mut send, request_id).await;
+                        return send_cancelled(&mut send, request_id, started).await;
                     }
                     Some(_) => {}
                 }
@@ -200,17 +202,20 @@ async fn handle_stream(
         }
     }
     write_frame(&mut send, &Frame::ProxyResponseHead { request_id, status, headers: out_headers }).await?;
+    info!(request_id, status, elapsed_ms = started.elapsed().as_millis() as u64, "upstream responded");
 
     // M2：流式透传——上游 body 逐块转 ProxyResponseBody 帧（SSE 天然支持），
     // 期间持续监听 Cancel，收到即中止，避免白算 token。
     let body_stream = resp.bytes_stream();
     tokio::pin!(body_stream);
     let mut ok = true;
+    let mut bytes_out = 0u64;
     loop {
         tokio::select! {
             chunk = body_stream.next() => {
                 match chunk {
                     Some(Ok(bytes)) => {
+                        bytes_out += bytes.len() as u64;
                         write_frame(&mut send, &Frame::ProxyResponseBody { request_id, chunk: bytes.to_vec() }).await?;
                     }
                     Some(Err(e)) => {
@@ -224,7 +229,7 @@ async fn handle_stream(
             f = read_frame(&mut recv) => {
                 match f? {
                     Some(Frame::Cancel { .. }) | None => {
-                        return send_cancelled(&mut send, request_id).await;
+                        return send_cancelled(&mut send, request_id, started).await;
                     }
                     Some(_) => {}
                 }
@@ -234,10 +239,23 @@ async fn handle_stream(
 
     write_frame(&mut send, &Frame::ProxyResponseEnd { request_id, ok }).await?;
     send.finish()?;
+    info!(
+        request_id,
+        status,
+        ok,
+        bytes_out,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "proxy request done"
+    );
     Ok(())
 }
 
-async fn send_cancelled(send: &mut quinn::SendStream, request_id: u64) -> anyhow::Result<()> {
+async fn send_cancelled(
+    send: &mut quinn::SendStream,
+    request_id: u64,
+    started: std::time::Instant,
+) -> anyhow::Result<()> {
+    info!(request_id, elapsed_ms = started.elapsed().as_millis() as u64, "request cancelled by gateway");
     let _ = write_frame(
         send,
         &Frame::Error {
