@@ -9,12 +9,14 @@
 
 import http from 'k6/http';
 import { check, sleep } from 'k6';
-import { Rate } from 'k6/metrics';
+import { Rate, Counter } from 'k6/metrics';
 
 const BASE = __ENV.GATEWAY_URL || 'http://127.0.0.1:8080';
 const KEY = __ENV.GATEWAY_KEY || 'sk-missing';
 
 const qpsOk = new Rate('qps_success');
+// 状态码分布：报告中可直接看到 200 / 429 / 5xx 各占多少
+const statusCounts = new Counter('http_status_counts');
 
 export const options = {
   vus: Number(__ENV.VUS || 50),
@@ -42,7 +44,12 @@ export default function () {
   });
 
   qpsOk.add(chat.status === 200);
-  check(chat, { 'chat status 200': (r) => r.status === 200 });
+  statusCounts.add(1, { code: String(chat.status) });
+  check(chat, {
+    'chat status 200': (r) => r.status === 200,
+    'accepted (200 or 429)': (r) => r.status === 200 || r.status === 429,
+    'no 5xx': (r) => r.status < 500,
+  });
   check(models, { 'models status 200': (r) => r.status === 200 });
 
   sleep(0.05); // 极短思考时间，避免无限打满

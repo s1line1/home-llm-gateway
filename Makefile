@@ -9,8 +9,10 @@ GATEWAY_BIN  := target/debug/gateway
 AGENT_BIN    := target/debug/agent
 MOCK_BIN     := target/debug/mock-llm
 
-# k6 宏观压测参数（make bench-k6 KEY=sk-xxx VUS=20 DUR=30s）
+# k6 宏观压测参数（命令行注入，不写死机器特定值）：
+#   make bench-k6 KEY=sk-xxx GATEWAY_URL=http://IP:9090 VUS=20 DUR=30s
 KEY ?= sk-missing
+GATEWAY_URL ?= http://127.0.0.1:8080
 VUS ?= 20
 DUR ?= 30s
 
@@ -50,8 +52,8 @@ test: ## 运行全部 Rust 测试（含 e2e）
 bench: ## 基准测试（Criterion）：make bench BENCH="-p proto -p gateway"
 	cargo bench $(BENCH)
 
-bench-k6: ## k6 宏观压测（SSE 长流）：make bench-k6 KEY=sk-xxx VUS=20 DUR=30s
-	k6 run -e GATEWAY_URL=$${GATEWAY_URL:-http://127.0.0.1:8080} -e GATEWAY_KEY=$(KEY) -e VUS=$(VUS) -e DURATION=$(DUR) scripts/bench-k6/sse.js
+bench-k6: ## k6 宏观压测（SSE 长流）：make bench-k6 KEY=sk-xxx GATEWAY_URL=http://IP:9090
+	k6 run -e GATEWAY_URL=$(GATEWAY_URL) -e GATEWAY_KEY=$(KEY) -e VUS=$(VUS) -e DURATION=$(DUR) scripts/bench-k6/sse.js
 
 release: ## 多平台打包到 dist/（见 scripts/build-release.sh）
 	bash scripts/build-release.sh

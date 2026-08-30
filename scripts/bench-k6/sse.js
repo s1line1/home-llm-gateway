@@ -8,7 +8,7 @@
 
 import http from 'k6/http';
 import { check } from 'k6';
-import { Trend, Rate } from 'k6/metrics';
+import { Trend, Rate, Counter } from 'k6/metrics';
 
 const BASE = __ENV.GATEWAY_URL || 'http://127.0.0.1:8080';
 const KEY = __ENV.GATEWAY_KEY || 'sk-missing';
@@ -17,6 +17,8 @@ const CONTENT_LEN = Number(__ENV.CONTENT_LEN || 100); // 提示词长度（mock 
 const sseDur = new Trend('sse_duration_ms');
 const sseOk = new Rate('sse_success');
 const sseEvents = new Trend('sse_events_per_stream');
+// 状态码分布：报告中可直接看到 200 / 429 / 5xx 各占多少
+const statusCounts = new Counter('http_status_counts');
 
 export const options = {
   vus: Number(__ENV.VUS || 20),
@@ -45,9 +47,14 @@ export default function () {
   sseDur.add(res.timings.duration);
   sseOk.add(ok);
   if (events > 0) sseEvents.add(events);
+  statusCounts.add(1, { code: String(res.status) });
 
   check(res, {
     'status 200': (r) => r.status === 200,
     'stream complete [DONE]': () => done,
+    // 429 = admission control 按设计拒绝（agent max_concurrency 上限），可接受
+    'accepted (200 or 429)': (r) => r.status === 200 || r.status === 429,
+    // 5xx = 网关/上游真故障，出现即排查
+    'no 5xx': (r) => r.status < 500,
   });
 }
