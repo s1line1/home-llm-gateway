@@ -70,6 +70,7 @@ pub fn app(state: AppState) -> Router {
         let admin = Router::new()
             .route("/keys", get(crate::admin::list_keys).post(crate::admin::create_key))
             .route("/keys/{id}", axum::routing::delete(crate::admin::delete_key))
+            .route("/agents", get(crate::admin::list_agents))
             .route_layer(middleware::from_fn_with_state(state.clone(), crate::admin::admin_auth));
         router = router.nest("/admin", admin);
     }

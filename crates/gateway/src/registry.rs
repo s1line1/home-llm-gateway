@@ -10,7 +10,20 @@ use std::{
 };
 
 use quinn::Connection;
+use serde::Serialize;
 use tracing::{info, warn};
+
+/// agent 明细快照（供 /admin/agents 管理接口序列化）。
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentInfo {
+    pub agent_id: String,
+    pub models: Vec<String>,
+    pub max_concurrency: u32,
+    /// 当前在途请求数。
+    pub inflight: u32,
+    /// 距上次心跳的秒数。
+    pub last_seen_secs_ago: u64,
+}
 
 #[derive(Clone, Default)]
 pub struct Registry {
@@ -71,6 +84,24 @@ impl Registry {
 
     pub fn len(&self) -> usize {
         self.inner.lock().unwrap().len()
+    }
+
+    /// 返回全部已注册 agent 的明细快照（按 agent_id 排序）。
+    pub fn snapshot(&self) -> Vec<AgentInfo> {
+        let inner = self.inner.lock().unwrap();
+        let now = Instant::now();
+        let mut out: Vec<AgentInfo> = inner
+            .iter()
+            .map(|(id, e)| AgentInfo {
+                agent_id: id.clone(),
+                models: e.models.clone(),
+                max_concurrency: e.max_concurrency,
+                inflight: e.inflight.load(Ordering::Relaxed),
+                last_seen_secs_ago: now.duration_since(e.last_seen).as_secs(),
+            })
+            .collect();
+        out.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
+        out
     }
 
     /// 按最少负载（在途数最小）挑选一个健康 agent 并原子占用并发槽位；
@@ -261,5 +292,33 @@ mod tests {
         for _ in 0..5 {
             let (_entry, _slot) = reg.try_acquire(Duration::from_secs(10)).unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn snapshot_reports_agent_details() {
+        let reg = Registry::default();
+        let conn = test_connection().await;
+        reg.register(
+            "home-1".into(),
+            vec!["qwen2.5".into(), "llama3".into()],
+            2,
+            conn.clone(),
+        );
+        let snap = reg.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].agent_id, "home-1");
+        assert_eq!(snap[0].models, vec!["qwen2.5".to_string(), "llama3".to_string()]);
+        assert_eq!(snap[0].max_concurrency, 2);
+        assert_eq!(snap[0].inflight, 0);
+        assert!(snap[0].last_seen_secs_ago < 1, "freshly registered agent");
+
+        // 按 agent_id 排序、空注册表为空
+        let conn2 = test_connection().await;
+        reg.register("agent-a".into(), vec![], 4, conn2.clone());
+        let snap = reg.snapshot();
+        assert_eq!(snap.len(), 2);
+        assert_eq!(snap[0].agent_id, "agent-a");
+        assert_eq!(snap[1].agent_id, "home-1");
+        assert!(Registry::default().snapshot().is_empty());
     }
 }
