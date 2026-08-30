@@ -1,7 +1,8 @@
 // 应用布局：左侧导航 + 顶栏（网关健康状态）+ 内容区。
 
-import { NavLink, Outlet } from "react-router-dom";
+import { NavLink, Outlet, useNavigate } from "react-router-dom";
 
+import { useAdminToken, useSetAdminToken } from "../hooks/useAdminToken";
 import { useMetricsHistory } from "../hooks/useMetricsHistory";
 import { StatusPill } from "./ui";
 
@@ -21,6 +22,14 @@ function navClass({ isActive }: { isActive: boolean }): string {
 
 export default function Layout() {
   const { latest, reachable, error } = useMetricsHistory();
+  const token = useAdminToken();
+  const clearToken = useSetAdminToken();
+  const navigate = useNavigate();
+
+  const logout = () => {
+    clearToken("");
+    navigate("/login", { replace: true });
+  };
 
   return (
     <div className="flex min-h-screen">
@@ -36,8 +45,18 @@ export default function Layout() {
             </NavLink>
           ))}
         </nav>
-        <div className="px-4 py-4 text-[11px] leading-relaxed text-slate-500">
-          网关版本 0.1.0 · QUIC 隧道 + mTLS
+        <div className="space-y-1 px-4 py-4">
+          <div className="text-[11px] leading-relaxed text-slate-500">
+            网关版本 0.1.0 · QUIC 隧道 + mTLS
+          </div>
+          {token && (
+            <button
+              onClick={logout}
+              className="block w-full rounded-lg px-3 py-1.5 text-left text-xs font-medium text-slate-400 transition-colors hover:bg-slate-800 hover:text-white"
+            >
+              退出登录
+            </button>
+          )}
         </div>
       </aside>
 
