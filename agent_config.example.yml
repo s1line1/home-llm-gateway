@@ -29,3 +29,7 @@ models:
 
 # 声明的最大并发请求数（网关据此做 admission control）
 max_concurrency: 2
+
+# 每请求转发日志开关（received/responded/done/cancelled）。
+# 默认 true；高并发/压测时建议改为 false，避免日志刷屏（连接/注册等低频日志不受影响）。
+request_log: true

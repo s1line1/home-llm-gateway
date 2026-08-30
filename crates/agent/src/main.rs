@@ -48,6 +48,9 @@ struct ConfigFile {
     /// 声明的最大并发请求数（网关据此做 admission control）
     #[serde(default = "default_max_concurrency")]
     max_concurrency: u32,
+    /// 每请求转发日志开关（received/responded/done；高并发时建议关闭）
+    #[serde(default = "default_request_log")]
+    request_log: bool,
 }
 
 fn default_server_name() -> String {
@@ -67,6 +70,9 @@ fn default_models() -> Vec<String> {
 }
 fn default_max_concurrency() -> u32 {
     4
+}
+fn default_request_log() -> bool {
+    true
 }
 
 /// 把 YAML 配置映射为 agent 配置（独立函数，便于单元测试）。
@@ -91,6 +97,7 @@ fn config_from_file(cfg: ConfigFile) -> anyhow::Result<AgentConfig> {
         max_concurrency: cfg.max_concurrency,
         upstream_base: cfg.upstream,
         heartbeat_interval: Duration::from_secs(cfg.heartbeat_secs),
+        request_log: cfg.request_log,
     })
 }
 
@@ -181,6 +188,7 @@ max_concurrency: 2
         assert_eq!(cfg.heartbeat_interval, Duration::from_secs(7));
         assert_eq!(cfg.models, vec!["qwen2.5".to_string(), "llama3".to_string()]);
         assert_eq!(cfg.max_concurrency, 2);
+        assert!(cfg.request_log, "explicit request_log: true should be honored");
     }
 
     #[test]
@@ -200,6 +208,7 @@ max_concurrency: 2
         assert_eq!(cfg.heartbeat_interval, Duration::from_secs(5));
         assert_eq!(cfg.models, vec!["*".to_string()]);
         assert_eq!(cfg.max_concurrency, 4);
+        assert!(cfg.request_log, "request_log should default to true");
     }
 
     #[test]

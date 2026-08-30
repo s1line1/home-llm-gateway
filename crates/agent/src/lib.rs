@@ -38,6 +38,9 @@ pub struct AgentConfig {
     /// 本地 LLM 的 OpenAI 兼容地址，如 http://127.0.0.1:11434
     pub upstream_base: String,
     pub heartbeat_interval: Duration,
+    /// 是否打印每请求的转发日志（received/responded/done/cancelled）。
+    /// 高并发/压测时建议关闭，避免日志刷屏；连接/注册等低频日志不受此开关影响。
+    pub request_log: bool,
 }
 
 pub struct Agent {
@@ -106,8 +109,9 @@ async fn connect_once(cfg: &AgentConfig, client_config: quinn::ClientConfig) -> 
         };
         let http = http.clone();
         let upstream = upstream.clone();
+        let request_log = cfg.request_log;
         tokio::spawn(async move {
-            if let Err(e) = handle_stream(send, recv, &http, &upstream).await {
+            if let Err(e) = handle_stream(send, recv, &http, &upstream, request_log).await {
                 warn!("proxy stream error: {e}");
             }
         });
@@ -150,17 +154,21 @@ async fn heartbeat_loop(conn: Connection, agent_id: String, interval: Duration) 
 }
 
 /// 处理一条代理流：读 ProxyRequest → 转发本地 LLM → 流式回传响应帧。
+/// `request_log` 控制每请求的 INFO 日志（received/responded/done/cancelled）。
 async fn handle_stream(
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
     http: &reqwest::Client,
     upstream: &str,
+    request_log: bool,
 ) -> anyhow::Result<()> {
     let Some(Frame::ProxyRequest { request_id, method, path, headers, body }) = read_frame(&mut recv).await? else {
         anyhow::bail!("expected ProxyRequest frame");
     };
     let started = std::time::Instant::now();
-    info!(request_id, method = %method, path = %path, body_bytes = body.len(), "proxy request received");
+    if request_log {
+        info!(request_id, method = %method, path = %path, body_bytes = body.len(), "proxy request received");
+    }
 
     let url = format!("{upstream}{path}");
     let mut rb = http.request(reqwest::Method::from_bytes(method.as_bytes())?, &url);
@@ -182,7 +190,7 @@ async fn handle_stream(
             f = read_frame(&mut recv) => {
                 match f? {
                     Some(Frame::Cancel { .. }) | None => {
-                        return send_cancelled(&mut send, request_id, started).await;
+                        return send_cancelled(&mut send, request_id, started, request_log).await;
                     }
                     Some(_) => {}
                 }
@@ -202,7 +210,9 @@ async fn handle_stream(
         }
     }
     write_frame(&mut send, &Frame::ProxyResponseHead { request_id, status, headers: out_headers }).await?;
-    info!(request_id, status, elapsed_ms = started.elapsed().as_millis() as u64, "upstream responded");
+    if request_log {
+        info!(request_id, status, elapsed_ms = started.elapsed().as_millis() as u64, "upstream responded");
+    }
 
     // M2：流式透传——上游 body 逐块转 ProxyResponseBody 帧（SSE 天然支持），
     // 期间持续监听 Cancel，收到即中止，避免白算 token。
@@ -229,7 +239,7 @@ async fn handle_stream(
             f = read_frame(&mut recv) => {
                 match f? {
                     Some(Frame::Cancel { .. }) | None => {
-                        return send_cancelled(&mut send, request_id, started).await;
+                        return send_cancelled(&mut send, request_id, started, request_log).await;
                     }
                     Some(_) => {}
                 }
@@ -239,14 +249,16 @@ async fn handle_stream(
 
     write_frame(&mut send, &Frame::ProxyResponseEnd { request_id, ok }).await?;
     send.finish()?;
-    info!(
-        request_id,
-        status,
-        ok,
-        bytes_out,
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "proxy request done"
-    );
+    if request_log {
+        info!(
+            request_id,
+            status,
+            ok,
+            bytes_out,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "proxy request done"
+        );
+    }
     Ok(())
 }
 
@@ -254,8 +266,11 @@ async fn send_cancelled(
     send: &mut quinn::SendStream,
     request_id: u64,
     started: std::time::Instant,
+    request_log: bool,
 ) -> anyhow::Result<()> {
-    info!(request_id, elapsed_ms = started.elapsed().as_millis() as u64, "request cancelled by gateway");
+    if request_log {
+        info!(request_id, elapsed_ms = started.elapsed().as_millis() as u64, "request cancelled by gateway");
+    }
     let _ = write_frame(
         send,
         &Frame::Error {
@@ -427,6 +442,7 @@ mod tests {
             max_concurrency: 2,
             upstream_base: "http://127.0.0.1:1".into(),
             heartbeat_interval: Duration::from_millis(50),
+            request_log: true,
         }
     }
 

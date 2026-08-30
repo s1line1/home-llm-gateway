@@ -203,6 +203,7 @@ async fn start_stack(
         max_concurrency,
         upstream_base: format!("http://{mock_addr}"),
         heartbeat_interval: Duration::from_millis(200),
+        request_log: true,
     })
     .unwrap();
 
@@ -466,6 +467,7 @@ async fn e2e_multi_agent_least_loaded() {
             max_concurrency: 1,
             upstream_base: format!("http://{upstream}"),
             heartbeat_interval: Duration::from_millis(200),
+        request_log: true,
         })
         .unwrap()
     };
@@ -698,6 +700,7 @@ async fn e2e_https_public_entry() {
         max_concurrency: 4,
         upstream_base: format!("http://{mock_addr}"),
         heartbeat_interval: Duration::from_millis(200),
+        request_log: true,
     })
     .unwrap();
     wait_for_agents(&gw, 1, Duration::from_secs(10)).await;
