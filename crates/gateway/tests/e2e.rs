@@ -629,6 +629,38 @@ async fn e2e_admin_api_keys() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
+async fn e2e_admin_agents_lists_registry() {
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    let (gw, agent, base, _key) = start_stack(Duration::from_secs(10), 0, 4, Some("admin-token")).await;
+    let client = reqwest::Client::new();
+
+    // 无 admin token → 401
+    let resp = client.get(format!("{base}/admin/agents")).send().await.unwrap();
+    assert_eq!(resp.status(), 401, "agent list requires admin token");
+
+    // 带 admin token → 明细（已注册 1 个 agent：test-agent, mock-llm, 容量 4）
+    let resp = client
+        .get(format!("{base}/admin/agents"))
+        .header("Authorization", "Bearer admin-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let agents: serde_json::Value = resp.json().await.unwrap();
+    let arr = agents.as_array().expect("should be an array");
+    assert_eq!(arr.len(), 1, "one agent should be registered");
+    assert_eq!(arr[0]["agent_id"], "test-agent");
+    assert_eq!(arr[0]["models"][0], "mock-llm");
+    assert_eq!(arr[0]["max_concurrency"], 4);
+    assert_eq!(arr[0]["inflight"], 0);
+    assert!(arr[0]["last_seen_secs_ago"].as_u64().unwrap() < 5, "agent just heartbeated");
+
+    agent.shutdown().await;
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn e2e_https_public_entry() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     let (ca_pem, srv_pem, srv_key_pem, cli_pem, cli_key_pem) = gen_certs_pem();
