@@ -106,16 +106,18 @@ clean: ## 清理构建产物（Rust + 前端）
 
 # 证书存在性检查：certs/out/ 是 gitignored 的，新 clone 的项目没有，
 # 配置里引用的证书路径必须先生成（make certs / make setup）
+# 注意：用 order-only 依赖（|）——只保证执行顺序、不触发目标重建，
+#       否则每次 make 都会把用户手动改过的配置覆盖回默认值
 certs-required:
 	@if [ ! -f certs/out/ca.crt ] || [ ! -f certs/out/server.crt ] || [ ! -f certs/out/client.crt ]; then \
 		echo "✖ 缺少开发证书（certs/out/），先执行: make certs"; \
 		exit 1; \
 	fi
 
-gateway-config.yml: certs-required
+gateway-config.yml: | certs-required
 	@echo "生成本地开发 gateway-config.yml（admin_token: dev-admin）..."
 	@printf 'listen_addr: "0.0.0.0:8080"\nquic_addr: "0.0.0.0:4433"\ncert: certs/out/server.crt\nkey: certs/out/server.key\nca: certs/out/ca.crt\nadmin_token: dev-admin\nkeys_file: keys.db\n' > gateway-config.yml
 
-$(AGENT_CONFIG): certs-required
+$(AGENT_CONFIG): | certs-required
 	@echo "生成本地 agent 配置 $(AGENT_CONFIG)..."
 	@printf 'cloud_addr: "127.0.0.1:4433"\nca: certs/out/ca.crt\ncert: certs/out/client.crt\nkey: certs/out/client.key\nagent_id: "home-1"\nupstream: "http://127.0.0.1:11435"\nmax_concurrency: 4\n' > $(AGENT_CONFIG)

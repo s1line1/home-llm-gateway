@@ -9,6 +9,7 @@ argon2 = "0.5"
 axum = { workspace = true }
 clap = { workspace = true }
 getrandom = "0.3"
+http-body-util = "0.1"
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 proto = { path = "../proto" }
