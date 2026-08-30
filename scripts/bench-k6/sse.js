@@ -52,5 +52,9 @@ export default function () {
   check(res, {
     'status 200': (r) => r.status === 200,
     'stream complete [DONE]': () => done,
+    // 429 = admission control 按设计拒绝（agent max_concurrency 上限），可接受
+    'accepted (200 or 429)': (r) => r.status === 200 || r.status === 429,
+    // 5xx = 网关/上游真故障，出现即排查
+    'no 5xx': (r) => r.status < 500,
   });
 }

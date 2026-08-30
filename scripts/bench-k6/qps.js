@@ -45,7 +45,11 @@ export default function () {
 
   qpsOk.add(chat.status === 200);
   statusCounts.add(1, { code: String(chat.status) });
-  check(chat, { 'chat status 200': (r) => r.status === 200 });
+  check(chat, {
+    'chat status 200': (r) => r.status === 200,
+    'accepted (200 or 429)': (r) => r.status === 200 || r.status === 429,
+    'no 5xx': (r) => r.status < 500,
+  });
   check(models, { 'models status 200': (r) => r.status === 200 });
 
   sleep(0.05); // 极短思考时间，避免无限打满
