@@ -84,3 +84,26 @@
       防御性错误路径（可注入故障测试）
 - [ ] **keys.json 保护**：部署时文件权限 600、定期备份/恢复演练（含明文密钥安全说明）
 - [ ] **/admin/* 暴露面收敛**：安全组只放行管理网段（README 已提示，可补部署脚本/检查项）
+
+## P3 — 协议层改造（postcard → protobuf）
+
+> 前置判断：**只有动机是"跨语言互操作 / 生态标准化"才值得做**；postcard 在性能和简单性上仍更优
+> （小帧更快更小，64KiB body 序列化 ~2 GiB/s 已是 memcpy 级）。若仅为协议演进，
+> postcard 加字段本身也向后兼容（serde 忽略未知字段）。
+
+- [ ] **隧道帧协议 postcard → protobuf**：
+      目标：`Frame` 枚举 8 种帧改用 protobuf 编解码，获得跨语言互操作与显式 .proto schema。
+      **设计要点（已定稿）**：
+      1. 选型：**prost**（prost + prost-build + protoc，build.rs 编译期生成）；备选 rust-protobuf（免 protoc）
+      2. Schema：`Frame { oneof kind { register=1 ... error=8 } }` + 各 message（字段编号见设计文档）；
+         长度前缀 framing 不变（`[u32 大端长度][protobuf 字节]`）
+      3. **关键设计：内部 Frame 枚举保留，只换编解码层**——`io.rs` 的 write_frame/read_frame
+         签名不变，gateway/agent 调用方几乎零改动；tests 重写
+      4. 迁移策略：一次性切换 + **版本校验**（版本号 0.2.0；Register.version 已存在，
+         gateway 拒绝 <0.2.0 的 agent，避免双端不同步静默解析失败）；不做双协议共存
+      5. 性能门槛：bench 双实现对比（postcard vs protobuf）——若回退超预期（>3x）停下重新评估；
+         预期小帧慢 1.5-2x（tag 开销）、大 body 接近持平
+      6. 构建影响：+prost 依赖、.proto 文件、protoc（CI/交叉编译需安装，文档化）
+      7. 测试：proto roundtrip（8 帧/边界）+ 全量 e2e 回归 + bench 对比报告
+      8. 分步：schema+prost 接入 → io.rs 切换+单测 → bench 双实现对比（决策门槛）→
+         全量回归 → 版本 0.2.0+校验 → 文档（DESIGN §4.2、部署同版本升级说明）
