@@ -25,6 +25,27 @@
 - [ ] **进程级优雅关闭**：gateway/agent 注册 SIGTERM/SIGINT（`tokio::signal`），收到后打 INFO 日志
       → 调用 `Gateway::shutdown()` / `Agent::shutdown()` 干净退出；
       覆盖 systemd stop、Ctrl+C、harness job_kill 场景。当前 `pending().await` 永久挂起，信号直接杀进程
+- [ ] **多 CA 信任根 + 动态增删（每 agent 独立 CA，gateway 不停机）**：
+      目标：每个 agent 用独立 CA 签发证书，gateway 维护全部 CA 的信任根集合；
+      运行时热添加/移除单个 CA——移除即吊销该 CA 下所有 agent（新连接被拒，
+      已建立连接不受影响，其他 agent 零影响）；重启后动态配置不丢。
+      **设计要点（已定稿）**：
+      1. 新模块 `ca_store.rs`：`TrustStore { cas: RwLock<HashMap<指纹, TrustedCa>>, roots: RwLock<RootCertStore> }`，
+         指纹 = sha256(cert DER) 十六进制（标识/防重/吊销定位）；add/remove 同步更新 roots
+      2. 自定义 rustls `ClientCertVerifier`（参考官方 dynamic-certs 示例）：verify_client_cert 时
+         读 TrustStore 当前信任根验证——每次握手走最新信任根；quinn Endpoint 构建一次，无需重建
+      3. Admin API（受 admin_token 保护，与 /admin/keys 同层）：
+         `GET /admin/ca` 列表；`POST /admin/ca {pem, name}` 添加（校验 X.509、≤64KB、
+         重复指纹 409、非法 400 → 201）；`DELETE /admin/ca/{fp}` 移除（204/404）；
+         可选 `POST /admin/ca/{fp}/disable` 禁用不删除
+      4. 持久化：SQLite 新表 `trust_cas(fingerprint PK, name, pem, added_at, enabled)`，
+         写穿模式（复用 keystore）；启动时加载全部 CA
+      5. 兼容性：现有 `ca:` 配置文件 = 初始信任根（行为不变），动态 CA 走 API
+      6. 测试：单测（指纹/add/list/remove/409/持久化 roundtrip）；
+         e2e：① 双 CA 双 agent 接入 → DELETE 其一 → 该 agent 重连被拒（agent_count 回落）
+         另一 agent 不受影响；② POST 新 CA → 新 agent 热接入；③ 重启后动态 CA 仍生效
+      7. 分步：TrustStore+verifier → Admin API → SQLite 持久化 → e2e + 文档
+         （README/DEPLOY/DESIGN 安全章节更新：每 agent 独立 CA 的管理模型与吊销语义）
 - [ ] **UDP 被封时的 TCP+TLS fallback**（DESIGN.md §10）：帧协议不变，仅替换 QUIC 传输层
 - [ ] **健康上报驱动的更精细路由**（DESIGN.md §9 M4 待办）：当前按在途请求数最少路由，
       后续可结合 agent 心跳上报的延迟/队列深度
