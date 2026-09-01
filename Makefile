@@ -16,7 +16,7 @@ GATEWAY_URL ?= http://127.0.0.1:8080
 VUS ?= 20
 DUR ?= 30s
 
-.PHONY: help setup certs certs-required web-install web-build web-dev build test bench bench-k6 release \
+.PHONY: help setup certs certs-required web-install web-build web-dev build fmt clippy check test bench bench-k6 release \
         run-gateway run-agent run-mock dev dev-ui logs stop clean
 
 help: ## 显示所有命令
@@ -45,6 +45,14 @@ web-dev: ## 前端开发服务器（Vite :5173，代理到网关，需先起网�
 
 build: ## 编译 release 二进制（target/release/）
 	cargo build --release --bin gateway --bin agent --bin mock-llm
+
+fmt: ## 检查代码格式（cargo fmt --check）
+	cargo fmt --check
+
+clippy: ## clippy 检查（-D warnings，与 CI 同等门槛）
+	cargo clippy --workspace --all-targets -- -D warnings
+
+check: fmt clippy test web-build ## 一键全量验证（格式 + clippy + 测试 + 前端构建，同 CI）
 
 test: ## 运行全部 Rust 测试（含 e2e）
 	cargo test
