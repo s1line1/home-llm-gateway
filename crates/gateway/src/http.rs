@@ -101,9 +101,8 @@ async fn ui_fallback(
     headers: HeaderMap,
     uri: Uri,
 ) -> Response {
-    let Some(dir) = &state.ui else {
-        return (StatusCode::NOT_FOUND, Json(json!({ "error": { "message": "not found", "type": "not_found" } }))).into_response();
-    };
+    // 仅在 ui_dir 配置时注册本 handler，故此处必然为 Some
+    let dir = state.ui.as_ref().expect("ui_fallback registered only when ui_dir is set");
     let wants_html = headers
         .get(axum::http::header::ACCEPT)
         .and_then(|v| v.to_str().ok())
@@ -502,6 +501,16 @@ mod tests {
         let text = body_str(resp).await;
         assert!(text.contains("# TYPE hlmg_requests_total counter"));
         assert!(text.contains("hlmg_agents"));
+    }
+
+    #[test]
+    fn app_builds_with_ui_dir() {
+        // ui_dir 存在时 app() 注册 ui_fallback（覆盖静态托管分支）
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "<div id=\"root\">ui</div>").unwrap();
+        let _router = app(test_state(Some(dir.path().to_path_buf())));
+        // 未配 ui_dir 时走 ui_missing 占位页分支
+        let _router2 = app(test_state(None));
     }
 
     /// 构造 ui_fallback 的请求并返回响应。

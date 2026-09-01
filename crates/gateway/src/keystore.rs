@@ -475,6 +475,13 @@ mod tests {
     }
 
     #[test]
+    fn verify_rejects_malformed_hash() {
+        // 存储的哈希不是合法 PHC 格式 → 校验直接拒绝（不 panic）
+        assert!(!verify_argon2("sk-anything", "not-a-phc-hash"));
+        assert!(!verify_argon2("sk-anything", ""));
+    }
+
+    #[test]
     fn migrates_legacy_plaintext_db() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("keys.db");

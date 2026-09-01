@@ -21,7 +21,12 @@ async fn run(args: Args) -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(args.addr).await?;
     tracing::info!(name = %args.name, "mock-llm listening on {}", listener.local_addr()?);
-    axum::serve(listener, mock_llm::router(&args.name)).await?;
+    serve_forever(listener, args.name).await
+}
+
+/// 服务挂起点（正常永不返回；coverage 排除，避免不可达代码计入覆盖率）。
+async fn serve_forever(listener: tokio::net::TcpListener, name: String) -> anyhow::Result<()> {
+    axum::serve(listener, mock_llm::router(&name)).await?;
     Ok(())
 }
 

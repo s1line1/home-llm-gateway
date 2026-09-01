@@ -514,4 +514,26 @@ mod tests {
         assert!(!task.is_finished(), "run loop should keep running after disconnect");
         task.abort();
     }
+
+    /// Agent::start 在客户端证书/私钥无效时报错（不 panic）。
+    #[test]
+    fn start_rejects_invalid_client_key() {
+        use rustls::pki_types::PrivatePkcs8KeyDer;
+        let (ca, _srv_cert, _srv_key, cli_cert, _cli_key) = gen_pki();
+        let bad_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(vec![0x01; 16]));
+        let cfg = AgentConfig {
+            cloud_addr: "127.0.0.1:1".parse().unwrap(),
+            server_name: "localhost".into(),
+            ca_cert: vec![ca],
+            client_cert: vec![cli_cert],
+            client_key: bad_key,
+            agent_id: "t".into(),
+            models: vec!["m".into()],
+            max_concurrency: 2,
+            upstream_base: "http://127.0.0.1:1".into(),
+            heartbeat_interval: Duration::from_millis(50),
+            request_log: true,
+        };
+        assert!(Agent::start(cfg).is_err(), "invalid key should fail start");
+    }
 }
