@@ -1,6 +1,6 @@
 //! TLS 配置构造与 PEM 加载。
 
-use std::{fs::File, io::{BufReader, Cursor}, path::Path, sync::Arc, time::Duration};
+use std::{io::Cursor, sync::Arc, time::Duration};
 
 use quinn::crypto::rustls::QuicServerConfig;
 use rustls::{
@@ -36,22 +36,11 @@ pub fn server_config(
     Ok(cfg)
 }
 
-/// 从 PEM 文件加载证书链。
-pub fn load_certs(path: &Path) -> anyhow::Result<Vec<CertificateDer<'static>>> {
-    let mut reader = BufReader::new(File::open(path)?);
-    let certs = rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>()?;
-    Ok(certs)
-}
-
-/// 从 PEM 文件加载私钥。
-pub fn load_key(path: &Path) -> anyhow::Result<PrivateKeyDer<'static>> {
-    let mut reader = BufReader::new(File::open(path)?);
-    rustls_pemfile::private_key(&mut reader)?
-        .ok_or_else(|| anyhow::anyhow!("no private key found in {}", path.display()))
-}
-
 /// 构造 HTTPS（公网 API 入口）的 rustls ServerConfig，由 PEM 字节构建。
-pub fn https_server_config(cert_pem: &[u8], key_pem: &[u8]) -> anyhow::Result<rustls::ServerConfig> {
+pub fn https_server_config(
+    cert_pem: &[u8],
+    key_pem: &[u8],
+) -> anyhow::Result<rustls::ServerConfig> {
     let mut cert_reader = Cursor::new(cert_pem);
     let certs = rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
     let mut key_reader = Cursor::new(key_pem);
@@ -93,8 +82,7 @@ mod tests {
 
         let cli_key = KeyPair::generate().unwrap();
         let mut cli = CertificateParams::default();
-        cli.distinguished_name
-            .push(DnType::CommonName, "agent");
+        cli.distinguished_name.push(DnType::CommonName, "agent");
         cli.is_ca = IsCa::NoCa;
         cli.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
         cli.key_usages = vec![KeyUsagePurpose::DigitalSignature];
@@ -119,31 +107,6 @@ mod tests {
         rustls_pemfile::private_key(&mut Cursor::new(pem.as_bytes()))
             .unwrap()
             .unwrap()
-    }
-
-    #[test]
-    fn load_certs_and_key_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
-        let (ca_pem, srv_pem, srv_key_pem, _, _) = gen_pem();
-        let ca_path = dir.path().join("ca.crt");
-        let cert_path = dir.path().join("server.crt");
-        let key_path = dir.path().join("server.key");
-        std::fs::write(&ca_path, &ca_pem).unwrap();
-        std::fs::write(&cert_path, &srv_pem).unwrap();
-        std::fs::write(&key_path, &srv_key_pem).unwrap();
-
-        let certs = load_certs(&ca_path).unwrap();
-        assert_eq!(certs.len(), 1);
-        let key = load_key(&key_path).unwrap();
-        assert!(!key.secret_der().as_ref().is_empty());
-    }
-
-    #[test]
-    fn load_key_rejects_file_without_key() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("not-a-key.pem");
-        std::fs::write(&path, "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n").unwrap();
-        assert!(load_key(&path).is_err());
     }
 
     #[test]

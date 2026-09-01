@@ -1411,9 +1411,14 @@ dependencies = [
 name = "proto"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "criterion",
  "postcard",
+ "rcgen",
+ "rustls",
+ "rustls-pemfile",
  "serde",
+ "tempfile",
  "tokio",
 ]
 

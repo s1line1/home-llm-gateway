@@ -27,7 +27,10 @@ fn frame_fixtures() -> Vec<Frame> {
             path: "/v1/chat/completions?stream=true".into(),
             headers: vec![
                 ("content-type".into(), "application/json".into()),
-                ("authorization".into(), "Bearer sk-0123456789abcdef0123456789abcdef".into()),
+                (
+                    "authorization".into(),
+                    "Bearer sk-0123456789abcdef0123456789abcdef".into(),
+                ),
             ],
             body: vec![b'a'; 1024],
         },

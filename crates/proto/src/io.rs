@@ -15,8 +15,8 @@ pub async fn write_frame<W>(w: &mut W, frame: &Frame) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
-    let bytes = postcard::to_allocvec(frame)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let bytes =
+        postcard::to_allocvec(frame).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let len = u32::try_from(bytes.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "frame too large"))?;
     w.write_all(&len.to_be_bytes()).await?;
@@ -38,12 +38,15 @@ where
     }
     let len = u32::from_be_bytes(len_buf) as usize;
     if len > MAX_FRAME {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame too large",
+        ));
     }
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf).await?;
-    let frame = postcard::from_bytes(&buf)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let frame =
+        postcard::from_bytes(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     Ok(Some(frame))
 }
 
@@ -151,7 +154,10 @@ mod tests {
         };
         let mut buf = Vec::new();
         write_frame(&mut buf, &frame).await.unwrap();
-        assert!(buf.len() > 64 * 1024, "serialized size should exceed body size");
+        assert!(
+            buf.len() > 64 * 1024,
+            "serialized size should exceed body size"
+        );
         let mut reader = buf.as_slice();
         let got = read_frame(&mut reader).await.unwrap().unwrap();
         assert_eq!(got, frame);
@@ -166,10 +172,7 @@ mod tests {
             _cx: &mut std::task::Context<'_>,
             _buf: &mut tokio::io::ReadBuf<'_>,
         ) -> std::task::Poll<std::io::Result<()>> {
-            std::task::Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "boom",
-            )))
+            std::task::Poll::Ready(Err(std::io::Error::other("boom")))
         }
     }
 

@@ -14,7 +14,10 @@ use std::{
 
 use agent::{Agent, AgentConfig};
 use gateway::{Gateway, GatewayConfig, TlsPem};
-use proto::{io::{read_frame, write_frame}, Frame};
+use proto::{
+    io::{read_frame, write_frame},
+    Frame,
+};
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
     KeyUsagePurpose, SanType,
@@ -74,7 +77,13 @@ fn gen_certs() -> (
         .clone();
     let client_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(client_key.serialize_der()));
 
-    (ca_cert.der().clone(), server_cert, server_key, client_cert, client_key)
+    (
+        ca_cert.der().clone(),
+        server_cert,
+        server_key,
+        client_cert,
+        client_key,
+    )
 }
 
 /// 生成同一套证书的 PEM 文本（HTTPS 公网入口需要 PEM 字节）。
@@ -220,7 +229,11 @@ async fn e2e_chain_with_mock_llm() {
     let client = reqwest::Client::new();
 
     // 无认证 → 401
-    let resp = client.get(format!("{base}/v1/models")).send().await.unwrap();
+    let resp = client
+        .get(format!("{base}/v1/models"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 401, "missing api key must be rejected");
 
     // healthz 无需认证
@@ -231,9 +244,18 @@ async fn e2e_chain_with_mock_llm() {
     let resp = client.get(format!("{base}/")).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     let page = resp.text().await.unwrap();
-    assert!(page.contains("Home LLM Gateway"), "root should serve the UI placeholder");
-    assert!(page.contains("尚未构建"), "placeholder should mention building the UI");
-    assert!(page.starts_with("<!doctype html>"), "placeholder should be HTML");
+    assert!(
+        page.contains("Home LLM Gateway"),
+        "root should serve the UI placeholder"
+    );
+    assert!(
+        page.contains("尚未构建"),
+        "placeholder should mention building the UI"
+    );
+    assert!(
+        page.starts_with("<!doctype html>"),
+        "placeholder should be HTML"
+    );
 
     // 认证后 /v1/models 穿透到 mock
     let resp = client
@@ -315,8 +337,14 @@ async fn e2e_sse_streaming_passthrough() {
     let text = resp.text().await.unwrap();
     // 逐字事件 + finish_reason 事件 + [DONE]
     let data_lines = text.matches("data: ").count();
-    assert!(data_lines >= 3, "expected multiple SSE events, got {data_lines}: {text}");
-    assert!(text.contains("data: [DONE]"), "missing [DONE] terminator: {text}");
+    assert!(
+        data_lines >= 3,
+        "expected multiple SSE events, got {data_lines}: {text}"
+    );
+    assert!(
+        text.contains("data: [DONE]"),
+        "missing [DONE] terminator: {text}"
+    );
     assert!(
         text.contains(r#""content":"流""#) && text.contains(r#""content":"试""#),
         "SSE should stream the echoed content per char: {text}"
@@ -341,7 +369,11 @@ async fn e2e_gateway_timeout_cancels_upstream() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 504, "slow upstream should be cut off by idle timeout");
+    assert_eq!(
+        resp.status(),
+        504,
+        "slow upstream should be cut off by idle timeout"
+    );
 
     // Cancel 不应影响 agent 连接本身，之后仍能正常服务
     let resp = client
@@ -423,7 +455,11 @@ async fn e2e_admission_control() {
 
     // 槽位释放后，新请求应成功
     let resp = req().send().await.unwrap();
-    assert_eq!(resp.status(), 200, "slot should be released after completion");
+    assert_eq!(
+        resp.status(),
+        200,
+        "slot should be released after completion"
+    );
 
     agent.shutdown().await;
     gw.shutdown().await;
@@ -467,7 +503,7 @@ async fn e2e_multi_agent_least_loaded() {
             max_concurrency: 1,
             upstream_base: format!("http://{upstream}"),
             heartbeat_interval: Duration::from_millis(200),
-        request_log: true,
+            request_log: true,
         })
         .unwrap()
     };
@@ -499,7 +535,10 @@ async fn e2e_multi_agent_least_loaded() {
         }
     }
     assert_eq!(servers.len(), 2, "two requests should be admitted");
-    assert_ne!(servers[0], servers[1], "concurrent requests should be spread across agents");
+    assert_ne!(
+        servers[0], servers[1],
+        "concurrent requests should be spread across agents"
+    );
     assert!(
         servers.iter().all(|s| s == "mock-a" || s == "mock-b"),
         "unexpected upstream: {servers:?}"
@@ -518,7 +557,11 @@ async fn e2e_metrics_endpoint() {
     let client = reqwest::Client::new();
 
     // 先发两个请求（一个 401、一个 200），让计数器有值
-    let _ = client.get(format!("{base}/v1/models")).send().await.unwrap();
+    let _ = client
+        .get(format!("{base}/v1/models"))
+        .send()
+        .await
+        .unwrap();
     let _ = client
         .get(format!("{base}/v1/models"))
         .header("Authorization", format!("Bearer {key}"))
@@ -529,10 +572,22 @@ async fn e2e_metrics_endpoint() {
     let resp = client.get(format!("{base}/metrics")).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     let text = resp.text().await.unwrap();
-    assert!(text.contains("hlmg_requests_total{status=\"401\"} 1"), "missing 401 counter: {text}");
-    assert!(text.contains("hlmg_requests_total{status=\"200\"} 1"), "missing 200 counter: {text}");
-    assert!(text.contains("hlmg_agents 1"), "missing agents gauge: {text}");
-    assert!(text.contains("hlmg_bytes_out "), "missing bytes counter: {text}");
+    assert!(
+        text.contains("hlmg_requests_total{status=\"401\"} 1"),
+        "missing 401 counter: {text}"
+    );
+    assert!(
+        text.contains("hlmg_requests_total{status=\"200\"} 1"),
+        "missing 200 counter: {text}"
+    );
+    assert!(
+        text.contains("hlmg_agents 1"),
+        "missing agents gauge: {text}"
+    );
+    assert!(
+        text.contains("hlmg_bytes_out "),
+        "missing bytes counter: {text}"
+    );
 
     agent.shutdown().await;
     gw.shutdown().await;
@@ -542,7 +597,8 @@ async fn e2e_metrics_endpoint() {
 #[serial]
 async fn e2e_admin_api_keys() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
-    let (gw, agent, base, key) = start_stack(Duration::from_secs(10), 0, 4, Some("admin-token")).await;
+    let (gw, agent, base, key) =
+        start_stack(Duration::from_secs(10), 0, 4, Some("admin-token")).await;
     let client = reqwest::Client::new();
 
     // 无 admin token → 401；普通 API key 也不行
@@ -560,7 +616,11 @@ async fn e2e_admin_api_keys() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 401, "API keys must not unlock admin endpoints");
+    assert_eq!(
+        resp.status(),
+        401,
+        "API keys must not unlock admin endpoints"
+    );
 
     // 创建 key
     let resp = client
@@ -574,7 +634,10 @@ async fn e2e_admin_api_keys() {
     let created: serde_json::Value = resp.json().await.unwrap();
     let new_key = created["key"].as_str().unwrap().to_string();
     let new_id = created["id"].as_str().unwrap().to_string();
-    assert!(new_key.starts_with("sk-"), "generated key should have sk- prefix");
+    assert!(
+        new_key.starts_with("sk-"),
+        "generated key should have sk- prefix"
+    );
 
     // 新 key 立即生效（运行时创建，无需重启）
     let resp = client
@@ -583,7 +646,11 @@ async fn e2e_admin_api_keys() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200, "runtime-created key should work immediately");
+    assert_eq!(
+        resp.status(),
+        200,
+        "runtime-created key should work immediately"
+    );
 
     // 列表包含刚创建的 key（且不暴露明文）
     let resp = client
@@ -594,11 +661,17 @@ async fn e2e_admin_api_keys() {
         .unwrap();
     let list: serde_json::Value = resp.json().await.unwrap();
     assert!(
-        list.as_array().unwrap().iter().any(|k| k["name"] == "dsh-client" && k["id"] == new_id),
+        list.as_array()
+            .unwrap()
+            .iter()
+            .any(|k| k["name"] == "dsh-client" && k["id"] == new_id),
         "list should contain the created key"
     );
     let list_text = serde_json::to_string(&list).unwrap();
-    assert!(!list_text.contains(&new_key), "list must not leak full key secrets");
+    assert!(
+        !list_text.contains(&new_key),
+        "list must not leak full key secrets"
+    );
 
     // 吊销 → 204，之后该 key 立即失效
     let resp = client
@@ -633,11 +706,16 @@ async fn e2e_admin_api_keys() {
 #[serial]
 async fn e2e_admin_agents_lists_registry() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
-    let (gw, agent, base, _key) = start_stack(Duration::from_secs(10), 0, 4, Some("admin-token")).await;
+    let (gw, agent, base, _key) =
+        start_stack(Duration::from_secs(10), 0, 4, Some("admin-token")).await;
     let client = reqwest::Client::new();
 
     // 无 admin token → 401
-    let resp = client.get(format!("{base}/admin/agents")).send().await.unwrap();
+    let resp = client
+        .get(format!("{base}/admin/agents"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 401, "agent list requires admin token");
 
     // 带 admin token → 明细（已注册 1 个 agent：test-agent, mock-llm, 容量 4）
@@ -655,7 +733,10 @@ async fn e2e_admin_agents_lists_registry() {
     assert_eq!(arr[0]["models"][0], "mock-llm");
     assert_eq!(arr[0]["max_concurrency"], 4);
     assert_eq!(arr[0]["inflight"], 0);
-    assert!(arr[0]["last_seen_secs_ago"].as_u64().unwrap() < 5, "agent just heartbeated");
+    assert!(
+        arr[0]["last_seen_secs_ago"].as_u64().unwrap() < 5,
+        "agent just heartbeated"
+    );
 
     agent.shutdown().await;
     gw.shutdown().await;
@@ -718,7 +799,11 @@ async fn e2e_https_public_entry() {
     assert_eq!(resp.status(), 200);
 
     // 无 key → 401
-    let resp = client.get(format!("{base}/v1/models")).send().await.unwrap();
+    let resp = client
+        .get(format!("{base}/v1/models"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 401);
 
     // 认证请求穿透到 mock
@@ -751,7 +836,9 @@ async fn e2e_https_public_entry() {
     // 裸 TCP 发非 TLS 字节 → 握手失败（服务端走 warn 分支，连接不崩溃）
     use tokio::io::AsyncWriteExt;
     let mut raw = tokio::net::TcpStream::connect(gw.http_addr).await.unwrap();
-    let _ = raw.write_all(b"GET / HTTP/1.1\r\n\r\nnot a tls handshake").await;
+    let _ = raw
+        .write_all(b"GET / HTTP/1.1\r\n\r\nnot a tls handshake")
+        .await;
     let _ = raw.shutdown().await;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -766,7 +853,6 @@ async fn e2e_https_public_entry() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn e2e_quic_control_stream_edge_frames() {
-
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     let (ca, server_cert, server_key, client_cert, client_key) = gen_certs();
 
@@ -788,9 +874,12 @@ async fn e2e_quic_control_stream_edge_frames() {
     .unwrap();
 
     // 裸 quinn 客户端（复用 agent 的 mTLS 配置），不走 agent crate 逻辑
-    let client_config =
-        agent::tls::client_config(&[ca.clone()], vec![client_cert.clone()], client_key.clone_key())
-            .unwrap();
+    let client_config = agent::tls::client_config(
+        std::slice::from_ref(&ca),
+        vec![client_cert.clone()],
+        client_key.clone_key(),
+    )
+    .unwrap();
     let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
     endpoint.set_default_client_config(client_config);
     let conn = endpoint
@@ -847,7 +936,11 @@ async fn e2e_quic_control_stream_edge_frames() {
     send4.write_all(&u32::MAX.to_be_bytes()).await.unwrap();
     send4.finish().unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(gw.agent_count(), 0, "reg-1 should be removed after control-loop error");
+    assert_eq!(
+        gw.agent_count(),
+        0,
+        "reg-1 should be removed after control-loop error"
+    );
 
     // 第二个裸客户端：注册后直接关闭连接 → accept_bi 出错 → 正常摘除
     let conn2 = endpoint
@@ -872,7 +965,11 @@ async fn e2e_quic_control_stream_edge_frames() {
     assert_eq!(gw.agent_count(), 1);
     conn2.close(0u32.into(), b"bye");
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(gw.agent_count(), 0, "reg-2 should be removed after connection close");
+    assert_eq!(
+        gw.agent_count(),
+        0,
+        "reg-2 should be removed after connection close"
+    );
 
     // 错误 CA 签发的客户端证书 → 握手失败 → "connection attempt failed" 分支
     let bad_ca_key = KeyPair::generate().unwrap();
@@ -887,7 +984,9 @@ async fn e2e_quic_control_stream_edge_frames() {
     bad_cli
         .distinguished_name
         .push(DnType::CommonName, "bad agent");
-    let bad_cli_cert = bad_cli.signed_by(&bad_key, &bad_ca_cert, &bad_ca_key).unwrap();
+    let bad_cli_cert = bad_cli
+        .signed_by(&bad_key, &bad_ca_cert, &bad_ca_key)
+        .unwrap();
     let bad_cfg = agent::tls::client_config(
         &[bad_ca_cert.der().clone()],
         vec![bad_cli_cert.der().clone()],
@@ -896,7 +995,10 @@ async fn e2e_quic_control_stream_edge_frames() {
     .unwrap();
     let mut bad_endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
     bad_endpoint.set_default_client_config(bad_cfg);
-    let _ = bad_endpoint.connect(gw.quic_addr, "localhost").unwrap().await;
+    let _ = bad_endpoint
+        .connect(gw.quic_addr, "localhost")
+        .unwrap()
+        .await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(gw.agent_count(), 0, "failed handshake must not register");
 
@@ -906,7 +1008,6 @@ async fn e2e_quic_control_stream_edge_frames() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn e2e_proxy_protocol_edge_cases() {
-
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     let (ca, server_cert, server_key, client_cert, client_key) = gen_certs();
     let (keys_path, key) = seed_keys_db();
@@ -930,9 +1031,12 @@ async fn e2e_proxy_protocol_edge_cases() {
     .unwrap();
 
     // 裸 quinn 客户端：注册后按场景应答网关的代理请求
-    let client_config =
-        agent::tls::client_config(&[ca.clone()], vec![client_cert.clone()], client_key.clone_key())
-            .unwrap();
+    let client_config = agent::tls::client_config(
+        std::slice::from_ref(&ca),
+        vec![client_cert.clone()],
+        client_key.clone_key(),
+    )
+    .unwrap();
     let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
     endpoint.set_default_client_config(client_config);
     let conn = endpoint
@@ -980,9 +1084,15 @@ async fn e2e_proxy_protocol_edge_cases() {
                 }
                 1 => {
                     // 立即回 ProxyResponseEnd（空响应）
-                    write_frame(&mut send, &Frame::ProxyResponseEnd { request_id: 1, ok: true })
-                        .await
-                        .unwrap();
+                    write_frame(
+                        &mut send,
+                        &Frame::ProxyResponseEnd {
+                            request_id: 1,
+                            ok: true,
+                        },
+                    )
+                    .await
+                    .unwrap();
                 }
                 2 => {
                     // 先 Body 后 Head 再 Body + End（head 前的 body 应被忽略）
@@ -1014,9 +1124,15 @@ async fn e2e_proxy_protocol_edge_cases() {
                     )
                     .await
                     .unwrap();
-                    write_frame(&mut send, &Frame::ProxyResponseEnd { request_id: 1, ok: true })
-                        .await
-                        .unwrap();
+                    write_frame(
+                        &mut send,
+                        &Frame::ProxyResponseEnd {
+                            request_id: 1,
+                            ok: true,
+                        },
+                    )
+                    .await
+                    .unwrap();
                 }
                 3 => {
                     // 直接关流，不回复
@@ -1063,9 +1179,15 @@ async fn e2e_proxy_protocol_edge_cases() {
                     write_frame(&mut send, &Frame::Cancel { request_id: 1 })
                         .await
                         .unwrap();
-                    write_frame(&mut send, &Frame::ProxyResponseEnd { request_id: 1, ok: true })
-                        .await
-                        .unwrap();
+                    write_frame(
+                        &mut send,
+                        &Frame::ProxyResponseEnd {
+                            request_id: 1,
+                            ok: true,
+                        },
+                    )
+                    .await
+                    .unwrap();
                 }
                 7 => {
                     // head 200 后直接关流（没有 End）
@@ -1130,9 +1252,15 @@ async fn e2e_proxy_protocol_edge_cases() {
                     )
                     .await
                     .unwrap();
-                    write_frame(&mut send, &Frame::ProxyResponseEnd { request_id: 1, ok: true })
-                        .await
-                        .unwrap();
+                    write_frame(
+                        &mut send,
+                        &Frame::ProxyResponseEnd {
+                            request_id: 1,
+                            ok: true,
+                        },
+                    )
+                    .await
+                    .unwrap();
                 }
             }
             let _ = send.finish();
@@ -1167,7 +1295,10 @@ async fn e2e_proxy_protocol_edge_cases() {
     // 5: head 200 + Error → 状态 200，body 报错
     let r = get("/v1/models").send().await.unwrap();
     assert_eq!(r.status(), 200);
-    assert!(r.bytes().await.is_err(), "mid-stream error should fail body read");
+    assert!(
+        r.bytes().await.is_err(),
+        "mid-stream error should fail body read"
+    );
     // 6: head 200 + Cancel + End → 200 正常
     let r = get("/v1/models").send().await.unwrap();
     assert_eq!(r.status(), 200);
@@ -1175,15 +1306,24 @@ async fn e2e_proxy_protocol_edge_cases() {
     // 7: head 200 + 提前关流 → 200，body 报错
     let r = get("/v1/models").send().await.unwrap();
     assert_eq!(r.status(), 200);
-    assert!(r.bytes().await.is_err(), "early close should fail body read");
+    assert!(
+        r.bytes().await.is_err(),
+        "early close should fail body read"
+    );
     // 8: head 200 + 畸形 → 200，body 报错
     let r = get("/v1/models").send().await.unwrap();
     assert_eq!(r.status(), 200);
-    assert!(r.bytes().await.is_err(), "garbage body should fail body read");
+    assert!(
+        r.bytes().await.is_err(),
+        "garbage body should fail body read"
+    );
     // 9: head 200 + 沉默 → 空闲超时 → 200，body 报错
     let r = get("/v1/models").send().await.unwrap();
     assert_eq!(r.status(), 200);
-    assert!(r.bytes().await.is_err(), "idle timeout should fail body read");
+    assert!(
+        r.bytes().await.is_err(),
+        "idle timeout should fail body read"
+    );
     // 10: 带 query string 的请求 → 200
     let r = get("/v1/models?foo=bar").send().await.unwrap();
     assert_eq!(r.status(), 200);

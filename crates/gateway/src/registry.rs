@@ -4,7 +4,7 @@ use std::{
     collections::HashMap,
     sync::{
         atomic::{AtomicU32, Ordering},
-        Arc, Mutex,
+        Arc, RwLock,
     },
     time::{Duration, Instant},
 };
@@ -27,7 +27,7 @@ pub struct AgentInfo {
 
 #[derive(Clone, Default)]
 pub struct Registry {
-    inner: Arc<Mutex<HashMap<String, Entry>>>,
+    inner: Arc<RwLock<HashMap<String, Entry>>>,
 }
 
 #[derive(Clone)]
@@ -43,13 +43,19 @@ pub struct Entry {
 
 impl Registry {
     /// 注册 agent；若同名 agent 已有其他连接，关闭旧连接。
-    pub fn register(&self, agent_id: String, models: Vec<String>, max_concurrency: u32, conn: Connection) {
+    pub fn register(
+        &self,
+        agent_id: String,
+        models: Vec<String>,
+        max_concurrency: u32,
+        conn: Connection,
+    ) {
         let stable_id = conn.stable_id();
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.write().unwrap();
         if let Some(old) = inner.get(&agent_id) {
             if old.stable_id != stable_id {
                 warn!(agent = %agent_id, "duplicate agent connection, closing old one");
-                let _ = old.conn.close(0u32.into(), b"duplicate agent");
+                old.conn.close(0u32.into(), b"duplicate agent");
             }
         }
         inner.insert(
@@ -66,14 +72,14 @@ impl Registry {
     }
 
     pub fn heartbeat(&self, agent_id: &str) {
-        if let Some(e) = self.inner.lock().unwrap().get_mut(agent_id) {
+        if let Some(e) = self.inner.write().unwrap().get_mut(agent_id) {
             e.last_seen = Instant::now();
         }
     }
 
     /// 仅当条目仍对应给定连接（stable_id）时才移除，防止误删新连接的同名条目。
     pub fn remove_if_same(&self, agent_id: &str, stable_id: usize) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.write().unwrap();
         if let Some(e) = inner.get(agent_id) {
             if e.stable_id == stable_id {
                 inner.remove(agent_id);
@@ -83,12 +89,16 @@ impl Registry {
     }
 
     pub fn len(&self) -> usize {
-        self.inner.lock().unwrap().len()
+        self.inner.read().unwrap().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.read().unwrap().is_empty()
     }
 
     /// 返回全部已注册 agent 的明细快照（按 agent_id 排序）。
     pub fn snapshot(&self) -> Vec<AgentInfo> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.read().unwrap();
         let now = Instant::now();
         let mut out: Vec<AgentInfo> = inner
             .iter()
@@ -107,7 +117,7 @@ impl Registry {
     /// 按最少负载（在途数最小）挑选一个健康 agent 并原子占用并发槽位；
     /// 返回的 [`SlotGuard`] 期间该请求计入在途数。
     pub fn try_acquire(&self, stale_after: Duration) -> Result<(Entry, SlotGuard), AcquireError> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.read().unwrap();
         let mut candidates: Vec<&Entry> = inner
             .values()
             .filter(|e| e.last_seen.elapsed() < stale_after)
@@ -162,7 +172,7 @@ mod tests {
     use super::*;
     use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
     use rcgen::{CertificateParams, KeyPair};
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 
     /// 建立一对本地 QUIC 端点并返回客户端连接（无 mTLS，仅用于构造 Connection）。
     /// 返回后端点随作用域结束 drop，连接被关闭，但 stable_id / inflight 字段仍可读，
@@ -173,7 +183,7 @@ mod tests {
             .unwrap()
             .self_signed(&key)
             .unwrap();
-        let cert_der = CertificateDer::from(cert.der().clone());
+        let cert_der = cert.der().clone();
         let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
 
         let tls = rustls::ServerConfig::builder()
@@ -222,7 +232,7 @@ mod tests {
         let c2 = test_connection().await;
         reg.register("home-1".into(), vec!["m".into()], 2, c2.clone());
         assert_eq!(reg.len(), 1);
-        let entry = reg.inner.lock().unwrap().get("home-1").cloned().unwrap();
+        let entry = reg.inner.read().unwrap().get("home-1").cloned().unwrap();
         assert_eq!(entry.stable_id, c2.stable_id());
     }
 
@@ -233,7 +243,7 @@ mod tests {
         let c2 = test_connection().await;
         reg.register("x".into(), vec![], 4, c1.clone());
         reg.register("x".into(), vec![], 4, c2.clone()); // 条目换成 c2，c1 被关
-        // 用旧连接的 stable_id 移除 → 不删除（条目现在属于 c2）
+                                                         // 用旧连接的 stable_id 移除 → 不删除（条目现在属于 c2）
         reg.remove_if_same("x", c1.stable_id());
         assert_eq!(reg.len(), 1);
         // 用当前连接的 stable_id 移除 → 删除
@@ -307,7 +317,10 @@ mod tests {
         let snap = reg.snapshot();
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].agent_id, "home-1");
-        assert_eq!(snap[0].models, vec!["qwen2.5".to_string(), "llama3".to_string()]);
+        assert_eq!(
+            snap[0].models,
+            vec!["qwen2.5".to_string(), "llama3".to_string()]
+        );
         assert_eq!(snap[0].max_concurrency, 2);
         assert_eq!(snap[0].inflight, 0);
         assert!(snap[0].last_seen_secs_ago < 1, "freshly registered agent");

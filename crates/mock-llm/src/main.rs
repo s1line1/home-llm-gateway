@@ -44,8 +44,10 @@ mod tests {
         // 用 127.0.0.1:0 随机端口启动，短暂运行后中止，验证启动路径可执行
         let task = tokio::spawn(run(Args::parse_from([
             "mock-llm",
-            "--addr", "127.0.0.1:0",
-            "--name", "test-instance",
+            "--addr",
+            "127.0.0.1:0",
+            "--name",
+            "test-instance",
         ])));
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert!(!task.is_finished(), "mock server should keep serving");

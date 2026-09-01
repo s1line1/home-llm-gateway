@@ -4,25 +4,14 @@ pub mod tls;
 
 use std::{net::SocketAddr, time::Duration};
 
-use proto::{io::{read_frame, write_frame}, Frame};
 use futures_util::StreamExt;
+use proto::{
+    io::{read_frame, write_frame},
+    Frame,
+};
 use quinn::Connection;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tracing::{info, warn};
-
-/// 逐跳头，转发时剔除。
-const HOP_BY_HOP: &[&str] = &[
-    "connection",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "te",
-    "trailer",
-    "transfer-encoding",
-    "upgrade",
-    "host",
-    "content-length",
-];
 
 pub struct AgentConfig {
     /// 云端网关 QUIC 地址。
@@ -81,9 +70,7 @@ async fn run(cfg: AgentConfig, client_config: quinn::ClientConfig) {
 async fn connect_once(cfg: &AgentConfig, client_config: quinn::ClientConfig) -> anyhow::Result<()> {
     let mut endpoint = quinn::Endpoint::client(SocketAddr::from(([0, 0, 0, 0], 0)))?;
     endpoint.set_default_client_config(client_config);
-    let conn = endpoint
-        .connect(cfg.cloud_addr, &cfg.server_name)?
-        .await?;
+    let conn = endpoint.connect(cfg.cloud_addr, &cfg.server_name)?.await?;
     info!("connected to cloud gateway at {}", cfg.cloud_addr);
 
     register(&conn, cfg).await?;
@@ -144,7 +131,14 @@ async fn heartbeat_loop(conn: Connection, agent_id: String, interval: Duration) 
         tokio::time::sleep(interval).await;
         match conn.open_bi().await {
             Ok((mut send, mut recv)) => {
-                let _ = write_frame(&mut send, &Frame::Heartbeat { agent_id: agent_id.clone(), inflight: 0 }).await;
+                let _ = write_frame(
+                    &mut send,
+                    &Frame::Heartbeat {
+                        agent_id: agent_id.clone(),
+                        inflight: 0,
+                    },
+                )
+                .await;
                 let _ = send.finish();
                 let _ = read_frame(&mut recv).await; // 等 EOF
             }
@@ -162,7 +156,14 @@ async fn handle_stream(
     upstream: &str,
     request_log: bool,
 ) -> anyhow::Result<()> {
-    let Some(Frame::ProxyRequest { request_id, method, path, headers, body }) = read_frame(&mut recv).await? else {
+    let Some(Frame::ProxyRequest {
+        request_id,
+        method,
+        path,
+        headers,
+        body,
+    }) = read_frame(&mut recv).await?
+    else {
         anyhow::bail!("expected ProxyRequest frame");
     };
     let started = std::time::Instant::now();
@@ -173,7 +174,7 @@ async fn handle_stream(
     let url = format!("{upstream}{path}");
     let mut rb = http.request(reqwest::Method::from_bytes(method.as_bytes())?, &url);
     for (k, v) in headers {
-        if !HOP_BY_HOP.contains(&k.as_str()) {
+        if !proto::headers::is_hop_by_hop(k.as_str()) {
             if let Ok(v) = reqwest::header::HeaderValue::from_str(&v) {
                 rb = rb.header(k, v);
             }
@@ -202,16 +203,29 @@ async fn handle_stream(
     let mut out_headers = Vec::new();
     for (k, v) in resp.headers() {
         let name = k.as_str();
-        if HOP_BY_HOP.contains(&name) {
+        if proto::headers::is_hop_by_hop(name) {
             continue;
         }
         if let Ok(v) = v.to_str() {
             out_headers.push((name.to_string(), v.to_string()));
         }
     }
-    write_frame(&mut send, &Frame::ProxyResponseHead { request_id, status, headers: out_headers }).await?;
+    write_frame(
+        &mut send,
+        &Frame::ProxyResponseHead {
+            request_id,
+            status,
+            headers: out_headers,
+        },
+    )
+    .await?;
     if request_log {
-        info!(request_id, status, elapsed_ms = started.elapsed().as_millis() as u64, "upstream responded");
+        info!(
+            request_id,
+            status,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "upstream responded"
+        );
     }
 
     // M2：流式透传——上游 body 逐块转 ProxyResponseBody 帧（SSE 天然支持），
@@ -269,7 +283,11 @@ async fn send_cancelled(
     request_log: bool,
 ) -> anyhow::Result<()> {
     if request_log {
-        info!(request_id, elapsed_ms = started.elapsed().as_millis() as u64, "request cancelled by gateway");
+        info!(
+            request_id,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "request cancelled by gateway"
+        );
     }
     let _ = write_frame(
         send,
@@ -323,8 +341,7 @@ mod tests {
 
         let cli_key = KeyPair::generate().unwrap();
         let mut cli = CertificateParams::default();
-        cli.distinguished_name
-            .push(DnType::CommonName, "agent");
+        cli.distinguished_name.push(DnType::CommonName, "agent");
         cli.is_ca = IsCa::NoCa;
         cli.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
         cli.key_usages = vec![KeyUsagePurpose::DigitalSignature];
@@ -346,7 +363,7 @@ mod tests {
             .unwrap()
             .self_signed(&key)
             .unwrap();
-        let cert_der = CertificateDer::from(cert.der().clone());
+        let cert_der = cert.der().clone();
         let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
 
         let tls = rustls::ServerConfig::builder()
@@ -511,7 +528,10 @@ mod tests {
         // 服务端主动关闭连接 → agent 干净断开（Ok 分支）→ 退避重连
         server_conn.close(0u32.into(), b"bye");
         tokio::time::sleep(Duration::from_millis(900)).await;
-        assert!(!task.is_finished(), "run loop should keep running after disconnect");
+        assert!(
+            !task.is_finished(),
+            "run loop should keep running after disconnect"
+        );
         task.abort();
     }
 

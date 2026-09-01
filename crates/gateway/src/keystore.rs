@@ -165,7 +165,14 @@ impl KeyStore {
 
     /// 列出动态 key（不含明文；由调用方决定展示形式）。
     pub fn list(&self) -> Vec<KeyRecord> {
-        let mut v: Vec<KeyRecord> = self.inner.runtime.read().unwrap().values().cloned().collect();
+        let mut v: Vec<KeyRecord> = self
+            .inner
+            .runtime
+            .read()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect();
         v.sort_by_key(|r| r.created_at);
         v
     }
@@ -211,9 +218,7 @@ fn migrate_legacy_keys(conn: &mut Connection) -> rusqlite::Result<usize> {
     // 读取旧行（明文 key → 重哈希）；旧表可能为空，也要重建结构
     let mut rows = Vec::new();
     {
-        let mut stmt = conn.prepare(
-            "SELECT id, key, name, created_at, enabled FROM api_keys",
-        )?;
+        let mut stmt = conn.prepare("SELECT id, key, name, created_at, enabled FROM api_keys")?;
         let iter = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -246,12 +251,7 @@ fn migrate_legacy_keys(conn: &mut Connection) -> rusqlite::Result<usize> {
         )?;
         for (id, lookup, key_hash, name, created_at, enabled) in &rows {
             ins.execute(rusqlite::params![
-                id,
-                lookup,
-                key_hash,
-                name,
-                created_at,
-                enabled
+                id, lookup, key_hash, name, created_at, enabled
             ])?;
         }
     }
@@ -278,9 +278,8 @@ fn table_has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::R
 
 /// 从 SQLite 加载全部动态 key（key = lookup）。
 fn load_keys(conn: &Connection) -> rusqlite::Result<HashMap<String, KeyRecord>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, lookup, key_hash, name, created_at, enabled FROM api_keys",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT id, lookup, key_hash, name, created_at, enabled FROM api_keys")?;
     let rows = stmt.query_map([], |r| {
         Ok(KeyRecord {
             id: r.get(0)?,
@@ -341,7 +340,13 @@ fn generate_id_key() -> (String, String) {
     getrandom::fill(&mut id_buf).expect("os rng");
     getrandom::fill(&mut key_buf).expect("os rng");
     let id = format!("{:08x}", u32::from_be_bytes(id_buf));
-    let key = format!("sk-{}", key_buf.iter().map(|b| format!("{b:02x}")).collect::<String>());
+    let key = format!(
+        "sk-{}",
+        key_buf
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    );
     (id, key)
 }
 
@@ -375,7 +380,10 @@ mod tests {
         let path = dir.path().join("keys.db");
         let store = KeyStore::new(Some(path.clone()));
         let created = store.create("dsh".into());
-        assert!(store.authorize(&created.plaintext), "new key should authorize");
+        assert!(
+            store.authorize(&created.plaintext),
+            "new key should authorize"
+        );
         assert!(!store.authorize("nope"));
         drop(store);
 
@@ -400,7 +408,10 @@ mod tests {
             !text.contains(&created.plaintext),
             "plaintext key must not be persisted"
         );
-        assert!(text.contains("$argon2id$"), "argon2 hash should be persisted");
+        assert!(
+            text.contains("$argon2id$"),
+            "argon2 hash should be persisted"
+        );
         // 明文不落盘后，重启依然能通过哈希校验授权
         let reloaded = KeyStore::new(Some(path.clone()));
         assert!(reloaded.authorize(&created.plaintext));
@@ -419,7 +430,10 @@ mod tests {
             !store.authorize(&created.plaintext),
             "revoked key must be rejected"
         );
-        assert!(!store.delete(&created.record.id), "deleting twice returns false");
+        assert!(
+            !store.delete(&created.record.id),
+            "deleting twice returns false"
+        );
 
         // 吊销同样持久化：重载后 key 依然失效
         let reloaded = KeyStore::new(Some(path.clone()));
@@ -464,7 +478,11 @@ mod tests {
         drop(store);
         // 文件确实是 SQLite 格式（magic 头 "SQLite format 3"）
         let head = std::fs::read(&path).unwrap();
-        assert_eq!(&head[..16], b"SQLite format 3\x00", "expected sqlite header");
+        assert_eq!(
+            &head[..16],
+            b"SQLite format 3\x00",
+            "expected sqlite header"
+        );
     }
 
     #[test]

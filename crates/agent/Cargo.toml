@@ -21,3 +21,6 @@ tracing-subscriber = { workspace = true }
 [dev-dependencies]
 rcgen = { workspace = true }
 tempfile = "3"
+
+[lints]
+workspace = true

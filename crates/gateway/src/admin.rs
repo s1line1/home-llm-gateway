@@ -104,18 +104,12 @@ pub async fn list_agents(State(state): State<AppState>) -> Json<Vec<crate::regis
     Json(state.registry.snapshot())
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
 
-    use crate::{
-        http::AppState,
-        keystore::KeyStore,
-        metrics::Metrics,
-        registry::Registry,
-    };
+    use crate::{http::AppState, keystore::KeyStore, metrics::Metrics, registry::Registry};
 
     fn test_state() -> AppState {
         AppState {
@@ -165,7 +159,10 @@ mod tests {
         let listed = list_keys(State(state)).await;
         let text = listed.0.to_string();
         assert!(text.contains("my-key"));
-        assert!(!text.contains(&full_key), "list must not leak plaintext key");
+        assert!(
+            !text.contains(&full_key),
+            "list must not leak plaintext key"
+        );
         assert!(!text.contains("$argon2id$"), "list must not leak key hash");
     }
 }

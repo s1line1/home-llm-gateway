@@ -8,7 +8,10 @@ use tracing_subscriber::EnvFilter;
 
 /// 命令行仅保留：指定配置文件路径。
 #[derive(Parser)]
-#[command(version, about = "cloud-gateway: 家庭 LLM 远程访问网关（公网入口 + QUIC 隧道服务端）")]
+#[command(
+    version,
+    about = "cloud-gateway: 家庭 LLM 远程访问网关（公网入口 + QUIC 隧道服务端）"
+)]
 struct Args {
     /// 配置文件路径（YAML），所有参数都在其中配置
     #[arg(long, default_value = "gateway-config.yml")]
@@ -81,7 +84,10 @@ fn default_agent_stale_secs() -> u64 {
 
 /// 把 YAML 配置映射为网关配置（独立函数，便于单元测试）。
 fn config_from_file(cfg: ConfigFile) -> anyhow::Result<GatewayConfig> {
-    if cfg.cert.as_os_str().is_empty() || cfg.key.as_os_str().is_empty() || cfg.ca.as_os_str().is_empty() {
+    if cfg.cert.as_os_str().is_empty()
+        || cfg.key.as_os_str().is_empty()
+        || cfg.ca.as_os_str().is_empty()
+    {
         anyhow::bail!("config: cert/key/ca paths are required");
     }
     let tls = match (&cfg.tls_cert, &cfg.tls_key) {
@@ -104,11 +110,11 @@ fn config_from_file(cfg: ConfigFile) -> anyhow::Result<GatewayConfig> {
             .quic_addr
             .parse::<SocketAddr>()
             .with_context(|| format!("config: invalid quic_addr {:?}", cfg.quic_addr))?,
-        ca_cert: gateway::tls::load_certs(&cfg.ca)
+        ca_cert: proto::pem::load_certs(&cfg.ca)
             .with_context(|| format!("config: cannot load ca cert {}", cfg.ca.display()))?,
-        server_cert: gateway::tls::load_certs(&cfg.cert)
+        server_cert: proto::pem::load_certs(&cfg.cert)
             .with_context(|| format!("config: cannot load cert {}", cfg.cert.display()))?,
-        server_key: gateway::tls::load_key(&cfg.key)
+        server_key: proto::pem::load_key(&cfg.key)
             .with_context(|| format!("config: cannot load key {}", cfg.key.display()))?,
         admin_token: cfg.admin_token,
         keys_file: cfg.keys_file,
@@ -229,8 +235,16 @@ rate_limit_per_min: 60
             ca.to_str().unwrap(),
         );
         let cfg = config_from_file(parse_yaml(&yaml)).unwrap();
-        assert_eq!(cfg.http_bind.to_string(), "0.0.0.0:8080", "default listen_addr");
-        assert_eq!(cfg.quic_bind.to_string(), "0.0.0.0:4433", "default quic_addr");
+        assert_eq!(
+            cfg.http_bind.to_string(),
+            "0.0.0.0:8080",
+            "default listen_addr"
+        );
+        assert_eq!(
+            cfg.quic_bind.to_string(),
+            "0.0.0.0:4433",
+            "default quic_addr"
+        );
         assert_eq!(cfg.request_timeout, Duration::from_secs(120));
         assert_eq!(cfg.agent_stale_after, Duration::from_secs(15));
         assert_eq!(cfg.rate_limit_per_min, 0);
@@ -310,7 +324,9 @@ keys_file: {}
             dir.path().join("keys.db").to_str().unwrap(),
         );
         std::fs::write(&config_path, &yaml).unwrap();
-        let task = tokio::spawn(run(Args { config: config_path }));
+        let task = tokio::spawn(run(Args {
+            config: config_path,
+        }));
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         assert!(!task.is_finished(), "gateway loop should stay running");
         task.abort();
