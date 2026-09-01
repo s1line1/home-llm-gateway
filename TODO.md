@@ -47,6 +47,28 @@
       7. 分步：TrustStore+verifier → Admin API → SQLite 持久化 → e2e + 文档
          （README/DEPLOY/DESIGN 安全章节更新：每 agent 独立 CA 的管理模型与吊销语义）
 - [ ] **UDP 被封时的 TCP+TLS fallback**（DESIGN.md §10）：帧协议不变，仅替换 QUIC 传输层
+- [ ] **per-API-key token 用量计量**：
+      目标：按 API key 统计 token 消耗（prompt/completion/total + 请求数 + 最后使用时间），
+      Admin API 可查询、Keys 页展示；吊销 key 后用量记录仍保留（可审计）。
+      **设计要点（已定稿）**：
+      1. 数据来源：网关透传层提取上游响应的 `usage` 字段（OpenAI 兼容：非流式 JSON 里有；
+         流式在最后一个 chunk 通常带 usage）；上游无 usage 时降级为估算（字符数/4，中文按字符），
+         数据标记估算来源
+      2. 流式性能：SSE 逐块转发时**先 `contains("usage")` 字符串预过滤**，命中才 JSON 解析，
+         避免每块全量解析（99% chunk 零开销）；取消/断流请求按已转发字节估算 completion
+      3. 存储：keys.db 新表 `key_usage(key_id PK, prompt_tokens, completion_tokens,
+         total_tokens, requests, last_used_at)`；热路径内存
+         `RwLock<HashMap<key_id, Mutex<Usage>>>`（AtomicU64 无锁累加），每请求结束写穿 SQLite；
+         高并发再优化为 spawn_blocking/批量 flush（见 keys.db 迁移条目）
+      4. API/UI：`GET /admin/usage` 每 key 用量汇总；`GET /admin/keys` 响应可选带 usage；
+         Keys 页加用量列；`POST /admin/usage/reset` 留后期
+      5. 范围：本次只做**计量**（统计+查询+展示）；配额/超限拒绝（key 设 quota 超限 429）
+         明确排除，留到多租户阶段（DESIGN.md §11.3 两级限流）
+      6. 测试：单测（非流式 JSON usage 提取、流式 usage chunk 提取、无 usage 估算降级、
+         并发累加正确性）；e2e（打请求后 /admin/usage 与 mock-llm 返回的 usage 一致、
+         吊销后记录仍可查）
+      7. 分步：usage 提取模块（透传层挂钩）→ 内存累加 + SQLite 持久化 →
+         /admin/usage + Keys 页展示 → e2e + 文档
 - [ ] **健康上报驱动的更精细路由**（DESIGN.md §9 M4 待办）：当前按在途请求数最少路由，
       后续可结合 agent 心跳上报的延迟/队列深度
 - [ ] **Grafana 仪表盘模板**（DESIGN.md §9 M4 待办）：消费 `/metrics` 指标
@@ -62,3 +84,26 @@
       防御性错误路径（可注入故障测试）
 - [ ] **keys.json 保护**：部署时文件权限 600、定期备份/恢复演练（含明文密钥安全说明）
 - [ ] **/admin/* 暴露面收敛**：安全组只放行管理网段（README 已提示，可补部署脚本/检查项）
+
+## P3 — 协议层改造（postcard → protobuf）
+
+> 前置判断：**只有动机是"跨语言互操作 / 生态标准化"才值得做**；postcard 在性能和简单性上仍更优
+> （小帧更快更小，64KiB body 序列化 ~2 GiB/s 已是 memcpy 级）。若仅为协议演进，
+> postcard 加字段本身也向后兼容（serde 忽略未知字段）。
+
+- [ ] **隧道帧协议 postcard → protobuf**：
+      目标：`Frame` 枚举 8 种帧改用 protobuf 编解码，获得跨语言互操作与显式 .proto schema。
+      **设计要点（已定稿）**：
+      1. 选型：**prost**（prost + prost-build + protoc，build.rs 编译期生成）；备选 rust-protobuf（免 protoc）
+      2. Schema：`Frame { oneof kind { register=1 ... error=8 } }` + 各 message（字段编号见设计文档）；
+         长度前缀 framing 不变（`[u32 大端长度][protobuf 字节]`）
+      3. **关键设计：内部 Frame 枚举保留，只换编解码层**——`io.rs` 的 write_frame/read_frame
+         签名不变，gateway/agent 调用方几乎零改动；tests 重写
+      4. 迁移策略：一次性切换 + **版本校验**（版本号 0.2.0；Register.version 已存在，
+         gateway 拒绝 <0.2.0 的 agent，避免双端不同步静默解析失败）；不做双协议共存
+      5. 性能门槛：bench 双实现对比（postcard vs protobuf）——若回退超预期（>3x）停下重新评估；
+         预期小帧慢 1.5-2x（tag 开销）、大 body 接近持平
+      6. 构建影响：+prost 依赖、.proto 文件、protoc（CI/交叉编译需安装，文档化）
+      7. 测试：proto roundtrip（8 帧/边界）+ 全量 e2e 回归 + bench 对比报告
+      8. 分步：schema+prost 接入 → io.rs 切换+单测 → bench 双实现对比（决策门槛）→
+         全量回归 → 版本 0.2.0+校验 → 文档（DESIGN §4.2、部署同版本升级说明）
