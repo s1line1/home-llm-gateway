@@ -47,14 +47,23 @@ async fn handle_conn_inner(
         };
 
         match read_frame(&mut recv).await? {
-            Some(Frame::Register { agent_id: id, models, max_concurrency, .. }) => {
+            Some(Frame::Register {
+                agent_id: id,
+                models,
+                max_concurrency,
+                ..
+            }) => {
                 let stable_id = conn.stable_id();
                 registry.register(id.clone(), models, max_concurrency, conn.clone());
                 *agent_id = Some((id.clone(), stable_id));
                 let _ = send.finish();
                 info!(agent = %id, "agent registered");
             }
-            Some(Frame::Heartbeat { agent_id: id, inflight, .. }) => {
+            Some(Frame::Heartbeat {
+                agent_id: id,
+                inflight,
+                ..
+            }) => {
                 registry.heartbeat(&id);
                 debug!(agent = %id, inflight, "heartbeat");
                 let _ = send.finish();

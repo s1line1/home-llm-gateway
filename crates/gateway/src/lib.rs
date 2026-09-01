@@ -9,12 +9,7 @@ pub mod ratelimit;
 pub mod registry;
 pub mod tls;
 
-use std::{
-    net::SocketAddr,
-    path::PathBuf,
-    sync::Arc,
-    time::Duration,
-};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use axum::Router;
 use hyper::{body::Incoming, server::conn::http1, service::service_fn};
@@ -120,7 +115,10 @@ impl Gateway {
                 }));
             }
         }
-        tasks.push(tokio::spawn(quic::accept_loop(endpoint.clone(), registry.clone())));
+        tasks.push(tokio::spawn(quic::accept_loop(
+            endpoint.clone(),
+            registry.clone(),
+        )));
 
         Ok(Self {
             http_addr,
@@ -144,7 +142,11 @@ impl Gateway {
 }
 
 /// 基于 tokio-rustls 的 HTTPS accept 循环（每连接一个任务）。
-async fn serve_https(listener: tokio::net::TcpListener, app: Router, tls: TlsPem) -> anyhow::Result<()> {
+async fn serve_https(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    tls: TlsPem,
+) -> anyhow::Result<()> {
     let server_config = tls::https_server_config(&tls.cert, &tls.key)?;
     let acceptor = TlsAcceptor::from(Arc::new(server_config));
     loop {

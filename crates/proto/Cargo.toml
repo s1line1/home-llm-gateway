@@ -4,13 +4,21 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+anyhow = { workspace = true }
 postcard = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+rcgen = { workspace = true }
+tempfile = "3"
 
 [[bench]]
 name = "frame"
 harness = false
+
+[lints]
+workspace = true

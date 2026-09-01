@@ -43,3 +43,6 @@ tempfile = "3"
 [[bench]]
 name = "keystore"
 harness = false
+
+[lints]
+workspace = true

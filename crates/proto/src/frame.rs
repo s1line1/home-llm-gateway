@@ -13,10 +13,7 @@ pub enum Frame {
         version: String,
     },
     /// 双向：保活 + 健康状态。
-    Heartbeat {
-        agent_id: String,
-        inflight: u32,
-    },
+    Heartbeat { agent_id: String, inflight: u32 },
     /// cloud → agent：一个 OpenAI 兼容请求。
     ProxyRequest {
         request_id: u64,
@@ -32,19 +29,11 @@ pub enum Frame {
         headers: Vec<(String, String)>,
     },
     /// agent → cloud：上游响应体分块（SSE 场景下逐块透传）。
-    ProxyResponseBody {
-        request_id: u64,
-        chunk: Vec<u8>,
-    },
+    ProxyResponseBody { request_id: u64, chunk: Vec<u8> },
     /// agent → cloud：响应结束。
-    ProxyResponseEnd {
-        request_id: u64,
-        ok: bool,
-    },
+    ProxyResponseEnd { request_id: u64, ok: bool },
     /// cloud → agent：客户端断开/超时，要求取消上游请求（避免白算 token）。
-    Cancel {
-        request_id: u64,
-    },
+    Cancel { request_id: u64 },
     /// 双向：错误。
     Error {
         request_id: Option<u64>,

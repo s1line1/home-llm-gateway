@@ -7,7 +7,10 @@ use async_stream::stream;
 use axum::{
     body::{Body, Bytes},
     extract::State,
-    http::{header::{CACHE_CONTROL, CONTENT_TYPE}, HeaderValue},
+    http::{
+        header::{CACHE_CONTROL, CONTENT_TYPE},
+        HeaderValue,
+    },
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -36,10 +39,7 @@ async fn models(State(st): State<AppState>) -> Json<serde_json::Value> {
     }))
 }
 
-async fn chat(
-    State(st): State<AppState>,
-    Json(req): Json<serde_json::Value>,
-) -> Response {
+async fn chat(State(st): State<AppState>, Json(req): Json<serde_json::Value>) -> Response {
     let model = req
         .get("model")
         .and_then(|v| v.as_str())
@@ -56,10 +56,7 @@ async fn chat(
         .unwrap_or_default()
         .to_string();
 
-    let is_stream = req
-        .get("stream")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let is_stream = req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
 
     if is_stream {
         // 模拟 SSE：逐字输出，模拟真实模型的打字机效果
@@ -122,7 +119,10 @@ async fn embeddings(
     State(st): State<AppState>,
     Json(req): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
-    let model = req.get("model").and_then(|v| v.as_str()).unwrap_or(st.name.as_ref());
+    let model = req
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or(st.name.as_ref());
     Json(serde_json::json!({
         "object": "list",
         "data": [{ "object": "embedding", "index": 0, "embedding": [0.1, 0.2, 0.3] }],

@@ -31,3 +31,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [workspace.dependencies.criterion]
 version = "0.8"
 features = ["html_reports"]
+
+# 统一的 Rust/clippy lint 策略（各 crate 通过 [lints] workspace = true 继承）
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"

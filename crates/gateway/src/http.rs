@@ -15,7 +15,10 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use proto::{io::{read_frame, write_frame}, Frame};
+use proto::{
+    io::{read_frame, write_frame},
+    Frame,
+};
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -29,20 +32,6 @@ use crate::ratelimit::RateLimiter;
 use crate::registry::{AcquireError, Registry};
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
-
-/// 逐跳头，转发时剔除。
-const HOP_BY_HOP: &[&str] = &[
-    "connection",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "te",
-    "trailer",
-    "transfer-encoding",
-    "upgrade",
-    "host",
-    "content-length",
-];
 
 #[derive(Clone)]
 pub struct AppState {
@@ -68,10 +57,19 @@ pub fn app(state: AppState) -> Router {
         );
     if state.admin_token.is_some() {
         let admin = Router::new()
-            .route("/keys", get(crate::admin::list_keys).post(crate::admin::create_key))
-            .route("/keys/{id}", axum::routing::delete(crate::admin::delete_key))
+            .route(
+                "/keys",
+                get(crate::admin::list_keys).post(crate::admin::create_key),
+            )
+            .route(
+                "/keys/{id}",
+                axum::routing::delete(crate::admin::delete_key),
+            )
             .route("/agents", get(crate::admin::list_agents))
-            .route_layer(middleware::from_fn_with_state(state.clone(), crate::admin::admin_auth));
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                crate::admin::admin_auth,
+            ));
         router = router.nest("/admin", admin);
     }
     // React UI 静态托管：存在时 `/` 返回 Dashboard，未命中的路径（SPA 前端路由，
@@ -89,20 +87,22 @@ pub fn app(state: AppState) -> Router {
     }
     router
         .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
-        .layer(middleware::from_fn_with_state(state.clone(), metrics_middleware))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            metrics_middleware,
+        ))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)
 }
 
 /// SPA fallback：浏览器导航（Accept: text/html）→ index.html；静态资源
 /// （带扩展名路径，如 /assets/*.js）→ 文件；其余（API 类未注册路径）→ 404。
-async fn ui_fallback(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    uri: Uri,
-) -> Response {
+async fn ui_fallback(State(state): State<AppState>, headers: HeaderMap, uri: Uri) -> Response {
     // 仅在 ui_dir 配置时注册本 handler，故此处必然为 Some
-    let dir = state.ui.as_ref().expect("ui_fallback registered only when ui_dir is set");
+    let dir = state
+        .ui
+        .as_ref()
+        .expect("ui_fallback registered only when ui_dir is set");
     let wants_html = headers
         .get(axum::http::header::ACCEPT)
         .and_then(|v| v.to_str().ok())
@@ -259,7 +259,9 @@ async fn proxy(
 
     let (mut send, mut recv) = match entry.conn.open_bi().await {
         Ok(s) => s,
-        Err(e) => return error_response(StatusCode::BAD_GATEWAY, format!("tunnel open failed: {e}")),
+        Err(e) => {
+            return error_response(StatusCode::BAD_GATEWAY, format!("tunnel open failed: {e}"))
+        }
     };
     let request = Frame::ProxyRequest {
         request_id,
@@ -295,7 +297,7 @@ async fn proxy(
             return error_response(StatusCode::GATEWAY_TIMEOUT, "upstream timed out");
         }
     };
-    out_headers.retain(|(k, _)| !HOP_BY_HOP.contains(&k.as_str()));
+    out_headers.retain(|(k, _)| !proto::headers::is_hop_by_hop(k.as_str()));
 
     // 流式回写响应体：后台任务把响应帧转进通道，HTTP 客户端从通道逐块读取。
     // 客户端断开（通道接收端被丢弃）→ 自动向 agent 发 Cancel，避免白算 token。
@@ -309,7 +311,10 @@ async fn proxy(
 
     let mut builder = Response::builder().status(status);
     for (k, v) in out_headers {
-        if let (Ok(name), Ok(value)) = (HeaderName::from_bytes(k.as_bytes()), HeaderValue::from_str(&v)) {
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(k.as_bytes()),
+            HeaderValue::from_str(&v),
+        ) {
             builder = builder.header(name, value);
         }
     }
@@ -328,7 +333,11 @@ enum HeadOutcome {
 async fn read_head(recv: &mut quinn::RecvStream) -> anyhow::Result<HeadOutcome> {
     loop {
         match read_frame(recv).await? {
-            Some(Frame::ProxyResponseHead { status: s, headers: h, .. }) => {
+            Some(Frame::ProxyResponseHead {
+                status: s,
+                headers: h,
+                ..
+            }) => {
                 return Ok(HeadOutcome::Head(
                     StatusCode::from_u16(s).unwrap_or(StatusCode::BAD_GATEWAY),
                     h,
@@ -342,7 +351,10 @@ async fn read_head(recv: &mut quinn::RecvStream) -> anyhow::Result<HeadOutcome> 
             }
             Some(_) => {}
             None => {
-                return Ok(HeadOutcome::Error(502, "upstream closed before responding".into()));
+                return Ok(HeadOutcome::Error(
+                    502,
+                    "upstream closed before responding".into(),
+                ));
             }
         }
     }
@@ -377,13 +389,17 @@ async fn forward_body(
                 return;
             }
             Ok(Ok(Some(Frame::Error { code, message, .. }))) => {
-                let _ = tx.send(Err(format!("upstream error {code}: {message}"))).await;
+                let _ = tx
+                    .send(Err(format!("upstream error {code}: {message}")))
+                    .await;
                 let _ = send.finish();
                 return;
             }
             Ok(Ok(Some(_))) => {}
             Ok(Ok(None)) => {
-                let _ = tx.send(Err("upstream closed the stream early".into())).await;
+                let _ = tx
+                    .send(Err("upstream closed the stream early".into()))
+                    .await;
                 return;
             }
             Ok(Err(e)) => {
@@ -405,7 +421,7 @@ async fn forward_body(
 fn filter_headers(headers: &HeaderMap) -> Vec<(String, String)> {
     headers
         .iter()
-        .filter(|(k, _)| !HOP_BY_HOP.contains(&k.as_str()))
+        .filter(|(k, _)| !proto::headers::is_hop_by_hop(k.as_str()))
         .map(|(k, v)| {
             (
                 k.as_str().to_string(),
@@ -420,12 +436,7 @@ mod tests {
     use super::*;
     use axum::http::{HeaderMap, HeaderValue};
 
-    use crate::{
-        keystore::KeyStore,
-        metrics::Metrics,
-        ratelimit::RateLimiter,
-        registry::Registry,
-    };
+    use crate::{keystore::KeyStore, metrics::Metrics, ratelimit::RateLimiter, registry::Registry};
 
     fn test_state(ui: Option<PathBuf>) -> AppState {
         AppState {
@@ -442,7 +453,10 @@ mod tests {
 
     fn headers_with_accept(accept: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
-        h.insert(axum::http::header::ACCEPT, HeaderValue::from_str(accept).unwrap());
+        h.insert(
+            axum::http::header::ACCEPT,
+            HeaderValue::from_str(accept).unwrap(),
+        );
         h
     }
 
@@ -467,7 +481,7 @@ mod tests {
         let names: Vec<&str> = out.iter().map(|(k, _)| k.as_str()).collect();
         assert!(names.contains(&"content-type"));
         assert!(names.contains(&"authorization"));
-        for hop in HOP_BY_HOP {
+        for hop in proto::headers::HOP_BY_HOP {
             assert!(!names.contains(hop), "hop-by-hop header leaked: {hop}");
         }
         // 值原样保留
@@ -484,7 +498,10 @@ mod tests {
 
         let resp = metrics_route(State(state.clone()), headers_with_accept("text/html")).await;
         assert_eq!(resp.status(), StatusCode::OK);
-        assert!(body_str(resp).await.contains("id=\"root\""), "browser should get the SPA");
+        assert!(
+            body_str(resp).await.contains("id=\"root\""),
+            "browser should get the SPA"
+        );
 
         // 未配 ui_dir 时降级为 Prometheus 文本
         let state2 = test_state(None);
@@ -548,6 +565,9 @@ mod tests {
         // API 类未注册路径（Accept: */*、无扩展名）→ 404，绝不能返回 index.html
         let resp = call_ui_fallback(state.clone(), "/admin/agents", Some("*/*")).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-        assert!(!body_str(resp).await.contains("id=\"root\""), "API paths must not get SPA");
+        assert!(
+            !body_str(resp).await.contains("id=\"root\""),
+            "API paths must not get SPA"
+        );
     }
 }

@@ -63,7 +63,10 @@ impl Metrics {
         let mut keys: Vec<u16> = counts.keys().copied().collect();
         keys.sort_unstable();
         for code in keys {
-            out.push_str(&format!("hlmg_requests_total{{status=\"{code}\"}} {}\n", counts[&code]));
+            out.push_str(&format!(
+                "hlmg_requests_total{{status=\"{code}\"}} {}\n",
+                counts[&code]
+            ));
         }
         out.push_str("# HELP hlmg_active_requests Currently in-flight requests.\n");
         out.push_str("# TYPE hlmg_active_requests gauge\n");

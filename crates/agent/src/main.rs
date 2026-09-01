@@ -8,7 +8,10 @@ use tracing_subscriber::EnvFilter;
 
 /// 命令行仅保留：指定配置文件路径。
 #[derive(Parser)]
-#[command(version, about = "home-agent: 常驻 LLM 所在机器，通过 QUIC 隧道接入云端网关")]
+#[command(
+    version,
+    about = "home-agent: 常驻 LLM 所在机器，通过 QUIC 隧道接入云端网关"
+)]
 struct Args {
     /// 配置文件路径（YAML），所有参数都在其中配置
     #[arg(long, default_value = "agent-config.yml")]
@@ -77,7 +80,10 @@ fn default_request_log() -> bool {
 
 /// 把 YAML 配置映射为 agent 配置（独立函数，便于单元测试）。
 fn config_from_file(cfg: ConfigFile) -> anyhow::Result<AgentConfig> {
-    if cfg.ca.as_os_str().is_empty() || cfg.cert.as_os_str().is_empty() || cfg.key.as_os_str().is_empty() {
+    if cfg.ca.as_os_str().is_empty()
+        || cfg.cert.as_os_str().is_empty()
+        || cfg.key.as_os_str().is_empty()
+    {
         anyhow::bail!("config: ca/cert/key paths are required");
     }
     Ok(AgentConfig {
@@ -86,11 +92,11 @@ fn config_from_file(cfg: ConfigFile) -> anyhow::Result<AgentConfig> {
             .parse::<SocketAddr>()
             .with_context(|| format!("config: invalid cloud_addr {:?}", cfg.cloud_addr))?,
         server_name: cfg.server_name,
-        ca_cert: agent::tls::load_certs(&cfg.ca)
+        ca_cert: proto::pem::load_certs(&cfg.ca)
             .with_context(|| format!("config: cannot load ca cert {}", cfg.ca.display()))?,
-        client_cert: agent::tls::load_certs(&cfg.cert)
+        client_cert: proto::pem::load_certs(&cfg.cert)
             .with_context(|| format!("config: cannot load cert {}", cfg.cert.display()))?,
-        client_key: agent::tls::load_key(&cfg.key)
+        client_key: proto::pem::load_key(&cfg.key)
             .with_context(|| format!("config: cannot load key {}", cfg.key.display()))?,
         agent_id: cfg.agent_id,
         models: cfg.models,
@@ -191,9 +197,15 @@ max_concurrency: 2
         assert_eq!(cfg.agent_id, "home-1");
         assert_eq!(cfg.upstream_base, "http://127.0.0.1:8000");
         assert_eq!(cfg.heartbeat_interval, Duration::from_secs(7));
-        assert_eq!(cfg.models, vec!["qwen2.5".to_string(), "llama3".to_string()]);
+        assert_eq!(
+            cfg.models,
+            vec!["qwen2.5".to_string(), "llama3".to_string()]
+        );
         assert_eq!(cfg.max_concurrency, 2);
-        assert!(cfg.request_log, "explicit request_log: true should be honored");
+        assert!(
+            cfg.request_log,
+            "explicit request_log: true should be honored"
+        );
     }
 
     #[test]
@@ -262,7 +274,9 @@ heartbeat_secs: 1
             key.to_str().unwrap(),
         );
         std::fs::write(&config_path, &yaml).unwrap();
-        let task = tokio::spawn(run(Args { config: config_path }));
+        let task = tokio::spawn(run(Args {
+            config: config_path,
+        }));
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert!(!task.is_finished(), "agent loop should stay running");
         task.abort();
