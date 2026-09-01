@@ -85,6 +85,7 @@ impl Gateway {
             }
         });
 
+        let metrics = Metrics::default();
         let state = http::AppState {
             registry: registry.clone(),
             key_store: KeyStore::new(cfg.keys_file.clone()),
@@ -92,7 +93,7 @@ impl Gateway {
             timeout: cfg.request_timeout,
             agent_stale_after: cfg.agent_stale_after,
             rate_limiter: RateLimiter::new(cfg.rate_limit_per_min),
-            metrics: Metrics::default(),
+            metrics: metrics.clone(),
             ui,
         };
         let app = http::app(state);
@@ -119,6 +120,7 @@ impl Gateway {
         tasks.push(tokio::spawn(quic::accept_loop(
             endpoint.clone(),
             registry.clone(),
+            metrics,
         )));
 
         Ok(Self {

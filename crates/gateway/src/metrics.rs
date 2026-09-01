@@ -26,6 +26,10 @@ struct MetricsInner {
     total_duration_ms: AtomicU64,
     /// 累计请求数（含 /metrics 之外的所有请求）。
     request_count: AtomicU64,
+    /// 当前在线 QUIC 连接数（隧道层 gauge）。
+    quic_connections: AtomicU64,
+    /// 累计 agent 连接次数（重连计数，counter）。
+    agent_connections_total: AtomicU64,
 }
 
 impl Metrics {
@@ -51,6 +55,19 @@ impl Metrics {
 
     pub fn add_bytes_out(&self, n: usize) {
         self.inner.bytes_out.fetch_add(n as u64, Ordering::Relaxed);
+    }
+
+    /// agent 连接建立：累计 +1、当前在线 +1。
+    pub fn agent_connected(&self) {
+        self.inner
+            .agent_connections_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner.quic_connections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// agent 连接断开：当前在线 -1。
+    pub fn agent_disconnected(&self) {
+        self.inner.quic_connections.fetch_sub(1, Ordering::Relaxed);
     }
 
     /// 渲染为 Prometheus 文本格式；`agent_count` 由调用方传入（注册表实时值）。
@@ -94,6 +111,20 @@ impl Metrics {
         out.push_str(&format!(
             "hlmg_request_count {}\n",
             inner.request_count.load(Ordering::Relaxed)
+        ));
+        out.push_str("# HELP hlmg_quic_connections Currently open agent QUIC connections.\n");
+        out.push_str("# TYPE hlmg_quic_connections gauge\n");
+        out.push_str(&format!(
+            "hlmg_quic_connections {}\n",
+            inner.quic_connections.load(Ordering::Relaxed)
+        ));
+        out.push_str(
+            "# HELP hlmg_agent_connections_total Cumulative agent connections (reconnects).\n",
+        );
+        out.push_str("# TYPE hlmg_agent_connections_total counter\n");
+        out.push_str(&format!(
+            "hlmg_agent_connections_total {}\n",
+            inner.agent_connections_total.load(Ordering::Relaxed)
         ));
         out
     }
