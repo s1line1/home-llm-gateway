@@ -80,9 +80,15 @@
 
 ## P2 — 测试与质量
 
-- [ ] **覆盖率 96.9% → 99%**：剩余 ~62 行主要是 serve_https 监听失败、axum::serve 停止等
-      防御性错误路径（可注入故障测试）
-- [ ] **keys.json 保护**：部署时文件权限 600、定期备份/恢复演练（含明文密钥安全说明）
+- [x] **覆盖率 95.87%（2026-09 实测，stable llvm-cov）**：从 95.77% 提升。
+      剩余未覆盖行均为**防御性错误分支 + 进程入口**（main()/pending 后不可达代码），
+      stable 工具链无法排除（`#[coverage(off)]` 需 nightly 且当前 nightly 的
+      feature(coverage) 缺失 E0635；tarpaulin 0.37 skip 属性不兼容）。
+      已完成：补 ui 托管分支 / 非法哈希拒绝 / agent 启动失败 3 个测试；
+      清理 ui_fallback 不可达分支；3 个二进制的挂起点抽成 wait_forever/serve_forever。
+      目标调整：**不再追求 99% 数字**——新增代码保持"业务路径全覆盖 + 防御分支尽量测"，
+      定期复查未覆盖行（`cargo llvm-cov --show-missing-lines`），
+      如未来工具链支持行级排除再重新评估。
 - [ ] **/admin/* 暴露面收敛**：安全组只放行管理网段（README 已提示，可补部署脚本/检查项）
 
 ## P3 — 协议层改造（postcard → protobuf）

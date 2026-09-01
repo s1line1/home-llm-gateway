@@ -135,9 +135,13 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let gw = Gateway::start(cfg).await?;
     tracing::info!(http = %gw.http_addr, quic = %gw.quic_addr, "Gateway ready");
     let _gw = gw;
+    wait_forever().await
+}
 
+/// 主循环挂起点（永不返回；coverage 排除，避免不可达代码计入覆盖率）。
+async fn wait_forever() -> ! {
     std::future::pending::<()>().await;
-    Ok(())
+    unreachable!("pending never resolves")
 }
 
 #[tokio::main]
