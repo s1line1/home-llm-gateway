@@ -17,21 +17,28 @@ pub fn server_config(
     ca: &[CertificateDer<'static>],
     cert: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
-) -> anyhow::Result<quinn::ServerConfig> {
+) -> Result<quinn::ServerConfig, crate::error::GatewayError> {
     let mut roots = RootCertStore::empty();
     for c in ca {
         roots.add(c.clone())?;
     }
-    let verifier = WebPkiClientVerifier::builder(Arc::new(roots)).build()?;
+    let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
+        .build()
+        .map_err(|e| crate::error::GatewayError::Other(format!("client verifier: {e}")))?;
     let mut tls = rustls::ServerConfig::builder()
         .with_client_cert_verifier(verifier)
         .with_single_cert(cert, key)?;
     tls.alpn_protocols = vec![ALPN.to_vec()];
-    let quic = QuicServerConfig::try_from(tls)?;
+    let quic = QuicServerConfig::try_from(tls)
+        .map_err(|e| crate::error::GatewayError::Other(format!("quic config: {e}")))?;
     let mut cfg = quinn::ServerConfig::with_crypto(Arc::new(quic));
     // 空闲超时：agent 失联（掉线/断电）后及时释放连接；agent 侧 keepalive 会维持存活
     let mut transport = quinn::TransportConfig::default();
-    transport.max_idle_timeout(Some(Duration::from_secs(20).try_into()?));
+    transport.max_idle_timeout(Some(
+        Duration::from_secs(20)
+            .try_into()
+            .map_err(|e| crate::error::GatewayError::Other(format!("transport: {e}")))?,
+    ));
     cfg.transport_config(Arc::new(transport));
     Ok(cfg)
 }

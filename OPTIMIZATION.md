@@ -10,18 +10,18 @@
 
 | # | 优化项 | 现状 | 方案 | 优先级/工作量 |
 |---|---|---|---|---|
-| S1 | gateway crate 按职责拆模块 | `http.rs` 340 行混合路由/代理转发/SPA fallback；`keystore.rs` 384 行混合哈希/DB/索引 | 拆 `http/`（路由+代理）、`config.rs`（YAML→Config 映射）、`keystore/`（hash/db/store 分离） | 高 / 中 |
+| S1 ✅ | gateway crate 按职责拆模块 | ~~混合~~ → `http_proxy.rs`（代理转发独立）、`keystore/hash.rs`（哈希原语独立）、`config.rs`（配置解析独立）；http.rs 只剩路由/中间件/fallback | 高 / 中 |
 | S2 | e2e 测试拆文件 | `e2e.rs` 1199 行单文件（12 测试 + 大量辅助） | 按主题拆 `e2e/chain.rs`、`agents.rs`、`admin.rs`、`stream.rs` + `common/mod.rs`（证书/栈辅助） | 中 / 中 |
-| S3 | 配置解析抽独立模块 | gateway/agent 的 `main.rs` 里 YAML 结构+映射+默认值混在一起 | 抽 `config.rs`（struct + serde + 校验 + 测试），main.rs 只留入口 | 中 / 低 |
+| S3 ✅ | 配置解析抽独立模块 | → gateway/agent 各建 `config.rs`（from_path/from_file + 14 个测试），main.rs 只留 CLI 入口与信号处理 | 中 / 低 |
 | S4 ✅ | 共享代码去重 | ~~两处重复~~ → `proto::pem`（load_certs/load_key）+ `proto::headers`（is_hop_by_hop），gateway/agent 引用统一，测试移入 proto | 高 / 低 |
 
 ## 二、整体架构优化（运行时能力）
 
 | # | 优化项 | 现状 | 方案 | 优先级/工作量 |
 |---|---|---|---|---|
-| A1 | 优雅关闭（TODO P1 已定稿） | `pending().await` 永久挂起，SIGTERM 直接杀进程 | 按 TODO 条目实现：signal + `Gateway::shutdown()`/`Agent::shutdown()` + 清理注册表 | **高 / 中** |
+| A1 ✅ | 优雅关闭（TODO P1 已定稿） | ~~pending 永久挂起~~ → SIGINT/SIGTERM 监听（tokio::signal）→ 打日志 → shutdown() 干净退出；实机验证 SIGTERM 生效 | **高 / 中** |
 | A2 | 隧道层可观测性 | metrics 只有 HTTP 层；QUIC 连接数/流数/重连次数无指标 | 加 `hlmg_quic_connections`、`hlmg_quic_streams`、`hlmg_agent_reconnects`（quic.rs/metrics.rs 挂钩） | 中 / 中 |
-| A3 | 错误类型化 | lib 层全部 `anyhow::Result`（错误无类型、无法 match） | 引入 `thiserror`：`GatewayError`/`AgentError`（Tunnel/Auth/Store…），anyhow 只留 main 入口 | 中 / 中 |
+| A3 ✅ | 错误类型化 | ~~全 anyhow~~ → `error.rs` 定义 `GatewayError`/`AgentError`（thiserror），Gateway/Agent::start 与 tls 配置返回类型化错误，anyhow 只留二进制入口 | 中 / 中 |
 | A4 | 配置热加载 | 配置只启动时读 | SIGHUP 重载运行时参数 | 低 / 高（**不做**） |
 | A5 | 健康检查深化 | `/healthz` 恒返 ok | 可选深度检查（QUIC endpoint 存活、agent 注册数） | 低 / 低 |
 
@@ -52,7 +52,7 @@
 - E1 CI（fmt/clippy/test 跑通）
 - E2/E3 工具链 + workspace lints
 
-**阶段 2 — 结构性重构**（约 2-3 天）
+**阶段 2 — 结构性重构 ✅ 已完成（2026-09）**
 - S1 gateway 模块拆分（http/config/keystore）
 - S3 配置解析独立化
 - A3 thiserror 错误类型化

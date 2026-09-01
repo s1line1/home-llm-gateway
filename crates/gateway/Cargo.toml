@@ -24,6 +24,7 @@ sha2 = "0.10"
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 tokio-stream = { workspace = true }
+thiserror = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["trace", "fs"] }
 tracing = { workspace = true }

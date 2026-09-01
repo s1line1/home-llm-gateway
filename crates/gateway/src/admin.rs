@@ -10,7 +10,7 @@ use axum::{
 use serde_json::json;
 
 use crate::http::AppState;
-use crate::keystore::constant_time_eq;
+use crate::keystore::hash::constant_time_eq;
 
 /// Admin 鉴权中间件：仅放行持有 admin token 的请求。
 pub async fn admin_auth(

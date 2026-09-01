@@ -557,3 +557,5 @@ mod tests {
         assert!(Agent::start(cfg).is_err(), "invalid key should fail start");
     }
 }
+pub mod config;
+pub mod error;
