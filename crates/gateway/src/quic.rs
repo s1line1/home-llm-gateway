@@ -4,17 +4,21 @@ use proto::{io::read_frame, Frame};
 use quinn::Connection;
 use tracing::{debug, info, warn};
 
+use crate::metrics::Metrics;
 use crate::registry::Registry;
 
-pub async fn accept_loop(endpoint: quinn::Endpoint, registry: Registry) {
+pub async fn accept_loop(endpoint: quinn::Endpoint, registry: Registry, metrics: Metrics) {
     while let Some(incoming) = endpoint.accept().await {
         let registry = registry.clone();
+        let metrics = metrics.clone();
         tokio::spawn(async move {
             match incoming.await {
                 Ok(conn) => {
+                    metrics.agent_connected();
                     if let Err(e) = handle_conn(conn, registry).await {
                         warn!("agent connection error: {e}");
                     }
+                    metrics.agent_disconnected();
                 }
                 Err(e) => warn!("connection attempt failed: {e}"),
             }

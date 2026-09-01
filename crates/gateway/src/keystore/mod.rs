@@ -18,13 +18,13 @@ use std::{
     collections::HashMap,
     path::PathBuf,
     sync::{Arc, Mutex, RwLock},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
-use argon2::Argon2;
 use rusqlite::Connection;
-use sha2::{Digest, Sha256};
+
+pub mod hash;
+
+use crate::keystore::hash::{generate_id_key, hash_argon2, lookup_of, now_secs, verify_argon2};
 
 #[derive(Clone)]
 pub struct KeyStore {
@@ -300,75 +300,6 @@ fn load_keys(conn: &Connection) -> rusqlite::Result<HashMap<String, KeyRecord>> 
 
 /// argon2id 哈希（默认参数 m=19456/t=2/p=1，OWASP 建议）。
 /// 失败仅可能发生在参数非法时——默认参数必然合法，故 expect。
-fn hash_argon2(token: &str) -> String {
-    // 盐用项目已有的 getrandom（0.3）生成，避免引入 rand_core 的 getrandom 版本纠缠；
-    // 16 字节盐是 argon2 推荐长度。
-    let mut salt_bytes = [0u8; 16];
-    getrandom::fill(&mut salt_bytes).expect("os rng");
-    let salt = SaltString::encode_b64(&salt_bytes).expect("16-byte salt is valid b64");
-    Argon2::default()
-        .hash_password(token.as_bytes(), &salt)
-        .expect("argon2 hashing with default params cannot fail")
-        .to_string()
-}
-
-/// 校验 token 是否匹配存储的 argon2 哈希（PHC 字符串内嵌参数，未来调参不影响旧记录）。
-fn verify_argon2(token: &str, encoded: &str) -> bool {
-    let parsed = match PasswordHash::new(encoded) {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
-    Argon2::default()
-        .verify_password(token.as_bytes(), &parsed)
-        .is_ok()
-}
-
-/// 快速索引：sha256(明文 key) 的十六进制。
-fn lookup_of(token: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(token.as_bytes());
-    hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
-}
-
-fn generate_id_key() -> (String, String) {
-    let mut id_buf = [0u8; 4];
-    let mut key_buf = [0u8; 24];
-    getrandom::fill(&mut id_buf).expect("os rng");
-    getrandom::fill(&mut key_buf).expect("os rng");
-    let id = format!("{:08x}", u32::from_be_bytes(id_buf));
-    let key = format!(
-        "sk-{}",
-        key_buf
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>()
-    );
-    (id, key)
-}
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-/// 恒定时间比较，防时序侧信道（仍用于 admin token 比较）。
-pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

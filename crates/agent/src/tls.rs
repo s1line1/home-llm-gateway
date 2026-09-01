@@ -14,7 +14,7 @@ pub fn client_config(
     ca: &[CertificateDer<'static>],
     cert: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
-) -> anyhow::Result<quinn::ClientConfig> {
+) -> Result<quinn::ClientConfig, crate::error::AgentError> {
     let mut roots = RootCertStore::empty();
     for c in ca {
         roots.add(c.clone())?;
@@ -23,11 +23,16 @@ pub fn client_config(
         .with_root_certificates(roots)
         .with_client_auth_cert(cert, key)?;
     tls.alpn_protocols = vec![b"h3".to_vec()];
-    let quic = QuicClientConfig::try_from(tls)?;
+    let quic = QuicClientConfig::try_from(tls)
+        .map_err(|e| crate::error::AgentError::Other(format!("quic config: {e}")))?;
 
     let mut transport = quinn::TransportConfig::default();
     transport.keep_alive_interval(Some(Duration::from_secs(5)));
-    transport.max_idle_timeout(Some(Duration::from_secs(20).try_into()?));
+    transport.max_idle_timeout(Some(
+        Duration::from_secs(20)
+            .try_into()
+            .map_err(|e| crate::error::AgentError::Other(format!("transport: {e}")))?,
+    ));
 
     let mut cfg = quinn::ClientConfig::new(Arc::new(quic));
     cfg.transport_config(Arc::new(transport));

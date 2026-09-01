@@ -1,6 +1,7 @@
 //! cloud-gateway：公网 OpenAI 兼容入口（可选 HTTPS）+ QUIC 隧道服务端。
 
 pub mod admin;
+pub mod error;
 pub mod http;
 pub mod keystore;
 pub mod metrics;
@@ -61,7 +62,7 @@ pub struct Gateway {
 }
 
 impl Gateway {
-    pub async fn start(cfg: GatewayConfig) -> anyhow::Result<Self> {
+    pub async fn start(cfg: GatewayConfig) -> Result<Self, crate::error::GatewayError> {
         // 显式安装 ring 为进程默认 crypto provider，保证各 rustls 使用方一致
         let _ = rustls::crypto::ring::default_provider().install_default();
 
@@ -84,6 +85,7 @@ impl Gateway {
             }
         });
 
+        let metrics = Metrics::default();
         let state = http::AppState {
             registry: registry.clone(),
             key_store: KeyStore::new(cfg.keys_file.clone()),
@@ -91,7 +93,7 @@ impl Gateway {
             timeout: cfg.request_timeout,
             agent_stale_after: cfg.agent_stale_after,
             rate_limiter: RateLimiter::new(cfg.rate_limit_per_min),
-            metrics: Metrics::default(),
+            metrics: metrics.clone(),
             ui,
         };
         let app = http::app(state);
@@ -118,6 +120,7 @@ impl Gateway {
         tasks.push(tokio::spawn(quic::accept_loop(
             endpoint.clone(),
             registry.clone(),
+            metrics,
         )));
 
         Ok(Self {
@@ -171,3 +174,5 @@ async fn serve_https(
         });
     }
 }
+pub mod config;
+pub mod http_proxy;

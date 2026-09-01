@@ -10,7 +10,7 @@ use axum::{
 use serde_json::json;
 
 use crate::http::AppState;
-use crate::keystore::constant_time_eq;
+use crate::keystore::hash::constant_time_eq;
 
 /// Admin 鉴权中间件：仅放行持有 admin token 的请求。
 pub async fn admin_auth(
@@ -72,7 +72,18 @@ pub async fn create_key(
         )
             .into_response();
     }
-    let created = state.key_store.create(name);
+    // argon2 哈希 + SQLite 写穿较重，移到阻塞线程池，避免卡 async worker
+    let store = state.key_store.clone();
+    let created = match tokio::task::spawn_blocking(move || store.create(name)).await {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": { "message": format!("key creation failed: {e}"), "type": "gateway_error" } })),
+            )
+                .into_response();
+        }
+    };
     (
         StatusCode::CREATED,
         Json(json!({
@@ -88,7 +99,18 @@ pub async fn create_key(
 
 /// 吊销 key。
 pub async fn delete_key(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    if state.key_store.delete(&id) {
+    let store = state.key_store.clone();
+    let removed = match tokio::task::spawn_blocking(move || store.delete(&id)).await {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": { "message": format!("key deletion failed: {e}"), "type": "gateway_error" } })),
+            )
+                .into_response();
+        }
+    };
+    if removed {
         StatusCode::NO_CONTENT.into_response()
     } else {
         (
