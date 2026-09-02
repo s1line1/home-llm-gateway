@@ -26,6 +26,18 @@
       方案 B：文档化前置 claude-code-router / LiteLLM 翻译层的部署方式
 - [ ] **接入文档**：README/DEPLOY 增加 DSH（`DEEPSEEK_BASE_URL`）、Codex（`OPENAI_BASE_URL`）、
       Claude Code（`ANTHROPIC_BASE_URL` 或 router）的配置示例与模型名约定
+- [x] **OpenAI 兼容错误语义标准化（2026-09 实施）**：对照 OpenAI 协议修补三处，
+      SDK/工具按 error.type 与 Retry-After 决定重试行为：
+      1. **error.type 按状态码映射**（`http_proxy::error_response`）：400→
+         `invalid_request_error`、401→`authentication_error`、403→`permission_error`、
+         404→`not_found_error`、409→`conflict_error`、429→`rate_limit_error`、
+         5xx→`server_error`、其余→`api_error`
+      2. **429 响应带 `Retry-After: 60`**（限流/配额拒绝，SDK/脚本退避依赖）
+      3. **`x-request-id` 响应头**：metrics_middleware 生成/透传（客户端自带则沿用），
+         并写入站 headers 供 proxy 复用为隧道 request_id——HTTP 层/隧道帧/日志
+         三方对账一致；proxy 无该头时自增兜底
+      （测试：error.type 映射单测 + 429 Retry-After 单测 + x-request-id 中间件单测 +
+       e2e `e2e_openai_error_semantics`：401/400/404/429/503 各状态码的 type 与头）
 
 ## P1 — 运维与健壮性
 
@@ -95,6 +107,22 @@
 - [ ] **健康上报驱动的更精细路由**（DESIGN.md §9 M4 待办）：当前按在途请求数最少路由，
       后续可结合 agent 心跳上报的延迟/队列深度
 - [ ] **Grafana 仪表盘模板**（DESIGN.md §9 M4 待办）：消费 `/metrics` 指标
+- [ ] **key 禁用/启用 toggle（B 档，可选）**：`KeyRecord.enabled` 字段已存在但 admin API
+      只有创建/删除——补 `POST /admin/keys/{id}/disable|enable`（"暂时停用"不吊销），
+      10 分钟级改动
+- [ ] **HTTP 层总并发 admission（B 档，可选）**：现有限流是 per-key（令牌桶）——
+      多个 key 总和仍可压垮单实例。补网关**全局在途上限**（HTTP 入口级，类似 agent 级
+      admission）；metrics 的 active_requests 已可观测，实施是加"超限即拒"判断
+- [ ] **请求体大小限制可配置（C 档，可选）**：`DefaultBodyLimit::max(16MB)` 硬编码
+      （http.rs）——多模态图像/大上下文请求 413 无法调；config 加字段即可
+- [ ] **首次部署 bootstrap（B 档，可选）**：第一个 API key 目前必须走 admin API
+      （admin_token 配置文件明文）；考虑"首次启动自动建默认 key"或引导提示
+- [ ] **usage 数据保留策略（B 档，可选）**：`key_usage` 无限累积（reset 是待定项）——
+      长时间运行表会涨；建议与 reset 一并设计保留窗口/归档
+- [ ] **Dockerfile / docker-compose（C 档，可选）**：当前部署是 systemd + 手动传文件
+      （DEPLOY.md）；容器化需多阶段构建含 web/dist
+- [ ] **结构化访问日志 JSONL（C 档，可选）**：tracing 文本日志给人看；如需审计
+      "谁何时调了什么"可加 JSON 行落盘
 - [ ] **keys.db 迁移规模化**：当前自动迁移（`keystore.rs::migrate_legacy_keys`）同步执行、
       全量读入内存 + 单一大事务——仅适合小数据量 / 个人 / 小团队（适用边界见 DEPLOY.md §10）。
       改进：① **分批流式**：cursor 每批 ~500 条、小事务提交、内存有界（低成本，建议先做）；
