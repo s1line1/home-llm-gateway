@@ -4,7 +4,7 @@ import { useCallback, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { createKey, deleteKey, listKeys } from "../api/client";
-import type { CreatedKey } from "../api/types";
+import type { CreatedKey, KeyUsage } from "../api/types";
 import { useAdminToken } from "../hooks/useAdminToken";
 import { Button, Card, EmptyState } from "../components/ui";
 
@@ -104,6 +104,8 @@ export default function Keys() {
                   <th className="pb-2 pr-4 font-medium">名称</th>
                   <th className="pb-2 pr-4 font-medium">ID</th>
                   <th className="pb-2 pr-4 font-medium">前缀</th>
+                  <th className="pb-2 pr-4 font-medium">用量（token）</th>
+                  <th className="pb-2 pr-4 font-medium">请求数</th>
                   <th className="pb-2 pr-4 font-medium">创建时间</th>
                   <th className="pb-2 pr-4 font-medium">状态</th>
                   <th className="pb-2 font-medium" />
@@ -115,6 +117,10 @@ export default function Keys() {
                     <td className="py-2.5 pr-4 font-medium text-slate-800">{k.name}</td>
                     <td className="py-2.5 pr-4 font-mono text-xs text-slate-500">{k.id}</td>
                     <td className="py-2.5 pr-4 font-mono text-xs text-slate-500">{k.prefix}</td>
+                    <td className="py-2.5 pr-4 text-slate-600">
+                      {formatTokens(k.usage)}
+                    </td>
+                    <td className="py-2.5 pr-4 text-slate-600">{k.usage.requests}</td>
                     <td className="py-2.5 pr-4 text-slate-600">
                       {new Date(k.created_at * 1000).toLocaleString()}
                     </td>
@@ -144,5 +150,20 @@ export default function Keys() {
         )}
       </Card>
     </div>
+  );
+}
+
+/** 用量列展示：prompt + completion + total，估算请求带 ~ 提示。 */
+function formatTokens(u: KeyUsage) {
+  if (u.requests === 0) return <span className="text-slate-300">—</span>;
+  const est = u.estimated_requests > 0 ? `（含 ${u.estimated_requests} 次估算）` : "";
+  return (
+    <span title={`prompt ${u.prompt_tokens} / completion ${u.completion_tokens}${est}`}>
+      {u.total_tokens.toLocaleString()}
+      <span className="text-slate-400"> = {u.prompt_tokens.toLocaleString()} in + {u.completion_tokens.toLocaleString()} out</span>
+      {u.estimated_requests > 0 && (
+        <span className="ml-1 text-amber-500" title="上游未提供 usage，按估算降级">~</span>
+      )}
+    </span>
   );
 }

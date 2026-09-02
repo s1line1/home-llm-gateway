@@ -1,5 +1,17 @@
 // 网关 API 数据类型（与 crates/gateway/src 的 JSON 契约对齐）。
 
+/** 每个 API key 的 token 用量（/admin/keys 内嵌 + /admin/usage）。 */
+export interface KeyUsage {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  requests: number;
+  /** 其中多少次请求走了估算降级（上游未提供 usage）。 */
+  estimated_requests: number;
+  /** 最后使用时间（unix 秒；无请求为 0）。 */
+  last_used_at: number;
+}
+
 /** GET /admin/keys 返回的 key 记录（明文不落盘，prefix 为固定掩码）。 */
 export interface ApiKey {
   id: string;
@@ -7,6 +19,20 @@ export interface ApiKey {
   created_at: number;
   enabled: boolean;
   prefix: string;
+  /** 用量汇总（无记录时各字段为 0）。 */
+  usage: KeyUsage;
+}
+
+/** /admin/usage 的单条记录（含已吊销 key 的历史，可审计）。 */
+export interface UsageRecord {
+  key_id: string;
+  name: string;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  requests: number;
+  estimated_requests: number;
+  last_used_at: number;
 }
 
 /** POST /admin/keys 创建成功时返回（明文 key 仅此一次展示）。 */

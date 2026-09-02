@@ -17,10 +17,14 @@
 use std::{
     collections::HashMap,
     path::PathBuf,
-    sync::{Arc, Mutex, RwLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, RwLock,
+    },
 };
 
 use rusqlite::Connection;
+use serde::Serialize;
 
 pub mod hash;
 
@@ -36,6 +40,8 @@ struct KeyStoreInner {
     runtime: RwLock<HashMap<String, KeyRecord>>,
     /// SQLite 持久化连接（None = 仅内存，如 db 打开失败时降级）。
     db: Mutex<Option<Connection>>,
+    /// per-key 用量（key = key id；吊销 key 后记录保留，可审计）。
+    usage: RwLock<HashMap<String, Arc<KeyUsageCell>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -56,6 +62,54 @@ pub struct CreatedKey {
     pub plaintext: String,
 }
 
+/// 每 key 的用量明细（/admin/usage 序列化用）。
+#[derive(Debug, Clone, Serialize)]
+pub struct KeyUsageInfo {
+    pub key_id: String,
+    /// key 名称快照（吊销后仍可审计名称）。
+    pub name: String,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    pub requests: u64,
+    /// 其中多少次请求走了估算降级（上游未提供 usage）。
+    pub estimated_requests: u64,
+    /// 最后使用时间（unix 秒）。
+    pub last_used_at: u64,
+}
+
+/// 用量累计单元：原子字段，热路径无锁累加。name 为创建时快照（吊销后仍可审计）。
+pub struct KeyUsageCell {
+    name: Mutex<String>,
+    prompt_tokens: AtomicU64,
+    completion_tokens: AtomicU64,
+    requests: AtomicU64,
+    estimated_requests: AtomicU64,
+    last_used_at: AtomicU64,
+}
+
+impl Default for KeyUsageCell {
+    fn default() -> Self {
+        Self {
+            name: Mutex::new(String::new()),
+            prompt_tokens: AtomicU64::new(0),
+            completion_tokens: AtomicU64::new(0),
+            requests: AtomicU64::new(0),
+            estimated_requests: AtomicU64::new(0),
+            last_used_at: AtomicU64::new(0),
+        }
+    }
+}
+
+/// 一次请求的用量增量（usage 提取见 `crate::usage`）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UsageDelta {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    /// 是否估算来源（上游未提供 usage）。
+    pub estimated: bool,
+}
+
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS api_keys (
     id TEXT PRIMARY KEY,
     lookup TEXT NOT NULL UNIQUE,
@@ -65,30 +119,52 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS api_keys (
     enabled INTEGER NOT NULL DEFAULT 1
 )";
 
+const USAGE_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS key_usage (
+    key_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL DEFAULT '',
+    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    requests INTEGER NOT NULL DEFAULT 0,
+    estimated_requests INTEGER NOT NULL DEFAULT 0,
+    last_used_at INTEGER NOT NULL DEFAULT 0
+)";
+
 impl KeyStore {
     pub fn new(file: Option<PathBuf>) -> Self {
         let db = match &file {
             Some(path) => match Connection::open(path) {
-                Ok(mut conn) => match conn.execute_batch(SCHEMA) {
-                    Ok(()) => {
-                        // 旧版库（明文 key 表，无 lookup 列）→ 无损迁移为 argon2 哈希
-                        match migrate_legacy_keys(&mut conn) {
-                            Ok(0) => {}
-                            Ok(n) => tracing::info!(
-                                count = n,
-                                "migrated legacy plaintext keys to argon2 hashes"
-                            ),
-                            Err(e) => {
-                                tracing::warn!("keys db migration failed: {e}; using empty store");
+                Ok(mut conn) => {
+                    let init = (|| {
+                        conn.execute_batch(SCHEMA)?;
+                        conn.execute_batch(USAGE_SCHEMA)?;
+                        Ok::<_, rusqlite::Error>(())
+                    })();
+                    match init {
+                        Ok(()) => {
+                            // 旧版库（明文 key 表，无 lookup 列）→ 无损迁移为 argon2 哈希
+                            match migrate_legacy_keys(&mut conn) {
+                                Ok(0) => {}
+                                Ok(n) => tracing::info!(
+                                    count = n,
+                                    "migrated legacy plaintext keys to argon2 hashes"
+                                ),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "keys db migration failed: {e}; using empty store"
+                                    );
+                                }
                             }
+                            Some(conn)
                         }
-                        Some(conn)
+                        Err(e) => {
+                            tracing::warn!(
+                                "keys db {:?} init failed: {e}; using memory only",
+                                path
+                            );
+                            None
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!("keys db {:?} init failed: {e}; using memory only", path);
-                        None
-                    }
-                },
+                }
                 Err(e) => {
                     tracing::warn!("keys db {:?} open failed: {e}; using memory only", path);
                     None
@@ -106,21 +182,42 @@ impl KeyStore {
             },
             None => HashMap::new(),
         };
+        let usage = match &db {
+            Some(conn) => match load_usage(conn) {
+                Ok(map) => map,
+                Err(e) => {
+                    tracing::warn!("usage db load failed: {e}; using empty usage store");
+                    HashMap::new()
+                }
+            },
+            None => HashMap::new(),
+        };
         Self {
             inner: Arc::new(KeyStoreInner {
                 runtime: RwLock::new(runtime),
                 db: Mutex::new(db),
+                usage: RwLock::new(usage),
             }),
         }
     }
 
     /// 校验 token 是否为启用中的动态 key（sha256 定位 + argon2 校验）。
     pub fn authorize(&self, token: &str) -> bool {
+        self.authorize_record(token).is_some()
+    }
+
+    /// 校验并返回 key id（argon2 一次；authorize 的带返回值版本）。
+    pub fn authorize_id(&self, token: &str) -> Option<String> {
+        self.authorize_record(token).map(|r| r.id.clone())
+    }
+
+    /// 校验并返回 key 记录（argon2 一次）。
+    pub fn authorize_record(&self, token: &str) -> Option<KeyRecord> {
         let lookup = lookup_of(token);
         let runtime = self.inner.runtime.read().unwrap();
         match runtime.get(&lookup) {
-            Some(rec) => rec.enabled && verify_argon2(token, &rec.key_hash),
-            None => false,
+            Some(rec) if rec.enabled && verify_argon2(token, &rec.key_hash) => Some(rec.clone()),
+            _ => None,
         }
     }
 
@@ -202,6 +299,139 @@ impl KeyStore {
         }
         removed
     }
+
+    /// 记录一次请求的用量（内存原子累加 + SQLite 写穿）。
+    /// 吊销的 key 也有可能在途请求刚结束——按 key_id 独立累计，记录保留可审计。
+    pub fn record_usage(&self, key_id: &str, name: &str, delta: &UsageDelta) {
+        let cell = {
+            let usage = self.inner.usage.read().unwrap();
+            usage.get(key_id).cloned()
+        };
+        let cell = match cell {
+            Some(c) => c,
+            None => {
+                let c = Arc::new(KeyUsageCell::default());
+                self.inner
+                    .usage
+                    .write()
+                    .unwrap()
+                    .entry(key_id.to_string())
+                    .or_insert_with(|| c.clone());
+                c
+            }
+        };
+        {
+            let mut n = cell.name.lock().unwrap();
+            if n.is_empty() {
+                *n = name.to_string();
+            }
+        }
+        let now = now_secs();
+        cell.prompt_tokens
+            .fetch_add(delta.prompt_tokens, Ordering::Relaxed);
+        cell.completion_tokens
+            .fetch_add(delta.completion_tokens, Ordering::Relaxed);
+        cell.requests.fetch_add(1, Ordering::Relaxed);
+        if delta.estimated {
+            cell.estimated_requests.fetch_add(1, Ordering::Relaxed);
+        }
+        cell.last_used_at.store(now, Ordering::Relaxed);
+
+        // SQLite 写穿（低 QPS 直接同步；高并发再优化为 spawn_blocking/批量 flush）
+        if let Some(conn) = self.inner.db.lock().unwrap().as_mut() {
+            let r = conn.execute(
+                "INSERT INTO key_usage
+                 (key_id, name, prompt_tokens, completion_tokens, requests, estimated_requests, last_used_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(key_id) DO UPDATE SET
+                   name = excluded.name,
+                   prompt_tokens = key_usage.prompt_tokens + excluded.prompt_tokens,
+                   completion_tokens = key_usage.completion_tokens + excluded.completion_tokens,
+                   requests = key_usage.requests + excluded.requests,
+                   estimated_requests = key_usage.estimated_requests + excluded.estimated_requests,
+                   last_used_at = excluded.last_used_at",
+                rusqlite::params![
+                    key_id,
+                    name,
+                    delta.prompt_tokens as i64,
+                    delta.completion_tokens as i64,
+                    1i64,
+                    delta.estimated as i64,
+                    now as i64
+                ],
+            );
+            if let Err(e) = r {
+                tracing::warn!("usage persist failed: {e}");
+            }
+        }
+    }
+
+    /// 单个 key 的用量快照（无记录 → None）。
+    pub fn usage_of(&self, key_id: &str) -> Option<KeyUsageInfo> {
+        let usage = self.inner.usage.read().unwrap();
+        let cell = usage.get(key_id)?;
+        Some(cell_to_info(key_id, cell))
+    }
+
+    /// 全部 key 的用量快照（按 key_id 排序）。
+    pub fn usage_snapshot(&self) -> Vec<KeyUsageInfo> {
+        let usage = self.inner.usage.read().unwrap();
+        let mut out: Vec<KeyUsageInfo> = usage
+            .iter()
+            .map(|(id, cell)| cell_to_info(id, cell))
+            .collect();
+        out.sort_by(|a, b| a.key_id.cmp(&b.key_id));
+        out
+    }
+}
+
+/// 把原子单元转成可序列化的明细。
+fn cell_to_info(key_id: &str, cell: &KeyUsageCell) -> KeyUsageInfo {
+    let prompt = cell.prompt_tokens.load(Ordering::Relaxed);
+    let completion = cell.completion_tokens.load(Ordering::Relaxed);
+    KeyUsageInfo {
+        key_id: key_id.to_string(),
+        name: cell.name.lock().unwrap().clone(),
+        prompt_tokens: prompt,
+        completion_tokens: completion,
+        total_tokens: prompt + completion,
+        requests: cell.requests.load(Ordering::Relaxed),
+        estimated_requests: cell.estimated_requests.load(Ordering::Relaxed),
+        last_used_at: cell.last_used_at.load(Ordering::Relaxed),
+    }
+}
+
+/// 从 SQLite 加载用量（key = key_id）。
+fn load_usage(conn: &Connection) -> rusqlite::Result<HashMap<String, Arc<KeyUsageCell>>> {
+    let mut stmt = conn.prepare(
+        "SELECT key_id, name, prompt_tokens, completion_tokens, requests, estimated_requests, last_used_at
+         FROM key_usage",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i64>(2)? as u64,
+            r.get::<_, i64>(3)? as u64,
+            r.get::<_, i64>(4)? as u64,
+            r.get::<_, i64>(5)? as u64,
+            r.get::<_, i64>(6)? as u64,
+        ))
+    })?;
+    let mut map = HashMap::new();
+    for row in rows {
+        let (id, name, prompt, completion, requests, estimated, last_used) = row?;
+        let cell = Arc::new(KeyUsageCell {
+            name: Mutex::new(name),
+            prompt_tokens: AtomicU64::new(prompt),
+            completion_tokens: AtomicU64::new(completion),
+            requests: AtomicU64::new(requests),
+            estimated_requests: AtomicU64::new(estimated),
+            last_used_at: AtomicU64::new(last_used),
+        });
+        map.insert(id, cell);
+    }
+    Ok(map)
 }
 
 /// 迁移旧版库（明文 key 表，无 lookup/key_hash 列）为 argon2 哈希存储。
@@ -395,6 +625,87 @@ mod tests {
         // 降级为仅内存后，动态 key 仍可用
         let created = store.create("mem".into());
         assert!(store.authorize(&created.plaintext));
+    }
+
+    #[test]
+    fn usage_accumulates_and_persists() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keys.db");
+        let store = KeyStore::new(Some(path.clone()));
+        let created = store.create("usage-test".into());
+        let id = created.record.id.clone();
+
+        // 3 次请求：2 次精确 usage + 1 次估算
+        store.record_usage(
+            &id,
+            "usage-test",
+            &UsageDelta {
+                prompt_tokens: 10,
+                completion_tokens: 20,
+                estimated: false,
+            },
+        );
+        store.record_usage(
+            &id,
+            "usage-test",
+            &UsageDelta {
+                prompt_tokens: 5,
+                completion_tokens: 5,
+                estimated: false,
+            },
+        );
+        store.record_usage(
+            &id,
+            "usage-test",
+            &UsageDelta {
+                prompt_tokens: 100,
+                completion_tokens: 50,
+                estimated: true,
+            },
+        );
+        let info = store.usage_of(&id).unwrap();
+        assert_eq!(info.prompt_tokens, 115);
+        assert_eq!(info.completion_tokens, 75);
+        assert_eq!(info.total_tokens, 190);
+        assert_eq!(info.requests, 3);
+        assert_eq!(info.estimated_requests, 1);
+        assert_eq!(info.name, "usage-test");
+        assert!(info.last_used_at > 0);
+
+        // 持久化：重载后用量仍在（吊销 key 也不丢记录，可审计）
+        drop(store);
+        let reloaded = KeyStore::new(Some(path.clone()));
+        let again = reloaded.usage_of(&id).unwrap();
+        assert_eq!(again.prompt_tokens, 115);
+        assert_eq!(again.completion_tokens, 75);
+        assert_eq!(again.requests, 3);
+        assert_eq!(again.estimated_requests, 1);
+
+        // 吊销 key 后 usage 记录仍保留（key 删了，用量表独立）
+        let store2 = KeyStore::new(Some(path.clone()));
+        store2.delete(&id);
+        drop(store2);
+        let store3 = KeyStore::new(Some(path));
+        let kept = store3.usage_of(&id).unwrap();
+        assert_eq!(kept.requests, 3, "usage survives key revocation");
+    }
+
+    #[test]
+    fn usage_in_memory_only_store() {
+        let store = KeyStore::new(None);
+        store.record_usage(
+            "mem-key",
+            "m",
+            &UsageDelta {
+                prompt_tokens: 1,
+                completion_tokens: 2,
+                estimated: false,
+            },
+        );
+        let info = store.usage_of("mem-key").unwrap();
+        assert_eq!(info.total_tokens, 3);
+        assert_eq!(store.usage_snapshot().len(), 1);
+        assert!(store.usage_of("ghost").is_none());
     }
 
     #[test]

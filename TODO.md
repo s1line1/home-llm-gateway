@@ -13,9 +13,11 @@
       （同模型内均衡）；`models: ["*"]` 全匹配；无 model → 400；模型无人能服务 → 404；
       `/v1/models` 改为网关聚合所有健康 edge 的显式声明模型（不再透传单台上游）。
       双 edge 异构模型 e2e 覆盖（路由正确性、聚合列表、404、400）
-- [ ] **实机验证链路**：本地起 gateway + mock-llm，用 curl 模拟 DSH/Codex 打全流程
-      （`/v1/models`、流式 chat、中途断开触发 Cancel），确认工具可直接连；
-      顺带确认 `/v1/models` 返回的上游模型名与工具端 `--model` 配置的对应关系
+- [x] **实机验证链路（生产拓扑，2026-09 实测）**：云端启动 gateway，本地 edge 节点跑
+      mock-llm + agent 拨号接入；**DSH/Codex 真实客户端** base_url 指向云端，**流式对话打通**
+      （认证 → 模型路由 → 隧道 → 上游 → SSE 回传 [DONE]），确认工具可直接连。
+      后续可选补：`/v1/models` 与工具端 `--model` 的对应关系文档化、实机断开触发 Cancel 复核
+      （后两者 e2e 已覆盖，属锦上添花）
 - [ ] **`/v1/responses`（OpenAI Responses API，Codex 新版）**：
       方案 A：网关内把 Responses 请求翻译为上游 chat/completions（含流式事件格式转换）；
       方案 B：确认上游（vLLM 等）原生支持后仅文档化。当前为纯透传，上游不支持即 404
@@ -52,28 +54,26 @@
       7. 分步：TrustStore+verifier → Admin API → SQLite 持久化 → e2e + 文档
          （README/DEPLOY/DESIGN 安全章节更新：每 agent 独立 CA 的管理模型与吊销语义）
 - [ ] **UDP 被封时的 TCP+TLS fallback**（DESIGN.md §10）：帧协议不变，仅替换 QUIC 传输层
-- [ ] **per-API-key token 用量计量**：
-      目标：按 API key 统计 token 消耗（prompt/completion/total + 请求数 + 最后使用时间），
+- [x] **per-API-key token 用量计量（2026-09 实施）**：
+      按 API key 统计 token 消耗（prompt/completion/total + 请求数 + 最后使用时间），
       Admin API 可查询、Keys 页展示；吊销 key 后用量记录仍保留（可审计）。
-      **设计要点（已定稿）**：
-      1. 数据来源：网关透传层提取上游响应的 `usage` 字段（OpenAI 兼容：非流式 JSON 里有；
-         流式在最后一个 chunk 通常带 usage）；上游无 usage 时降级为估算（字符数/4，中文按字符），
-         数据标记估算来源
-      2. 流式性能：SSE 逐块转发时**先 `contains("usage")` 字符串预过滤**，命中才 JSON 解析，
-         避免每块全量解析（99% chunk 零开销）；取消/断流请求按已转发字节估算 completion
-      3. 存储：keys.db 新表 `key_usage(key_id PK, prompt_tokens, completion_tokens,
-         total_tokens, requests, last_used_at)`；热路径内存
-         `RwLock<HashMap<key_id, Mutex<Usage>>>`（AtomicU64 无锁累加），每请求结束写穿 SQLite；
-         高并发再优化为 spawn_blocking/批量 flush（见 keys.db 迁移条目）
-      4. API/UI：`GET /admin/usage` 每 key 用量汇总；`GET /admin/keys` 响应可选带 usage；
-         Keys 页加用量列；`POST /admin/usage/reset` 留后期
-      5. 范围：本次只做**计量**（统计+查询+展示）；配额/超限拒绝（key 设 quota 超限 429）
-         明确排除，留到多租户阶段（DESIGN.md §11.3 两级限流）
-      6. 测试：单测（非流式 JSON usage 提取、流式 usage chunk 提取、无 usage 估算降级、
-         并发累加正确性）；e2e（打请求后 /admin/usage 与 mock-llm 返回的 usage 一致、
-         吊销后记录仍可查）
-      7. 分步：usage 提取模块（透传层挂钩）→ 内存累加 + SQLite 持久化 →
-         /admin/usage + Keys 页展示 → e2e + 文档
+      **实现（与定稿设计的差异已标注）**：
+      1. 数据来源：`crates/gateway/src/usage.rs` 透传层提取——非流式整包缓冲后解析
+         JSON usage；流式逐块 `contains("usage")` 预过滤 + SSE data 行级解析（零开销快路径）；
+         上游无 usage / 取消 / 断流 → 估算（prompt 按请求体 messages 字符 /4、
+         completion 按已转发字节 /4），`estimated_requests` 计数标记
+      2. 存储：keys.db 新表 `key_usage(key_id PK, name, prompt_tokens, completion_tokens,
+         requests, estimated_requests, last_used_at)`（**实现加了 name 快照与
+         estimated_requests 列**，吊销后名称仍可审计）；热路径内存
+         `RwLock<HashMap<key_id, Arc<KeyUsageCell>>>`（AtomicU64 无锁累加），
+         每请求结束写穿 SQLite（UPSERT 增量）
+      3. API/UI：`GET /admin/usage` 全部 key 汇总（含已吊销）；`GET /admin/keys` 每项内嵌
+         `usage`；Keys 页加用量列（total + in/out，估算带 `~` 标记）；
+         `POST /admin/usage/reset` 留后期
+      4. 范围：只做**计量**（统计+查询+展示）；配额/超限拒绝排除，留多租户阶段
+      5. 测试：单测（usage.rs 提取/SSE 行/无 usage 估算 ×6、keystore 累加+持久化+
+         吊销保留 ×2）；e2e `e2e_usage_metering`（打 2 次请求 → /admin/usage 与
+         mock 返回的 usage 一致、/admin/keys 内嵌一致、吊销后记录仍可查）
 - [ ] **健康上报驱动的更精细路由**（DESIGN.md §9 M4 待办）：当前按在途请求数最少路由，
       后续可结合 agent 心跳上报的延迟/队列深度
 - [ ] **Grafana 仪表盘模板**（DESIGN.md §9 M4 待办）：消费 `/metrics` 指标

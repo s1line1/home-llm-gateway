@@ -37,18 +37,57 @@ pub async fn admin_auth(
 }
 
 /// 列出所有动态 key（不暴露明文；明文不落盘后无法显示真实前缀，用固定掩码）。
+/// 每项附带该 key 的用量汇总（无记录时为 0）。
 pub async fn list_keys(State(state): State<AppState>) -> Json<serde_json::Value> {
     let out: Vec<serde_json::Value> = state
         .key_store
         .list()
         .into_iter()
         .map(|r| {
+            let usage = state.key_store.usage_of(&r.id);
             json!({
                 "id": r.id,
                 "name": r.name,
                 "created_at": r.created_at,
                 "enabled": r.enabled,
                 "prefix": "sk-••••",
+                "usage": usage.map(|u| json!({
+                    "prompt_tokens": u.prompt_tokens,
+                    "completion_tokens": u.completion_tokens,
+                    "total_tokens": u.total_tokens,
+                    "requests": u.requests,
+                    "estimated_requests": u.estimated_requests,
+                    "last_used_at": u.last_used_at,
+                })).unwrap_or_else(|| json!({
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                    "requests": 0,
+                    "estimated_requests": 0,
+                    "last_used_at": 0,
+                })),
+            })
+        })
+        .collect();
+    Json(json!(out))
+}
+
+/// 全部 key 的用量汇总（含已吊销 key 的历史记录，可审计）。
+pub async fn usage_route(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let out: Vec<serde_json::Value> = state
+        .key_store
+        .usage_snapshot()
+        .into_iter()
+        .map(|u| {
+            json!({
+                "key_id": u.key_id,
+                "name": u.name,
+                "prompt_tokens": u.prompt_tokens,
+                "completion_tokens": u.completion_tokens,
+                "total_tokens": u.total_tokens,
+                "requests": u.requests,
+                "estimated_requests": u.estimated_requests,
+                "last_used_at": u.last_used_at,
             })
         })
         .collect();
@@ -92,6 +131,15 @@ pub async fn create_key(
             "name": created.record.name,
             "created_at": created.record.created_at,
             "enabled": created.record.enabled,
+            "prefix": "sk-••••",
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "requests": 0,
+                "estimated_requests": 0,
+                "last_used_at": 0,
+            },
         })),
     )
         .into_response()
