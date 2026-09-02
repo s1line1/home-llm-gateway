@@ -28,6 +28,9 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: License check (cargo-deny)
+        uses: EmbarkStudios/cargo-deny-action@v2
+
       - name: Test
         run: cargo test --workspace
 

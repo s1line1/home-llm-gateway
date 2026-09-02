@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# git pre-commit hook：提交前质量门（许可证 + 格式）。
+# 启用：git config core.hooksPath scripts/git-hooks
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+echo "==> cargo-deny: advisories + bans + licenses + sources"
+cargo deny check
+
+echo "==> cargo fmt --check"
+cargo fmt --check

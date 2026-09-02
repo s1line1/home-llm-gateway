@@ -52,6 +52,9 @@ fmt: ## 检查代码格式（cargo fmt --check）
 clippy: ## clippy 检查（-D warnings，与 CI 同等门槛）
 	cargo clippy --workspace --all-targets -- -D warnings
 
+deny: ## 依赖许可证检查（cargo-deny，提交前 hook 同款）
+	cargo deny check licenses
+
 check: fmt clippy test web-build ## 一键全量验证（格式 + clippy + 测试 + 前端构建，同 CI）
 
 test: ## 运行全部 Rust 测试（含 e2e）
