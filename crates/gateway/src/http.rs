@@ -207,18 +207,40 @@ async fn metrics_route(State(state): State<AppState>, headers: HeaderMap) -> Res
     state.metrics.render(state.registry.len()).into_response()
 }
 
-/// 记录请求状态码与耗时（/metrics 自身不计入）。
-async fn metrics_middleware(State(state): State<AppState>, req: Request, next: Next) -> Response {
+/// 记录请求状态码与耗时（/metrics 自身不计入），并为每个请求生成/透传
+/// `x-request-id`（响应头 + 写进入站 headers 供 proxy 复用为隧道 request_id，
+/// 使 HTTP 层、隧道层、日志三方对账一致）。
+async fn metrics_middleware(
+    State(state): State<AppState>,
+    mut req: Request,
+    next: Next,
+) -> Response {
     if req.uri().path() == "/metrics" {
         return next.run(req).await;
     }
+    // 客户端自带 x-request-id 则沿用（幂等重试对账），否则分配
+    let request_id = match req.headers().get("x-request-id") {
+        Some(v) => v.to_str().unwrap_or_default().to_string(),
+        None => {
+            let id = NEXT_REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let id = format!("req-{id}");
+            if let Ok(v) = axum::http::HeaderValue::from_str(&id) {
+                req.headers_mut().insert("x-request-id", v);
+            }
+            id
+        }
+    };
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let start = state.metrics.record_start();
-    let resp = next.run(req).await;
+    let mut resp = next.run(req).await;
     let status = resp.status().as_u16();
     state.metrics.record_end(start, status);
+    if let Ok(v) = axum::http::HeaderValue::from_str(&request_id) {
+        resp.headers_mut().insert("x-request-id", v);
+    }
     info!(
+        request_id = %request_id,
         method = %method,
         path = %path,
         status,
@@ -227,6 +249,8 @@ async fn metrics_middleware(State(state): State<AppState>, req: Request, next: N
     );
     resp
 }
+
+static NEXT_REQUEST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 #[cfg(test)]
 mod tests {
@@ -303,6 +327,54 @@ mod tests {
         let _router = app(test_state(Some(dir.path().to_path_buf())));
         // 未配 ui_dir 时走 ui_missing 占位页分支
         let _router2 = app(test_state(None));
+    }
+
+    #[tokio::test]
+    async fn x_request_id_generated_and_echoed() {
+        // /healthz 经 metrics_middleware：响应带 x-request-id；客户端自带则沿用
+        let router = app(test_state(None));
+
+        // 无自带 → 生成 req-N 并回显
+        let resp = router
+            .clone()
+            .oneshot(
+                axum::extract::Request::builder()
+                    .uri("/healthz")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let rid = resp
+            .headers()
+            .get("x-request-id")
+            .expect("x-request-id set on response")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(rid.starts_with("req-"), "generated id format req-N: {rid}");
+
+        // 客户端自带 → 沿用（幂等重试对账）
+        let resp = router
+            .oneshot(
+                axum::extract::Request::builder()
+                    .uri("/healthz")
+                    .header("x-request-id", "req-999")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.headers()
+                .get("x-request-id")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "req-999",
+            "client-supplied id is echoed"
+        );
     }
 
     /// 构造 ui_fallback 的请求并返回响应。

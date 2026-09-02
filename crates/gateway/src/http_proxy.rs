@@ -24,12 +24,45 @@ use crate::registry::AcquireError;
 
 static NEXT_REQUEST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// OpenAI 兼容错误响应：`error.type` 按状态码映射（SDK 据此决定重试/报错语义），
+/// 429 自动带 `Retry-After`（秒）供退避。
 fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
-    (
-        status,
-        Json(json!({ "error": { "message": message.into(), "type": "gateway_error" } })),
-    )
-        .into_response()
+    let body = Json(json!({
+        "error": {
+            "message": message.into(),
+            "type": openai_error_type(status),
+        }
+    }));
+    let mut builder = Response::builder().status(status);
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        builder = builder.header(axum::http::header::RETRY_AFTER, "60");
+    }
+    builder
+        .body(body.into_response().into_body())
+        .unwrap_or_else(|e| {
+            // builder 失败（理论不发生）：退回无头响应，保证错误仍能送达
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(axum::body::Body::from(format!(
+                    "error building response: {e}"
+                )))
+                .unwrap()
+        })
+}
+
+/// OpenAI error.type 语义（https://platform.openai.com/docs/guides/error-codes）：
+/// SDK 对 429/5xx 自动重试，对 4xx（除 429）不重试——type 必须与状态码一致。
+fn openai_error_type(status: StatusCode) -> &'static str {
+    match status.as_u16() {
+        400 => "invalid_request_error",
+        401 => "authentication_error",
+        403 => "permission_error",
+        404 => "not_found_error",
+        409 => "conflict_error",
+        429 => "rate_limit_error",
+        500..=599 => "server_error",
+        _ => "api_error",
+    }
 }
 
 /// 校验 Bearer API Key（静态或动态 key）；通过时返回 (key_id, key_name, token)。
@@ -112,7 +145,14 @@ pub async fn proxy(
         Some(q) => format!("{}?{q}", uri.path()),
         None => uri.path().to_string(),
     };
-    let request_id = NEXT_REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // 隧道 request_id 复用 HTTP 层 x-request-id 的数字部分（metrics_middleware 注入，
+    // 格式 req-{n}）——HTTP 日志 / 隧道帧 / 响应头三方对账一致；无该头时自增兜底。
+    let request_id = headers
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("req-"))
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or_else(|| NEXT_REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
 
     let (mut send, mut recv) = match entry.conn.open_bi().await {
         Ok(s) => s,
@@ -451,5 +491,52 @@ mod tests {
         assert!(extract_model(br#"{"model":""}"#).is_err());
         // 非法 JSON → Err
         assert!(extract_model(b"not json").is_err());
+    }
+
+    #[test]
+    fn error_type_maps_to_openai_semantics() {
+        // 各状态码 → OpenAI error.type（SDK 据此决定是否自动重试）
+        assert_eq!(
+            openai_error_type(StatusCode::BAD_REQUEST),
+            "invalid_request_error"
+        );
+        assert_eq!(
+            openai_error_type(StatusCode::UNAUTHORIZED),
+            "authentication_error"
+        );
+        assert_eq!(openai_error_type(StatusCode::FORBIDDEN), "permission_error");
+        assert_eq!(openai_error_type(StatusCode::NOT_FOUND), "not_found_error");
+        assert_eq!(openai_error_type(StatusCode::CONFLICT), "conflict_error");
+        assert_eq!(
+            openai_error_type(StatusCode::TOO_MANY_REQUESTS),
+            "rate_limit_error"
+        );
+        assert_eq!(openai_error_type(StatusCode::BAD_GATEWAY), "server_error");
+        assert_eq!(
+            openai_error_type(StatusCode::SERVICE_UNAVAILABLE),
+            "server_error"
+        );
+        assert_eq!(openai_error_type(StatusCode::OK), "api_error");
+    }
+
+    #[tokio::test]
+    async fn error_response_carries_type_and_retry_after_on_429() {
+        let resp = error_response(StatusCode::BAD_REQUEST, "bad");
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+
+        // 429 必须带 Retry-After（SDK/脚本退避依赖）
+        let resp = error_response(StatusCode::TOO_MANY_REQUESTS, "slow down");
+        assert_eq!(
+            resp.headers().get(axum::http::header::RETRY_AFTER),
+            Some(&axum::http::HeaderValue::from_static("60"))
+        );
+        // 非 429 不带 Retry-After
+        let resp = error_response(StatusCode::BAD_REQUEST, "bad");
+        assert!(resp
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .is_none());
     }
 }

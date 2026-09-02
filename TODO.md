@@ -26,6 +26,18 @@
       方案 B：文档化前置 claude-code-router / LiteLLM 翻译层的部署方式
 - [ ] **接入文档**：README/DEPLOY 增加 DSH（`DEEPSEEK_BASE_URL`）、Codex（`OPENAI_BASE_URL`）、
       Claude Code（`ANTHROPIC_BASE_URL` 或 router）的配置示例与模型名约定
+- [x] **OpenAI 兼容错误语义标准化（2026-09 实施）**：对照 OpenAI 协议修补三处，
+      SDK/工具按 error.type 与 Retry-After 决定重试行为：
+      1. **error.type 按状态码映射**（`http_proxy::error_response`）：400→
+         `invalid_request_error`、401→`authentication_error`、403→`permission_error`、
+         404→`not_found_error`、409→`conflict_error`、429→`rate_limit_error`、
+         5xx→`server_error`、其余→`api_error`
+      2. **429 响应带 `Retry-After: 60`**（限流/配额拒绝，SDK/脚本退避依赖）
+      3. **`x-request-id` 响应头**：metrics_middleware 生成/透传（客户端自带则沿用），
+         并写入站 headers 供 proxy 复用为隧道 request_id——HTTP 层/隧道帧/日志
+         三方对账一致；proxy 无该头时自增兜底
+      （测试：error.type 映射单测 + 429 Retry-After 单测 + x-request-id 中间件单测 +
+       e2e `e2e_openai_error_semantics`：401/400/404/429/503 各状态码的 type 与头）
 
 ## P1 — 运维与健壮性
 
@@ -74,9 +86,43 @@
       5. 测试：单测（usage.rs 提取/SSE 行/无 usage 估算 ×6、keystore 累加+持久化+
          吊销保留 ×2）；e2e `e2e_usage_metering`（打 2 次请求 → /admin/usage 与
          mock 返回的 usage 一致、/admin/keys 内嵌一致、吊销后记录仍可查）
+- [ ] **计量与治理延伸（待定：暂未决定是否实施）**：usage 计量完成后的候选方向，
+      按价值排序与口径待定（含"放哪"的架构判断——现阶段放 gateway 合适，多实例/
+      多租户时随 11.4 无状态化外置 Redis）：
+      1. **per-key quota**：总量 token 配额 → 超限 429；实现收敛为可替换模块
+         （`key_store.check_quota`，将来可整体迁 Redis）；口径待定：token 总量 or
+         请求数 or 白名单 or 到期时间；估算请求计不计入；周期（自然月/滚动 N 天）
+      2. **用量按 model 归因**：`key_usage` 主键升级 `(key_id, model)` → 已部署
+         数据需一次性迁移（暂缓——keys.db 迁移规模化不做，本项连带暂缓）
+      3. **用量 reset**（`POST /admin/usage/reset`，TODO 已留口子，不动表结构）
+      4. **估算来源强化**（mock/上游补 usage 字段，提高精确占比，不动表）
+      5. **用量告警**（quota 80%/100% 打日志/UI 提示，纯读+日志）
+      6. **prompt 缓存命中率统计**（vLLM Automatic Prefix Caching：响应 usage 里
+         `prompt_tokens_details.cached_tokens` / DeepSeek `prompt_cache_hit_tokens`；
+         usage.rs 提取时顺手读 cached_tokens，算命中率 = cached/prompt）——
+         仅**代理计费 API**（DeepSeek/OpenAI cache hit 打折）时有省钱价值；
+         当前网关连自家 vLLM（无金钱成本），价值有限，暂缓
+      注：模型白名单/请求数配额/到期时间等非 token 维度与 token quota 二选一或组合，
+      取决于要防的场景（偷用贵模型 → 白名单；刷请求 → 请求数配额；失控并发 → key 并发上限）
 - [ ] **健康上报驱动的更精细路由**（DESIGN.md §9 M4 待办）：当前按在途请求数最少路由，
       后续可结合 agent 心跳上报的延迟/队列深度
 - [ ] **Grafana 仪表盘模板**（DESIGN.md §9 M4 待办）：消费 `/metrics` 指标
+- [ ] **key 禁用/启用 toggle（B 档，可选）**：`KeyRecord.enabled` 字段已存在但 admin API
+      只有创建/删除——补 `POST /admin/keys/{id}/disable|enable`（"暂时停用"不吊销），
+      10 分钟级改动
+- [ ] **HTTP 层总并发 admission（B 档，可选）**：现有限流是 per-key（令牌桶）——
+      多个 key 总和仍可压垮单实例。补网关**全局在途上限**（HTTP 入口级，类似 agent 级
+      admission）；metrics 的 active_requests 已可观测，实施是加"超限即拒"判断
+- [ ] **请求体大小限制可配置（C 档，可选）**：`DefaultBodyLimit::max(16MB)` 硬编码
+      （http.rs）——多模态图像/大上下文请求 413 无法调；config 加字段即可
+- [ ] **首次部署 bootstrap（B 档，可选）**：第一个 API key 目前必须走 admin API
+      （admin_token 配置文件明文）；考虑"首次启动自动建默认 key"或引导提示
+- [ ] **usage 数据保留策略（B 档，可选）**：`key_usage` 无限累积（reset 是待定项）——
+      长时间运行表会涨；建议与 reset 一并设计保留窗口/归档
+- [ ] **Dockerfile / docker-compose（C 档，可选）**：当前部署是 systemd + 手动传文件
+      （DEPLOY.md）；容器化需多阶段构建含 web/dist
+- [ ] **结构化访问日志 JSONL（C 档，可选）**：tracing 文本日志给人看；如需审计
+      "谁何时调了什么"可加 JSON 行落盘
 - [ ] **keys.db 迁移规模化**：当前自动迁移（`keystore.rs::migrate_legacy_keys`）同步执行、
       全量读入内存 + 单一大事务——仅适合小数据量 / 个人 / 小团队（适用边界见 DEPLOY.md §10）。
       改进：① **分批流式**：cursor 每批 ~500 条、小事务提交、内存有界（低成本，建议先做）；

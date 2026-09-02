@@ -229,3 +229,108 @@ async fn e2e_usage_metering() {
     agent.shutdown().await;
     gw.shutdown().await;
 }
+
+/// OpenAI 兼容错误语义：error.type 按状态码映射、429 带 Retry-After、
+/// 每个响应带 x-request-id（SDK 兼容性，见 TODO P0）。
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn e2e_openai_error_semantics() {
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    let (gw, agent, base, key) =
+        start_stack(Duration::from_secs(10), 0, 4, Some("admin-token")).await;
+    let client = reqwest::Client::new();
+
+    // 401：无 key → authentication_error
+    let resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&serde_json::json!({ "model": "mock-llm", "messages": [] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+    assert!(
+        resp.headers().get("x-request-id").is_some(),
+        "every response carries x-request-id"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "authentication_error");
+
+    // 400：body 无 model → invalid_request_error
+    let resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {key}"))
+        .json(&serde_json::json!({ "messages": [] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+
+    // 404：model 无 agent 服务 → not_found_error（mock-llm 声明了 mock-llm 模型）
+    let resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {key}"))
+        .json(&serde_json::json!({ "model": "no-such-model", "messages": [] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "not_found_error");
+
+    // 429：限流（每 key 1 次/分钟）→ rate_limit_error + Retry-After
+    let (gw2, agent2, base2, key2) = start_stack(Duration::from_secs(10), 1, 4, None).await;
+    let client2 = reqwest::Client::new();
+    let req = || {
+        client2
+            .get(format!("{base2}/v1/models"))
+            .header("Authorization", format!("Bearer {key2}"))
+    };
+    let _ = req().send().await.unwrap(); // 第 1 次放行
+    let resp = req().send().await.unwrap(); // 第 2 次 429
+    assert_eq!(resp.status(), 429);
+    assert_eq!(
+        resp.headers().get("retry-after").unwrap().to_str().unwrap(),
+        "60",
+        "429 must advertise Retry-After"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "rate_limit_error");
+
+    // 5xx：裸起一个**无 agent** 的 gateway → 请求必然 NoAgent → 503 server_error
+    let (ca, server_cert, server_key, _client_cert, _client_key) = gen_certs();
+    let (keys_path, lone_key) = seed_keys_db();
+    let gw3 = Gateway::start(GatewayConfig {
+        http_bind: "127.0.0.1:0".parse().unwrap(),
+        quic_bind: "127.0.0.1:0".parse().unwrap(),
+        ca_cert: vec![ca],
+        server_cert: vec![server_cert],
+        server_key,
+        admin_token: None,
+        keys_file: Some(keys_path),
+        request_timeout: Duration::from_secs(10),
+        agent_stale_after: Duration::from_secs(10),
+        rate_limit_per_min: 0,
+        tls: None,
+        ui_dir: None,
+    })
+    .await
+    .unwrap();
+    let resp = client
+        .post(format!("http://{}/v1/chat/completions", gw3.http_addr))
+        .header("Authorization", format!("Bearer {lone_key}"))
+        .json(&serde_json::json!({ "model": "mock-llm", "messages": [] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "server_error");
+    gw3.shutdown().await;
+
+    agent.shutdown().await;
+    agent2.shutdown().await;
+    gw.shutdown().await;
+    gw2.shutdown().await;
+}
