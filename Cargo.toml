@@ -28,7 +28,9 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 tokio-stream = { version = "0.1", features = ["sync"] }
 thiserror = "2"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "time"] }
+# time crate：日志时间戳固定东八区（UTC+8，无夏令时），不依赖系统时区设置
+time = { version = "0.3", features = ["formatting"] }
 
 [workspace.dependencies.criterion]
 version = "0.8"

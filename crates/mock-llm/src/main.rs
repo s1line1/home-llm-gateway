@@ -1,6 +1,8 @@
 use std::net::SocketAddr;
 
 use clap::Parser;
+use time::UtcOffset;
+use tracing_subscriber::fmt::time::OffsetTime;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -15,7 +17,13 @@ struct Args {
 
 /// 启动 mock 服务（独立函数，便于单元测试覆盖启动逻辑）。
 async fn run(args: Args) -> anyhow::Result<()> {
+    // 日志时间戳固定东八区（UTC+8）：China Standard Time，无夏令时。
+    let timer = OffsetTime::new(
+        UtcOffset::from_hms(8, 0, 0).expect("UTC+8 is a valid fixed offset"),
+        time::format_description::well_known::Rfc3339,
+    );
     let _ = tracing_subscriber::fmt()
+        .with_timer(timer)
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .try_init();
 

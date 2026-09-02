@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use agent::Agent;
 use clap::Parser;
+use time::UtcOffset;
+use tracing_subscriber::fmt::time::OffsetTime;
 use tracing_subscriber::EnvFilter;
 
 /// 命令行仅保留：指定配置文件路径。
@@ -18,7 +20,13 @@ struct Args {
 
 /// 启动 agent 主循环（独立函数，便于单元测试覆盖启动路径）。
 async fn run(args: Args) -> anyhow::Result<()> {
+    // 日志时间戳固定东八区（UTC+8）：China Standard Time，无夏令时。
+    let timer = OffsetTime::new(
+        UtcOffset::from_hms(8, 0, 0).expect("UTC+8 is a valid fixed offset"),
+        time::format_description::well_known::Rfc3339,
+    );
     let _ = tracing_subscriber::fmt()
+        .with_timer(timer)
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .try_init();
 
