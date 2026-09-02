@@ -153,14 +153,18 @@ export default function Keys() {
   );
 }
 
-/** 用量列展示：prompt + completion + total，估算请求带 ~ 提示。 */
+/** 用量列展示：主显总 token（大数易读），prompt/completion 明细放悬停提示。 */
 function formatTokens(u: KeyUsage) {
   if (u.requests === 0) return <span className="text-slate-300">—</span>;
-  const est = u.estimated_requests > 0 ? `（含 ${u.estimated_requests} 次估算）` : "";
+  const est = u.estimated_requests > 0
+    ? `（其中 ${u.estimated_requests} 次请求上游未提供 usage，按估算降级）`
+    : "";
   return (
-    <span title={`prompt ${u.prompt_tokens} / completion ${u.completion_tokens}${est}`}>
+    <span
+      className="cursor-help"
+      title={`prompt ${u.prompt_tokens.toLocaleString()} + completion ${u.completion_tokens.toLocaleString()}${est}`}
+    >
       {u.total_tokens.toLocaleString()}
-      <span className="text-slate-400"> = {u.prompt_tokens.toLocaleString()} in + {u.completion_tokens.toLocaleString()} out</span>
       {u.estimated_requests > 0 && (
         <span className="ml-1 text-amber-500" title="上游未提供 usage，按估算降级">~</span>
       )}
