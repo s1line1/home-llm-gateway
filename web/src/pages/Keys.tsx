@@ -36,13 +36,38 @@ export default function Keys() {
     onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["admin", "keys"] }),
   });
 
+  const [copied, setCopied] = useState(false);
+
   const copy = useCallback(async (text: string) => {
-    try {
-      await navigator.clipboard.writeText(text);
-    } catch {
-      // 明文 HTTP 部署下 clipboard API 不可用 → 降级提示手动复制
-      window.prompt("复制 API Key（剪贴板不可用，请手动复制）：", text);
+    // 1) 现代 Clipboard API（仅 HTTPS/localhost 安全上下文可用）
+    if (navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(text);
+        setCopied(true);
+        return;
+      } catch {
+        // 权限拒绝等 → 走降级
+      }
     }
+    // 2) 隐藏 textarea + execCommand('copy')：明文 HTTP 部署下可用
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      const ok = document.execCommand("copy");
+      document.body.removeChild(ta);
+      if (ok) {
+        setCopied(true);
+        return;
+      }
+    } catch {
+      // execCommand 不可用 → 弹窗手动复制
+    }
+    window.prompt("复制 API Key（剪贴板不可用，请手动复制）：", text);
   }, []);
 
   return (
@@ -81,8 +106,14 @@ export default function Keys() {
             <p className="font-medium text-emerald-800">创建成功——明文仅显示这一次：</p>
             <div className="mt-1.5 flex items-center gap-2">
               <code className="flex-1 break-all rounded bg-white px-2 py-1 font-mono text-xs">{created.key}</code>
-              <Button variant="secondary" onClick={() => void copy(created.key)}>
-                复制
+              <Button
+                variant="secondary"
+                onClick={() => {
+                  void copy(created.key);
+                  setTimeout(() => setCopied(false), 2000);
+                }}
+              >
+                {copied ? "已复制 ✓" : "复制"}
               </Button>
             </div>
           </div>
