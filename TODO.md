@@ -85,6 +85,11 @@
       3. **用量 reset**（`POST /admin/usage/reset`，TODO 已留口子，不动表结构）
       4. **估算来源强化**（mock/上游补 usage 字段，提高精确占比，不动表）
       5. **用量告警**（quota 80%/100% 打日志/UI 提示，纯读+日志）
+      6. **prompt 缓存命中率统计**（vLLM Automatic Prefix Caching：响应 usage 里
+         `prompt_tokens_details.cached_tokens` / DeepSeek `prompt_cache_hit_tokens`；
+         usage.rs 提取时顺手读 cached_tokens，算命中率 = cached/prompt）——
+         仅**代理计费 API**（DeepSeek/OpenAI cache hit 打折）时有省钱价值；
+         当前网关连自家 vLLM（无金钱成本），价值有限，暂缓
       注：模型白名单/请求数配额/到期时间等非 token 维度与 token quota 二选一或组合，
       取决于要防的场景（偷用贵模型 → 白名单；刷请求 → 请求数配额；失控并发 → key 并发上限）
 - [ ] **健康上报驱动的更精细路由**（DESIGN.md §9 M4 待办）：当前按在途请求数最少路由，
