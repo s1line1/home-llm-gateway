@@ -64,8 +64,9 @@ feature-depth = 1
 # https://embarkstudios.github.io/cargo-deny/checks/advisories/cfg.html
 [advisories]
 # The path where the advisory databases are cloned/fetched into
-# 放项目内（target/ 已 gitignore），使 pre-commit hook 不依赖 $CARGO_HOME 写权限
-db-path = "target/advisory-db"
+# 保持默认 $CARGO_HOME/advisory-dbs：放项目内（target/advisory-db）会导致
+# CI 容器内 git 对挂载卷报 dubious ownership，无法更新数据库。
+#db-path = "$CARGO_HOME/advisory-dbs"
 # The url(s) of the advisory databases to use
 #db-urls = ["https://github.com/rustsec/advisory-db"]
 # A list of advisory IDs to ignore. Note that ignored advisories will still
