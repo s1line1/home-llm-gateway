@@ -76,13 +76,13 @@ scripts/        多平台 release 打包脚本
 certs/gen-dev.sh        # 输出到 certs/out/（CA + 服务端 + 客户端）
 ```
 
-### 2. 起 mock LLM（模拟家里的大模型服务）
+### 2. 起 mock LLM（模拟 edge 上的模型服务）
 
 ```bash
 cargo run -p mock-llm -- --addr 127.0.0.1:11435
 ```
 
-### 3. 起 edge-agent（家里那台机器）
+### 3. 起 edge-agent（LLM 所在机器 / edge 节点）
 
 agent 同样用 YAML 配置（`agent --config agent-config.yml`，参考 `agent_config.example.yml`）：
 
@@ -92,7 +92,7 @@ cloud_addr: "127.0.0.1:4433"
 ca: certs/out/ca.crt
 cert: certs/out/client.crt
 key: certs/out/client.key
-agent_id: home-1
+agent_id: edge-1
 upstream: "http://127.0.0.1:11435"
 EOF
 cargo run -p agent -- --config agent-config.yml
@@ -232,7 +232,7 @@ cargo run -p gateway -- --config gateway-config.yml
 
 agent 配置里 `max_concurrency: 2`（声明最多 2 个并发请求）。
 
-网关按 agent 声明的上限做并发占位，超限回 429，避免把家里 GPU 打爆。
+网关按 agent 声明的上限做并发占位，超限回 429，避免把 edge 的 GPU 打爆。
 
 ### 多 agent（多台 LLM 机器，edge 异构模型）
 
@@ -241,10 +241,10 @@ agent 配置里 `max_concurrency: 2`（声明最多 2 个并发请求）。
 同组内按**最少负载**（在途请求最少者优先）自动路由（每台机器各自一份 agent 配置）：
 
 ```yaml
-# 机器 1（家里，跑 qwen2.5）agent-config.yml
+# edge 节点 1（家庭，跑 qwen2.5）agent-config.yml
 cloud_addr: "<网关>:4433"
 ca/cert/key: /etc/home-llm-gateway/*.crt
-agent_id: home-1
+agent_id: edge-1
 upstream: "http://127.0.0.1:11434"
 models: [qwen2.5]        # 声明能力：网关据此路由
 max_concurrency: 2
@@ -252,7 +252,7 @@ max_concurrency: 2
 # 机器 2（云上 GPU，跑 llama3）agent-config.yml
 cloud_addr: "<网关>:4433"
 ca/cert/key: /etc/home-llm-gateway/*.crt
-agent_id: home-2
+agent_id: edge-2
 upstream: "http://127.0.0.1:8000"
 models: [llama3]         # 声明能力：网关据此路由
 max_concurrency: 4

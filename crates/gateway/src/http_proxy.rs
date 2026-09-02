@@ -88,7 +88,7 @@ pub async fn proxy(
     let (entry, slot) = match state.registry.try_acquire(state.agent_stale_after, &model) {
         Ok(x) => x,
         Err(AcquireError::NoAgent) => {
-            return error_response(StatusCode::SERVICE_UNAVAILABLE, "no home agent available");
+            return error_response(StatusCode::SERVICE_UNAVAILABLE, "no edge available");
         }
         Err(AcquireError::NoModel) => {
             return error_response(StatusCode::NOT_FOUND, "model not found on any agent");

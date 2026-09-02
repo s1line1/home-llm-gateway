@@ -1,4 +1,4 @@
-# edge-agent systemd 单元（部署在 LLM 所在机器，家里或云上）
+# edge-agent systemd 单元（部署在 LLM 所在机器 / edge 节点）
 # 安装：
 #   1. 把二进制放到 /usr/local/bin/agent
 #   2. 把证书与 agent 配置放到 /etc/home-llm-gateway/

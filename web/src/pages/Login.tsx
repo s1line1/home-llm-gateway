@@ -38,7 +38,7 @@ export default function Login() {
     <div className="flex min-h-screen items-center justify-center bg-slate-100 px-4">
       <div className="w-full max-w-sm rounded-2xl border border-slate-200 bg-white p-8 shadow-sm">
         <div className="mb-6">
-          <h1 className="text-lg font-semibold text-slate-900">Home LLM Gateway</h1>
+          <h1 className="text-lg font-semibold text-slate-900">Edge LLM Gateway</h1>
           <p className="mt-1 text-sm text-slate-500">管理面板 · 管理员登录</p>
         </div>
 

@@ -12,7 +12,7 @@ use rustls::{
 /// 隧道 ALPN 标识（自定义协议，不必是真正的 h3）。
 pub const ALPN: &[u8] = b"h3";
 
-/// 构造 QUIC ServerConfig：校验家端 agent 的客户端证书（mTLS）。
+/// 构造 QUIC ServerConfig：校验 edge-agent 的客户端证书（mTLS）。
 pub fn server_config(
     ca: &[CertificateDer<'static>],
     cert: Vec<CertificateDer<'static>>,

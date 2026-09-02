@@ -57,7 +57,7 @@ scripts/        multi-platform release packaging script
 certs/gen-dev.sh        # outputs to certs/out/ (CA + server + client)
 ```
 
-### 2. Start the mock LLM (pretend it is your home model)
+### 2. Start the mock LLM (pretend it is your edge model service)
 
 ```bash
 cargo run -p mock-llm -- --addr 127.0.0.1:11435
@@ -73,7 +73,7 @@ cloud_addr: "127.0.0.1:4433"
 ca: certs/out/ca.crt
 cert: certs/out/client.crt
 key: certs/out/client.key
-agent_id: home-1
+agent_id: edge-1
 upstream: "http://127.0.0.1:11435"
 EOF
 cargo run -p agent -- --config agent-config.yml
@@ -176,24 +176,24 @@ Clients now use `https://`; for self-signed certificates either install `ca.crt`
 
 Set `max_concurrency: 2` in the agent config (advertise at most 2 concurrent requests).
 
-The gateway reserves concurrency slots according to the advertised cap and returns 429 when full, so your home GPU is never overwhelmed.
+The gateway reserves concurrency slots according to the advertised cap and returns 429 when full, so the edge GPU is never overwhelmed.
 
 ### Multiple agents (multiple LLM machines)
 
 Point several agents at the same gateway; it routes by **least load** (fewest in-flight requests). Each machine keeps its own agent config:
 
 ```yaml
-# machine 1 (home) agent-config.yml
+# edge node 1 agent-config.yml
 cloud_addr: "<gateway>:4433"
 ca/cert/key: /etc/home-llm-gateway/*.crt
-agent_id: home-1
+agent_id: edge-1
 upstream: "http://127.0.0.1:11434"
 max_concurrency: 2
 
 # machine 2 (another box / cloud) agent-config.yml
 cloud_addr: "<gateway>:4433"
 ca/cert/key: /etc/home-llm-gateway/*.crt
-agent_id: home-2
+agent_id: edge-2
 upstream: "http://127.0.0.1:8000"
 max_concurrency: 4
 ```

@@ -16,7 +16,7 @@ TARGETS=(
   "$(rustc -vV | sed -n 's/^host: //p')" # 当前主机（优先）
   x86_64-unknown-linux-gnu               # 阿里云 ECS x86
   aarch64-unknown-linux-gnu              # 阿里云 ECS ARM
-  aarch64-apple-darwin                   # 家里 Mac（Apple Silicon）
+  aarch64-apple-darwin                   # edge 节点 Mac（Apple Silicon）
 )
 
 for target in "${TARGETS[@]}"; do

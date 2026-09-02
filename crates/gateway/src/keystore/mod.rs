@@ -11,7 +11,7 @@
 //! - 架构：内存索引（runtime HashMap，key=lookup）保证 `authorize()` 热路径零 IO；
 //!   SQLite 负责持久化，创建/吊销时写穿（write-through）。
 //!
-//! 注意：argon2 校验每次请求约耗时 10-30ms（19MiB 内存、t=2）。家庭网关低 QPS 下
+//! 注意：argon2 校验每次请求约耗时 10-30ms（19MiB 内存、t=2）。edge 网关低 QPS 下
 //! 可接受；若需更高吞吐，可调低参数（如 Params::new(4096, 3, 1)）或用登录式缓存。
 
 use std::{

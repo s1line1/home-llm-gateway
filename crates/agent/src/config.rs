@@ -49,7 +49,7 @@ fn default_server_name() -> String {
     "localhost".into()
 }
 fn default_agent_id() -> String {
-    "home-agent-1".into()
+    "edge-1".into()
 }
 fn default_upstream() -> String {
     "http://127.0.0.1:11434".into()
@@ -191,7 +191,7 @@ max_concurrency: 2
         );
         let cfg = from_file(parse_yaml(&yaml)).unwrap();
         assert_eq!(cfg.server_name, "localhost");
-        assert_eq!(cfg.agent_id, "home-agent-1");
+        assert_eq!(cfg.agent_id, "edge-1");
         assert_eq!(cfg.upstream_base, "http://127.0.0.1:11434");
         assert_eq!(cfg.heartbeat_interval, Duration::from_secs(5));
         assert_eq!(cfg.models, vec!["*".to_string()]);

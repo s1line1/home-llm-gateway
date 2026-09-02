@@ -1,6 +1,6 @@
 # 阿里云 / 公网部署清单（Step-by-Step）
 
-> 目标：把 `home-llm-gateway` 跑在公网上——中转网关放阿里云 ECS，agent 放 LLM 所在机器（家里或另一台云主机），任何地点通过 HTTPS 访问家里的模型服务。
+> 目标：把 Edge LLM 网关（cloud-gateway + edge-agent）跑在公网上——中转网关放阿里云 ECS，agent 放 LLM 所在机器（edge 节点：家里 / 分支 / 云主机），任何地点通过 HTTPS 按 model 访问边缘模型服务。
 >
 > 阅读前提：已按 `README.md` 在本地跑通全链路（mock 或真实模型）。
 
@@ -13,7 +13,7 @@
 阿里云 ECS（中转网关）  gateway：HTTPS 8443 + QUIC UDP 4433
    │  QUIC（UDP 4433，mTLS）← agent 主动拨出
    ▼
-LLM 机器（家里 / 另一台云主机）  agent → 本地 Ollama / vLLM / llama.cpp
+edge 节点（家里 / 分支 / 云主机）  agent → 本地 Ollama / vLLM / llama.cpp
 ```
 
 ## 0. 准备
@@ -21,7 +21,7 @@ LLM 机器（家里 / 另一台云主机）  agent → 本地 Ollama / vLLM / ll
 | 项 | 说明 |
 |---|---|
 | 阿里云 ECS（中转网关） | 规格 **2C4G** 起步（纯转发，内存占用几十 MB）；系统 Ubuntu 22.04 / Debian 12 / Alibaba Cloud Linux |
-| LLM 机器 | 家里机器（NAT 后也可以，agent 是出站连接）；若 LLM 也放云上，按模型选 GPU/高配机型 |
+| LLM 机器（edge 节点） | 家里机器（NAT 后也可以，agent 是出站连接）；或分支/云主机；若多 edge 异构模型，网关按 model 路由 |
 | 域名（可选但推荐） | 有域名则证书 SAN 用 `DNS:`，IP 变更不影响；没有就用 `IP:` SAN 的自签证书 |
 | 本地 | 仓库已 clone（或 `dist/` 里有现成二进制） |
 
@@ -220,14 +220,14 @@ curl -N -k -H "Authorization: Bearer <你的key>" \
 
 | 现象 | 排查 |
 |---|---|
-| agent 日志：连接失败 / 一直重试 | ① 安全组 UDP 4433 是否放行；② 家里路由器是否封出站 UDP（少见）；③ `nc -u -vz <IP> 4433` 测连通 |
+| agent 日志：连接失败 / 一直重试 | ① 安全组 UDP 4433 是否放行；② edge 侧网络是否封出站 UDP（少见）；③ `nc -u -vz <IP> 4433` 测连通 |
 | agent：TLS 握手失败 | `--server-name` 与网关 server 证书 SAN 不匹配；确认填的是 SAN 里的域名或公网 IP |
 | 网关日志：agent connected 但很快消失 | agent 心跳被断（网络不稳）；检查 UDP 丢包；`--agent-stale-secs` 适当调大 |
 | curl 返回 401 | API Key 不对或没带 `Authorization: Bearer` |
 | curl 返回 503 | 网关没注册到健康 agent（看网关/agent 日志） |
 | curl 返回 429 | 限流超了（等下一分钟）或 agent 并发占满 |
 | 浏览器打开 8443 显示"尚未构建"提示页 | 未上传 web/dist（§4）或 gateway-config.yml 未配 `ui_dir`；API 不受影响，可后补 UI 再 `systemctl restart gateway` |
-| 家里 IP 变了连不上 | 用域名 SAN 证书 + `--server-name` 填域名，配 DDNS 指向新 IP |
+| edge 侧 IP 变了连不上 | 用域名 SAN 证书 + `--server-name` 填域名，配 DDNS 指向新 IP |
 
 ## 9. 部署后安全清单（必做）
 
