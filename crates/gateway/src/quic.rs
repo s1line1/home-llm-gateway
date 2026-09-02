@@ -1,4 +1,4 @@
-//! QUIC 服务端：接受家端 agent 连接，处理 Register / Heartbeat 控制流。
+//! QUIC 服务端：接受 edge-agent 连接，处理 Register / Heartbeat 控制流。
 
 use proto::{io::read_frame, Frame};
 use quinn::Connection;
@@ -28,7 +28,7 @@ pub async fn accept_loop(endpoint: quinn::Endpoint, registry: Registry, metrics:
 
 async fn handle_conn(conn: Connection, registry: Registry) -> anyhow::Result<()> {
     let remote = conn.remote_address();
-    info!(%remote, "home agent connected");
+    info!(%remote, "edge connected");
 
     let mut agent_id: Option<(String, usize)> = None;
     let result = handle_conn_inner(&conn, &registry, &mut agent_id).await;

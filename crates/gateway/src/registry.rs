@@ -1,4 +1,4 @@
-//! 家端 agent 注册表：agent_id → 连接 + 健康状态 + 并发占位。
+//! edge-agent 注册表：agent_id → 连接 + 健康状态 + 并发占位。
 
 use std::{
     collections::HashMap,

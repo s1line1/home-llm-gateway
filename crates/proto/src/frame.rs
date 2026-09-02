@@ -1,4 +1,4 @@
-//! 隧道帧协议：网关与家端 agent 之间通过 QUIC 双向流传输的轻量帧。
+//! 隧道帧协议：网关与 edge-agent 之间通过 QUIC 双向流传输的轻量帧。
 
 use serde::{Deserialize, Serialize};
 

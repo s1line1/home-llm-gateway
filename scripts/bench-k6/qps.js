@@ -33,7 +33,7 @@ export default function () {
   const chat = http.post(
     `${BASE}/v1/chat/completions`,
     JSON.stringify({
-      model: 'mock-llm',
+      model: 'qwen2.5',
       messages: [{ role: 'user', content: 'hi' }],
     }),
     { headers: { Authorization: `Bearer ${KEY}`, 'Content-Type': 'application/json' } },

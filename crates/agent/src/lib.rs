@@ -1,4 +1,4 @@
-//! home-agent：常驻家里，主动拨 QUIC 长连接上云，把云端请求转发给本地 LLM。
+//! edge-agent：常驻 LLM 所在机器（edge 节点），主动拨 QUIC 长连接上云，把云端请求转发给本地 LLM。
 
 pub mod tls;
 

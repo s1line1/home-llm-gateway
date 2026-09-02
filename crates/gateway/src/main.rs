@@ -10,7 +10,7 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser)]
 #[command(
     version,
-    about = "cloud-gateway: 家庭 LLM 远程访问网关（公网入口 + QUIC 隧道服务端）"
+    about = "cloud-gateway: Edge LLM 网关（公网入口 + QUIC 隧道服务端）"
 )]
 struct Args {
     /// 配置文件路径（YAML），所有参数都在其中配置

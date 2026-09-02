@@ -25,7 +25,7 @@ openssl x509 -req -in out/server.csr \
 # 3. 客户端证书（agent，mTLS）
 openssl req -newkey rsa:2048 -nodes \
   -keyout out/client.key -out out/client.csr \
-  -subj "/CN=home-agent-1"
+  -subj "/CN=edge-1"
 cat > out/client.ext <<'EOF'
 extendedKeyUsage=clientAuth
 EOF

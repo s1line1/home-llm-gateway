@@ -29,7 +29,7 @@
            │ ← 边缘端主动拨出的长连接，云端永不主动连对端
            ▼
 ┌──────────────────────────┐
-│  edge-agent（家里）        │  常驻进程
+│  edge-agent（edge 节点）    │  常驻进程
 │  · QUIC Client（拨号/心跳）│  解码帧 → 转发本地 LLM
 │  · 本地 LLM 转发/进程管理  │  流式回传 + 取消传播
 └──────────┬───────────────┘
@@ -39,10 +39,10 @@
    （Ollama / vLLM / llama.cpp）
 ```
 
-**核心原则**：家里主动向外拨 QUIC 长连接。云端只通过这条已建立的连接转发请求，因此：
-- 无需家里有公网 IP / 端口映射 / DDNS；
+**核心原则**：edge 主动向外拨 QUIC 长连接。云端只通过这条已建立的连接转发请求，因此：
+- 无需 edge 有公网 IP / 端口映射 / DDNS；
 - NAT 打洞问题被彻底绕开（连接是出站的，绝大多数 NAT 都允许）；
-- 云端可以精确知道家里 agent 的存活状态。
+- 云端可以精确知道 edge-agent 的存活状态。
 
 ## 3. 为什么用 QUIC（相对 TCP+TLS）
 
@@ -54,7 +54,7 @@
 | **内建 TLS 1.3 + mTLS** | 隧道加密和双向认证开箱即用，无需自己拼 TLS-over-TCP 栈 |
 | **Rust 生态成熟** | `quinn` 是生产级实现（Tokio 官方维护），API 稳定 |
 
-风险点：QUIC 走 **UDP**。极少数家庭路由器/运营商可能封锁出站 UDP，届时需要 fallback（见 §10）。
+风险点：QUIC 走 **UDP**。极少数 edge 侧网络（家庭路由器/运营商）可能封锁出站 UDP，届时需要 fallback（见 §10）。
 
 ## 4. 隧道协议设计
 
@@ -80,7 +80,7 @@
 | `ProxyResponseHead` | agent → cloud | `{ request_id, status, headers }`（转发上游响应头，如 `content-type: text/event-stream`） |
 | `ProxyResponseBody` | agent → cloud | `{ request_id, chunk }`，body 分块流式传输（SSE chunk 直接透传） |
 | `ProxyResponseEnd` | agent → cloud | `{ request_id, ok }`，流结束 |
-| `Cancel` | cloud → agent | 客户端断开/超时，通知 agent 取消上游请求（**防止家里白算 token**） |
+| `Cancel` | cloud → agent | 客户端断开/超时，通知 agent 取消上游请求（**防止白算 token**） |
 | `Error` | 双向 | 错误码 + 描述 |
 
 ### 4.3 流式转发语义
@@ -126,12 +126,12 @@
 | 公网入口 | 强制 TLS 1.3；API Key 认证；限流；请求大小上限；审计日志（来源 IP、Key、路径、耗时、token 估算） |
 | 隧道 | QUIC 内建 TLS 1.3 + mTLS（云端 CA 签发 agent 证书）；连接级空闲超时；证书轮换 |
 | 数据 | 全链路加密；日志脱敏（不记录 prompt 内容，或可配置） |
-| 密钥 | API Key 以 **argon2 哈希**存储（Argon2id，明文仅创建时返回一次），另存 sha256 快速索引用于授权 O(1) 定位；agent 私钥只存家里 |
+| 密钥 | API Key 以 **argon2 哈希**存储（Argon2id，明文仅创建时返回一次），另存 sha256 快速索引用于授权 O(1) 定位；agent 私钥只存 edge 节点本地 |
 
 ## 8. 部署形态
 
 - **云端**：编译为单二进制，`systemd` 或 Docker 运行；证书由自家 CA 签发脚本管理。
-- **家里**：单二进制，支持 Linux / macOS / Windows / WSL2（家里机器可能什么系统都有）。
+- **edge 节点**：单二进制，支持 Linux / macOS / Windows / WSL2（各节点系统可能不同）。
 - **配置**：网关侧 `config.yml`、边缘端 `config.yml`（均 YAML，模板见 `gateway_config.example.yml` 与 `crates/agent/config.example.yml`）。
 - **开机自启**：边缘端注册为 systemd/launchd 服务。
 
@@ -145,10 +145,10 @@
 
 ## 10. 风险与备选方案
 
-1. **UDP 被封锁**：极少数家庭网络封出站 UDP。备选：隧道降级为 TCP+TLS 并复用同一套帧协议（帧层不变，只换传输层），或提示用户放行 UDP 443。
+1. **UDP 被封锁**：极少数 edge 侧网络封出站 UDP。备选：隧道降级为 TCP+TLS 并复用同一套帧协议（帧层不变，只换传输层），或提示用户放行 UDP 443。
 2. **quinn API 学习成本**：备选直接上 HTTP/3（`h3` crate），用标准 HTTP 语义替代自定义帧，代价是少一点控制力、多一层依赖。
 3. **帧协议 bug 排查成本**：协议保持最小集（上表 8 种帧），先做对再做优化；用 `postcard` 保证序列化简单可调试。
-4. **家里断网/断电**：云端靠心跳超时自动摘除 agent，客户端得到 503 而非悬挂；agent 恢复后自动重连，无需人工干预。
+4. **edge 断网/断电**：云端靠心跳超时自动摘除 agent，客户端得到 503 而非悬挂；agent 恢复后自动重连，无需人工干预。
 5. **云服务器被攻击面**：公网入口只暴露认证后的转发能力，不暴露任何管理接口；管理走 SSH。
 
 ## 11. 演进路线（多用户 / 大团队 / 高并发）

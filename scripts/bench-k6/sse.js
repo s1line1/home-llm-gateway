@@ -33,7 +33,7 @@ export default function () {
   const res = http.post(
     `${BASE}/v1/chat/completions`,
     JSON.stringify({
-      model: 'mock-llm',
+      model: 'qwen2.5',
       stream: true,
       messages: [{ role: 'user', content: '你'.repeat(CONTENT_LEN) }],
     }),

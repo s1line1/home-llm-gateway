@@ -35,8 +35,8 @@ export default function Layout() {
     <div className="flex min-h-screen">
       <aside className="flex w-52 shrink-0 flex-col bg-slate-900">
         <div className="px-4 py-5">
-          <h1 className="text-base font-semibold text-white">Home LLM Gateway</h1>
-          <p className="mt-0.5 text-xs text-slate-400">家庭 LLM 远程访问网关</p>
+          <h1 className="text-base font-semibold text-white">Edge LLM Gateway</h1>
+          <p className="mt-0.5 text-xs text-slate-400">Edge LLM 网关</p>
         </div>
         <nav className="flex-1 space-y-1 px-2">
           {NAV.map((n) => (

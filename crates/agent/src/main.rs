@@ -10,7 +10,7 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser)]
 #[command(
     version,
-    about = "home-agent: 常驻 LLM 所在机器，通过 QUIC 隧道接入云端网关"
+    about = "edge-agent: 常驻 LLM 所在机器（edge 节点），通过 QUIC 隧道接入云端网关"
 )]
 struct Args {
     /// 配置文件路径（YAML），所有参数都在其中配置
