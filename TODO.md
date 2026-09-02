@@ -29,9 +29,9 @@
 
 ## P1 — 运维与健壮性
 
-- [ ] **进程级优雅关闭**：gateway/agent 注册 SIGTERM/SIGINT（`tokio::signal`），收到后打 INFO 日志
+- [x] **进程级优雅关闭**：gateway/agent 注册 SIGTERM/SIGINT（`tokio::signal`），收到后打 INFO 日志
       → 调用 `Gateway::shutdown()` / `Agent::shutdown()` 干净退出；
-      覆盖 systemd stop、Ctrl+C、harness job_kill 场景。当前 `pending().await` 永久挂起，信号直接杀进程
+      覆盖 systemd stop、Ctrl+C、harness job_kill 场景（对应 OPTIMIZATION.md A1 ✅）
 - [ ] **多 CA 信任根 + 动态增删（每 agent 独立 CA，gateway 不停机）**：
       目标：每个 agent 用独立 CA 签发证书，gateway 维护全部 CA 的信任根集合；
       运行时热添加/移除单个 CA——移除即吊销该 CA 下所有 agent（新连接被拒，
