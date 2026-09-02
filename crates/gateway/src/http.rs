@@ -60,6 +60,7 @@ pub fn app(state: AppState) -> Router {
                 axum::routing::delete(crate::admin::delete_key),
             )
             .route("/agents", get(crate::admin::list_agents))
+            .route("/usage", get(crate::admin::usage_route))
             .route_layer(middleware::from_fn_with_state(
                 state.clone(),
                 crate::admin::admin_auth,
