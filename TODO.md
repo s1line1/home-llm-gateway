@@ -74,6 +74,19 @@
       5. 测试：单测（usage.rs 提取/SSE 行/无 usage 估算 ×6、keystore 累加+持久化+
          吊销保留 ×2）；e2e `e2e_usage_metering`（打 2 次请求 → /admin/usage 与
          mock 返回的 usage 一致、/admin/keys 内嵌一致、吊销后记录仍可查）
+- [ ] **计量与治理延伸（待定：暂未决定是否实施）**：usage 计量完成后的候选方向，
+      按价值排序与口径待定（含"放哪"的架构判断——现阶段放 gateway 合适，多实例/
+      多租户时随 11.4 无状态化外置 Redis）：
+      1. **per-key quota**：总量 token 配额 → 超限 429；实现收敛为可替换模块
+         （`key_store.check_quota`，将来可整体迁 Redis）；口径待定：token 总量 or
+         请求数 or 白名单 or 到期时间；估算请求计不计入；周期（自然月/滚动 N 天）
+      2. **用量按 model 归因**：`key_usage` 主键升级 `(key_id, model)` → 已部署
+         数据需一次性迁移（暂缓——keys.db 迁移规模化不做，本项连带暂缓）
+      3. **用量 reset**（`POST /admin/usage/reset`，TODO 已留口子，不动表结构）
+      4. **估算来源强化**（mock/上游补 usage 字段，提高精确占比，不动表）
+      5. **用量告警**（quota 80%/100% 打日志/UI 提示，纯读+日志）
+      注：模型白名单/请求数配额/到期时间等非 token 维度与 token quota 二选一或组合，
+      取决于要防的场景（偷用贵模型 → 白名单；刷请求 → 请求数配额；失控并发 → key 并发上限）
 - [ ] **健康上报驱动的更精细路由**（DESIGN.md §9 M4 待办）：当前按在途请求数最少路由，
       后续可结合 agent 心跳上报的延迟/队列深度
 - [ ] **Grafana 仪表盘模板**（DESIGN.md §9 M4 待办）：消费 `/metrics` 指标
