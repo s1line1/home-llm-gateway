@@ -530,62 +530,65 @@ async fn e2e_proxy_protocol_edge_cases() {
 
     let client = reqwest::Client::new();
     let url = |p: &str| format!("http://{}{}", gw.http_addr, p);
-    let get = |p: &str| {
+    // 注意：/v1/models 已被网关聚合接管（不走代理），帧协议边界场景必须走
+    // 代理路径 /v1/chat/completions，并携带 agent 声明的模型（"raw"）
+    let post = |p: &str| {
         client
-            .get(url(p))
+            .post(url(p))
             .header("Authorization", format!("Bearer {key}"))
+            .json(&serde_json::json!({ "model": "raw" }))
     };
 
     // 0: Error 帧作响应头 → 503
-    let r = get("/v1/models").send().await.unwrap();
+    let r = post("/v1/chat/completions").send().await.unwrap();
     assert_eq!(r.status(), 503);
     // 1: 空响应 → 502
-    let r = get("/v1/models").send().await.unwrap();
+    let r = post("/v1/chat/completions").send().await.unwrap();
     assert_eq!(r.status(), 502);
     // 2: head 前 body 被忽略 → 200 + "hello"
-    let r = get("/v1/models").send().await.unwrap();
+    let r = post("/v1/chat/completions").send().await.unwrap();
     assert_eq!(r.status(), 200);
     assert_eq!(r.text().await.unwrap(), "hello");
     // 3: 不回复 → 502
-    let r = get("/v1/models").send().await.unwrap();
+    let r = post("/v1/chat/completions").send().await.unwrap();
     assert_eq!(r.status(), 502);
     // 4: 畸形响应头 → 502
-    let r = get("/v1/models").send().await.unwrap();
+    let r = post("/v1/chat/completions").send().await.unwrap();
     assert_eq!(r.status(), 502);
     // 5: head 200 + Error → 状态 200，body 报错
-    let r = get("/v1/models").send().await.unwrap();
+    let r = post("/v1/chat/completions").send().await.unwrap();
     assert_eq!(r.status(), 200);
     assert!(
         r.bytes().await.is_err(),
         "mid-stream error should fail body read"
     );
     // 6: head 200 + Cancel + End → 200 正常
-    let r = get("/v1/models").send().await.unwrap();
+    let r = post("/v1/chat/completions").send().await.unwrap();
     assert_eq!(r.status(), 200);
     let _ = r.bytes().await.unwrap();
     // 7: head 200 + 提前关流 → 200，body 报错
-    let r = get("/v1/models").send().await.unwrap();
+    let r = post("/v1/chat/completions").send().await.unwrap();
     assert_eq!(r.status(), 200);
     assert!(
         r.bytes().await.is_err(),
         "early close should fail body read"
     );
     // 8: head 200 + 畸形 → 200，body 报错
-    let r = get("/v1/models").send().await.unwrap();
+    let r = post("/v1/chat/completions").send().await.unwrap();
     assert_eq!(r.status(), 200);
     assert!(
         r.bytes().await.is_err(),
         "garbage body should fail body read"
     );
     // 9: head 200 + 沉默 → 空闲超时 → 200，body 报错
-    let r = get("/v1/models").send().await.unwrap();
+    let r = post("/v1/chat/completions").send().await.unwrap();
     assert_eq!(r.status(), 200);
     assert!(
         r.bytes().await.is_err(),
         "idle timeout should fail body read"
     );
     // 10: 带 query string 的请求 → 200
-    let r = get("/v1/models?foo=bar").send().await.unwrap();
+    let r = post("/v1/chat/completions?foo=bar").send().await.unwrap();
     assert_eq!(r.status(), 200);
     let _ = r.bytes().await.unwrap();
 

@@ -2,15 +2,15 @@
 
 # home-llm-gateway
 
-**家里本地部署大模型，云服务器做公网中转，在任何地点通过 OpenAI 兼容 API 访问家庭模型服务。**
+**Edge LLM 网关：家里/分支/边缘节点本地部署大模型，云服务器做公网中转，在任何地点通过 OpenAI 兼容 API 按模型路由访问边缘模型服务。**（家庭部署是首个实例）
 
-Rust 实现，零外部依赖组件（不依赖 frp/ngrok/nginx）。隧道协议 **QUIC**，**mTLS 双向认证**，SSE 流式透传，支持多 agent 负载均衡。
+Rust 实现，零外部依赖组件（不依赖 frp/ngrok/nginx）。隧道协议 **QUIC**，**mTLS 双向认证**，SSE 流式透传，支持多 edge 模型感知路由与负载均衡。
 
 ```
-客户端（任何地方）
+客户端（任何地方，请求带 model）
    │  HTTPS + OpenAI 兼容 API（含 SSE 流式）
    ▼
-cloud-gateway（公网）      axum 入口：API Key 认证 → 限流 → 路由 → 隧道帧
+cloud-gateway（公网）      axum 入口：API Key 认证 → 限流 → 按 model 路由 → 隧道帧
    │  QUIC（UDP，mTLS，一条连接多路复用，无队头阻塞）
    ▼
 edge-agent（LLM 所在机器）  主动拨号 + 心跳 + 断线重连，转发本地 LLM
@@ -25,7 +25,7 @@ edge-agent（LLM 所在机器）  主动拨号 + 心跳 + 断线重连，转发�
 - **流式优先**：SSE 逐块透传（打字机效果）；客户端断开/超时自动 `Cancel` 上游，不白算 token；逐帧空闲超时，不误杀长流
 - **公网 HTTPS 原生支持**：rustls 直接监听 443，无需 nginx/caddy
 - **安全与治理**：API Key 认证（恒定时间比较）、按 Key 令牌桶限流、按 agent 并发上限的 admission control（超限 429）
-- **多 agent 最少负载路由**：多台 LLM 机器自动均衡，失联 agent 自动摘除
+- **多 edge 模型感知路由**：按请求 model 路由到能服务它的 edge（精确优先、`*` 兜底），同组最少负载均衡，失联 agent 自动摘除；`/v1/models` 网关聚合
 - **可观测性**：`/metrics` Prometheus 指标、结构化请求日志（`request_id` / 状态码 / 耗时）、`/healthz` 探针
 - **多平台部署**：单静态二进制（Linux / macOS），交叉编译脚本 + systemd 单元
 
@@ -234,26 +234,32 @@ agent 配置里 `max_concurrency: 2`（声明最多 2 个并发请求）。
 
 网关按 agent 声明的上限做并发占位，超限回 429，避免把家里 GPU 打爆。
 
-### 多 agent（多台 LLM 机器）
+### 多 agent（多台 LLM 机器，edge 异构模型）
 
-多个 agent 指向同一个网关即可，网关按**最少负载**（在途请求最少者优先）自动路由（每台机器各自一份 agent 配置）：
+多个 agent 指向同一个网关即可。网关按**请求的 model 路由到能服务它的 edge**：
+精确声明该模型的 edge 优先，其次才轮到 `models: ["*"]` 的通配 edge；
+同组内按**最少负载**（在途请求最少者优先）自动路由（每台机器各自一份 agent 配置）：
 
 ```yaml
-# 机器 1（家里）agent-config.yml
+# 机器 1（家里，跑 qwen2.5）agent-config.yml
 cloud_addr: "<网关>:4433"
 ca/cert/key: /etc/home-llm-gateway/*.crt
 agent_id: home-1
 upstream: "http://127.0.0.1:11434"
+models: [qwen2.5]        # 声明能力：网关据此路由
 max_concurrency: 2
 
-# 机器 2（另一台 / 云上）agent-config.yml
+# 机器 2（云上 GPU，跑 llama3）agent-config.yml
 cloud_addr: "<网关>:4433"
 ca/cert/key: /etc/home-llm-gateway/*.crt
 agent_id: home-2
 upstream: "http://127.0.0.1:8000"
+models: [llama3]         # 声明能力：网关据此路由
 max_concurrency: 4
 ```
 
+- 客户端请求体必须带 `model`（缺失 → 400）；没有 edge 能服务该模型 → 404
+- `/v1/models` 由网关**聚合**所有健康 edge 声明的模型（`*` 通配不列入）
 - 每个 agent 单独签发客户端证书，`agent_id` 用于区分
 - 超过 `agent_stale_secs`（网关配置，默认 15s）未心跳的 agent 自动摘除
 - 全部占满时返回 429

@@ -2,9 +2,9 @@
 
 # home-llm-gateway
 
-**Run a local LLM at home, use a cloud server as the public relay, and access your home model service from anywhere via an OpenAI-compatible API.**
+**Edge LLM gateway: run local LLMs at home / branch / edge nodes, use a cloud server as the public relay, and access your edge model services from anywhere via an OpenAI-compatible API, routed by model.** (Home deployment is the first instance.)
 
-Implemented in Rust with zero external proxy components (no frp / ngrok / nginx). Tunnel protocol: **QUIC** with **mutual TLS**. SSE streaming passthrough, multi-agent load balancing.
+Implemented in Rust with zero external proxy components (no frp / ngrok / nginx). Tunnel protocol: **QUIC** with **mutual TLS**. SSE streaming passthrough, model-aware multi-edge routing with load balancing.
 
 ```
 Client (anywhere)
@@ -25,7 +25,7 @@ Local LLM (Ollama / vLLM / llama.cpp / mock-llm)
 - **Streaming-first**: SSE chunks are forwarded as they arrive (typewriter effect); client disconnect / timeout sends `Cancel` upstream so you never pay for abandoned tokens; per-frame idle timeout never kills long streams
 - **Native public HTTPS**: rustls directly on port 443 — no nginx/caddy needed
 - **Security & governance**: API-key auth (constant-time compare), per-key token-bucket rate limiting, per-agent concurrency admission control (429 when full)
-- **Multi-agent least-loaded routing**: automatically balances across multiple LLM machines; stale agents are evicted
+- **Model-aware multi-edge routing**: routes each request by its `model` to an edge that can serve it (exact match first, `*` wildcard as fallback), least-loaded within the same model group; stale agents are evicted; `/v1/models` is aggregated by the gateway
 - **Observability**: `/metrics` in Prometheus text format, structured request logs (`request_id` / status / latency), `/healthz` probe
 - **Multi-platform deployment**: single static binary (Linux / macOS), cross-compile script + systemd units
 
