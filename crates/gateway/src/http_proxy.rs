@@ -38,6 +38,36 @@ fn api_key<'a>(state: &AppState, headers: &'a HeaderMap) -> Option<&'a str> {
     state.key_store.authorize(token).then_some(token)
 }
 
+/// 认证 + 限流（/v1/* 统一入口，含 /v1/models 聚合路由）。
+/// 认证失败 → Some(401)；限流失败 → Some(429)；通过 → None。
+pub fn auth_and_rate_limit(state: &AppState, headers: &HeaderMap) -> Option<Response> {
+    let Some(token) = api_key(state, headers) else {
+        return Some(error_response(
+            StatusCode::UNAUTHORIZED,
+            "invalid or missing API key",
+        ));
+    };
+    if let Some(rl) = &state.rate_limiter {
+        if !rl.try_acquire(token) {
+            return Some(error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate limit exceeded",
+            ));
+        }
+    }
+    None
+}
+
+/// 从请求 body 提取路由所需模型：顶层 `model` 字段（OpenAI 兼容语义，必填）。
+/// 缺失 / 非字符串 / 空串 → Err（调用方返回 400）。
+fn extract_model(body: &[u8]) -> Result<String, ()> {
+    let value: serde_json::Value = serde_json::from_slice(body).map_err(|_| ())?;
+    match value.get("model") {
+        Some(serde_json::Value::String(s)) if !s.is_empty() => Ok(s.clone()),
+        _ => Err(()),
+    }
+}
+
 pub async fn proxy(
     State(state): State<AppState>,
     method: Method,
@@ -45,18 +75,23 @@ pub async fn proxy(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let Some(token) = api_key(&state, &headers) else {
-        return error_response(StatusCode::UNAUTHORIZED, "invalid or missing API key");
-    };
-    if let Some(rl) = &state.rate_limiter {
-        if !rl.try_acquire(token) {
-            return error_response(StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded");
-        }
+    if let Some(rejection) = auth_and_rate_limit(&state, &headers) {
+        return rejection;
     }
-    let (entry, slot) = match state.registry.try_acquire(state.agent_stale_after) {
+    // 路由需要模型：按请求 model 挑选能服务它的 agent（见 MODEL_ROUTING.md）
+    let model = match extract_model(&body) {
+        Ok(m) => m,
+        Err(()) => {
+            return error_response(StatusCode::BAD_REQUEST, "model is required in request body")
+        }
+    };
+    let (entry, slot) = match state.registry.try_acquire(state.agent_stale_after, &model) {
         Ok(x) => x,
         Err(AcquireError::NoAgent) => {
             return error_response(StatusCode::SERVICE_UNAVAILABLE, "no home agent available");
+        }
+        Err(AcquireError::NoModel) => {
+            return error_response(StatusCode::NOT_FOUND, "model not found on any agent");
         }
         Err(AcquireError::AtCapacity) => {
             return error_response(StatusCode::TOO_MANY_REQUESTS, "agent at capacity");
@@ -268,5 +303,24 @@ mod tests {
         // 值原样保留
         let auth = out.iter().find(|(k, _)| k == "authorization").unwrap();
         assert_eq!(auth.1, "Bearer sk-test");
+    }
+
+    #[test]
+    fn extract_model_reads_top_level_field() {
+        // 正常：字符串 model
+        assert_eq!(
+            extract_model(br#"{"model":"qwen2.5","messages":[]}"#).unwrap(),
+            "qwen2.5"
+        );
+        // model 是嵌套路径中的字段（不应误取）
+        assert!(extract_model(br#"{"messages":[{"role":"user","content":"model?"}]}"#).is_err());
+        // 缺失 model → Err（调用方返回 400）
+        assert!(extract_model(br#"{"messages":[]}"#).is_err());
+        // model 非字符串 → Err
+        assert!(extract_model(br#"{"model":123}"#).is_err());
+        // 空串 → Err
+        assert!(extract_model(br#"{"model":""}"#).is_err());
+        // 非法 JSON → Err
+        assert!(extract_model(b"not json").is_err());
     }
 }

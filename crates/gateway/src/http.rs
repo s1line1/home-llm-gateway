@@ -38,6 +38,9 @@ pub fn app(state: AppState) -> Router {
     let mut router = Router::new()
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics_route))
+        // /v1/models 是静态路径，优先于下方 /v1/{*rest}（matchit 规则）：
+        // GET 由网关聚合回答，不再透传单台 agent。
+        .route("/v1/models", get(models_route))
         .route(
             "/v1/{*rest}",
             get(crate::http_proxy::proxy)
@@ -159,6 +162,29 @@ const UI_MISSING: &str = r#"<!doctype html>
 
 async fn healthz() -> &'static str {
     "ok"
+}
+
+/// OpenAI 兼容 `/v1/models`：聚合所有**健康** agent 显式声明的模型并集
+/// （`["*"]` 全匹配的 agent 不贡献条目——它接受任意请求，但具体能跑什么
+/// 只有上游知道，列出会误导客户端）。与代理入口同级的认证 + 限流。
+async fn models_route(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(rejection) = crate::http_proxy::auth_and_rate_limit(&state, &headers) {
+        return rejection;
+    }
+    let data: Vec<_> = state
+        .registry
+        .healthy_models(state.agent_stale_after)
+        .into_iter()
+        .map(|id| {
+            json!({
+                "id": id,
+                "object": "model",
+                "created": 0,
+                "owned_by": "edge-agent",
+            })
+        })
+        .collect();
+    Json(json!({ "object": "list", "data": data })).into_response()
 }
 
 /// Prometheus 文本格式指标。

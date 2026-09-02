@@ -114,9 +114,31 @@ impl Registry {
         out
     }
 
-    /// 按最少负载（在途数最小）挑选一个健康 agent 并原子占用并发槽位；
+    /// 聚合所有**健康** agent 显式声明的模型（去重、排序）。
+    /// `["*"]` 不贡献条目（全匹配，但具体能跑什么只有上游知道）。
+    pub fn healthy_models(&self, stale_after: Duration) -> Vec<String> {
+        let inner = self.inner.read().unwrap();
+        let mut out: Vec<String> = inner
+            .values()
+            .filter(|e| e.last_seen.elapsed() < stale_after)
+            .flat_map(|e| e.models.iter().filter(|m| m.as_str() != "*").cloned())
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// 在**能服务指定模型**的健康 agent 中挑选一个并原子占用并发槽位；
     /// 返回的 [`SlotGuard`] 期间该请求计入在途数。
-    pub fn try_acquire(&self, stale_after: Duration) -> Result<(Entry, SlotGuard), AcquireError> {
+    ///
+    /// 模型匹配语义：agent 声明的 `models` 含 `"*"`（全匹配/兜底）或含 `model`。
+    /// 优先级：**精确声明该模型者优先于仅 `*` 通配者**（通配是兜底，不抢单）；
+    /// 同级内按负载最轻优先，同等负载取最近心跳者（多 agent 均衡）。
+    pub fn try_acquire(
+        &self,
+        stale_after: Duration,
+        model: &str,
+    ) -> Result<(Entry, SlotGuard), AcquireError> {
         let inner = self.inner.read().unwrap();
         let mut candidates: Vec<&Entry> = inner
             .values()
@@ -125,9 +147,17 @@ impl Registry {
         if candidates.is_empty() {
             return Err(AcquireError::NoAgent);
         }
-        // 负载最轻优先；同等负载取最近心跳者（多 agent 均衡）
+        // 模型过滤：只保留能服务请求模型的 agent（声明含 "*" 或含 model）
+        candidates.retain(|e| e.models.iter().any(|m| m == "*" || m == model));
+        if candidates.is_empty() {
+            return Err(AcquireError::NoModel);
+        }
+        // 排序：精确声明（exact=true）排前 → 负载轻优先 → 心跳新者优先。
+        // bool 排序 false < true，故用 !exact 让精确者排前。
         candidates.sort_by_key(|e| {
+            let exact = e.models.iter().any(|m| m == model);
             (
+                !exact,
                 e.inflight.load(Ordering::Relaxed),
                 std::cmp::Reverse(e.last_seen),
             )
@@ -154,6 +184,8 @@ impl Registry {
 pub enum AcquireError {
     /// 没有任何健康 agent。
     NoAgent,
+    /// 有健康 agent，但没有任何一个能服务请求的模型。
+    NoModel,
     /// agent 并发已满。
     AtCapacity,
 }
@@ -257,16 +289,18 @@ mod tests {
     async fn heartbeat_refreshes_stale_entry() {
         let reg = Registry::default();
         let conn = test_connection().await;
-        reg.register("h".into(), vec![], 4, conn.clone());
+        reg.register("h".into(), vec!["*".into()], 4, conn.clone());
         // 30ms 后仍按 10ms 判定失联
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(matches!(
-            reg.try_acquire(Duration::from_millis(10)),
+            reg.try_acquire(Duration::from_millis(10), "qwen2.5"),
             Err(AcquireError::NoAgent)
         ));
         // 心跳刷新 last_seen → 恢复可用
         reg.heartbeat("h");
-        assert!(reg.try_acquire(Duration::from_millis(100)).is_ok());
+        assert!(reg
+            .try_acquire(Duration::from_millis(100), "qwen2.5")
+            .is_ok());
         // 对不存在的 agent 心跳 → 无害
         reg.heartbeat("ghost");
     }
@@ -276,32 +310,127 @@ mod tests {
         let reg = Registry::default();
         let c1 = test_connection().await;
         let c2 = test_connection().await;
-        reg.register("a".into(), vec![], 1, c1.clone());
-        reg.register("b".into(), vec![], 1, c2.clone());
+        reg.register("a".into(), vec!["*".into()], 1, c1.clone());
+        reg.register("b".into(), vec!["*".into()], 1, c2.clone());
 
         // 两个容量各 1 的 agent：连续两个请求应命中不同 agent
-        let (e1, s1) = reg.try_acquire(Duration::from_secs(10)).unwrap();
-        let (e2, s2) = reg.try_acquire(Duration::from_secs(10)).unwrap();
+        let (e1, s1) = reg.try_acquire(Duration::from_secs(10), "qwen2.5").unwrap();
+        let (e2, s2) = reg.try_acquire(Duration::from_secs(10), "qwen2.5").unwrap();
         assert_ne!(e1.stable_id, e2.stable_id);
         // 全满 → AtCapacity
         assert!(matches!(
-            reg.try_acquire(Duration::from_secs(10)),
+            reg.try_acquire(Duration::from_secs(10), "qwen2.5"),
             Err(AcquireError::AtCapacity)
         ));
         drop(s1);
         drop(s2);
         // 槽位释放后恢复
-        assert!(reg.try_acquire(Duration::from_secs(10)).is_ok());
+        assert!(reg.try_acquire(Duration::from_secs(10), "qwen2.5").is_ok());
     }
 
     #[tokio::test]
     async fn max_concurrency_zero_always_acquires() {
         let reg = Registry::default();
         let conn = test_connection().await;
-        reg.register("z".into(), vec![], 0, conn.clone()); // 0 = 不限
+        reg.register("z".into(), vec!["*".into()], 0, conn.clone()); // 0 = 不限
         for _ in 0..5 {
-            let (_entry, _slot) = reg.try_acquire(Duration::from_secs(10)).unwrap();
+            let (_entry, _slot) = reg.try_acquire(Duration::from_secs(10), "qwen2.5").unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn try_acquire_filters_by_model() {
+        let reg = Registry::default();
+        let c1 = test_connection().await;
+        let c2 = test_connection().await;
+        let c3 = test_connection().await;
+        reg.register(
+            "qwen-edge".into(),
+            vec!["qwen2.5".into()],
+            1, // 容量 1：打满后验证回落通配
+            c1.clone(),
+        );
+        reg.register("llama-edge".into(), vec!["llama3".into()], 4, c2.clone());
+        // 通配 edge：任何模型都可路由到它
+        reg.register("wildcard-edge".into(), vec!["*".into()], 4, c3.clone());
+
+        // qwen2.5 → 精确声明的 qwen-edge 优先于仅通配的 wildcard-edge，
+        // 绝不能是 llama-edge
+        let (e, s) = reg.try_acquire(Duration::from_secs(10), "qwen2.5").unwrap();
+        let id = {
+            let inner = reg.inner.read().unwrap();
+            inner
+                .iter()
+                .find(|(_, v)| v.stable_id == e.stable_id)
+                .map(|(id, _)| id.clone())
+                .unwrap()
+        };
+        assert_eq!(id, "qwen-edge", "exact model match must win over wildcard");
+        drop(s);
+
+        // llama3 → 精确声明的 llama-edge 优先
+        let (e, s) = reg.try_acquire(Duration::from_secs(10), "llama3").unwrap();
+        let id = {
+            let inner = reg.inner.read().unwrap();
+            inner
+                .iter()
+                .find(|(_, v)| v.stable_id == e.stable_id)
+                .map(|(id, _)| id.clone())
+                .unwrap()
+        };
+        assert_eq!(id, "llama-edge", "exact model match must win over wildcard");
+        drop(s);
+
+        // 精确 edge 容量打满后，请求回落到通配 edge
+        let (e1, s1) = reg.try_acquire(Duration::from_secs(10), "qwen2.5").unwrap();
+        let (e2, s2) = reg.try_acquire(Duration::from_secs(10), "qwen2.5").unwrap();
+        assert_ne!(
+            e1.stable_id, e2.stable_id,
+            "second qwen2.5 request should fall back to wildcard edge"
+        );
+        drop(s1);
+        drop(s2);
+    }
+
+    #[tokio::test]
+    async fn try_acquire_returns_no_model_when_none_match() {
+        let reg = Registry::default();
+        // 无通配 agent：所有健康 agent 都无法服务 mistral-7b
+        let c1 = test_connection().await;
+        let c2 = test_connection().await;
+        reg.register("qwen-edge".into(), vec!["qwen2.5".into()], 4, c1.clone());
+        reg.register("llama-edge".into(), vec!["llama3".into()], 4, c2.clone());
+        assert!(matches!(
+            reg.try_acquire(Duration::from_secs(10), "mistral-7b"),
+            Err(AcquireError::NoModel)
+        ));
+    }
+
+    #[tokio::test]
+    async fn healthy_models_aggregates_and_excludes_wildcard() {
+        let reg = Registry::default();
+        let c1 = test_connection().await;
+        let c2 = test_connection().await;
+        reg.register(
+            "edge-a".into(),
+            vec!["qwen2.5".into(), "llama3".into()],
+            4,
+            c1.clone(),
+        );
+        reg.register(
+            "edge-b".into(),
+            vec!["llama3".into(), "*".into()],
+            4,
+            c2.clone(),
+        );
+        // 去重、排序、排除 "*"
+        assert_eq!(
+            reg.healthy_models(Duration::from_secs(10)),
+            vec!["llama3", "qwen2.5"]
+        );
+        // 失联 agent 的模型不聚合
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(reg.healthy_models(Duration::from_millis(10)).is_empty());
     }
 
     #[tokio::test]

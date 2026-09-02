@@ -146,7 +146,7 @@ async fn e2e_gateway_timeout_cancels_upstream() {
     let resp = client
         .post(format!("{base}/v1/slow"))
         .header("Authorization", format!("Bearer {key}"))
-        .json(&serde_json::json!({}))
+        .json(&serde_json::json!({ "model": "mock-llm" }))
         .send()
         .await
         .unwrap();
@@ -156,7 +156,7 @@ async fn e2e_gateway_timeout_cancels_upstream() {
         "slow upstream should be cut off by idle timeout"
     );
 
-    // Cancel 不应影响 agent 连接本身，之后仍能正常服务
+    // Cancel 不应影响 agent 连接本身，之后仍能正常服务（/v1/models 由网关聚合回答）
     let resp = client
         .get(format!("{base}/v1/models"))
         .header("Authorization", format!("Bearer {key}"))
@@ -164,6 +164,12 @@ async fn e2e_gateway_timeout_cancels_upstream() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["object"], "list");
+    assert_eq!(
+        body["data"][0]["id"], "mock-llm",
+        "healthy agent's declared model should be listed"
+    );
 
     agent.shutdown().await;
     gw.shutdown().await;

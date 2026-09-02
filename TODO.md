@@ -8,6 +8,11 @@
 当前已实现：OpenAI chat-completions 形态（`/v1/chat/completions`、`/v1/models`、SSE、Bearer 认证）、
 客户端断开/超时 → Cancel 上游（不白算 token）。缺口如下。
 
+- [x] **模型路由（Edge 定位，见 MODEL_ROUTING.md，2026-09 实施）**：
+      网关按请求 body 的 model 字段，在**能服务该模型的健康 edge** 中挑最少负载者
+      （同模型内均衡）；`models: ["*"]` 全匹配；无 model → 400；模型无人能服务 → 404；
+      `/v1/models` 改为网关聚合所有健康 edge 的显式声明模型（不再透传单台上游）。
+      双 edge 异构模型 e2e 覆盖（路由正确性、聚合列表、404、400）
 - [ ] **实机验证链路**：本地起 gateway + mock-llm，用 curl 模拟 DSH/Codex 打全流程
       （`/v1/models`、流式 chat、中途断开触发 Cancel），确认工具可直接连；
       顺带确认 `/v1/models` 返回的上游模型名与工具端 `--model` 配置的对应关系

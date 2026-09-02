@@ -33,7 +33,8 @@ pub struct ConfigFile {
     /// 心跳间隔秒数
     #[serde(default = "default_heartbeat_secs")]
     heartbeat_secs: u64,
-    /// 声明的模型列表（* = 全部）
+    /// 声明的模型列表（edge 能力声明，网关据此做模型路由；`*` = 全匹配，
+    /// 不贡献 /v1/models 聚合条目）。示例：`[qwen2.5, llama3]`
     #[serde(default = "default_models")]
     models: Vec<String>,
     /// 声明的最大并发请求数（网关据此做 admission control）
