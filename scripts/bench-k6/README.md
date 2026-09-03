@@ -51,3 +51,22 @@ make bench-k6 KEY=$KEY VUS=20 DUR=30s
 网关按 agent `max_concurrency` 做 admission control（超限返回 429）。这是**设计行为**：
 - 想压 HTTP 层纯吞吐 → 调大 agent 并发上限
 - 想验证 admission 正确性 → 保持小上限，观察 429 比例（见 `cargo test` 的 e2e_admission_control）
+
+## HTTP 层闸门验证（admission.js）
+
+验证网关 `max_concurrent_requests`（HTTP 全局在途上限）是否精确钳制并发：
+
+```bash
+# 云上已运行的 gateway（agent 上游需能响应 /v1/slow 慢端点，放大在途窗口）
+make bench-admission KEY=sk-xxx GATEWAY_URL=http://IP:9090 VUS=200 DUR=20s
+
+# 本地自建临时栈（mock+gateway+agent，专用端口，不碰现有配置）
+make bench-admission-local LIMIT=20 VUS=200
+```
+
+**判定**：
+- 429 占比 = 被闸门拒绝的请求（超出 limit 的并发）
+- 压测期间网关 `/metrics` 的 `hlmg_active_requests` **峰值应精确等于 limit**（闸门生效铁证）
+- 本地验证脚本已自动采样并输出峰值；云上需自行 ssh 到网关侧轮询 `/metrics`
+
+注意：agent 声明 `models` 若与默认 `MODEL=qwen2.5` 不一致，用 `MODEL=xxx` 覆盖（模型路由要求匹配）。

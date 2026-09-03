@@ -11,12 +11,16 @@ MOCK_BIN     := target/debug/mock-llm
 
 # k6 宏观压测参数（命令行注入，不写死机器特定值）：
 #   make bench-k6 KEY=sk-xxx GATEWAY_URL=http://IP:9090 VUS=20 DUR=30s
+#   make bench-admission KEY=sk-xxx GATEWAY_URL=http://IP:9090 VUS=200 DUR=20s MODEL=qwen2.5
 KEY ?= sk-missing
 GATEWAY_URL ?= http://127.0.0.1:8080
 VUS ?= 20
 DUR ?= 30s
+MODEL ?= qwen2.5
+LIMIT ?= 20
 
-.PHONY: help setup certs certs-required web-install web-build web-dev build fmt clippy check test bench bench-k6 release \
+.PHONY: help setup certs certs-required web-install web-build web-dev build fmt clippy check test bench bench-k6 \
+        bench-admission bench-admission-local release \
         run-gateway run-agent run-mock dev dev-ui logs stop clean
 
 help: ## 显示所有命令
@@ -65,6 +69,17 @@ bench: ## 基准测试（Criterion）：make bench BENCH="-p proto -p gateway"
 
 bench-k6: ## k6 宏观压测（SSE 长流）：make bench-k6 KEY=sk-xxx GATEWAY_URL=http://IP:9090
 	k6 run -e GATEWAY_URL=$(GATEWAY_URL) -e GATEWAY_KEY=$(KEY) -e VUS=$(VUS) -e DURATION=$(DUR) scripts/bench-k6/sse.js
+
+bench-admission: ## 验证 HTTP 闸门（打外部 gateway /v1/slow）：make bench-admission KEY=sk-xxx GATEWAY_URL=http://IP:9090 VUS=200
+	## 前置：被测 gateway 已配 max_concurrent_requests；agent 上游能响应 /v1/slow
+	## （慢端点放大在途窗口）。429 占比突增点 = 闸门阈值；看 k6 报告 + 网关
+	## /metrics 的 hlmg_active_requests 峰值是否贴住闸门值。
+	k6 run -e GATEWAY_URL=$(GATEWAY_URL) -e GATEWAY_KEY=$(KEY) -e VUS=$(VUS) \
+		-e DURATION=$(DUR) -e MODEL=$(MODEL) scripts/bench-k6/admission.js
+
+bench-admission-local: ## 本地自建栈验证闸门：make bench-admission-local [LIMIT=20] [VUS=200]
+	## 输出 hlmg_active_requests 峰值，应精确等于 LIMIT。
+	bash scripts/bench-admission-local.sh $(LIMIT) $(VUS)
 
 release: ## 多平台打包到 dist/（见 scripts/build-release.sh）
 	bash scripts/build-release.sh

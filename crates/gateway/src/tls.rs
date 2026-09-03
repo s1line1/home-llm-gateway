@@ -39,6 +39,10 @@ pub fn server_config(
             .try_into()
             .map_err(|e| crate::error::GatewayError::Other(format!("transport: {e}")))?,
     ));
+    // 一条 QUIC 连接多路复用所有代理请求的流：quinn 默认并发流上限 100，
+    // 多客户端高并发时会排队等流、延迟爆炸（压测实测：VUS 500+ 延迟飙到 15s）。
+    // 单 agent 单连接场景调大到 1000。
+    transport.max_concurrent_bidi_streams(1000u32.into());
     cfg.transport_config(Arc::new(transport));
     Ok(cfg)
 }
