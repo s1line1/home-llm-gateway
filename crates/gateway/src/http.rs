@@ -234,11 +234,11 @@ async fn metrics_middleware(
     };
     let method = req.method().clone();
     let path = req.uri().path().to_string();
-    let start = state.metrics.record_start();
-    // HTTP 全局在途上限（0 = 不限）：超限立即 429，防多 key 总和压垮单实例
+    // HTTP 全局在途上限（0 = 不限）：try_enter 原子占位（旧值判定，无竞态），
+    // 超限返回 None → 立即 429，防多 key 总和压垮单实例
     let limit = state.max_concurrent_requests;
-    if limit > 0 && state.metrics.active_count() > limit as u64 {
-        state.metrics.record_end(start, 429);
+    let Some(start) = state.metrics.try_enter(limit) else {
+        state.metrics.record_rejected(429);
         let mut resp = crate::http_proxy::error_response(
             axum::http::StatusCode::TOO_MANY_REQUESTS,
             "too many concurrent requests, retry later",
@@ -255,7 +255,7 @@ async fn metrics_middleware(
             "concurrent request limit reached, rejecting 429"
         );
         return resp;
-    }
+    };
     let mut resp = next.run(req).await;
     let status = resp.status().as_u16();
     state.metrics.record_end(start, status);
@@ -460,6 +460,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn try_enter_is_atomic_under_concurrency() {
+        // limit=1：8 个线程同时 try_enter → 恰 1 个成功（无 check-then-act 竞态）。
+        // 这是 e2e 曾出现 [429,429] 双拒的根因回归测试。
+        let metrics = Metrics::default();
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let m = metrics.clone();
+            handles.push(std::thread::spawn(move || m.try_enter(1).is_some()));
+        }
+        let admitted: usize = handles
+            .into_iter()
+            .map(|h| h.join().unwrap() as usize)
+            .sum();
+        assert_eq!(admitted, 1, "exactly one concurrent entry admitted");
+        // 占用未释放时后续仍拒；释放后恢复
+        assert!(metrics.try_enter(1).is_none());
+        metrics.record_end(std::time::Instant::now(), 200); // 释放占用的那个
+        assert!(metrics.try_enter(1).is_some());
     }
 
     /// 构造 ui_fallback 的请求并返回响应。

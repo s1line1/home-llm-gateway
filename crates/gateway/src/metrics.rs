@@ -39,11 +39,36 @@ impl Metrics {
         Instant::now()
     }
 
+    /// 原子占位（HTTP 全局并发 admission）：`fetch_add` 用**旧值**判定是否超限——
+    /// 两个并发请求各自拿到唯一旧值，恰好允许 limit 个进入，无 check-then-act 竞态。
+    /// 超限 → 回退占位并返回 None（调用方返回 429，**不要**再调 record_end）；
+    /// 通过 → Some(Instant)，最终必须配 record_end 释放。
+    pub fn try_enter(&self, limit: u32) -> Option<Instant> {
+        let prev = self.inner.active.fetch_add(1, Ordering::Relaxed);
+        if limit > 0 && prev >= limit as u64 {
+            self.inner.active.fetch_sub(1, Ordering::Relaxed);
+            None
+        } else {
+            self.inner.request_count.fetch_add(1, Ordering::Relaxed);
+            Some(Instant::now())
+        }
+    }
+
     pub fn record_end(&self, start: Instant, status: u16) {
         self.inner.active.fetch_sub(1, Ordering::Relaxed);
         self.inner
             .total_duration_ms
             .fetch_add(start.elapsed().as_millis() as u64, Ordering::Relaxed);
+        self.record_status(status);
+    }
+
+    /// 记录被 admission 拒绝的请求（不计 active/耗时，但计入请求数与状态码分布）。
+    pub fn record_rejected(&self, status: u16) {
+        self.inner.request_count.fetch_add(1, Ordering::Relaxed);
+        self.record_status(status);
+    }
+
+    fn record_status(&self, status: u16) {
         *self
             .inner
             .status_counts
