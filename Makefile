@@ -133,4 +133,4 @@ gateway-config.yml: | certs-required
 
 $(AGENT_CONFIG): | certs-required
 	@echo "生成本地 agent 配置 $(AGENT_CONFIG)..."
-	@printf 'cloud_addr: "127.0.0.1:4433"\nca: certs/out/ca.crt\ncert: certs/out/client.crt\nkey: certs/out/client.key\nagent_id: "home-1"\nupstream: "http://127.0.0.1:11435"\nmax_concurrency: 4\n' > $(AGENT_CONFIG)
+	@printf 'cloud_addr: "127.0.0.1:4433"\nca: certs/out/ca.crt\ncert: certs/out/client.crt\nkey: certs/out/client.key\nagent_id: "edge-1"\nupstream: "http://127.0.0.1:11435"\nmax_concurrency: 4\n' > $(AGENT_CONFIG)
