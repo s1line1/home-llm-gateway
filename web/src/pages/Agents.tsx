@@ -1,5 +1,6 @@
-// Agents 页：在线 agent 状态。优先使用 /admin/agents 明细（契约预留），
-// 后端未实现（404）时降级为仅展示 /metrics 中的在线总数与说明。
+// Agents 页：在线 agent 状态。明细来自 /admin/agents（agent_id / models /
+// max_concurrency / inflight / last_seen），顶部卡展示在线总数（/metrics）
+// 与明细聚合（在途、并发上限合计）。
 
 import { useQuery } from "@tanstack/react-query";
 
@@ -86,8 +87,14 @@ export default function Agents() {
         <Card title="在途请求" subtitle="所有 agent 合计">
           <div className="text-2xl font-semibold tabular-nums">{latest ? latest.active_requests : "—"}</div>
         </Card>
-        <Card title="并发上限" subtitle="agent 声明值，用于 admission control">
-          <div className="text-2xl font-semibold tabular-nums text-slate-400">—</div>
+        <Card title="并发上限" subtitle="agent 声明值合计，用于 admission control">
+          <div className="text-2xl font-semibold tabular-nums">
+            {detailQuery.data && detailQuery.data.length > 0
+              ? detailQuery.data.some((a) => a.max_concurrency === 0)
+                ? "不限"
+                : detailQuery.data.reduce((s, a) => s + (a.max_concurrency || 0), 0)
+              : "—"}
+          </div>
         </Card>
       </div>
 
