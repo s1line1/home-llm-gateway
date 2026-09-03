@@ -21,6 +21,7 @@ async fn e2e_https_public_entry() {
         request_timeout: Duration::from_secs(10),
         agent_stale_after: Duration::from_secs(10),
         rate_limit_per_min: 0,
+        max_concurrent_requests: 0,
         tls: Some(TlsPem {
             cert: srv_pem.clone().into_bytes(),
             key: srv_key_pem.clone().into_bytes(),
@@ -127,6 +128,7 @@ async fn e2e_quic_control_stream_edge_frames() {
         request_timeout: Duration::from_secs(10),
         agent_stale_after: Duration::from_secs(10),
         rate_limit_per_min: 0,
+        max_concurrent_requests: 0,
         tls: None,
         ui_dir: None,
     })
@@ -284,6 +286,7 @@ async fn e2e_proxy_protocol_edge_cases() {
         request_timeout: Duration::from_millis(200),
         agent_stale_after: Duration::from_secs(10),
         rate_limit_per_min: 0,
+        max_concurrent_requests: 0,
         tls: None,
         ui_dir: None,
     })

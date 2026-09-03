@@ -47,6 +47,8 @@ pub struct GatewayConfig {
     pub agent_stale_after: Duration,
     /// 每个 API Key 每分钟请求上限（0 = 不限流）。
     pub rate_limit_per_min: u32,
+    /// HTTP 全局在途请求上限（0 = 不限）。
+    pub max_concurrent_requests: u32,
     /// 提供后，公网入口启用 HTTPS（rustls）。
     pub tls: Option<TlsPem>,
     /// React UI 静态目录（含 index.html；存在时 `/` 托管 Dashboard，否则显示构建提示页）。
@@ -93,6 +95,7 @@ impl Gateway {
             timeout: cfg.request_timeout,
             agent_stale_after: cfg.agent_stale_after,
             rate_limiter: RateLimiter::new(cfg.rate_limit_per_min),
+            max_concurrent_requests: cfg.max_concurrent_requests,
             metrics: metrics.clone(),
             ui,
         };

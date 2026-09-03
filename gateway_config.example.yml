@@ -30,6 +30,10 @@ agent_stale_secs: 15
 # 每个 API Key 每分钟请求上限（0 = 不限流）
 rate_limit_per_min: 60
 
+# HTTP 全局在途请求上限（0 = 不限；per-key 限流之外的总闸门，
+# 防止多 key 并发总和压垮单实例；SSE 长流每个连接计 1）
+# max_concurrent_requests: 100
+
 # 公网入口 HTTPS 证书（提供后公网入口启用 TLS，客户端用 https:// 访问；
 # 与 tls_key 成对，去掉即明文 HTTP）
 # tls_cert: /etc/home-llm-gateway/server.crt

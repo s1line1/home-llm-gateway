@@ -13,7 +13,7 @@ use axum::{
 use serde_json::json;
 use tower::ServiceExt;
 use tower_http::services::{ServeDir, ServeFile};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::keystore::KeyStore;
 use crate::metrics::Metrics;
@@ -29,6 +29,8 @@ pub struct AppState {
     pub timeout: Duration,
     pub agent_stale_after: Duration,
     pub rate_limiter: Option<RateLimiter>,
+    /// HTTP 全局在途请求上限（0 = 不限；per-key 限流之外的总闸门）。
+    pub max_concurrent_requests: u32,
     pub metrics: Metrics,
     /// React UI 静态目录（None = `/` 显示构建提示页）。
     pub ui: Option<PathBuf>,
@@ -232,7 +234,28 @@ async fn metrics_middleware(
     };
     let method = req.method().clone();
     let path = req.uri().path().to_string();
-    let start = state.metrics.record_start();
+    // HTTP 全局在途上限（0 = 不限）：try_enter 原子占位（旧值判定，无竞态），
+    // 超限返回 None → 立即 429，防多 key 总和压垮单实例
+    let limit = state.max_concurrent_requests;
+    let Some(start) = state.metrics.try_enter(limit) else {
+        state.metrics.record_rejected(429);
+        let mut resp = crate::http_proxy::error_response(
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            "too many concurrent requests, retry later",
+        );
+        if let Ok(v) = axum::http::HeaderValue::from_str(&request_id) {
+            resp.headers_mut().insert("x-request-id", v);
+        }
+        warn!(
+            request_id = %request_id,
+            method = %method,
+            path = %path,
+            active = state.metrics.active_count(),
+            limit,
+            "concurrent request limit reached, rejecting 429"
+        );
+        return resp;
+    };
     let mut resp = next.run(req).await;
     let status = resp.status().as_u16();
     state.metrics.record_end(start, status);
@@ -267,6 +290,7 @@ mod tests {
             timeout: Duration::from_secs(10),
             agent_stale_after: Duration::from_secs(10),
             rate_limiter: RateLimiter::new(0),
+            max_concurrent_requests: 0,
             metrics: Metrics::default(),
             ui,
         }
@@ -375,6 +399,88 @@ mod tests {
             "req-999",
             "client-supplied id is echoed"
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_request_limit_rejects_with_429() {
+        // max_concurrent_requests=1：先人为占住 1 个在途 → 第二个请求 429
+        let mut state = test_state(None);
+        state.max_concurrent_requests = 1;
+        let metrics = state.metrics.clone();
+        let router = app(state);
+
+        // 占住唯一的并发槽（record_start 模拟一个在途请求，不 record_end）
+        metrics.record_start();
+        let resp = router
+            .clone()
+            .oneshot(
+                axum::extract::Request::builder()
+                    .uri("/healthz")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "second concurrent request over limit must be rejected"
+        );
+        assert_eq!(
+            resp.headers().get(axum::http::header::RETRY_AFTER),
+            Some(&axum::http::HeaderValue::from_static("60")),
+            "429 carries Retry-After"
+        );
+        metrics.record_end(std::time::Instant::now(), 429); // 释放槽位
+
+        // 槽位释放后恢复
+        let resp = router
+            .oneshot(
+                axum::extract::Request::builder()
+                    .uri("/healthz")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn zero_limit_never_rejects() {
+        // max_concurrent_requests=0（默认）→ 不限
+        let router = app(test_state(None));
+        let resp = router
+            .oneshot(
+                axum::extract::Request::builder()
+                    .uri("/healthz")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn try_enter_is_atomic_under_concurrency() {
+        // limit=1：8 个线程同时 try_enter → 恰 1 个成功（无 check-then-act 竞态）。
+        // 这是 e2e 曾出现 [429,429] 双拒的根因回归测试。
+        let metrics = Metrics::default();
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let m = metrics.clone();
+            handles.push(std::thread::spawn(move || m.try_enter(1).is_some()));
+        }
+        let admitted: usize = handles
+            .into_iter()
+            .map(|h| h.join().unwrap() as usize)
+            .sum();
+        assert_eq!(admitted, 1, "exactly one concurrent entry admitted");
+        // 占用未释放时后续仍拒；释放后恢复
+        assert!(metrics.try_enter(1).is_none());
+        metrics.record_end(std::time::Instant::now(), 200); // 释放占用的那个
+        assert!(metrics.try_enter(1).is_some());
     }
 
     /// 构造 ui_fallback 的请求并返回响应。

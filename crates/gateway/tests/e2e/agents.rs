@@ -66,6 +66,7 @@ async fn e2e_multi_agent_least_loaded() {
         request_timeout: Duration::from_secs(10),
         agent_stale_after: Duration::from_secs(10),
         rate_limit_per_min: 0,
+        max_concurrent_requests: 0,
         tls: None,
         ui_dir: None,
     })
@@ -185,6 +186,7 @@ async fn e2e_model_routing_and_models_endpoint() {
         request_timeout: Duration::from_secs(10),
         agent_stale_after: Duration::from_secs(10),
         rate_limit_per_min: 0,
+        max_concurrent_requests: 0,
         tls: None,
         ui_dir: None,
     })
@@ -316,6 +318,79 @@ async fn e2e_admin_agents_lists_registry() {
         arr[0]["last_seen_secs_ago"].as_u64().unwrap() < 5,
         "agent just heartbeated"
     );
+
+    agent.shutdown().await;
+    gw.shutdown().await;
+}
+
+/// HTTP 全局并发上限（max_concurrent_requests=1）：并发两个慢请求 → 一个 200、
+/// 一个 429（防多 key 总和压垮单实例，见 TODO P1 B 档）。
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn e2e_http_concurrent_request_limit() {
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    let (ca, server_cert, server_key, client_cert, client_key) = gen_certs();
+    let mock_addr = start_mock_llm("mock-llm").await;
+    let (keys_path, key) = seed_keys_db();
+
+    let gw = Gateway::start(GatewayConfig {
+        http_bind: "127.0.0.1:0".parse().unwrap(),
+        quic_bind: "127.0.0.1:0".parse().unwrap(),
+        ca_cert: vec![ca.clone()],
+        server_cert: vec![server_cert.clone()],
+        server_key,
+        admin_token: None,
+        keys_file: Some(keys_path),
+        request_timeout: Duration::from_secs(10),
+        agent_stale_after: Duration::from_secs(10),
+        rate_limit_per_min: 0,
+        max_concurrent_requests: 1,
+        tls: None,
+        ui_dir: None,
+    })
+    .await
+    .unwrap();
+
+    let agent = Agent::start(AgentConfig {
+        cloud_addr: gw.quic_addr,
+        server_name: "localhost".into(),
+        ca_cert: vec![ca.clone()],
+        client_cert: vec![client_cert.clone()],
+        client_key: client_key.clone_key(),
+        agent_id: "limit-agent".into(),
+        models: vec!["mock-llm".into()],
+        max_concurrency: 4,
+        upstream_base: format!("http://{mock_addr}"),
+        heartbeat_interval: Duration::from_millis(200),
+        request_log: false,
+    })
+    .unwrap();
+    wait_for_agents(&gw, 1, Duration::from_secs(10)).await;
+
+    let client = reqwest::Client::new();
+    let url = format!("http://{}/v1/slow", gw.http_addr); // mock 睡 800ms → 并发窗口大
+    let req = || {
+        client
+            .post(&url)
+            .header("Authorization", format!("Bearer {key}"))
+            .json(&serde_json::json!({ "model": "mock-llm" }))
+    };
+
+    // 两个并发慢请求：limit=1 → 恰一个 200、一个 429
+    let (a, b) = tokio::join!(req().send(), req().send());
+    let (ra, rb) = (a.unwrap(), b.unwrap());
+    let mut statuses = vec![ra.status(), rb.status()];
+    statuses.sort();
+    assert_eq!(
+        statuses,
+        vec![
+            reqwest::StatusCode::OK,
+            reqwest::StatusCode::TOO_MANY_REQUESTS
+        ],
+        "global concurrent limit=1 should admit exactly one in-flight request"
+    );
+    let _ = ra.bytes().await;
+    let _ = rb.bytes().await;
 
     agent.shutdown().await;
     gw.shutdown().await;

@@ -190,6 +190,7 @@ pub async fn start_stack(
         request_timeout,
         agent_stale_after: Duration::from_secs(10),
         rate_limit_per_min,
+        max_concurrent_requests: 0,
         tls: None,
         ui_dir: None,
     })

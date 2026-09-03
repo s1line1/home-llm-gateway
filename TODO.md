@@ -110,9 +110,12 @@
 - [ ] **key 禁用/启用 toggle（B 档，可选）**：`KeyRecord.enabled` 字段已存在但 admin API
       只有创建/删除——补 `POST /admin/keys/{id}/disable|enable`（"暂时停用"不吊销），
       10 分钟级改动
-- [ ] **HTTP 层总并发 admission（B 档，可选）**：现有限流是 per-key（令牌桶）——
-      多个 key 总和仍可压垮单实例。补网关**全局在途上限**（HTTP 入口级，类似 agent 级
-      admission）；metrics 的 active_requests 已可观测，实施是加"超限即拒"判断
+- [x] **HTTP 层总并发 admission（2026-09 实施）**：配置 `max_concurrent_requests`
+      （0 = 不限，默认关闭）；metrics_middleware 在 record_start 后检查
+      `metrics.active_count() > limit` → 立即 429（复用 OpenAI 语义 error_response，
+      带 Retry-After 与 x-request-id），防多 key 总和压垮单实例。
+      测试：lib 单测（占 1 槽后第 2 请求 429 / 0 不限 / 释放后恢复）+ e2e
+      `e2e_http_concurrent_request_limit`（limit=1 并发两慢请求 → 200 + 429）
 - [ ] **请求体大小限制可配置（C 档，可选）**：`DefaultBodyLimit::max(16MB)` 硬编码
       （http.rs）——多模态图像/大上下文请求 413 无法调；config 加字段即可
 - [ ] **首次部署 bootstrap（B 档，可选）**：第一个 API key 目前必须走 admin API
