@@ -33,6 +33,8 @@ pub fn client_config(
             .try_into()
             .map_err(|e| crate::error::AgentError::Other(format!("transport: {e}")))?,
     ));
+    // 与 gateway 侧一致：并发流上限 100 → 1000（单连接多路复用所有代理请求）
+    transport.max_concurrent_bidi_streams(1000u32.into());
 
     let mut cfg = quinn::ClientConfig::new(Arc::new(quic));
     cfg.transport_config(Arc::new(transport));
