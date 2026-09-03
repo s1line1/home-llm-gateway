@@ -126,12 +126,14 @@ sudo cp gateway_config.example.yml /etc/home-llm-gateway/gateway-config.yml
 sudo vi /etc/home-llm-gateway/gateway-config.yml
 
 # 3) 安装并启动（systemd 单元只负责 --config 指向配置文件）
+sudo mkdir -p /var/log/home-llm-gateway
 sudo cp deploy/gateway.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now gateway
 
-# 4) 看日志
-sudo journalctl -u gateway -f
+# 4) 看日志（日志落盘到文件，见 deploy/gateway.service 的 StandardOutput；
+#    也可 journalctl -u gateway -f 看 systemd 侧）
+sudo tail -f /var/log/home-llm-gateway/gateway.log
 ```
 
 `gateway-config.yml` 关键参数（按需修改，完整示例见 `gateway_config.example.yml`）：
@@ -191,12 +193,13 @@ sudo cp agent_config.example.yml /etc/home-llm-gateway/agent-config.yml
 sudo vi /etc/home-llm-gateway/agent-config.yml
 
 # deploy/agent.service 只负责 --config 指向配置文件
+sudo mkdir -p /var/log/home-llm-gateway
 sudo cp deploy/agent.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now agent
 
 # 看到 connected to cloud gateway / registered with cloud gateway 即成功
-sudo journalctl -u agent -f
+sudo tail -f /var/log/home-llm-gateway/agent.log
 ```
 
 ## 7. 端到端验证（从任意地点）

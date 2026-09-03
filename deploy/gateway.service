@@ -6,7 +6,10 @@
 #   3. Web UI（可选）：本机 cd web && pnpm install && pnpm build 后，
 #      把 web/dist 整个上传到 /etc/home-llm-gateway/web/，gateway-config.yml 配 ui_dir: web
 #      （WorkingDirectory=/etc/home-llm-gateway，相对路径即可；不配 = `/` 显示构建提示页）
-#   4. sudo cp deploy/gateway.service /etc/systemd/system/ && sudo systemctl enable --now gateway
+#   4. 建日志目录（服务以 root 运行，目录 root 所有即可）：
+#      sudo mkdir -p /var/log/home-llm-gateway
+#   5. sudo cp deploy/gateway.service /etc/systemd/system/ && sudo systemctl daemon-reload \
+#      && sudo systemctl enable --now gateway
 [Unit]
 Description=Home LLM Gateway (cloud relay)
 After=network-online.target
@@ -20,6 +23,12 @@ WorkingDirectory=/etc/home-llm-gateway
 ExecStart=/usr/local/bin/gateway --config /etc/home-llm-gateway/gateway-config.yml
 Restart=on-failure
 RestartSec=3
+# 日志落盘（追加，重启不丢）。stdout/stderr 不再进 journald；
+# 查看：tail -f /var/log/home-llm-gateway/gateway.log
+# 建议配 logrotate 轮转（见 deploy/logrotate.example 或自行 crontab）。
+# 想保留 journald 双写可去掉以下两行（默认回 journald）。
+StandardOutput=append:/var/log/home-llm-gateway/gateway.log
+StandardError=append:/var/log/home-llm-gateway/gateway.log
 
 [Install]
 WantedBy=multi-user.target

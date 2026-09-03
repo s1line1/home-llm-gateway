@@ -3,7 +3,9 @@
 #   1. 把二进制放到 /usr/local/bin/agent
 #   2. 把证书与 agent 配置放到 /etc/home-llm-gateway/
 #      （基于 agent_config.example.yml 修改：cloud_addr、证书路径、upstream 等）
-#   3. sudo cp deploy/agent.service /etc/systemd/system/ && sudo systemctl enable --now agent
+#   3. 建日志目录：sudo mkdir -p /var/log/home-llm-gateway
+#   4. sudo cp deploy/agent.service /etc/systemd/system/ && sudo systemctl daemon-reload \
+#      && sudo systemctl enable --now agent
 [Unit]
 Description=Edge LLM Agent (QUIC tunnel client)
 After=network-online.target
@@ -15,6 +17,11 @@ Type=simple
 ExecStart=/usr/local/bin/agent --config /etc/home-llm-gateway/agent-config.yml
 Restart=always
 RestartSec=3
+# 日志落盘（追加，重启不丢）。stdout/stderr 不再进 journald；
+# 查看：tail -f /var/log/home-llm-gateway/agent.log
+# 建议配 logrotate 轮转（见 deploy/logrotate.example）。
+StandardOutput=append:/var/log/home-llm-gateway/agent.log
+StandardError=append:/var/log/home-llm-gateway/agent.log
 
 [Install]
 WantedBy=multi-user.target
