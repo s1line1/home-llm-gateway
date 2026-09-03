@@ -189,6 +189,7 @@ mod tests {
             timeout: Duration::from_secs(10),
             agent_stale_after: Duration::from_secs(10),
             rate_limiter: None,
+            max_concurrent_requests: 0,
             metrics: Metrics::default(),
             ui: None,
         }

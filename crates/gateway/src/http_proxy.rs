@@ -25,8 +25,9 @@ use crate::registry::AcquireError;
 static NEXT_REQUEST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// OpenAI 兼容错误响应：`error.type` 按状态码映射（SDK 据此决定重试/报错语义），
-/// 429 自动带 `Retry-After`（秒）供退避。
-fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
+/// 429 自动带 `Retry-After`（秒）供退避。pub(crate)：metrics_middleware（HTTP 总并发
+/// admission 拒绝）也用它，保证错误格式全局一致。
+pub(crate) fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
     let body = Json(json!({
         "error": {
             "message": message.into(),

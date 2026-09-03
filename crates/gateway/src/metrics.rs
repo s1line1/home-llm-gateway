@@ -57,6 +57,16 @@ impl Metrics {
         self.inner.bytes_out.fetch_add(n as u64, Ordering::Relaxed);
     }
 
+    /// 当前在途请求数（admission 判定用）。
+    pub fn active_count(&self) -> u64 {
+        self.inner.active.load(Ordering::Relaxed)
+    }
+
+    /// 累计请求数。
+    pub fn request_count(&self) -> u64 {
+        self.inner.request_count.load(Ordering::Relaxed)
+    }
+
     /// agent 连接建立：累计 +1、当前在线 +1。
     pub fn agent_connected(&self) {
         self.inner

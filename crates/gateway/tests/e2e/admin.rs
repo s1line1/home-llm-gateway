@@ -312,6 +312,7 @@ async fn e2e_openai_error_semantics() {
         request_timeout: Duration::from_secs(10),
         agent_stale_after: Duration::from_secs(10),
         rate_limit_per_min: 0,
+        max_concurrent_requests: 0,
         tls: None,
         ui_dir: None,
     })

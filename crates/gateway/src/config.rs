@@ -41,6 +41,9 @@ pub struct ConfigFile {
     /// 每个 API Key 每分钟请求上限（0 = 不限流）
     #[serde(default)]
     rate_limit_per_min: u32,
+    /// HTTP 全局在途请求上限（0 = 不限；防多 key 总和压垮单实例）
+    #[serde(default)]
+    max_concurrent_requests: u32,
     /// 公网入口 HTTPS 证书 PEM（提供后启用 TLS，与 tls_key 成对）
     #[serde(default)]
     tls_cert: Option<PathBuf>,
@@ -119,6 +122,7 @@ pub fn from_file(cfg: ConfigFile) -> anyhow::Result<GatewayConfig> {
         request_timeout: Duration::from_secs(cfg.timeout_secs),
         agent_stale_after: Duration::from_secs(cfg.agent_stale_secs),
         rate_limit_per_min: cfg.rate_limit_per_min,
+        max_concurrent_requests: cfg.max_concurrent_requests,
         tls,
         ui_dir: cfg.ui_dir,
     })
