@@ -13,7 +13,7 @@ use axum::{
 use serde_json::json;
 use tower::ServiceExt;
 use tower_http::services::{ServeDir, ServeFile};
-use tracing::{info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::keystore::KeyStore;
 use crate::metrics::Metrics;
@@ -212,6 +212,13 @@ async fn metrics_route(State(state): State<AppState>, headers: HeaderMap) -> Res
 /// 记录请求状态码与耗时（/metrics 自身不计入），并为每个请求生成/透传
 /// `x-request-id`（响应头 + 写进入站 headers 供 proxy 复用为隧道 request_id，
 /// 使 HTTP 层、隧道层、日志三方对账一致）。
+///
+/// 访问日志分级（target `gateway::access`），避免每请求一条 info 淹没真正的
+/// warn/error 日志：
+///   - status < 400 → debug（正常流量；状态码/耗时已由 /metrics 覆盖）
+///   - 400..=499     → info（客户端/路由类异常，代码多静默返回，仅此可见）
+///   - status >= 500 → error（真实失败：tunnel/upstream/内部错误）
+/// 需要临时恢复全量访问日志：RUST_LOG=info,gateway::access=debug
 async fn metrics_middleware(
     State(state): State<AppState>,
     mut req: Request,
@@ -262,14 +269,36 @@ async fn metrics_middleware(
     if let Ok(v) = axum::http::HeaderValue::from_str(&request_id) {
         resp.headers_mut().insert("x-request-id", v);
     }
-    info!(
-        request_id = %request_id,
-        method = %method,
-        path = %path,
-        status,
-        duration_ms = start.elapsed().as_millis() as u64,
-        "request handled"
-    );
+    let duration_ms = start.elapsed().as_millis() as u64;
+    match status {
+        400..=499 => info!(
+            target: "gateway::access",
+            request_id = %request_id,
+            method = %method,
+            path = %path,
+            status,
+            duration_ms,
+            "request failed (client error)"
+        ),
+        s if s >= 500 => error!(
+            target: "gateway::access",
+            request_id = %request_id,
+            method = %method,
+            path = %path,
+            status,
+            duration_ms,
+            "request failed (server error)"
+        ),
+        _ => debug!(
+            target: "gateway::access",
+            request_id = %request_id,
+            method = %method,
+            path = %path,
+            status,
+            duration_ms,
+            "request handled"
+        ),
+    }
     resp
 }
 
