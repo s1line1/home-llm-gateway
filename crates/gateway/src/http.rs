@@ -218,7 +218,8 @@ async fn metrics_route(State(state): State<AppState>, headers: HeaderMap) -> Res
 ///   - status < 400 → debug（正常流量；状态码/耗时已由 /metrics 覆盖）
 ///   - 400..=499     → info（客户端/路由类异常，代码多静默返回，仅此可见）
 ///   - status >= 500 → error（真实失败：tunnel/upstream/内部错误）
-/// 需要临时恢复全量访问日志：RUST_LOG=info,gateway::access=debug
+///
+/// 需要临时恢复全量访问日志：`RUST_LOG=info,gateway::access=debug`
 async fn metrics_middleware(
     State(state): State<AppState>,
     mut req: Request,
