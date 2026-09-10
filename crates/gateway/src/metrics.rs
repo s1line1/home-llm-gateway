@@ -33,33 +33,22 @@ struct MetricsInner {
 }
 
 impl Metrics {
-    pub fn record_start(&self) -> Instant {
-        self.inner.active.fetch_add(1, Ordering::Relaxed);
-        self.inner.request_count.fetch_add(1, Ordering::Relaxed);
-        Instant::now()
-    }
-
     /// 原子占位（HTTP 全局并发 admission）：`fetch_add` 用**旧值**判定是否超限——
     /// 两个并发请求各自拿到唯一旧值，恰好允许 limit 个进入，无 check-then-act 竞态。
-    /// 超限 → 回退占位并返回 None（调用方返回 429，**不要**再调 record_end）；
-    /// 通过 → Some(Instant)，最终必须配 record_end 释放。
-    pub fn try_enter(&self, limit: u32) -> Option<Instant> {
+    /// 超限 → 回退占位并返回 None（调用方返回 429）；
+    /// 通过 → 返回 [`Admission`] 票据，**槽位由票据的 Drop 释放**（见其文档）。
+    pub fn try_enter(&self, limit: u32) -> Option<Admission> {
         let prev = self.inner.active.fetch_add(1, Ordering::Relaxed);
         if limit > 0 && prev >= limit as u64 {
             self.inner.active.fetch_sub(1, Ordering::Relaxed);
             None
         } else {
             self.inner.request_count.fetch_add(1, Ordering::Relaxed);
-            Some(Instant::now())
+            Some(Admission {
+                metrics: self.clone(),
+                start: Instant::now(),
+            })
         }
-    }
-
-    pub fn record_end(&self, start: Instant, status: u16) {
-        self.inner.active.fetch_sub(1, Ordering::Relaxed);
-        self.inner
-            .total_duration_ms
-            .fetch_add(start.elapsed().as_millis() as u64, Ordering::Relaxed);
-        self.record_status(status);
     }
 
     /// 记录被 admission 拒绝的请求（不计 active/耗时，但计入请求数与状态码分布）。
@@ -68,7 +57,8 @@ impl Metrics {
         self.record_status(status);
     }
 
-    fn record_status(&self, status: u16) {
+    /// 记录请求结果状态码（在途槽位的释放不在此处，由 [`Admission`] 负责）。
+    pub fn record_status(&self, status: u16) {
         *self
             .inner
             .status_counts
@@ -162,5 +152,35 @@ impl Metrics {
             inner.agent_connections_total.load(Ordering::Relaxed)
         ));
         out
+    }
+}
+
+/// 在途准入票据：持有期间该请求计入 `hlmg_active_requests`；**槽位在 Drop 时释放**。
+///
+/// 释放必须挂在 Drop 上，不能依赖调用方"await 之后"的尾部语句：客户端中断时 hyper 会
+/// 直接 drop 在途的请求 future，尾部代码永不执行——槽位会永久泄漏，配了
+/// `max_concurrent_requests` 的网关会被**一次**中断打成此后全部 429（只能重启）。
+///
+/// 因此：票据要么被正常作用域 drop，要么随请求 future 被丢弃而 drop，两条路都归还槽位。
+/// 注意不可 `Clone`/`Copy`（会导致重复释放）。
+pub struct Admission {
+    metrics: Metrics,
+    start: Instant,
+}
+
+impl Admission {
+    /// 占位时刻（调用方据此计算 TTFB 等日志字段）。
+    pub fn started_at(&self) -> Instant {
+        self.start
+    }
+}
+
+impl Drop for Admission {
+    fn drop(&mut self) {
+        self.metrics.inner.active.fetch_sub(1, Ordering::Relaxed);
+        self.metrics
+            .inner
+            .total_duration_ms
+            .fetch_add(self.start.elapsed().as_millis() as u64, Ordering::Relaxed);
     }
 }

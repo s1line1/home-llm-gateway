@@ -243,9 +243,11 @@ async fn metrics_middleware(
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     // HTTP 全局在途上限（0 = 不限）：try_enter 原子占位（旧值判定，无竞态），
-    // 超限返回 None → 立即 429，防多 key 总和压垮单实例
+    // 超限返回 None → 立即 429，防多 key 总和压垮单实例。
+    // 票据的释放完全由 Drop 负责，分两段：① 移交 body 之前（含客户端中断导致 future
+    // 被 drop）→ 就地 Drop 归还；② 移交 body 之后 → 随 body 结束/丢弃归还。
     let limit = state.max_concurrent_requests;
-    let Some(start) = state.metrics.try_enter(limit) else {
+    let Some(admission) = state.metrics.try_enter(limit) else {
         state.metrics.record_rejected(429);
         let mut resp = crate::http_proxy::error_response(
             axum::http::StatusCode::TOO_MANY_REQUESTS,
@@ -264,13 +266,16 @@ async fn metrics_middleware(
         );
         return resp;
     };
+    let start = admission.started_at();
     let mut resp = next.run(req).await;
     let status = resp.status().as_u16();
-    state.metrics.record_end(start, status);
+    state.metrics.record_status(status);
     if let Ok(v) = axum::http::HeaderValue::from_str(&request_id) {
         resp.headers_mut().insert("x-request-id", v);
     }
-    let duration_ms = start.elapsed().as_millis() as u64;
+    // 访问日志记的是"到首字节"的延迟（TTFB）；完整请求耗时的记账在准入票据里，
+    // 它在 body 结束时才结算（见下方移交），故两者字段名区分开。
+    let ttfb_ms = start.elapsed().as_millis() as u64;
     match status {
         400..=499 => info!(
             target: "gateway::access",
@@ -278,7 +283,7 @@ async fn metrics_middleware(
             method = %method,
             path = %path,
             status,
-            duration_ms,
+            ttfb_ms,
             "request failed (client error)"
         ),
         s if s >= 500 => error!(
@@ -287,7 +292,7 @@ async fn metrics_middleware(
             method = %method,
             path = %path,
             status,
-            duration_ms,
+            ttfb_ms,
             "request failed (server error)"
         ),
         _ => debug!(
@@ -296,11 +301,20 @@ async fn metrics_middleware(
             method = %method,
             path = %path,
             status,
-            duration_ms,
+            ttfb_ms,
             "request handled"
         ),
     }
-    resp
+
+    // 把准入票据**移交**给 response body：槽位与耗时记账持有到 body 流结束、或中途
+    // 被丢弃（客户端断开）为止。这样闸门才真正覆盖"整个请求"——LLM 的 SSE 长流恰恰
+    // 是最需要被计入的场景；若在此处直接释放，闸门只能覆盖到首字节。
+    let (parts, body) = resp.into_parts();
+    let body = http_body_util::BodyExt::map_frame(body, move |frame| {
+        let _held = &admission; // 仅为把票据生命周期绑定到 body 上，不改动任何帧
+        frame
+    });
+    Response::from_parts(parts, axum::body::Body::new(body))
 }
 
 static NEXT_REQUEST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -439,8 +453,10 @@ mod tests {
         let metrics = state.metrics.clone();
         let router = app(state);
 
-        // 占住唯一的并发槽（record_start 模拟一个在途请求，不 record_end）
-        metrics.record_start();
+        // 占住唯一的并发槽（limit=0 = 不限，必进；票据持有到 drop 为止）
+        let held = metrics
+            .try_enter(0)
+            .expect("limit=0 admits unconditionally");
         let resp = router
             .clone()
             .oneshot(
@@ -461,7 +477,7 @@ mod tests {
             Some(&axum::http::HeaderValue::from_static("60")),
             "429 carries Retry-After"
         );
-        metrics.record_end(std::time::Instant::now(), 429); // 释放槽位
+        drop(held); // 票据 Drop → 释放槽位
 
         // 槽位释放后恢复
         let resp = router
@@ -496,20 +512,19 @@ mod tests {
     fn try_enter_is_atomic_under_concurrency() {
         // limit=1：8 个线程同时 try_enter → 恰 1 个成功（无 check-then-act 竞态）。
         // 这是 e2e 曾出现 [429,429] 双拒的根因回归测试。
+        // 票据随返回值离开线程并在此持有，保证 8 次尝试真正并发竞争同一个槽位。
         let metrics = Metrics::default();
         let mut handles = Vec::new();
         for _ in 0..8 {
             let m = metrics.clone();
-            handles.push(std::thread::spawn(move || m.try_enter(1).is_some()));
+            handles.push(std::thread::spawn(move || m.try_enter(1)));
         }
-        let admitted: usize = handles
-            .into_iter()
-            .map(|h| h.join().unwrap() as usize)
-            .sum();
+        let admissions: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let admitted = admissions.iter().filter(|a| a.is_some()).count();
         assert_eq!(admitted, 1, "exactly one concurrent entry admitted");
-        // 占用未释放时后续仍拒；释放后恢复
+        // 占用未释放时后续仍拒；票据 Drop 后恢复
         assert!(metrics.try_enter(1).is_none());
-        metrics.record_end(std::time::Instant::now(), 200); // 释放占用的那个
+        drop(admissions); // 释放占用的那个
         assert!(metrics.try_enter(1).is_some());
     }
 
@@ -551,6 +566,50 @@ mod tests {
         assert!(
             !body_str(resp).await.contains("id=\"root\""),
             "API paths must not get SPA"
+        );
+    }
+
+    /// 客户端在 handler 返回前中断（请求 future 被 drop）**不得**泄漏全局并发槽位。
+    ///
+    /// 回归背景：释放原先只挂在中间件尾部（`next.run(req).await` 之后），而 hyper 会在
+    /// 连接断开时直接 drop 在途 future → 尾部永不执行 → 槽位永久占住，此后**所有**请求
+    /// （含 /healthz）被打成 429，只能重启网关。
+    #[tokio::test]
+    async fn aborted_request_does_not_leak_concurrency_slot() {
+        let mut state = test_state(None);
+        state.admin_token = Some("admin".into());
+        state.max_concurrent_requests = 1;
+        let router = app(state);
+
+        // /admin/keys 的 handler 会 parked 在 spawn_blocking(argon2)（约 10-30ms），
+        // 1ms 后放弃即落在窗口内。多次尝试确保至少一次落在窗口内：若全部正常返回，
+        // 本测试会退化成空转（不会误报，但也拦不住回归）。
+        for _ in 0..30 {
+            let req = axum::extract::Request::builder()
+                .method("POST")
+                .uri("/admin/keys")
+                .header(axum::http::header::AUTHORIZATION, "Bearer admin")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(r#"{"name":"probe"}"#))
+                .unwrap();
+            let _ =
+                tokio::time::timeout(Duration::from_millis(1), router.clone().oneshot(req)).await;
+        }
+
+        // 用户可见契约：中断后槽位必须已释放，后续请求不得被 429
+        let resp = router
+            .oneshot(
+                axum::extract::Request::builder()
+                    .uri("/healthz")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "aborted in-flight request leaked the concurrency slot"
         );
     }
 }
