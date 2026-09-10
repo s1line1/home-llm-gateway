@@ -180,7 +180,10 @@ async fn handle_stream(
     let url = format!("{upstream}{path}");
     let mut rb = http.request(reqwest::Method::from_bytes(method.as_bytes())?, &url);
     for (k, v) in headers {
-        if !proto::headers::is_hop_by_hop(k.as_str()) {
+        // 逐跳头 + 调用方凭据都不转发：凭据只属于「客户端 ↔ 网关」那一跳，不该到上游
+        // （网关侧已经剥过一层，这里是纵深防御，也覆盖"新 agent 配旧网关"的混版本场景）。
+        let name = k.as_str();
+        if !proto::headers::is_hop_by_hop(name) && !proto::headers::is_client_credential(name) {
             if let Ok(v) = reqwest::header::HeaderValue::from_str(&v) {
                 rb = rb.header(k, v);
             }
