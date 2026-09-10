@@ -467,10 +467,23 @@ async fn forward_body(
     }
 }
 
+/// 过滤要放进隧道帧的头：剔除逐跳头**与调用方凭据**。
+///
+/// 凭据（`authorization` / `cookie`）只在「客户端 ↔ 网关」这一跳有意义：客户端持有的是
+/// **网关签发**的 API key（对全部模型有效、能打公网网关），而 edge 与上游属于另一个信任域，
+/// 三种上游（Ollama/vLLM/llama.cpp）又都不认证——透传零收益、纯风险：edge 一旦被攻破，
+/// 攻击者白得一把可用的公网凭据，edge / 上游日志里还会留下吊销不掉的副本。
+/// 上游确实需要认证时，应在 **agent 侧**配置上游自己的凭据。
+///
+/// 注意凭据**不是**逐跳头（RFC 语义上端到端），因此这里用两条独立规则，
+/// 规则常量见 `proto::headers`。
 fn filter_headers(headers: &HeaderMap) -> Vec<(String, String)> {
     headers
         .iter()
-        .filter(|(k, _)| !proto::headers::is_hop_by_hop(k.as_str()))
+        .filter(|(k, _)| {
+            let name = k.as_str();
+            !proto::headers::is_hop_by_hop(name) && !proto::headers::is_client_credential(name)
+        })
         .map(|(k, v)| {
             (
                 k.as_str().to_string(),
@@ -492,18 +505,52 @@ mod tests {
         headers.insert("transfer-encoding", HeaderValue::from_static("chunked"));
         headers.insert("content-length", HeaderValue::from_static("42"));
         headers.insert("content-type", HeaderValue::from_static("application/json"));
-        headers.insert("authorization", HeaderValue::from_static("Bearer sk-test"));
 
         let out = filter_headers(&headers);
         let names: Vec<&str> = out.iter().map(|(k, _)| k.as_str()).collect();
         assert!(names.contains(&"content-type"));
-        assert!(names.contains(&"authorization"));
         for hop in proto::headers::HOP_BY_HOP {
             assert!(!names.contains(hop), "hop-by-hop header leaked: {hop}");
         }
-        // 值原样保留
-        let auth = out.iter().find(|(k, _)| k == "authorization").unwrap();
-        assert_eq!(auth.1, "Bearer sk-test");
+    }
+
+    /// 规格：调用方的凭据**不得**随隧道帧离开网关。
+    ///
+    /// 客户端用的是**网关签发**的 API key（对全部模型有效、能打公网网关），而 edge 与上游
+    /// 属于另一个信任域：三种上游（Ollama/vLLM/llama.cpp）都不认证，透传零收益纯风险——
+    /// edge 一旦被攻破，攻击者就白得一把可用的公网凭据；而且 edge / 上游日志里会留下
+    /// 一份吊销不掉的副本。上游确实需要认证时，应在 agent 侧配置上游自己的凭据。
+    #[test]
+    fn filter_headers_never_forwards_client_credentials() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        headers.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer sk-secret"),
+        );
+        headers.insert("cookie", HeaderValue::from_static("session=topsecret"));
+
+        let out = filter_headers(&headers);
+        let names: Vec<&str> = out.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(names.contains(&"content-type"), "普通头照旧转发: {names:?}");
+        assert!(
+            !names.contains(&"authorization"),
+            "网关自己的 API key 不得进入隧道帧: {names:?}"
+        );
+        assert!(
+            !names.contains(&"cookie"),
+            "客户端 cookie 同样不得进入隧道帧: {names:?}"
+        );
+        // 值也不得出现在帧里（防「改了头名但仍漏出」）
+        let joined: String = out
+            .iter()
+            .map(|(_, v)| v.as_str())
+            .collect::<Vec<_>>()
+            .join("|");
+        assert!(
+            !joined.contains("sk-secret") && !joined.contains("topsecret"),
+            "凭据值不得出现在隧道帧里: {joined}"
+        );
     }
 
     #[test]

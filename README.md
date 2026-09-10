@@ -315,6 +315,7 @@ curl -X DELETE http://127.0.0.1:8080/admin/keys/<id> -H "Authorization: Bearer <
 |---|---|
 | 公网入口 | TLS 1.3、API Key 认证（恒定时间比较）、令牌桶限流、请求体大小上限 |
 | 隧道 | QUIC 内建 TLS 1.3 + mTLS（云端 CA 签发 agent 证书），未注册 agent 无法接入 |
+| 凭据边界 | 调用方凭据（`Authorization` / `Cookie`）只留在「客户端 ↔ 网关」这一跳，**不**随隧道帧转发给 edge / 上游（上游需要认证时，在 agent 侧配置上游自己的凭据） |
 | 并发 | 按 agent `max_concurrency` 原子占位，超限 429 |
 | 密钥 | CA 私钥仅在自己手里；每个 agent 单独签发客户端证书；`certs/out/` 不入库 |
 
