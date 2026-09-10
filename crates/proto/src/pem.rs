@@ -4,10 +4,20 @@ use std::{fs::File, io::BufReader, path::Path};
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
-/// 从 PEM 文件加载证书链。
+/// 从 PEM 文件加载证书链。文件里没有任何证书 → **报错**（返回空列表绝无用处）。
+///
+/// 为什么必须报错：空证书链/空信任根不会在加载期暴露——agent 会带着空 roots 一路跑到
+/// 握手失败，然后无限重连（日志里只有 `UnknownIssuer`），运维很难定位到"ca 指错文件了"。
+/// 最常见的手滑是把 `ca:` 指向私钥文件，或指向了一个不含 CERTIFICATE 块的文件。
 pub fn load_certs(path: &Path) -> anyhow::Result<Vec<CertificateDer<'static>>> {
     let mut reader = BufReader::new(File::open(path)?);
     let certs = rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>()?;
+    if certs.is_empty() {
+        anyhow::bail!(
+            "no certificates found in {}（是否把 ca/cert 指向了私钥或其他不含 CERTIFICATE 的文件？）",
+            path.display()
+        );
+    }
     Ok(certs)
 }
 
@@ -61,5 +71,30 @@ mod tests {
     fn load_missing_file_errors() {
         assert!(load_certs(Path::new("/nonexistent/ca.crt")).is_err());
         assert!(load_key(Path::new("/nonexistent/ca.key")).is_err());
+    }
+
+    /// 规格：文件里**没有证书**时必须报配置错，而不是静默返回空列表。
+    ///
+    /// 空信任根/空证书链不会在加载期暴露：agent 会带着它一路跑到握手失败，然后无限
+    /// 重连（日志里只有 UnknownIssuer），运维很难定位到"ca 指错文件了"。
+    /// 最常见的手滑就是把 `ca:` 指向私钥文件 —— 用这个场景做用例。
+    #[test]
+    fn load_certs_rejects_file_without_certificates() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // ① 只有私钥的 PEM（把 ca/cert 指到 key 文件）
+        let (_, key_pem) = gen_pem();
+        let key_path = dir.path().join("client.key");
+        std::fs::write(&key_path, &key_pem).unwrap();
+        let err = load_certs(&key_path).unwrap_err();
+        assert!(
+            err.to_string().contains("client.key"),
+            "错误信息应指出是哪个文件: {err}"
+        );
+
+        // ② 完全空的文件
+        let empty_path = dir.path().join("empty.pem");
+        std::fs::write(&empty_path, "").unwrap();
+        assert!(load_certs(&empty_path).is_err(), "空文件也不该静默通过");
     }
 }

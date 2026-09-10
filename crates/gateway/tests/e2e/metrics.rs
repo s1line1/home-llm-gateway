@@ -41,6 +41,12 @@ async fn e2e_metrics_endpoint() {
         text.contains("hlmg_quic_connections 1"),
         "missing quic connections gauge: {text}"
     );
+    // 隧道入口存活：网关给 accept_loop 与 /metrics 传的必须是**同一个** Metrics，
+    // 否则入口死了这个 gauge 也永远是 0，告警就成了摆设（单测只覆盖循环自身的行为）。
+    assert!(
+        text.contains("hlmg_quic_accepting 1"),
+        "running gateway must report its tunnel entry as accepting: {text}"
+    );
     assert!(
         text.contains("hlmg_agent_connections_total "),
         "missing agent connections counter: {text}"

@@ -30,9 +30,26 @@ struct MetricsInner {
     quic_connections: AtomicU64,
     /// 累计 agent 连接次数（重连计数，counter）。
     agent_connections_total: AtomicU64,
+    /// QUIC 隧道入口是否仍在接受新连接（1/0）。入口停止后进程照常运行，这是唯一的告警信号。
+    quic_accepting: AtomicU64,
 }
 
 impl Metrics {
+    /// 标记「隧道入口正在接受连接」；返回的守卫 Drop 时置回 0。
+    ///
+    /// 用 Drop 而不是「循环之后的语句」，是因为任务被 abort（优雅关闭）或 panic 时
+    /// 循环后的代码不会执行——本仓库已经在同一个坑里摔过两次（`Admission` 的槽位释放、
+    /// `serve_https` 的配置解析），手法保持一致。
+    pub fn mark_accepting(&self) -> AcceptingGuard {
+        self.inner.quic_accepting.store(1, Ordering::Relaxed);
+        AcceptingGuard(self.clone())
+    }
+
+    /// 隧道入口是否仍在接受新连接（1/0）。
+    pub fn quic_accepting(&self) -> u64 {
+        self.inner.quic_accepting.load(Ordering::Relaxed)
+    }
+
     /// 原子占位（HTTP 全局并发 admission）：`fetch_add` 用**旧值**判定是否超限——
     /// 两个并发请求各自拿到唯一旧值，恰好允许 limit 个进入，无 check-then-act 竞态。
     /// 超限 → 回退占位并返回 None（调用方返回 429）；
@@ -144,6 +161,14 @@ impl Metrics {
             inner.quic_connections.load(Ordering::Relaxed)
         ));
         out.push_str(
+            "# HELP hlmg_quic_accepting Whether the tunnel entry still accepts new edge connections (1/0).\n",
+        );
+        out.push_str("# TYPE hlmg_quic_accepting gauge\n");
+        out.push_str(&format!(
+            "hlmg_quic_accepting {}\n",
+            inner.quic_accepting.load(Ordering::Relaxed)
+        ));
+        out.push_str(
             "# HELP hlmg_agent_connections_total Cumulative agent connections (reconnects).\n",
         );
         out.push_str("# TYPE hlmg_agent_connections_total counter\n");
@@ -182,5 +207,15 @@ impl Drop for Admission {
             .inner
             .total_duration_ms
             .fetch_add(self.start.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+}
+
+/// 隧道入口「接受中」守卫：见 [`Metrics::mark_accepting`]。Drop 时把 gauge 置回 0，
+/// 因此**结束方式不影响可观测性**——正常返回、任务被 abort、panic 都会留下痕迹。
+pub struct AcceptingGuard(Metrics);
+
+impl Drop for AcceptingGuard {
+    fn drop(&mut self) {
+        self.0.inner.quic_accepting.store(0, Ordering::Relaxed);
     }
 }
