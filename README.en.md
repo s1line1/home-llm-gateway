@@ -24,8 +24,8 @@ Local LLM (Ollama / vLLM / llama.cpp / mock-llm)
 - **QUIC tunnel + mTLS**: the agent dials an outbound long-lived connection, naturally punching through NAT / dynamic IPs; two-way certificate authentication keeps unregistered agents out
 - **Streaming-first**: SSE chunks are forwarded as they arrive (typewriter effect); client disconnect / timeout sends `Cancel` upstream so you never pay for abandoned tokens; per-frame idle timeout never kills long streams
 - **Native public HTTPS**: rustls directly on port 443 — no nginx/caddy needed
-- **Security & governance**: API-key auth (constant-time compare), per-key token-bucket rate limiting, per-agent concurrency admission control (429 when full)
-- **Model-aware multi-edge routing**: routes each request by its `model` to an edge that can serve it (exact match first, `*` wildcard as fallback), least-loaded within the same model group; stale agents are evicted; `/v1/models` is aggregated by the gateway
+- **Security & governance**: API-key auth (`sha256(token)` index lookup + argon2 verify, plaintext never stored), per-key token-bucket rate limiting, per-agent concurrency admission control (429 when full)
+- **Model-aware multi-edge routing**: routes each request by its `model` to an edge that can serve it (exact match first, `*` wildcard as fallback), least-loaded within the same model group; stale agents stop being routing candidates; `/v1/models` is aggregated by the gateway
 - **Observability**: `/metrics` in Prometheus text format, structured request logs (`request_id` / status / latency), `/healthz` probe
 - **Multi-platform deployment**: single static binary (Linux / macOS), cross-compile script + systemd units
 
@@ -39,7 +39,9 @@ crates/
 └── mock-llm/   fake OpenAI-compatible LLM (to bring up the full chain without a real model)
 certs/          dev certificate script
 deploy/         systemd units (gateway.service / agent.service)
-scripts/        multi-platform release packaging script
+scripts/        multi-platform release packaging script + git pre-commit hook (cargo deny + fmt)
+Dockerfile      multi-stage container build (gateway / agent / mock-llm binaries; see the header comment)
+deny.toml       cargo-deny policy (dependency licenses / advisories; run by CI and the pre-commit hook)
 ```
 
 ## Quick Start (fully local, no real LLM required)
@@ -199,12 +201,14 @@ max_concurrency: 4
 ```
 
 - Issue a separate client certificate per agent; `agent_id` distinguishes them
-- Agents that miss heartbeats for `agent_stale_secs` (gateway config, default 15s) are evicted automatically
+- ⚠️ **`agent_id` must be unique per machine**: a duplicate id makes the gateway close the older connection (intended for reconnect takeover), and two machines evicting each other makes **every request that outlives the eviction period fail** (the only visible signals are `/admin/agents` forever showing 1 online agent and `hlmg_agent_connections_total` climbing) — see `TODO.md` P1
+- Agents that miss heartbeats for `agent_stale_secs` (gateway config, default 15s) **stop being routing candidates** (503/404). The registry entry is only removed once the connection actually closes, so `/metrics hlmg_agents` and `/admin/agents` still count a stale agent as online meanwhile
 - When every agent is at capacity, the gateway returns 429
 
 ### Observability
 
 - **`GET /metrics`**: Prometheus text format (per-status counters, in-flight requests, online agents, bytes forwarded, cumulative latency) — scrapable by Prometheus/Grafana
+  - Opened directly in a browser (`Accept: text/html`) it serves the dashboard page instead of text; scrapers (`Accept: */*`) are unaffected
 - **Structured logs**: `tracing` with `request_id` / status / latency per request (`tower-http` TraceLayer)
 - **`/healthz`**: liveness probe
 
@@ -245,13 +249,13 @@ curl http://127.0.0.1:8080/admin/keys -H "Authorization: Bearer <admin-token>"
 curl -X DELETE http://127.0.0.1:8080/admin/keys/<id> -H "Authorization: Bearer <admin-token>"
 ```
 
-> Security: use a strong random value for `admin_token` (`openssl rand -hex 32`); `keys.db` (SQLite) holds plaintext secrets and is git-ignored; in production, restrict `/admin/*` to your management network via the security group.
+> Security: use a strong random value for `admin_token` (`openssl rand -hex 32`); `keys.db` (SQLite) stores argon2 hashes only — **no plaintext keys** — and is git-ignored; in production, restrict `/admin/*` to your management network via the security group.
 
 ## Security Model
 
 | Surface | Measure |
 |---|---|
-| Public entry | TLS 1.3, API-key auth (constant-time compare), token-bucket rate limiting, request body size cap |
+| Public entry | TLS 1.3 (HTTPS once `tls_cert`/`tls_key` are set; plaintext HTTP otherwise), API-key auth (sha256 index + argon2 verify), token-bucket rate limiting, request body size cap |
 | Tunnel | QUIC built-in TLS 1.3 + mTLS (agent certs issued by your CA); unregistered agents cannot connect |
 | Concurrency | Atomic slot reservation against the agent's `max_concurrency`; 429 when full |
 | Secrets | The CA private key never leaves your hands; a separate client cert per agent; `certs/out/` is git-ignored |

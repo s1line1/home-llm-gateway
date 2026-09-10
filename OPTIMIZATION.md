@@ -11,7 +11,7 @@
 | # | 优化项 | 现状 | 方案 | 优先级/工作量 |
 |---|---|---|---|---|
 | S1 ✅ | gateway crate 按职责拆模块 | ~~混合~~ → `http_proxy.rs`（代理转发独立）、`keystore/hash.rs`（哈希原语独立）、`config.rs`（配置解析独立）；http.rs 只剩路由/中间件/fallback | 高 / 中 |
-| S2 ✅ | e2e 测试拆文件 | ~~1379 行单文件~~ → `tests/e2e/` 目录（main.rs 入口 + common.rs 辅助 + chain/agents/admin/metrics/https 场景，13 测试），保持单二进制使 #[serial] 全局生效 | 中 / 中 |
+| S2 ✅ | e2e 测试拆文件 | ~~1379 行单文件~~ → `tests/e2e/` 目录（main.rs 入口 + common.rs 辅助 + chain/agents/admin/metrics/https 场景，23 测试），保持单二进制使 #[serial] 全局生效 | 中 / 中 |
 | S3 ✅ | 配置解析抽独立模块 | → gateway/agent 各建 `config.rs`（from_path/from_file + 14 个测试），main.rs 只留 CLI 入口与信号处理 | 中 / 低 |
 | S4 ✅ | 共享代码去重 | ~~两处重复~~ → `proto::pem`（load_certs/load_key）+ `proto::headers`（is_hop_by_hop），gateway/agent 引用统一，测试移入 proto | 高 / 低 |
 
@@ -21,7 +21,7 @@
 |---|---|---|---|---|
 | A1 ✅ | 优雅关闭（TODO P1 已定稿） | ~~pending 永久挂起~~ → SIGINT/SIGTERM 监听（tokio::signal）→ 打日志 → shutdown() 干净退出；实机验证 SIGTERM 生效 | **高 / 中** |
 | A2 ✅ | 隧道层可观测性 | ~~只有 HTTP 层~~ → `hlmg_quic_connections`（gauge）+ `hlmg_agent_connections_total`（counter，重连计数），quic accept_loop 挂钩，e2e 断言 | 中 / 中 |
-| A3 ✅ | 错误类型化 | ~~全 anyhow~~ → `error.rs` 定义 `GatewayError`/`AgentError`（thiserror），Gateway/Agent::start 与 tls 配置返回类型化错误，anyhow 只留二进制入口 | 中 / 中 |
+| A3 ⚠️ 部分 | 错误类型化 | ~~全 anyhow~~ → `error.rs` 定义 `GatewayError`/`AgentError`（thiserror）。**现状**：gateway 侧 `GatewayError` 已用；`Agent::start` 仍返回 `anyhow::Result`，`tls::https_server_config` 也是 anyhow，且 `config_err`/`AgentError::Forward`/`GatewayError::Sqlite` 从未被构造（死变体）——见 TODO「2026-09 全项目代码审查」 | 中 / 中 |
 | A4 | 配置热加载 | 配置只启动时读 | SIGHUP 重载运行时参数 | 低 / 高（**不做**） |
 | A5 | 健康检查深化 | `/healthz` 恒返 ok | 可选深度检查（QUIC endpoint 存活、agent 注册数） | 低 / 低 |
 
@@ -55,13 +55,13 @@
 **阶段 2 — 结构性重构 ✅ 已完成（2026-09）**
 - S1 gateway 模块拆分（http/config/keystore）
 - S3 配置解析独立化
-- A3 thiserror 错误类型化
+- A3 thiserror 错误类型化（**部分完成**：gateway 侧已类型化，agent 侧仍 anyhow）
 - A1 优雅关闭（TODO P1 实现）
 
 **阶段 3 — 深化 ✅ 已完成（2026-09，S2/C2/A2；C3 零拷贝暂缓）**
 - S2 e2e 拆文件
 - A2 隧道层指标
-- C2/C3 keystore 异步化 + 转发零拷贝
+- C2 keystore 写操作异步化（C3 转发零拷贝按阶段 3 说明**暂缓**，见上表）
 - A4/A5/C5 明确不做
 
 ## 六、明确不做（防过度优化）

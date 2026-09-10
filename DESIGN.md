@@ -75,7 +75,7 @@
 | 帧类型 | 方向 | 用途 |
 |---|---|---|
 | `Register` | agent → cloud | 上报 agent_id、模型能力列表、并发上限、版本 |
-| `Heartbeat` | 双向 | 保活 + 健康状态（存活、当前并发、队列深度、最近延迟） |
+| `Heartbeat` | agent → cloud | 保活（现状载荷：`agent_id` + `inflight`）。**尚未实现**：agent 恒发 `inflight: 0`，网关只打 debug 日志，健康判定用的是"心跳到达时间"——队列深度/最近延迟是后续"容量感知路由"的输入（见 TODO 审查登记「Heartbeat 载荷空洞」） |
 | `ProxyRequest` | cloud → agent | `{ request_id, method, path, headers, body }`，对应一个 OpenAI 兼容请求 |
 | `ProxyResponseHead` | agent → cloud | `{ request_id, status, headers }`（转发上游响应头，如 `content-type: text/event-stream`） |
 | `ProxyResponseBody` | agent → cloud | `{ request_id, chunk }`，body 分块流式传输（SSE chunk 直接透传） |
@@ -101,11 +101,11 @@
 
 职责：
 1. **公网 HTTP(S) 入口**：监听 443（TLS），暴露 OpenAI 兼容路径 `/v1/models`、`/v1/chat/completions`、`/v1/embeddings` 等，一律透传给隧道内的 agent。
-2. **认证**：Bearer API Key（恒定时间比较，防时序侧信道）；可选 IP 白名单。
+2. **认证**：Bearer API Key（`sha256(token)` 快速索引定位单条记录 + argon2 校验，见 §7 密钥行；恒定时间比较只用在 admin token 上）；可选 IP 白名单（未实现）。
 3. **限流**：token bucket 按 Key 限流；按 agent 并发上限 admission control（429）。
-4. **Agent 路由**：维护 agent 注册表（agent_id → 当前 QUIC 连接 + 健康状态）；多 agent 时按"最少并发"或"轮询"选择；无健康 agent 时返回 503。
+4. **Agent 路由**：维护 agent 注册表（agent_id → 当前 QUIC 连接 + 健康状态）；按请求 `model` 过滤候选（精确声明优先、`models: ["*"]` 通配兜底），同组内取在途最少者（见 `MODEL_ROUTING.md`）；无健康 agent → 503，有健康 agent 但无人能服务该模型 → 404。
 5. **QUIC Server**：接受边缘端连接，校验 mTLS 证书，处理 Register/Heartbeat，更新注册表，踢掉同一 agent_id 的旧连接（防重复拨号）。
-6. **请求转发**：HTTP → `ProxyRequest` 帧 → 等 `ProxyResponse*` 帧流式回写；超时（空闲超时 + 总超时）→ `Cancel`。
+6. **请求转发**：HTTP → `ProxyRequest` 帧 → 等 `ProxyResponse*` 帧流式回写；**逐帧空闲超时**（`timeout_secs`，默认 120s）→ `Cancel`。（总超时未实现——SSE 长流不能被整请求时限误杀，故只保留逐帧空闲超时。）
 7. **可观测性**：`tracing` 结构化日志 + `metrics`（请求数、延迟、token 量、在线 agent 数）。
 
 ## 6. 边缘端（edge-agent）设计
@@ -113,7 +113,8 @@
 **技术栈**：`quinn` + `reqwest` + `tokio` + `clap` + `tracing` + `serde`
 
 职责：
-1. **拨号与保活**：启动即连接云端，指数退避 + 抖动重连（0.5s → 1s → … → 上限 60s）；每 N 秒发 `Heartbeat`。
+1. **拨号与保活**：启动即连接云端，指数退避重连（0.5s → 1s → … → **上限 30s**）；每 N 秒（`heartbeat_secs`，默认 5s）发 `Heartbeat`。
+   **与本节原设计的差异**：无抖动（jitter）、上限是 30s 而非 60s。缺抖动会让多台 agent 的重连同步化，见 TODO 审查登记「重连退避无抖动、上限 30s」。
 2. **mTLS**：持有云端 CA 签发的客户端证书。
 3. **请求处理**：收到 `ProxyRequest` → 映射为对本地 LLM 的 HTTP 请求（如 `http://127.0.0.1:11434/v1/chat/completions`）→ 流式回传；收到 `Cancel` → 取消上游请求（reqwest 的 `AbortHandle`）。
 4. **本地 LLM 管理（可选但推荐）**：进程守护——启动、健康检查（`/v1/models`）、崩溃自动重启。
@@ -123,7 +124,7 @@
 
 | 面 | 措施 |
 |---|---|
-| 公网入口 | 强制 TLS 1.3；API Key 认证；限流；请求大小上限；审计日志（来源 IP、Key、路径、耗时、token 估算） |
+| 公网入口 | TLS 1.3（配置 `tls_cert`/`tls_key` 后启用 HTTPS；**未配置就是明文 HTTP**，生产必须配）；API Key 认证；限流；请求体大小上限（16 MiB，当前硬编码）；访问日志（`request_id` / method / path / status / TTFB）；per-key token 用量计量（上游 `usage` 优先，缺失时估算并标记）。**尚未包含来源 IP 与 key id**（见 TODO 审查登记） |
 | 隧道 | QUIC 内建 TLS 1.3 + mTLS（云端 CA 签发 agent 证书）；连接级空闲超时；证书轮换 |
 | 数据 | 全链路加密；日志脱敏（不记录 prompt 内容，或可配置） |
 | 密钥 | API Key 以 **argon2 哈希**存储（Argon2id，明文仅创建时返回一次），另存 sha256 快速索引用于授权 O(1) 定位；agent 私钥只存 edge 节点本地 |
@@ -132,7 +133,7 @@
 
 - **云端**：编译为单二进制，`systemd` 或 Docker 运行；证书由自家 CA 签发脚本管理。
 - **edge 节点**：单二进制，支持 Linux / macOS / Windows / WSL2（各节点系统可能不同）。
-- **配置**：网关侧 `config.yml`、边缘端 `config.yml`（均 YAML，模板见 `gateway_config.example.yml` 与 `crates/agent/config.example.yml`）。
+- **配置**：网关侧固定 `gateway-config.yml`、边缘端固定 `agent-config.yml`（均 YAML，模板见 `gateway_config.example.yml` 与 `agent_config.example.yml`；两份配置都含密钥类信息，已 gitignore，不提交）。
 - **开机自启**：边缘端注册为 systemd/launchd 服务。
 
 ## 9. 里程碑
@@ -148,7 +149,7 @@
 1. **UDP 被封锁**：极少数 edge 侧网络封出站 UDP。备选：隧道降级为 TCP+TLS 并复用同一套帧协议（帧层不变，只换传输层），或提示用户放行 UDP 443。
 2. **quinn API 学习成本**：备选直接上 HTTP/3（`h3` crate），用标准 HTTP 语义替代自定义帧，代价是少一点控制力、多一层依赖。
 3. **帧协议 bug 排查成本**：协议保持最小集（上表 8 种帧），先做对再做优化；用 `postcard` 保证序列化简单可调试。
-4. **edge 断网/断电**：云端靠心跳超时自动摘除 agent，客户端得到 503 而非悬挂；agent 恢复后自动重连，无需人工干预。
+4. **edge 断网/断电**：云端靠心跳超时把 agent **排除出路由候选**（`agent_stale_secs`，默认 15s），客户端得到 503/404 而非悬挂；agent 恢复后自动重连，无需人工干预。注意现状：注册表条目要等连接真正关闭才摘除，因此 `Registry::len()`、`/metrics hlmg_agents`、`/admin/agents` 会把失联连接一并算作"在线"（见 TODO 审查登记）。
 5. **云服务器被攻击面**：公网入口只暴露认证后的转发能力，不暴露任何管理接口；管理走 SSH。
 
 ## 11. 演进路线（多用户 / 大团队 / 高并发）
@@ -165,14 +166,14 @@
 | 令牌桶限流在内存 | 多实例各自计数，限流失效 |
 | 单进程承载 HTTP+QUIC+Admin | 无法水平扩展 |
 | SQLite 单文件持久化 | 写锁竞争，高并发 key 管理吃力 |
-| key 校验 O(n) 遍历 | key 数万级后变慢 |
+| ~~key 校验 O(n) 遍历~~ | ✅ 已解决：`sha256(token)` lookup 索引 O(1) 定位单条记录，再对单条做 argon2 校验 |
 | 无租户概念 | 所有 key 权限相同，无法隔离/配额/计量 |
 
 ### 11.2 阶段 1：单实例优化（小团队，几十并发）
 
-- key 校验改为"先哈希定位、再恒定时间比较"，避免全表遍历
-- SQLite 写操作（create/revoke）挪到 `spawn_blocking`，不阻塞 async runtime
-- QUIC 流上限调优：`max_concurrent_bidi_streams` 默认 100，高并发流场景上调
+- key 校验改为"先哈希定位、再恒定时间比较"，避免全表遍历 ✅ 已实施（`sha256(token)` lookup 索引 + argon2 校验，见 `gateway/src/keystore/`；恒定时间比较落在 admin token 上）
+- SQLite 写操作（create/revoke）挪到 `spawn_blocking`，不阻塞 async runtime ✅ 已实施（OPTIMIZATION.md C2；keystore argon2/落库走阻塞线程池）
+- QUIC 流上限调优：`max_concurrent_bidi_streams` 默认 100，高并发流场景上调 ✅ 已实施（网关侧调到 1000，见 `gateway/src/tls.rs`）
 - 慢上游排队：agent 满时先排队（带超时）而非直接 429
 - SSE 流式转发增加内存缓冲上限，防慢客户端拖垮
 

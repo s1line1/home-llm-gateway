@@ -1,6 +1,8 @@
 # home-llm-gateway TODO
 
-> 基于实际代码审查与需求梳理（2026-08），按优先级排列。状态：未实现，仅规划。
+> 基于实际代码审查与需求梳理（2026-08），按优先级排列。
+> 状态：P0 主体已实施（2026-09）；其余按优先级推进，`[x]` 表示已完成，未勾选项为待办。
+> 文末「2026-09 全项目代码审查（两轴）」登记了最近一次全量审查发现的代码问题与文档漂移。
 
 ## P0 — 工具接入（DSH / Codex / Claude Code 直连）
 
@@ -73,6 +75,10 @@
           3 秒内新增连接 ≤2、慢请求 200；修复前红在 `expected 2 agents, got 1`
         - 单测 `agent_id_gets_a_unique_suffix_per_load`（`agent/src/config.rs`）：同一份配置
           加载两次 → 前缀保留 + 8 位十六进制后缀 + 两次必须不同
+        ⚠️ **更正（2026-09 全项目审查）**：这两个测试**目前不在树中**（随修法一并撤回，
+        `grep` 只命中本文件）——重做时必须重新写，不要以为能直接跑。另外当时的默认值
+        `edge-1` 仍在 `agent/src/config.rs:51-53` 与 `Makefile` 中生效，`DEPLOY.md` 与
+        `README.md` 已在本次审查中补上"每台机器 `agent_id` 必须唯一"的警告与排障行。
       注：网关侧"踢旧连接"的机制本身是对的（同机重连接管），无需改动——现在的问题只是它
       会被配置撞车误触发。
 - [x] **进程级优雅关闭**：gateway/agent 注册 SIGTERM/SIGINT（`tokio::signal`），收到后打 INFO 日志
@@ -156,8 +162,10 @@
       （admin_token 配置文件明文）；考虑"首次启动自动建默认 key"或引导提示
 - [ ] **usage 数据保留策略（B 档，可选）**：`key_usage` 无限累积（reset 是待定项）——
       长时间运行表会涨；建议与 reset 一并设计保留窗口/归档
-- [ ] **Dockerfile / docker-compose（C 档，可选）**：当前部署是 systemd + 手动传文件
-      （DEPLOY.md）；容器化需多阶段构建含 web/dist
+- [ ] **Dockerfile / docker-compose（C 档，可选）**：~~当前部署是 systemd + 手动传文件~~
+      **更正（2026-09 审查）**：`Dockerfile` 已存在（多阶段，产出 gateway/agent/mock-llm 三个二进制），
+      并已在 README 目录结构中登记；剩余缺口是 **docker-compose**，以及镜像不含 `web/dist`
+      （容器内 `/` 会是构建提示页）——容器化需多阶段构建把前端一并打进去
 - [ ] **结构化访问日志 JSONL（C 档，可选）**：tracing 文本日志给人看；如需审计
       "谁何时调了什么"可加 JSON 行落盘
 - [ ] **keys.db 迁移规模化**：当前自动迁移（`keystore.rs::migrate_legacy_keys`）同步执行、
@@ -201,3 +209,107 @@
       7. 测试：proto roundtrip（8 帧/边界）+ 全量 e2e 回归 + bench 对比报告
       8. 分步：schema+prost 接入 → io.rs 切换+单测 → bench 双实现对比（决策门槛）→
          全量回归 → 版本 0.2.0+校验 → 文档（DESIGN §4.2、部署同版本升级说明）
+
+---
+
+## 2026-09 全项目代码审查（两轴）— 发现登记
+
+> 方法：按 code-review 的两条轴——**规范轴**（是否符合本仓库已文档化的规范 + Fowler 坏味道基线）
+> 与**规格轴**（代码是否兑现 DESIGN / MODEL_ROUTING / OPTIMIZATION / TODO / README 的承诺）——
+> 对**整个仓库**（不是 diff）做并行审查，基线提交 `745e8e8`。
+> 基线健康度：`cargo fmt --check` ✅、`cargo clippy --workspace --all-targets -- -D warnings` ✅、
+> `cargo test --workspace` ✅（119 个测试全绿）——即下列问题都不是构建/测试造成的。
+> 本节只登记**尚未修复**的代码问题；已随本次一并修掉的文档漂移见本节末尾清单。
+> 同名 `agent_id` 互踢那条已在上文 P1 单独登记（并已补"回归测试不在树中"的更正），此处不重复。
+
+### P1 — 正确性 / 健壮性
+
+- [ ] **usage 内存累加竞态（少报用量）**：`gateway/src/keystore/mod.rs:318-335` 在 map 无 cell 时
+      新建 `c` 再 `or_insert_with(|| c.clone())`，然后**返回本地 `c`**——若并发请求先插入成功，
+      `or_insert_with` 保留的是别人的 cell，本次增量就记进了不在 map 里的孤儿 cell。
+      后果：SQLite 的 `key_usage` 正确，但 `/admin/usage`、`/admin/keys` 的内存视图少报，
+      **重启后自愈**（启动时从 SQLite 重载，见 `:185-199`）；窗口 = 新建 key 的首批并发请求。
+      修法：返回 entry 里的值（`usage.entry(..).or_insert_with(..)` 的返回值）。
+- [ ] **失联 agent 不摘除，却被当成"健康"计数**：`registry.rs:91` 的 `len()` 不做新鲜度过滤，
+      直接喂给 `/metrics hlmg_agents`（HELP 文案是 "Registered healthy agents"，`metrics.rs:136-138`）
+      与 `/admin/agents`（`admin.rs:173`）；只有 `try_acquire`（`registry.rs:145`）过滤了
+      `agent_stale_secs`。活跃但沉默的连接会一直多报。修法：`len()`/`snapshot()` 接 `stale_after`，
+      或另给一个 `healthy_len()` 供指标使用。
+- [ ] **慢客户端无限占并发槽**：`http_proxy.rs:419` 的 `tx.send(...).await` 无超时，也没有响应写超时
+      → 停止读取的客户端会无限期持有 `SlotGuard`（连带占住该 agent 的并发额度与 QUIC 流）。
+      DESIGN §11.2 已列"SSE 流式转发增加内存缓冲上限"，与本项合并做。
+- [ ] **公网入口 accept 出错即永久停服**：`gateway/src/lib.rs:175` 的 `listener.accept().await?`
+      用 `?` 结束整个循环，外层只有一句 `warn!("https server stopped")`。对比 QUIC 侧专门做了
+      `hlmg_quic_accepting` + `error!` 告警（`quic.rs:29-36`），HTTP 入口（唯一公网入口）反而没有
+      等价信号——瞬时错误（EMFILE 等）就能让网关"进程活着但不监听"。修法：accept 错误重试 + 计数指标。
+- [ ] **Cancel→上游缺上游侧断言**：`mock-llm` 没有"请求被取消"的可观测信号，`chain.rs:205-217`
+      只断言断开后 `/v1/models` 仍可用；README 承诺的"客户端断开 → 不白算 token"因此只有间接覆盖。
+      修法：mock-llm 暴露取消计数（或日志端点），e2e 断言断开后上游请求确实被中断。
+
+### P2 — 契约 / 一致性
+
+- [ ] **`error.type` 分叉**：`http_proxy::error_response` 自我声明是 OpenAI 错误格式的唯一来源
+      （`http_proxy.rs:27-29`），但 `admin.rs:34/110/121/156/166` 与 `http.rs:117` 手搓了 5 种
+      不一致的 type（`auth_error` / `invalid_request` / `gateway_error` / `not_found`）。
+      修法：admin 与 UI fallback 也走同一个构造器/映射表。
+- [ ] **`x-request-id` 只在 `req-<u64>` 形状下才等于隧道 `request_id`**：`http_proxy.rs:168-173`
+      只认 `strip_prefix("req-")`，其他形状（Codex/DSH 发的是 UUID 形态）回落到**第二个**静态计数器
+      （`http_proxy.rs:25`，与 `http.rs:320` 的计数器都从 1 开始）→ 数值撞车；P0 宣称的
+      "HTTP 层 / 隧道帧 / 日志三方对账一致"在真实客户端上并不成立。修法：统一 id 生成器，
+      客户端 id 原样进隧道（改名叫 trace id）或帧内改用字符串。
+- [ ] **`extract_model` 卡住非 chat 的 `/v1/*`**：`http_proxy.rs:142-147` 对 `http.rs:46-53`
+      catch-all 注册的**所有方法与路径**都要求 body 是带 `model` 的 JSON → `GET /v1/files`、
+      `DELETE /v1/files/{id}`、multipart（`/v1/audio/transcriptions`）现在一律 400，
+      与 DESIGN §5.1"一律透传"冲突。修法：按路径/方法白名单要求 model（chat/completions、
+      embeddings…），其余透传。
+- [ ] **A3 类型化错误收尾**（OPTIMIZATION.md 已改标 ⚠️ 部分）：`Agent::start`
+      （`agent/src/lib.rs:40`）与 `tls::https_server_config`（`gateway/src/tls.rs:51-54`）仍返回 anyhow；
+      `config_err`、`AgentError::Forward`、`GatewayError::Sqlite` 是从未被构造的死变体。
+- [ ] **Makefile `deny` 目标 ≠ hook/CI**：目标只跑 `cargo deny check licenses`，而 pre-commit hook
+      与 CI 跑完整 `cargo deny check`（广告语已改，行为未变）。二选一：把目标改成完整检查，
+      或明确 `make check` 不含完整 cargo-deny。
+- [ ] **Heartbeat 载荷空洞**：`Frame::Heartbeat { inflight }` 恒为 0（`agent/src/lib.rs:136-140`），
+      网关只打 debug 日志（`quic.rs:76-84`）。它是"容量感知路由"的前置数据：要么实现上报，
+      要么删掉该字段（现在是死载荷，容易误导）。
+- [ ] **重连退避无抖动、上限 30s**（DESIGN §6.1 原设计为抖动 + 上限 60s）：多台 agent 同时断线
+      会同步重连；与同名 `agent_id` 互踢叠加时更糟。修法：加 jitter（±20%）并对齐上限。
+
+### P3 — 坏味道 / 清理（不成灾，但会持续收利息）
+
+- [ ] **e2e 证书 fixture 重复且已分叉**：`tests/e2e/common.rs` 的 `gen_certs`（`:24-82`）与
+      `gen_certs_pem`（`:85-123`）逐行重复，CA 的 `key_usages` 一个 3 项、一个 2 项；全仓另有
+      23 处 `CertificateParams::default()` 的 PKI 脚手架（`agent/src/lib.rs:326-366`、
+      `gateway/src/tls.rs:75-109`、`gateway/src/main.rs:76-100`、`agent/src/main.rs:75-99`、
+      `registry.rs:212-255`、`quic.rs:103-125`）。抽一个共享 fixture。
+- [ ] **重复逻辑**：`proxy` 内联了 `auth_and_rate_limit` 已封装的认证 + 限流（`http_proxy.rs:133-140`）；
+      `Accept: text/html` 探测复制两份（`http.rs:103-107` 与 `:197-201`）。
+- [ ] **`UsageCollector` 位置与自我声明矛盾**：110 行、有状态的它住在 `http_proxy.rs:292-395`，
+      而 `usage.rs:10` 自称"只含纯函数"，OPTIMIZATION S1 又把 http_proxy 限定为"代理转发"——
+      二选一：搬去 `usage.rs`，或改掉那句注释。
+- [ ] **前端四份独立 `/metrics` 轮询**：`Layout.tsx:24`、`Overview.tsx:9`、`MetricsPage.tsx:10`、
+      `Agents.tsx:61` 各实例化一个 `useMetricsHistory()`（各自 5s 轮询、各自一份历史）。抽 context 共享。
+- [ ] **小体积/常量类**：`Agents.tsx:72` 用 `error.message.includes("404")` 嗅探状态码
+      （`ApiError.status` 就在手边）；`Agents.tsx:28` 硬编码 `agent_stale_secs` 的默认值 `15`；
+      `registry.rs:124,151,158` 三处裸比较 `"*"`；`extract_model -> Result<String, ()>` 丢掉失败原因；
+      `HeadOutcome::Error(u16, String)` 用裸状态码。
+- [ ] **死代码 / 死常量**：`KeyStore::authorize_id`（`keystore/mod.rs:210`）、`Metrics::request_count`
+      （`metrics.rs:98`）、`HISTORY_LEN` 被导出但 `useMetricsHistory.ts:41` 硬编码 `60`。
+
+### 本次一并修掉的文档漂移（无需再动代码）
+
+- `README.md` / `README.en.md`：API Key 认证机制（"恒定时间比较" → sha256 索引 + argon2 校验）、
+  失联 agent 语义（"自动摘除" → 不再参与路由，但计数仍包含失联连接）、`/metrics` 被浏览器访问时
+  返回 Dashboard、目录结构补 `Dockerfile` / `deny.toml` / git hook、
+  **每台机器 `agent_id` 必须唯一**的警告；英文版另修了"keys.db 存明文"的错误描述。
+- `DESIGN.md`：Heartbeat 实际载荷、§5.2 认证机制、§5.4 模型感知路由、§5.6 只有逐帧空闲超时、
+  §6.1 退避无抖动 / 上限 30s、§7 公网入口现状（TLS 需显式配置、审计日志缺来源 IP 与 key id）、
+  §8 配置文件名、§10.4 摘除语义、§11.1/§11.2 的已实施项标注。
+- `DEPLOY.md`：删掉"openssl 生成静态 API Key"这一步（网关没有静态 key）、
+  已删除的 CLI 旗标（`--server-name` / `--agent-stale-secs` / `--admin-token`）改为配置项、
+  新增 `agent_id` 唯一性警告与对应排障行、安全清单同步。
+- `CODE_READING.md` / `OPTIMIZATION.md` / `EDGE_REBRAND.md`：e2e 数量（13 → 23）、
+  测试总数（85 → 119）、模块地图补 `usage.rs` / `error.rs`、A3 与 C3 的状态标注更正。
+- `web/README.md` + `web/src/api/{client,types}.ts`、`web/src/pages/Agents.tsx`、
+  `web/src/hooks/useMetricsHistory.ts`：`/admin/agents` 已实现（不再是"契约预留"），
+  404 分支改为"旧版网关或未启用 `/admin/*`"的降级说明。
+- `Makefile` 的 `deny` 目标注释、`deploy/gateway.service` 的 `Description`（Home → Edge）。

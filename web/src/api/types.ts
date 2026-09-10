@@ -44,10 +44,9 @@ export interface CreatedKey extends ApiKey {
 export type HealthStatus = { ok: boolean; text: string };
 
 /**
- * GET /admin/agents 的 agent 明细（契约预留）。
- * 当前网关版本尚未实现该端点（registry 为进程内存），实现后返回：
+ * GET /admin/agents 的 agent 明细（网关已实现，数据来自注册表实时快照）。
  * agent_id / models / max_concurrency / inflight / last_seen 距现在秒数。
- * 前端在 404 时优雅降级为仅展示 /metrics 中的在线总数。
+ * 前端在 404（旧版网关或未启用 /admin/*）时优雅降级为仅展示 /metrics 中的在线总数。
  */
 export interface AgentInfo {
   agent_id: string;

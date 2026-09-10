@@ -24,8 +24,8 @@ edge-agent（LLM 所在机器）  主动拨号 + 心跳 + 断线重连，转发�
 - **QUIC 隧道 + mTLS**：边缘端主动向外拨长连接，天然穿透 NAT / 动态 IP；双向证书认证，未注册 agent 无法接入
 - **流式优先**：SSE 逐块透传（打字机效果）；客户端断开/超时自动 `Cancel` 上游，不白算 token；逐帧空闲超时，不误杀长流
 - **公网 HTTPS 原生支持**：rustls 直接监听 443，无需 nginx/caddy
-- **安全与治理**：API Key 认证（恒定时间比较）、按 Key 令牌桶限流、按 agent 并发上限的 admission control（超限 429）
-- **多 edge 模型感知路由**：按请求 model 路由到能服务它的 edge（精确优先、`*` 兜底），同组最少负载均衡，失联 agent 自动摘除；`/v1/models` 网关聚合
+- **安全与治理**：API Key 认证（`sha256(token)` 索引定位 + argon2 校验，明文不落盘）、按 Key 令牌桶限流、按 agent 并发上限的 admission control（超限 429）
+- **多 edge 模型感知路由**：按请求 model 路由到能服务它的 edge（精确优先、`*` 兜底），同组最少负载均衡，失联 agent 不再参与路由；`/v1/models` 网关聚合
 - **可观测性**：`/metrics` Prometheus 指标、结构化请求日志（`request_id` / 状态码 / 耗时）、`/healthz` 探针
 - **多平台部署**：单静态二进制（Linux / macOS），交叉编译脚本 + systemd 单元
 
@@ -42,7 +42,9 @@ certs/          证书生成脚本（开发用）
 gateway_config.example.yml  网关配置模板（所有参数，YAML）
 agent_config.example.yml    edge-agent 配置模板（所有参数，YAML）
 deploy/         systemd 单元（gateway.service / agent.service）
-scripts/        多平台 release 打包脚本
+scripts/        多平台 release 打包脚本 + git pre-commit hook（cargo deny + fmt）
+Dockerfile      多阶段容器构建（gateway / agent / mock-llm 三个二进制，用法见文件头注释）
+deny.toml       cargo-deny 策略（依赖许可证 / 公告；CI 与 pre-commit hook 执行）
 ```
 
 > 配置文件命名：**网关固定 `gateway-config.yml`，agent 固定 `agent-config.yml`**（本地/生产一致；
@@ -261,12 +263,14 @@ max_concurrency: 4
 - 客户端请求体必须带 `model`（缺失 → 400）；没有 edge 能服务该模型 → 404
 - `/v1/models` 由网关**聚合**所有健康 edge 声明的模型（`*` 通配不列入）
 - 每个 agent 单独签发客户端证书，`agent_id` 用于区分
-- 超过 `agent_stale_secs`（网关配置，默认 15s）未心跳的 agent 自动摘除
+- ⚠️ **每台机器的 `agent_id` 必须唯一**：同名 agent 会让网关踢掉旧连接（本意是同一台机器重连接管），两台机器互踢会让**活得比踢连接周期长的请求全部失败**（表象是 `/admin/agents` 恒显示 1 个 agent 在线、只有 `hlmg_agent_connections_total` 在飞涨）——详见 `TODO.md` P1
+- 超过 `agent_stale_secs`（网关配置，默认 15s）未心跳的 agent **不再参与路由**（503/404）；注册表条目要等连接真正关闭才摘除，因此 `/metrics hlmg_agents` 与 `/admin/agents` 在失联期间仍会把它算作在线
 - 全部占满时返回 429
 
 ### 可观测性
 
 - **`GET /metrics`**：Prometheus 文本格式指标（按状态码计数、在途请求、在线 agent 数、转发字节、累计耗时），可直接被 Prometheus/Grafana 抓取
+  - 浏览器直接访问（`Accept: text/html`）时返回 Dashboard 页面而非文本，便于点进指标页；Prometheus 抓取（`Accept: */*`）不受影响
   - `hlmg_quic_accepting`：隧道入口是否仍在接受新 agent（1/0）。UDP 驱动失效时入口会停止接受新连接，而进程与 HTTP 入口照常运行——**建议对该指标为 0 告警**（这是唯一能发现该故障的信号）
 - **结构化日志**：`tracing`，每个请求带 `request_id` / 状态码 / 耗时（`tower-http` TraceLayer）
 - **`/healthz`**：存活探针
@@ -314,7 +318,7 @@ curl -X DELETE http://127.0.0.1:8080/admin/keys/<id> -H "Authorization: Bearer <
 
 | 面 | 措施 |
 |---|---|
-| 公网入口 | TLS 1.3、API Key 认证（恒定时间比较）、令牌桶限流、请求体大小上限 |
+| 公网入口 | TLS 1.3（配 `tls_cert`/`tls_key` 后启用 HTTPS；未配即明文 HTTP）、API Key 认证（sha256 索引 + argon2 校验）、令牌桶限流、请求体大小上限 |
 | 隧道 | QUIC 内建 TLS 1.3 + mTLS（云端 CA 签发 agent 证书），未注册 agent 无法接入 |
 | 凭据边界 | 调用方凭据（`Authorization` / `Cookie`）只留在「客户端 ↔ 网关」这一跳，**不**随隧道帧转发给 edge / 上游（上游需要认证时，在 agent 侧配置上游自己的凭据） |
 | 并发 | 按 agent `max_concurrency` 原子占位，超限 429 |

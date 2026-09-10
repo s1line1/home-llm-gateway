@@ -11,7 +11,7 @@
 #   5. sudo cp deploy/gateway.service /etc/systemd/system/ && sudo systemctl daemon-reload \
 #      && sudo systemctl enable --now gateway
 [Unit]
-Description=Home LLM Gateway (cloud relay)
+Description=Edge LLM Gateway (cloud relay)
 After=network-online.target
 Wants=network-online.target
 

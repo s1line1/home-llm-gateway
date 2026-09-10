@@ -69,7 +69,8 @@ export default function Agents() {
   });
 
   const hasDetail = detailQuery.data !== null && !detailQuery.isError;
-  const notImplemented = detailQuery.isError && detailQuery.error.message.includes("404");
+  // 旧版网关（或未挂载 /admin/* 的部署）返回 404 → 降级为仅显示汇总
+  const detailUnavailable = detailQuery.isError && detailQuery.error.message.includes("404");
 
   return (
     <div className="space-y-6">
@@ -103,20 +104,17 @@ export default function Agents() {
         subtitle={
           hasDetail
             ? "来自 /admin/agents（每 5 秒刷新）"
-            : "当前网关版本未提供 /admin/agents 端点，仅显示汇总"
+            : "未取到 /admin/agents 明细（旧版网关或未启用 /admin/*），仅显示汇总"
         }
       >
         {detailQuery.isPending ? (
           <EmptyState text="加载中…" />
-        ) : notImplemented ? (
+        ) : detailUnavailable ? (
           <div className="space-y-3">
             <p className="text-sm text-slate-500">
               <code className="rounded bg-slate-100 px-1 font-mono text-xs">GET /admin/agents</code>{" "}
-              尚未在网关实现（agent 注册表位于网关进程内存）。在线总数见上方卡片。
-            </p>
-            <p className="text-xs text-slate-400">
-              集成时可在 <code className="rounded bg-slate-100 px-1">crates/gateway/src/admin.rs</code>{" "}
-              暴露注册表明细（agent_id / models / max_concurrency / inflight / last_seen），前端已按此契约预留。
+              返回 404：网关版本较旧，或该部署没有配置 <code className="rounded bg-slate-100 px-1 font-mono text-xs">admin_token</code>
+              （`/admin/*` 未挂载）。在线总数见上方卡片。
             </p>
           </div>
         ) : detailQuery.isError ? (

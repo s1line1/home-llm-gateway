@@ -75,8 +75,9 @@ export async function deleteKey(token: string, id: string): Promise<void> {
 }
 
 /**
- * Agent 明细（契约预留，当前网关返回 404）。
- * 返回 null 表示端点未实现（由调用方决定降级展示）。
+ * Agent 明细（网关已实现；数据来自注册表实时快照）。
+ * 返回 null 表示拿不到明细——旧版网关，或该部署未配置 admin_token（`/admin/*` 未挂载）；
+ * 由调用方决定降级展示。
  */
 export async function fetchAgents(token: string): Promise<AgentInfo[] | null> {
   const resp = await fetch("/admin/agents", {

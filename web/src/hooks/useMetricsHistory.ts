@@ -17,7 +17,7 @@ export interface MetricsHistory {
   raw: string | null;
   /** 最近一次拉取错误信息（连续失败时保留上次成功数据）。 */
   error: string | null;
-  /** 网关是否可达（healthz 失败时为 false，用于总览状态点）。 */
+  /** 网关是否可达（最近一次 /metrics 拉取失败时为 false，用于总览状态点）。 */
   reachable: boolean;
 }
 
