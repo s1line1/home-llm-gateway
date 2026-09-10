@@ -267,6 +267,7 @@ max_concurrency: 4
 ### 可观测性
 
 - **`GET /metrics`**：Prometheus 文本格式指标（按状态码计数、在途请求、在线 agent 数、转发字节、累计耗时），可直接被 Prometheus/Grafana 抓取
+  - `hlmg_quic_accepting`：隧道入口是否仍在接受新 agent（1/0）。UDP 驱动失效时入口会停止接受新连接，而进程与 HTTP 入口照常运行——**建议对该指标为 0 告警**（这是唯一能发现该故障的信号）
 - **结构化日志**：`tracing`，每个请求带 `request_id` / 状态码 / 耗时（`tower-http` TraceLayer）
 - **`/healthz`**：存活探针
 
