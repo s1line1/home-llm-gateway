@@ -335,3 +335,111 @@ async fn e2e_openai_error_semantics() {
     gw.shutdown().await;
     gw2.shutdown().await;
 }
+
+/// 规格：用量落库**不得拖住响应流**。
+///
+/// 用独占锁把 keys.db 卡住（rusqlite 默认 busy timeout 5s，所以那次写会真的阻塞）：
+/// 旧实现把落库放在响应流关闭之前，客户端要等到锁释放才拿到 body 结束；
+/// 正确实现下客户端应立即拿到完整响应，落库在后台完成。
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn e2e_usage_write_does_not_stall_the_response() {
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    let (ca, server_cert, server_key, client_cert, client_key) = gen_certs();
+    let mock_addr = start_mock_llm("mock-llm").await;
+    let (keys_path, key) = seed_keys_db();
+
+    let gw = Gateway::start(GatewayConfig {
+        http_bind: "127.0.0.1:0".parse().unwrap(),
+        quic_bind: "127.0.0.1:0".parse().unwrap(),
+        ca_cert: vec![ca.clone()],
+        server_cert: vec![server_cert.clone()],
+        server_key,
+        admin_token: None,
+        keys_file: Some(keys_path.clone()),
+        request_timeout: Duration::from_secs(30),
+        agent_stale_after: Duration::from_secs(10),
+        rate_limit_per_min: 0,
+        max_concurrent_requests: 0,
+        tls: None,
+        ui_dir: None,
+    })
+    .await
+    .unwrap();
+
+    let agent = Agent::start(AgentConfig {
+        cloud_addr: gw.quic_addr,
+        server_name: "localhost".into(),
+        ca_cert: vec![ca.clone()],
+        client_cert: vec![client_cert.clone()],
+        client_key,
+        agent_id: "usage-lock-agent".into(),
+        models: vec!["mock-llm".into()],
+        max_concurrency: 4,
+        upstream_base: format!("http://{mock_addr}"),
+        heartbeat_interval: Duration::from_millis(200),
+        request_log: false,
+    })
+    .unwrap();
+    wait_for_agents(&gw, 1, Duration::from_secs(10)).await;
+
+    // 后台线程取 keys.db 独占锁并保持 3s（BEGIN EXCLUSIVE 立即取锁）
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel::<()>();
+    let holder_path = keys_path.clone();
+    let holder = std::thread::spawn(move || {
+        let conn = rusqlite::Connection::open(&holder_path).unwrap();
+        conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        locked_tx.send(()).unwrap();
+        std::thread::sleep(Duration::from_secs(3));
+        let _ = conn.execute_batch("ROLLBACK");
+    });
+    locked_rx.recv().expect("锁已取得");
+
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", gw.http_addr);
+    let started = std::time::Instant::now();
+    let resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {key}"))
+        .json(&serde_json::json!({
+            "model": "mock-llm",
+            "messages": [{ "role": "user", "content": "hi" }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.bytes().await.unwrap(); // ← 等 body 真正结束（chunked 终止符）
+    let elapsed = started.elapsed();
+    println!(
+        "PROBE: 独占锁持有期间，客户端拿到完整响应用了 {elapsed:?}（body {} 字节）",
+        body.len()
+    );
+    assert!(
+        elapsed < Duration::from_millis(1500),
+        "用量落库拖住了响应流：客户端等了 {elapsed:?}（锁只持有 3s）"
+    );
+    holder.join().unwrap();
+
+    // 锁释放后必须最终落库（异步结算不能丢数据）
+    let deadline = std::time::Instant::now() + Duration::from_secs(6);
+    let mut persisted = false;
+    while std::time::Instant::now() < deadline && !persisted {
+        std::thread::sleep(Duration::from_millis(100));
+        if let Ok(conn) = rusqlite::Connection::open(&keys_path) {
+            persisted = conn
+                .query_row(
+                    "SELECT COALESCE(SUM(requests), 0) FROM key_usage",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map(|n| n >= 1)
+                .unwrap_or(false);
+        }
+    }
+    println!("PROBE: 锁释放后用量是否最终落库 = {persisted}");
+    assert!(persisted, "用量必须最终落库（异步结算不能丢数据）");
+
+    agent.shutdown().await;
+    gw.shutdown().await;
+}

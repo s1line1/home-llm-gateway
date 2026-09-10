@@ -300,9 +300,22 @@ impl KeyStore {
         removed
     }
 
-    /// 记录一次请求的用量（内存原子累加 + SQLite 写穿）。
+    /// 记录一次请求的用量（内存原子累加 + SQLite 写穿，同步）。
     /// 吊销的 key 也有可能在途请求刚结束——按 key_id 独立累计，记录保留可审计。
+    ///
+    /// 仅测试使用：它是 `accumulate_usage` + `persist_usage` 的同步组合，而
+    /// `persist_usage` **会阻塞**（SQLite busy 重试可达数秒）。请求路径必须走
+    /// 「内存累加 + 阻塞线程池落库」，见 `http_proxy::UsageCollector::finish`——
+    /// 所以这里用 `cfg(test)` 把它挡在生产代码之外，避免再被误用到热路径上。
+    #[cfg(test)]
     pub fn record_usage(&self, key_id: &str, name: &str, delta: &UsageDelta) {
+        self.accumulate_usage(key_id, name, delta);
+        self.persist_usage(key_id, name, delta);
+    }
+
+    /// 只做内存累加：纳秒级、无 IO，用于让 `/admin/usage`（读的正是这份内存计数）
+    /// 在响应返回时立即一致。
+    pub fn accumulate_usage(&self, key_id: &str, name: &str, delta: &UsageDelta) {
         let cell = {
             let usage = self.inner.usage.read().unwrap();
             usage.get(key_id).cloned()
@@ -326,7 +339,6 @@ impl KeyStore {
                 *n = name.to_string();
             }
         }
-        let now = now_secs();
         cell.prompt_tokens
             .fetch_add(delta.prompt_tokens, Ordering::Relaxed);
         cell.completion_tokens
@@ -335,9 +347,15 @@ impl KeyStore {
         if delta.estimated {
             cell.estimated_requests.fetch_add(1, Ordering::Relaxed);
         }
-        cell.last_used_at.store(now, Ordering::Relaxed);
+        cell.last_used_at.store(now_secs(), Ordering::Relaxed);
+    }
 
-        // SQLite 写穿（低 QPS 直接同步；高并发再优化为 spawn_blocking/批量 flush）
+    /// 把一次用量写穿到 SQLite（增量 UPSERT）。
+    ///
+    /// **阻塞调用**：SQLite busy 重试可能让它等上数秒（rusqlite 默认 busy timeout 5s），
+    /// 且全程持有 `db` 互斥锁。因此调用方必须把它放到阻塞线程池上，绝不要放在
+    /// async worker 上，也不要放在响应流的收尾路径上（会变成客户端的尾延迟）。
+    pub fn persist_usage(&self, key_id: &str, name: &str, delta: &UsageDelta) {
         if let Some(conn) = self.inner.db.lock().unwrap().as_mut() {
             let r = conn.execute(
                 "INSERT INTO key_usage
@@ -357,7 +375,7 @@ impl KeyStore {
                     delta.completion_tokens as i64,
                     1i64,
                     delta.estimated as i64,
-                    now as i64
+                    now_secs() as i64
                 ],
             );
             if let Err(e) = r {

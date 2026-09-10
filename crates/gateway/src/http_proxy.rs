@@ -66,26 +66,43 @@ fn openai_error_type(status: StatusCode) -> &'static str {
     }
 }
 
-/// 校验 Bearer API Key（静态或动态 key）；通过时返回 (key_id, key_name, token)。
-/// key_id 用于用量计量；token 用作限流 key。
-fn api_key<'a>(state: &AppState, headers: &'a HeaderMap) -> Option<(&'a str, String, String)> {
+/// 校验 Bearer API Key（动态 key）；通过时返回 (token, key_id, key_name)。
+/// token 用作限流 key；key_id/key_name 用于用量计量。
+///
+/// argon2 校验单次 10-30ms（19MiB 内存）的 CPU 密集操作，**必须**放到阻塞线程池：
+/// 直接在请求路径上同步执行会占住 async worker（worker 数 = CPU 核数），
+/// 连带拖慢同一个 worker 上所有在途请求，包括正在流式回传的 SSE。
+async fn api_key(state: &AppState, headers: &HeaderMap) -> Option<(String, String, String)> {
     let value = headers.get(axum::http::header::AUTHORIZATION)?;
-    let token = value.to_str().ok()?.strip_prefix("Bearer ")?;
-    let record = state.key_store.authorize_record(token)?;
+    let token = value.to_str().ok()?.strip_prefix("Bearer ")?.to_string();
+    let store = state.key_store.clone();
+    let token_for_verify = token.clone();
+    let record = match tokio::task::spawn_blocking(move || {
+        store.authorize_record(&token_for_verify)
+    })
+    .await
+    {
+        Ok(rec) => rec?,
+        Err(e) => {
+            // 校验任务 panic/被取消：按认证失败处理，不放行
+            warn!("key verification task failed: {e}");
+            return None;
+        }
+    };
     Some((token, record.id, record.name))
 }
 
 /// 认证 + 限流（/v1/* 统一入口，含 /v1/models 聚合路由）。
 /// 认证失败 → Some(401)；限流失败 → Some(429)；通过 → None。
-pub fn auth_and_rate_limit(state: &AppState, headers: &HeaderMap) -> Option<Response> {
-    let Some((token, _id, _name)) = api_key(state, headers) else {
+pub async fn auth_and_rate_limit(state: &AppState, headers: &HeaderMap) -> Option<Response> {
+    let Some((token, _id, _name)) = api_key(state, headers).await else {
         return Some(error_response(
             StatusCode::UNAUTHORIZED,
             "invalid or missing API key",
         ));
     };
     if let Some(rl) = &state.rate_limiter {
-        if !rl.try_acquire(token) {
+        if !rl.try_acquire(&token) {
             return Some(error_response(
                 StatusCode::TOO_MANY_REQUESTS,
                 "rate limit exceeded",
@@ -113,11 +130,11 @@ pub async fn proxy(
     body: Bytes,
 ) -> Response {
     // 认证：同时拿到 key_id/key_name（用量计量）与 token（限流）
-    let Some((token, key_id, key_name)) = api_key(&state, &headers) else {
+    let Some((token, key_id, key_name)) = api_key(&state, &headers).await else {
         return error_response(StatusCode::UNAUTHORIZED, "invalid or missing API key");
     };
     if let Some(rl) = &state.rate_limiter {
-        if !rl.try_acquire(token) {
+        if !rl.try_acquire(&token) {
             return error_response(StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded");
         }
     }
@@ -326,6 +343,12 @@ impl UsageCollector {
     }
 
     /// 响应结束（End / 断流 / 超时 / 客户端断开）：结算用量并记录。
+    ///
+    /// **不得在这里等落库**：SQLite 写可能因锁重试阻塞数秒（rusqlite 默认 busy timeout 5s），
+    /// 而本函数在响应流关闭**之前**执行——等它就会变成客户端的尾延迟（实测：DB 被独占锁
+    /// 卡住 3s，客户端就要多等 3s 才拿到 body 结束）。所以：
+    /// 内存累加立即做（`/admin/usage` 读的正是这份内存计数，读一致性不受影响），
+    /// 落库丢给阻塞线程池且不等结果。
     fn finish(mut self) {
         if self.recorded {
             return;
@@ -333,7 +356,15 @@ impl UsageCollector {
         self.recorded = true;
         let delta = self.resolve_delta();
         self.key_store
-            .record_usage(&self.key_id, &self.key_name, &delta);
+            .accumulate_usage(&self.key_id, &self.key_name, &delta);
+        let store = self.key_store.clone();
+        let key_id = self.key_id.clone();
+        let key_name = self.key_name.clone();
+        // 显式 drop 句柄（= detach）：阻塞任务一旦启动就不会因句柄被丢弃而取消，
+        // 落库会在阻塞线程池上跑完；这里既不等它，也不占 async worker。
+        drop(tokio::task::spawn_blocking(move || {
+            store.persist_usage(&key_id, &key_name, &delta)
+        }));
     }
 
     fn resolve_delta(&mut self) -> UsageDelta {
