@@ -41,6 +41,40 @@
 
 ## P1 — 运维与健壮性
 
+- [ ] **同名 `agent_id` 会让网关静默不可用（2026-09 发现，已实测；修法已验证但代码已撤回）**：
+      两台 edge 用同一个 `agent_id` 时，网关对同名注册会**关掉旧连接**（`registry.rs`，本意是
+      让同一台机器重连时接管），而 agent 把"被踢"当成干净断开、把退避重置回 500ms
+      （`agent/src/lib.rs` 的 `run()`）→ 两台机器每 ~500ms 互踢一次、永不收敛。每次踢都会
+      掐断在途 QUIC 流，因此**凡是活得比踢连接周期长的请求全部失败**（实测：3 秒内新增 5 次
+      连接；6 个 `/v1/slow` 请求 0 成功、全 502）。
+      **表象极难察觉**：两侧进程都健康、`/admin/agents` 恒显示"1 个 agent 在线"、日志只有
+      反复的 `disconnected from cloud, reconnecting`，唯一异常信号是
+      `hlmg_agent_connections_total` 在飞涨（它是 counter，不看 rate 注意不到）。
+      触发门槛很低：`agent/src/config.rs` 的默认值与 `Makefile` 生成的都是 `edge-1`，示例配置
+      是 `home-1`，而 DEPLOY.md 全文没提"多台机器要改 agent_id"。
+      **已定修法（跑通过，含红→绿）**：`agent_id` 改为「可读前缀 + 每进程唯一的随机后缀」
+      （`edge-1-6d69369d`），在 `agent/src/config.rs` 的 `from_file` 里生成；需加依赖
+      `getrandom = "0.3"`（gateway 已在用同版本，Cargo.lock 只多一条依赖边）。
+      后缀**每进程生成一次**（不是每连接）→ 同一进程内重连沿用同一 id，网关"重连接管"
+      逻辑不受影响。
+      **撤回原因 / 待决**：每进程随机会导致**进程重启后 id 变化**（断链重连不变，只有重启变）。
+      当前影响有限——**没有任何指标带 `agent_id` 标签**（`hlmg_requests_total` 唯一的 label 是
+      `status`，其余 metrics 都是无标签标量），`/admin/agents` 是实时视图——但将来加"按 agent 的
+      容量/负载指标"（见本文件"容量感知路由"那条）时会咬人。三个候选改法（择一）：
+        1. **主机名后缀**（`home-1-mac-mini`）：跨重启稳定且最可读；需加安全小依赖
+           `gethostname`（workspace lints 禁 `unsafe`，不能直接用 libc）；两台机器主机名
+           相同（克隆 VM/容器）时仍会撞
+        2. **持久化随机后缀**：首次生成后写进配置同目录的 `agent-id` 文件、以后复用；稳定且
+           不会撞、无需新依赖；代价是多一个状态文件、目录需可写（只读挂载/临时 FS 时退化）
+        3. **主机名 + 随机回退**：两者结合，复杂度叠加
+      **回归测试（已写好并验证过红，重做时照搬）**：
+        - e2e `e2e_two_agents_sharing_one_config_coexist`（`tests/e2e/agents.rs`）：两台机器读
+          **同一份配置**（走生产路径 `agent::config::from_path`）→ 断言两个 agent 同时在册、
+          3 秒内新增连接 ≤2、慢请求 200；修复前红在 `expected 2 agents, got 1`
+        - 单测 `agent_id_gets_a_unique_suffix_per_load`（`agent/src/config.rs`）：同一份配置
+          加载两次 → 前缀保留 + 8 位十六进制后缀 + 两次必须不同
+      注：网关侧"踢旧连接"的机制本身是对的（同机重连接管），无需改动——现在的问题只是它
+      会被配置撞车误触发。
 - [x] **进程级优雅关闭**：gateway/agent 注册 SIGTERM/SIGINT（`tokio::signal`），收到后打 INFO 日志
       → 调用 `Gateway::shutdown()` / `Agent::shutdown()` 干净退出；
       覆盖 systemd stop、Ctrl+C、harness job_kill 场景（对应 OPTIMIZATION.md A1 ✅）
