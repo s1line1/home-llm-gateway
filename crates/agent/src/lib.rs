@@ -6,7 +6,7 @@ use std::{net::SocketAddr, time::Duration};
 
 use futures_util::StreamExt;
 use proto::{
-    io::{read_frame, write_frame},
+    io::{read_frame, write_frame, FrameReader},
     Frame,
 };
 use quinn::Connection;
@@ -151,18 +151,24 @@ async fn heartbeat_loop(conn: Connection, agent_id: String, interval: Duration) 
 /// `request_log` 控制每请求的 INFO 日志（received/responded/done/cancelled）。
 async fn handle_stream(
     mut send: quinn::SendStream,
-    mut recv: quinn::RecvStream,
+    recv: quinn::RecvStream,
     http: &reqwest::Client,
     upstream: &str,
     request_log: bool,
 ) -> anyhow::Result<()> {
+    // 帧读取一律走 FrameReader：`next()` 可安全取消（半读状态在它自己身上），
+    // 因此下面两处 select! 落败时不会丢字节。用裸 `read_frame` 会把半读的帧
+    // 连同局部缓冲一起丢掉 → 长度前缀错位 → 网关发来的 Cancel 被静默丢弃、
+    // 取消传播失效（上游 token 继续白烧）。
+    let mut reader = FrameReader::new(recv);
+
     let Some(Frame::ProxyRequest {
         request_id,
         method,
         path,
         headers,
         body,
-    }) = read_frame(&mut recv).await?
+    }) = reader.next().await?
     else {
         anyhow::bail!("expected ProxyRequest frame");
     };
@@ -188,7 +194,7 @@ async fn handle_stream(
     let resp = loop {
         tokio::select! {
             r = &mut send_fut => break r?,
-            f = read_frame(&mut recv) => {
+            f = reader.next() => {
                 match f? {
                     Some(Frame::Cancel { .. }) | None => {
                         return send_cancelled(&mut send, request_id, started, request_log).await;
@@ -250,7 +256,7 @@ async fn handle_stream(
                     None => break,
                 }
             }
-            f = read_frame(&mut recv) => {
+            f = reader.next() => {
                 match f? {
                     Some(Frame::Cancel { .. }) | None => {
                         return send_cancelled(&mut send, request_id, started, request_log).await;
