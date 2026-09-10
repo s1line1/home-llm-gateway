@@ -71,6 +71,20 @@ impl Gateway {
         let registry = Registry::default();
 
         let server_config = tls::server_config(&cfg.ca_cert, cfg.server_cert, cfg.server_key)?;
+        // HTTPS 侧的 TLS 材料同样在**碰任何资源之前**校验：构建不出 rustls 配置就必须
+        // 让启动失败（fail fast）。否则进程会"启动成功"却从未监听公网端口——systemd
+        // 显示 active(running)、日志写着 Gateway ready，而端口是 connection refused；
+        // 且 /healthz、/metrics、/admin/* 全在同一端口上，可观测性一起陪葬。
+        let https: Option<Arc<rustls::ServerConfig>> = match &cfg.tls {
+            Some(tls) => Some(Arc::new(
+                tls::https_server_config(&tls.cert, &tls.key).map_err(|e| {
+                    crate::error::GatewayError::Config(format!(
+                        "tls_cert/tls_key 无法构建 HTTPS 服务端配置: {e}"
+                    ))
+                })?,
+            )),
+            None => None,
+        };
         let endpoint = quinn::Endpoint::server(server_config, cfg.quic_bind)?;
         let quic_addr = endpoint.local_addr()?;
 
@@ -102,11 +116,11 @@ impl Gateway {
         let app = http::app(state);
 
         let mut tasks = Vec::new();
-        match cfg.tls {
-            Some(tls) => {
+        match https {
+            Some(https) => {
                 info!(addr = %cfg.http_bind, "https public entry enabled");
                 tasks.push(tokio::spawn(async move {
-                    if let Err(e) = serve_https(listener, app, tls).await {
+                    if let Err(e) = serve_https(listener, app, https).await {
                         warn!("https server stopped: {e}");
                     }
                 }));
@@ -148,13 +162,15 @@ impl Gateway {
 }
 
 /// 基于 tokio-rustls 的 HTTPS accept 循环（每连接一个任务）。
+///
+/// rustls 配置由调用方（`Gateway::start`）预先构建好传入，这样证书材料有问题会在
+/// **启动时**就失败，而不是在这里默默结束、留下一个"看起来启动了"的空壳进程。
 async fn serve_https(
     listener: tokio::net::TcpListener,
     app: Router,
-    tls: TlsPem,
+    server_config: Arc<rustls::ServerConfig>,
 ) -> anyhow::Result<()> {
-    let server_config = tls::https_server_config(&tls.cert, &tls.key)?;
-    let acceptor = TlsAcceptor::from(Arc::new(server_config));
+    let acceptor = TlsAcceptor::from(server_config);
     loop {
         let (stream, peer) = listener.accept().await?;
         let acceptor = acceptor.clone();

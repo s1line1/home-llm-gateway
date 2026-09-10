@@ -171,7 +171,7 @@ async fn healthz() -> &'static str {
 /// （`["*"]` 全匹配的 agent 不贡献条目——它接受任意请求，但具体能跑什么
 /// 只有上游知道，列出会误导客户端）。与代理入口同级的认证 + 限流。
 async fn models_route(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Some(rejection) = crate::http_proxy::auth_and_rate_limit(&state, &headers) {
+    if let Some(rejection) = crate::http_proxy::auth_and_rate_limit(&state, &headers).await {
         return rejection;
     }
     let data: Vec<_> = state
@@ -566,6 +566,67 @@ mod tests {
         assert!(
             !body_str(resp).await.contains("id=\"root\""),
             "API paths must not get SPA"
+        );
+    }
+
+    /// 规格：API Key 校验（argon2，单次 10-30ms CPU）**不得阻塞 async worker**。
+    ///
+    /// 用默认的 current-thread runtime：worker 一旦被同步阻塞，其它任务（这里是 1ms
+    /// 周期的计时任务）完全无法推进。把 argon2 放回请求路径上同步执行，本测试即红。
+    #[tokio::test]
+    async fn key_verification_does_not_block_the_runtime() {
+        use std::sync::{
+            atomic::{AtomicU32, Ordering},
+            Arc,
+        };
+
+        // 真实 KeyStore（argon2 校验真的会跑）；key 在计时任务起跑前先建好
+        let store = KeyStore::new(None);
+        let created = store.create("blocking-test".into());
+        let mut state = test_state(None);
+        state.key_store = store;
+        let router = app(state);
+
+        // 1ms 周期的计时任务：只有 runtime 让出线程时才会推进
+        let ticks = Arc::new(AtomicU32::new(0));
+        let t = Arc::clone(&ticks);
+        let ticker = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                t.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let before = ticks.load(Ordering::Relaxed);
+
+        let resp = router
+            .oneshot(
+                axum::extract::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {}", created.plaintext),
+                    )
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(r#"{"model":"m","messages":[]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let ticks_during = ticks.load(Ordering::Relaxed) - before;
+        ticker.abort();
+
+        // 认证已通过（无 agent → 503），说明 argon2 确实被执行过
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "key should authenticate, then fail for lack of an agent"
+        );
+        assert!(
+            ticks_during >= 5,
+            "argon2 校验阻塞了 runtime：1ms 计时任务在整段校验期间只推进了 {ticks_during} 次\
+             （校验本身 10-30ms，放到阻塞线程池后应推进几十次）"
         );
     }
 
