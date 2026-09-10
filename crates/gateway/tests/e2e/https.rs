@@ -598,3 +598,66 @@ async fn e2e_proxy_protocol_edge_cases() {
     client_task.abort();
     gw.shutdown().await;
 }
+
+/// 规格：TLS 材料无法构建出 rustls 配置时，`Gateway::start` **必须直接失败**（fail fast），
+/// 而不是"启动成功、但公网入口从未监听"。
+///
+/// 回归背景：HTTPS 的 PEM 解析原先放在 spawn 的任务里（`serve_https` 的第一行），
+/// 解析失败只留一行 `warn!`，listener 随即被 drop —— 进程活着、systemd 显示
+/// active(running)、日志写着 `Gateway ready`，但 8443 是 connection refused；
+/// 而 `/healthz`、`/metrics`、`/admin/*` 全挂在同一端口上，可观测性一起陪葬。
+///
+/// 有效证书下的正常启动由 `e2e_https_public_entry` 覆盖（防"无脑全拒"的假修复）。
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn gateway_start_fails_fast_on_unusable_tls() {
+    /// 用给定的 TLS 材料起网关（QUIC 侧用一套正常证书，保证失败只因 HTTPS 材料）。
+    async fn start_with_tls(tls: TlsPem) -> Result<Gateway, gateway::error::GatewayError> {
+        let (ca, server_cert, server_key, _client_cert, _client_key) = gen_certs();
+        Gateway::start(GatewayConfig {
+            http_bind: "127.0.0.1:0".parse().unwrap(),
+            quic_bind: "127.0.0.1:0".parse().unwrap(),
+            ca_cert: vec![ca],
+            server_cert: vec![server_cert],
+            server_key,
+            admin_token: None,
+            keys_file: None,
+            request_timeout: Duration::from_secs(5),
+            agent_stale_after: Duration::from_secs(10),
+            rate_limit_per_min: 0,
+            max_concurrent_requests: 0,
+            tls: Some(tls),
+            ui_dir: None,
+        })
+        .await
+    }
+
+    // 场景 1：文件内容根本不是 PEM
+    let garbage = start_with_tls(TlsPem {
+        cert: b"not a pem".to_vec(),
+        key: b"not a key".to_vec(),
+    })
+    .await;
+    // 不能用 unwrap_err()：Gateway 未实现 Debug，用 let-else 解构
+    let Err(e) = garbage else {
+        panic!("垃圾 PEM 必须让启动失败，而不是静默失去公网入口");
+    };
+    let msg = e.to_string();
+    assert!(
+        msg.to_lowercase().contains("tls") || msg.to_lowercase().contains("config"),
+        "错误信息应能让运维定位到证书配置问题，实际: {msg}"
+    );
+
+    // 场景 2（更现实的运维手滑）：两个文件都是合法 PEM，但证书与私钥不配对
+    // （例如从两台机器各拷了一半）。同样必须启动即失败。
+    let (_ca_pem, srv_pem, _srv_key_pem, _cli_pem, cli_key_pem) = gen_certs_pem();
+    let mismatched = start_with_tls(TlsPem {
+        cert: srv_pem.into_bytes(),
+        key: cli_key_pem.into_bytes(),
+    })
+    .await;
+    assert!(
+        mismatched.is_err(),
+        "证书与私钥不配对也必须启动即失败（否则只会在握手时才暴露）"
+    );
+}
