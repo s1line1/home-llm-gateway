@@ -70,7 +70,7 @@
 ## 4. 影响与验证
 
 - **零逻辑变更**：不涉及协议帧、路由、配置结构、指标名；无新测试。
-- 回归：现有 85 测试应全绿（cargo test --workspace）+ fmt/clippy。
+- 回归：`cargo test --workspace` 应全绿（当前 119 个测试）+ fmt/clippy。
 - Web：改 3 处文案后重建 `web/dist`，CI web job 通过即可。
 
 ## 5. 实施顺序

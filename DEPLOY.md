@@ -48,16 +48,16 @@ openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
 
 # 3) 每台 LLM 机器单独签发一个客户端证书（mTLS）
 openssl req -newkey rsa:2048 -nodes \
-  -keyout client-home1.key -out client-home1.csr -subj "/CN=home-agent-1"
+  -keyout client-edge1.key -out client-edge1.csr -subj "/CN=edge-agent-1"
 cat > client.ext <<EOF
 extendedKeyUsage=clientAuth
 EOF
-openssl x509 -req -in client-home1.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
-  -out client-home1.crt -days 825 -extfile client.ext
-# 有第二台就再签一份 client-home2
+openssl x509 -req -in client-edge1.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+  -out client-edge1.crt -days 825 -extfile client.ext
+# 有第二台就再签一份 client-edge2（CN 同名无害，agent_id 才是身份标识）
 ```
 
-分发：`ca.crt` 给两端；`server.crt/server.key` 给中转服务器；`client-home1.crt/client-home1.key` 给对应 agent 机器。
+分发：`ca.crt` 给两端；`server.crt/server.key` 给中转服务器；`client-edge1.crt/client-edge1.key` 给对应 agent 机器。
 
 > **证书轮换**：825 天有效期，到期前重签替换即可（重签后重启服务）。
 > 不建议用 Let's Encrypt：90 天自动续期需要给 rustls 热重载证书，个人项目自签更省事。
@@ -117,9 +117,8 @@ sudo chmod 600 /etc/home-llm-gateway/certs/server.key
 ## 5. 部署网关（中转服务器）
 
 ```bash
-# 1) 生成强随机 API Key 与 Admin Token
-openssl rand -hex 32        # API Key（记下来，客户端要用）
-openssl rand -hex 32        # Admin Token
+# 1) 生成强随机 Admin Token（网关没有静态 API Key，key 一律由 Admin API 运行时创建）
+openssl rand -hex 32        # Admin Token（记下来，登录管理页 / 调 /admin/* 用）
 
 # 2) 基于模板生成网关配置（所有参数都在这里）
 sudo cp gateway_config.example.yml /etc/home-llm-gateway/gateway-config.yml
@@ -182,16 +181,25 @@ curl -s http://127.0.0.1:11434/v1/models          # 本机确认 OpenAI 兼容�
 
 ```bash
 sudo mkdir -p /opt/home-llm-gateway/certs
-sudo cp agent ca.crt client-home1.crt client-home1.key /opt/home-llm-gateway/certs/
+sudo cp agent ca.crt client-edge1.crt client-edge1.key /opt/home-llm-gateway/certs/
 # 目录里只有 agent 二进制 + 证书
 
 # 基于 agent_config.example.yml 生成 agent 配置：
 #   cloud_addr: <公网IP>:4433
 #   server_name: <与网关 server 证书 SAN 一致的域名或 IP>   ← 关键！不一致会 TLS 握手失败
+#   agent_id: <每台机器唯一！>                              ← 关键！同名会让两台机器互踢（见下方警告）
 #   upstream: http://127.0.0.1:11434
 sudo cp agent_config.example.yml /etc/home-llm-gateway/agent-config.yml
 sudo vi /etc/home-llm-gateway/agent-config.yml
+```
 
+> ⚠️ **`agent_id` 必须每台机器唯一**：`agent_config.example.yml` 与 `Makefile` 生成的默认值都是
+> `edge-1`，**多台机器直接照抄就会撞车**。同名时网关会关掉旧连接（本意是同一台机器重连接管），
+> agent 把"被踢"当干净断开、把退避重置回 500ms，于是两台机器每 ~500ms 互踢一次、永不收敛——
+> **凡活得比踢连接周期长的请求全部失败（502）**，而两侧进程都健康、`/admin/agents` 恒显示
+> "1 个 agent 在线"，只有 `hlmg_agent_connections_total` 在飞涨。详见 `TODO.md` P1。
+
+```bash
 # deploy/agent.service 只负责 --config 指向配置文件
 sudo mkdir -p /var/log/home-llm-gateway
 sudo cp deploy/agent.service /etc/systemd/system/
@@ -224,19 +232,21 @@ curl -N -k -H "Authorization: Bearer <你的key>" \
 | 现象 | 排查 |
 |---|---|
 | agent 日志：连接失败 / 一直重试 | ① 安全组 UDP 4433 是否放行；② edge 侧网络是否封出站 UDP（少见）；③ `nc -u -vz <IP> 4433` 测连通 |
-| agent：TLS 握手失败 | `--server-name` 与网关 server 证书 SAN 不匹配；确认填的是 SAN 里的域名或公网 IP |
-| 网关日志：agent connected 但很快消失 | agent 心跳被断（网络不稳）；检查 UDP 丢包；`--agent-stale-secs` 适当调大 |
+| agent：TLS 握手失败 | 配置项 `server_name` 与网关 server 证书 SAN 不匹配；确认填的是 SAN 里的域名或公网 IP |
+| 网关日志：agent connected 但很快消失 | agent 心跳被断（网络不稳）；检查 UDP 丢包；`agent_stale_secs`（网关配置）适当调大 |
+| **请求大面积 502/超时，`/admin/agents` 恒显示 1 个 agent，`hlmg_agent_connections_total` 飞涨** | **两台机器 `agent_id` 撞车**（见 §6 警告）：改配置里任一方的 `agent_id` 为唯一值后重启该 agent |
 | curl 返回 401 | API Key 不对或没带 `Authorization: Bearer` |
 | curl 返回 503 | 网关没注册到健康 agent（看网关/agent 日志） |
 | curl 返回 429 | 限流超了（等下一分钟）或 agent 并发占满 |
 | 浏览器打开 8443 显示"尚未构建"提示页 | 未上传 web/dist（§4）或 gateway-config.yml 未配 `ui_dir`；API 不受影响，可后补 UI 再 `systemctl restart gateway` |
-| edge 侧 IP 变了连不上 | 用域名 SAN 证书 + `--server-name` 填域名，配 DDNS 指向新 IP |
+| edge 侧 IP 变了连不上 | 用域名 SAN 证书 + `server_name` 填域名，配 DDNS 指向新 IP |
 
 ## 9. 部署后安全清单（必做）
 
 - [ ] `ca.key` 只在本地，未上传到任何服务器
-- [ ] API Key 用 `openssl rand -hex 32` 生成，未用弱密码
-- [ ] `--admin-token` 用独立强随机串；`/admin/*` 在安全组中仅对管理网段开放
+- [ ] 第一个 API Key 由 Admin API 创建（明文只显示一次），未使用可猜测的名字/弱口令
+- [ ] `admin_token` 用独立强随机串（配置文件 `admin_token`）；`/admin/*` 在安全组中仅对管理网段开放
+- [ ] 每台 LLM 机器的 `agent_id` 唯一（见 §6 警告）
 - [ ] 安全组仅放行所需端口（22 限制来源 IP）
 - [ ] `/metrics` 未加认证：安全组中仅对监控网段放行，或后续给 metrics 加鉴权
 - [ ] server.key / client.key / keys.db 权限 `chmod 600`

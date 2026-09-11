@@ -74,19 +74,22 @@ crates/proto/src/headers.rs  逐跳头过滤（gateway/agent 共享）
 ### 第 3 步：支撑模块（治理逻辑，1 小时）
 
 ```
-gateway/src/registry.rs    agent 注册表 + SlotGuard 并发占位（admission control）
-gateway/src/keystore/       SQLite 存储 + argon2 哈希 + sha256 lookup 快速索引
-gateway/src/admin.rs        Admin API（key 管理 + agents 列表）
+gateway/src/registry.rs    agent 注册表 + 模型过滤/精确优先排序 + SlotGuard 并发占位（admission control）
+gateway/src/keystore/       SQLite 存储 + argon2 哈希 + sha256 lookup 快速索引（+ hash.rs 哈希原语）
+gateway/src/admin.rs        Admin API（key 管理 + agents 列表 + usage 查询）
+gateway/src/usage.rs        per-key token 用量提取 / 无 usage 时估算（纯函数，由 http_proxy 调用）
 gateway/src/ratelimit.rs    令牌桶
 gateway/src/metrics.rs      Prometheus 指标（HTTP 层 + 隧道层）
+gateway/src/error.rs        GatewayError（thiserror；anyhow 只留 main.rs）
 gateway/src/tls.rs          mTLS 配置（动态信任根方向见 TODO P1 多 CA 方案）
 ```
 
 ### 第 4 步：测试与验证（1 小时）
 
 ```
-crates/gateway/tests/e2e/   13 个 e2e 场景（common.rs 怎么起全栈；chain.rs 全链路；
-                            agents.rs 并发正确性；admin.rs 管理 API；metrics.rs 指标）
+crates/gateway/tests/e2e/   23 个 e2e 场景（common.rs 怎么起全栈；chain.rs 全链路；
+                            agents.rs 并发正确性 + 模型路由；admin.rs 管理 API + 错误语义；
+                            metrics.rs 指标；https.rs 公网 TLS + 隧道控制流 + 启动 fail-fast）
 crates/gateway/benches/     Criterion 微基准（帧编解码 + keystore argon2）
 scripts/bench-k6/           k6 宏观压测模板（SSE 长流 + QPS，含 429 分类断言）
 ```

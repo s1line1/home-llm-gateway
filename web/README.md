@@ -7,7 +7,7 @@ cloud-gateway 的 React 管理界面（TypeScript + React 19 + Vite + Tailwind C
 
 - **总览**：网关健康、在线 agent 数、在途请求、累计请求/转发字节、状态码分布、趋势图
 - **API Keys**：admin token 登录（localStorage）→ 创建（明文仅一次展示）/ 列表 / 吊销 / 复制
-- **Agents**：在线 agent 明细（`/admin/agents`，契约预留；当前网关未实现时降级为仅显示总数）
+- **Agents**：在线 agent 明细（`/admin/agents`：agent_id / models / max_concurrency / inflight / last_seen）
 - **指标**：每 5 秒轮询 `/metrics`，最近 60 个采样点的趋势图 + 状态码分布 + 原始文本查看
 
 ## 开发
@@ -60,7 +60,7 @@ cd .. && gateway --config gateway-config.yml
 | `POST /admin/keys` | 创建 key（返回明文一次） | ✅ 已实现 |
 | `GET /admin/keys` | 列出 key（脱敏） | ✅ 已实现 |
 | `DELETE /admin/keys/{id}` | 吊销 key | ✅ 已实现 |
-| `GET /admin/agents` | agent 明细（`agent_id/models/max_concurrency/inflight/last_seen_secs_ago`） | ⏳ 契约预留，网关侧待实现 |
+| `GET /admin/agents` | agent 明细（`agent_id/models/max_concurrency/inflight/last_seen_secs_ago`） | ✅ 已实现 |
 
-`GET /admin/agents` 实现后，Agents 页自动从"仅显示总数"切换为明细表格，
-无需改动前端（可加在 `crates/gateway/src/admin.rs`，数据在 `registry.rs` 中已有）。
+`GET /admin/agents` 返回 404 时（旧版网关，或未配置 `admin_token` 因而没有挂载 `/admin/*`），
+Agents 页自动降级为"仅显示总数"，其余页面不受影响。
