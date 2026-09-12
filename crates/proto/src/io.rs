@@ -10,6 +10,9 @@ use crate::Frame;
 /// 单帧最大字节数（64 MiB）。
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
 
+// 长度前缀只有 u32：MAX_FRAME 必须装得下，否则下面 `as u32` 会静默截断。
+const _: () = assert!(MAX_FRAME <= u32::MAX as usize);
+
 /// 写入一帧：`[u32 大端长度][postcard 字节]`。
 pub async fn write_frame<W>(w: &mut W, frame: &Frame) -> io::Result<()>
 where
@@ -17,10 +20,18 @@ where
 {
     let bytes =
         postcard::to_allocvec(frame).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    let len = u32::try_from(bytes.len())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "frame too large"))?;
-    w.write_all(&len.to_be_bytes()).await?;
-    w.write_all(&bytes).await?;
+    if bytes.len() > MAX_FRAME {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame too large",
+        ));
+    }
+    let len = bytes.len() as u32;
+    let mut buf = Vec::with_capacity(4 + bytes.len());
+    buf.extend_from_slice(&len.to_be_bytes());
+    buf.extend_from_slice(&bytes);
+    w.write_all(&buf).await?;
+
     Ok(())
 }
 
