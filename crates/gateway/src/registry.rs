@@ -210,6 +210,7 @@ mod tests {
     /// 返回后端点随作用域结束 drop，连接被关闭，但 stable_id / inflight 字段仍可读，
     /// 注册表测试不依赖连接可用性。
     async fn test_connection() -> Connection {
+        proto::install_ring_crypto_provider();
         let key = KeyPair::generate().unwrap();
         let cert = CertificateParams::new(vec!["localhost".to_string()])
             .unwrap()

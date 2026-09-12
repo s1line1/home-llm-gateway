@@ -31,6 +31,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "time"] }
 # time crate：日志时间戳固定东八区（UTC+8，无夏令时），不依赖系统时区设置
 time = { version = "0.3", features = ["formatting"] }
+# s2n-quic：默认 feature 走 s2n-tls（C 库）→ 显式关默认，只开 rustls provider；
+# provider-address-token-default 顺带带出 crypto/zerocopy/zeroize（关默认后必须显式开）
+s2n-quic = { version = "1.88", default-features = false, features = ["provider-address-token-default", "provider-tls-rustls"] }
 
 [workspace.dependencies.criterion]
 version = "0.8"

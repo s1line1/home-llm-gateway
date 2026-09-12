@@ -2,6 +2,7 @@
 
 use std::{sync::Arc, time::Duration};
 
+use proto::ALPN;
 use quinn::crypto::rustls::QuicClientConfig;
 use rustls::{
     pki_types::{CertificateDer, PrivateKeyDer},
@@ -15,6 +16,7 @@ pub fn client_config(
     cert: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
 ) -> Result<quinn::ClientConfig, crate::error::AgentError> {
+    proto::install_ring_crypto_provider();
     let mut roots = RootCertStore::empty();
     for c in ca {
         roots.add(c.clone())?;
@@ -22,7 +24,7 @@ pub fn client_config(
     let mut tls = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_client_auth_cert(cert, key)?;
-    tls.alpn_protocols = vec![b"h3".to_vec()];
+    tls.alpn_protocols = vec![ALPN.to_vec()];
     let quic = QuicClientConfig::try_from(tls)
         .map_err(|e| crate::error::AgentError::Other(format!("quic config: {e}")))?;
 

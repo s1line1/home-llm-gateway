@@ -2,6 +2,7 @@
 
 use std::{io::Cursor, sync::Arc, time::Duration};
 
+use proto::ALPN;
 use quinn::crypto::rustls::QuicServerConfig;
 use rustls::{
     pki_types::{CertificateDer, PrivateKeyDer},
@@ -9,15 +10,13 @@ use rustls::{
     RootCertStore,
 };
 
-/// 隧道 ALPN 标识（自定义协议，不必是真正的 h3）。
-pub const ALPN: &[u8] = b"h3";
-
 /// 构造 QUIC ServerConfig：校验 edge-agent 的客户端证书（mTLS）。
 pub fn server_config(
     ca: &[CertificateDer<'static>],
     cert: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
 ) -> Result<quinn::ServerConfig, crate::error::GatewayError> {
+    proto::install_ring_crypto_provider();
     let mut roots = RootCertStore::empty();
     for c in ca {
         roots.add(c.clone())?;
@@ -52,6 +51,7 @@ pub fn https_server_config(
     cert_pem: &[u8],
     key_pem: &[u8],
 ) -> anyhow::Result<rustls::ServerConfig> {
+    proto::install_ring_crypto_provider();
     let mut cert_reader = Cursor::new(cert_pem);
     let certs = rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
     let mut key_reader = Cursor::new(key_pem);

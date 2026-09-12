@@ -38,6 +38,8 @@ pub struct Agent {
 
 impl Agent {
     pub fn start(cfg: AgentConfig) -> anyhow::Result<Self> {
+        // 双 provider（ring + aws-lc-rs）共存时必须显式安装，见 proto::install_ring_crypto_provider
+        proto::install_ring_crypto_provider();
         let client_config = tls::client_config(
             &cfg.ca_cert,
             cfg.client_cert.clone(),
@@ -314,6 +316,7 @@ async fn send_cancelled(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proto::ALPN;
     use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
     use rcgen::{
         BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
@@ -367,6 +370,7 @@ mod tests {
 
     /// 建立一对本地 QUIC 端点并返回客户端连接（无 mTLS）。
     async fn test_connection() -> Connection {
+        proto::install_ring_crypto_provider();
         let key = KeyPair::generate().unwrap();
         let cert = CertificateParams::new(vec!["localhost".to_string()])
             .unwrap()
@@ -419,6 +423,7 @@ mod tests {
         cert: CertificateDer<'static>,
         key: PrivateKeyDer<'static>,
     ) -> (SocketAddr, tokio::sync::mpsc::Receiver<Connection>) {
+        proto::install_ring_crypto_provider();
         let mut roots = rustls::RootCertStore::empty();
         roots.add(ca.clone()).unwrap();
         let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
@@ -428,7 +433,7 @@ mod tests {
             .with_client_cert_verifier(verifier)
             .with_single_cert(vec![cert], key)
             .unwrap();
-        tls.alpn_protocols = vec![b"h3".to_vec()]; // 与 agent 客户端 ALPN 匹配
+        tls.alpn_protocols = vec![ALPN.to_vec()]; // 与 agent 客户端 ALPN 匹配
         let quic = QuicServerConfig::try_from(tls).unwrap();
         let mut scfg = quinn::ServerConfig::with_crypto(Arc::new(quic));
         let mut transport = quinn::TransportConfig::default();
