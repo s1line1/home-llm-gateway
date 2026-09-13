@@ -23,11 +23,13 @@ use tracing::{info, warn};
 use crate::{keystore::KeyStore, metrics::Metrics, ratelimit::RateLimiter, registry::Registry};
 
 /// HTTPS 证书 PEM 内容。
+#[derive(Debug)]
 pub struct TlsPem {
     pub cert: Vec<u8>,
     pub key: Vec<u8>,
 }
 
+#[derive(Debug)]
 pub struct GatewayConfig {
     /// HTTP(S) 公网入口监听地址。
     pub http_bind: SocketAddr,
