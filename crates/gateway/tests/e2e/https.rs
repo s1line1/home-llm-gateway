@@ -2,6 +2,9 @@
 
 use super::common::*;
 
+use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
+
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn e2e_https_public_entry() {
@@ -135,23 +138,29 @@ async fn e2e_quic_control_stream_edge_frames() {
     .await
     .unwrap();
 
-    // 裸 quinn 客户端（复用 agent 的 mTLS 配置），不走 agent crate 逻辑
-    let client_config = agent::tls::client_config(
-        std::slice::from_ref(&ca),
-        vec![client_cert.clone()],
-        client_key.clone_key(),
-    )
-    .unwrap();
-    let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
-    endpoint.set_default_client_config(client_config);
-    let conn = endpoint
-        .connect(gw.quic_addr, "localhost")
+    // 裸 s2n-quic 客户端（复用 agent 的 mTLS 配置），不走 agent crate 逻辑
+    let client = s2n_quic::Client::builder()
+        .with_tls(s2n_quic::provider::tls::rustls::Client::from(Arc::new(
+            agent::tls::rustls_client_config(
+                std::slice::from_ref(&ca),
+                vec![client_cert.clone()],
+                client_key.clone_key(),
+            )
+            .unwrap(),
+        )))
         .unwrap()
+        .with_io("0.0.0.0:0")
+        .unwrap()
+        .start()
+        .unwrap();
+    let mut conn = client
+        .connect(s2n_quic::client::Connect::new(gw.quic_addr).with_server_name("localhost"))
         .await
         .unwrap();
 
     // 正常注册 → 进入注册表
-    let (mut rs, mut rr) = conn.open_bi().await.unwrap();
+    let stream = conn.open_bidirectional_stream().await.unwrap();
+    let (mut rr, mut rs) = stream.split();
     write_frame(
         &mut rs,
         &Frame::Register {
@@ -168,7 +177,8 @@ async fn e2e_quic_control_stream_edge_frames() {
     assert_eq!(gw.agent_count(), 1);
 
     // 控制流上发非预期帧（Cancel）→ 服务端走 "unexpected frame" 分支，连接不受影响
-    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    let stream = conn.open_bidirectional_stream().await.unwrap();
+    let (mut recv, mut send) = stream.split();
     write_frame(&mut send, &Frame::Cancel { request_id: 1 })
         .await
         .unwrap();
@@ -176,11 +186,13 @@ async fn e2e_quic_control_stream_edge_frames() {
     let _ = read_frame(&mut recv).await;
 
     // 立即结束的空流 → 服务端走干净 EOF 分支
-    let (mut send2, _recv2) = conn.open_bi().await.unwrap();
+    let stream = conn.open_bidirectional_stream().await.unwrap();
+    let (_recv2, mut send2) = stream.split();
     send2.finish().unwrap();
 
     // 未注册 agent 的心跳 → registry 无害忽略
-    let (mut send3, mut recv3) = conn.open_bi().await.unwrap();
+    let stream = conn.open_bidirectional_stream().await.unwrap();
+    let (mut recv3, mut send3) = stream.split();
     write_frame(
         &mut send3,
         &Frame::Heartbeat {
@@ -194,7 +206,8 @@ async fn e2e_quic_control_stream_edge_frames() {
     let _ = read_frame(&mut recv3).await;
 
     // 畸形帧（非法长度前缀）→ 控制循环读帧出错 → handle_conn 报错并摘除 reg-1
-    let (mut send4, _recv4) = conn.open_bi().await.unwrap();
+    let stream = conn.open_bidirectional_stream().await.unwrap();
+    let (_recv4, mut send4) = stream.split();
     send4.write_all(&u32::MAX.to_be_bytes()).await.unwrap();
     send4.finish().unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -205,12 +218,12 @@ async fn e2e_quic_control_stream_edge_frames() {
     );
 
     // 第二个裸客户端：注册后直接关闭连接 → accept_bi 出错 → 正常摘除
-    let conn2 = endpoint
-        .connect(gw.quic_addr, "localhost")
-        .unwrap()
+    let mut conn2 = client
+        .connect(s2n_quic::client::Connect::new(gw.quic_addr).with_server_name("localhost"))
         .await
         .unwrap();
-    let (mut rs2, mut rr2) = conn2.open_bi().await.unwrap();
+    let stream = conn2.open_bidirectional_stream().await.unwrap();
+    let (mut rr2, mut rs2) = stream.split();
     write_frame(
         &mut rs2,
         &Frame::Register {
@@ -225,7 +238,7 @@ async fn e2e_quic_control_stream_edge_frames() {
     rs2.finish().unwrap();
     let _ = read_frame(&mut rr2).await;
     assert_eq!(gw.agent_count(), 1);
-    conn2.close(0u32.into(), b"bye");
+    conn2.close(0u32.into());
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(
         gw.agent_count(),
@@ -249,17 +262,23 @@ async fn e2e_quic_control_stream_edge_frames() {
     let bad_cli_cert = bad_cli
         .signed_by(&bad_key, &bad_ca_cert, &bad_ca_key)
         .unwrap();
-    let bad_cfg = agent::tls::client_config(
+    let bad_cfg = agent::tls::rustls_client_config(
         &[bad_ca_cert.der().clone()],
         vec![bad_cli_cert.der().clone()],
         PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(bad_key.serialize_der())),
     )
     .unwrap();
-    let mut bad_endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
-    bad_endpoint.set_default_client_config(bad_cfg);
-    let _ = bad_endpoint
-        .connect(gw.quic_addr, "localhost")
+    let bad_client = s2n_quic::Client::builder()
+        .with_tls(s2n_quic::provider::tls::rustls::Client::from(Arc::new(
+            bad_cfg,
+        )))
         .unwrap()
+        .with_io("0.0.0.0:0")
+        .unwrap()
+        .start()
+        .unwrap();
+    let _ = bad_client
+        .connect(s2n_quic::client::Connect::new(gw.quic_addr).with_server_name("localhost"))
         .await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(gw.agent_count(), 0, "failed handshake must not register");
@@ -293,21 +312,27 @@ async fn e2e_proxy_protocol_edge_cases() {
     .await
     .unwrap();
 
-    // 裸 quinn 客户端：注册后按场景应答网关的代理请求
-    let client_config = agent::tls::client_config(
-        std::slice::from_ref(&ca),
-        vec![client_cert.clone()],
-        client_key.clone_key(),
-    )
-    .unwrap();
-    let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
-    endpoint.set_default_client_config(client_config);
-    let conn = endpoint
-        .connect(gw.quic_addr, "localhost")
+    // 裸 s2n-quic 客户端：注册后按场景应答网关的代理请求
+    let client = s2n_quic::Client::builder()
+        .with_tls(s2n_quic::provider::tls::rustls::Client::from(Arc::new(
+            agent::tls::rustls_client_config(
+                std::slice::from_ref(&ca),
+                vec![client_cert.clone()],
+                client_key.clone_key(),
+            )
+            .unwrap(),
+        )))
         .unwrap()
+        .with_io("0.0.0.0:0")
+        .unwrap()
+        .start()
+        .unwrap();
+    let mut conn = client
+        .connect(s2n_quic::client::Connect::new(gw.quic_addr).with_server_name("localhost"))
         .await
         .unwrap();
-    let (mut rs, mut rr) = conn.open_bi().await.unwrap();
+    let stream = conn.open_bidirectional_stream().await.unwrap();
+    let (mut rr, mut rs) = stream.split();
     write_frame(
         &mut rs,
         &Frame::Register {
@@ -326,10 +351,12 @@ async fn e2e_proxy_protocol_edge_cases() {
     let client_task = tokio::spawn(async move {
         let mut sc = 0usize;
         loop {
-            let (mut send, mut recv) = match conn.accept_bi().await {
-                Ok(s) => s,
+            let stream = match conn.accept_bidirectional_stream().await {
+                Ok(Some(s)) => s,
+                Ok(None) => break, // 连接正常关闭
                 Err(_) => break,
             };
+            let (mut recv, mut send) = stream.split();
             let _ = read_frame(&mut recv).await; // 丢弃 ProxyRequest
             match sc {
                 0 => {
