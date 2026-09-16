@@ -112,8 +112,11 @@ impl Metrics {
         self.inner.quic_connections.fetch_sub(1, Ordering::Relaxed);
     }
 
-    /// 渲染为 Prometheus 文本格式；`agent_count` 由调用方传入（注册表实时值）。
-    pub fn render(&self, agent_count: usize) -> String {
+    /// 渲染为 Prometheus 文本格式。
+    ///
+    /// - `agent_count`：注册表实时值（由调用方传入）
+    /// - `verify_hits` / `verify_misses`：已验证身份缓存的命中/未命中（来自 KeyStore）
+    pub fn render(&self, agent_count: usize, verify_hits: u64, verify_misses: u64) -> String {
         let inner = &self.inner;
         let mut out = String::with_capacity(512);
         out.push_str("# HELP hlmg_requests_total Total gateway requests by HTTP status.\n");
@@ -154,6 +157,16 @@ impl Metrics {
             "hlmg_request_count {}\n",
             inner.request_count.load(Ordering::Relaxed)
         ));
+        out.push_str(
+            "# HELP hlmg_key_verify_hits_total Cached key verifications served without argon2.\n",
+        );
+        out.push_str("# TYPE hlmg_key_verify_hits_total counter\n");
+        out.push_str(&format!("hlmg_key_verify_hits_total {verify_hits}\n"));
+        out.push_str(
+            "# HELP hlmg_key_verify_misses_total Key verifications that ran argon2 (cache miss).\n",
+        );
+        out.push_str("# TYPE hlmg_key_verify_misses_total counter\n");
+        out.push_str(&format!("hlmg_key_verify_misses_total {verify_misses}\n"));
         out.push_str("# HELP hlmg_quic_connections Currently open agent QUIC connections.\n");
         out.push_str("# TYPE hlmg_quic_connections gauge\n");
         out.push_str(&format!(

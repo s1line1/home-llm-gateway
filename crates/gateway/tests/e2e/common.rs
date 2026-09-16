@@ -185,10 +185,49 @@ pub async fn start_stack(
     .await
 }
 
+/// 同上，但可指定"已验证身份缓存容量"（0 = 关闭，用于验证与旧行为一致）。
+pub async fn start_stack_with_verify_cache(
+    request_timeout: Duration,
+    verified_cache_max: usize,
+    rate_limit_per_min: u32,
+    max_concurrency: u32,
+    admin_token: Option<&str>,
+) -> (Gateway, Agent, String, String) {
+    start_stack_full(
+        request_timeout,
+        Duration::from_secs(2),
+        verified_cache_max,
+        rate_limit_per_min,
+        max_concurrency,
+        admin_token,
+    )
+    .await
+}
+
 /// 同上，但可指定隧道控制操作超时（测"隧道卡死 → 快速失败"用短值）。
 pub async fn start_stack_with_tunnel_timeout(
     request_timeout: Duration,
     tunnel_op_timeout: Duration,
+    rate_limit_per_min: u32,
+    max_concurrency: u32,
+    admin_token: Option<&str>,
+) -> (Gateway, Agent, String, String) {
+    start_stack_full(
+        request_timeout,
+        tunnel_op_timeout,
+        gateway::keystore::DEFAULT_VERIFIED_MAX,
+        rate_limit_per_min,
+        max_concurrency,
+        admin_token,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn start_stack_full(
+    request_timeout: Duration,
+    tunnel_op_timeout: Duration,
+    verified_cache_max: usize,
     rate_limit_per_min: u32,
     max_concurrency: u32,
     admin_token: Option<&str>,
@@ -206,6 +245,7 @@ pub async fn start_stack_with_tunnel_timeout(
         admin_token: admin_token.map(|s| s.to_string()),
         keys_file: Some(keys_path),
         request_timeout,
+        verified_cache_max,
         tunnel_op_timeout,
         head_timeout: Duration::from_secs(5),
         agent_stale_after: Duration::from_secs(10),

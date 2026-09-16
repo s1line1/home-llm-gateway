@@ -11,8 +11,15 @@
 //! - 架构：内存索引（runtime HashMap，key=lookup）保证 `authorize()` 热路径零 IO；
 //!   SQLite 负责持久化，创建/吊销时写穿（write-through）。
 //!
-//! 注意：argon2 校验每次请求约耗时 10-30ms（19MiB 内存、t=2）。edge 网关低 QPS 下
-//! 可接受；若需更高吞吐，可调低参数（如 Params::new(4096, 3, 1)）或用登录式缓存。
+//! 注意：argon2 校验每次约耗时 10-30ms，且**同时占用 19MiB 工作内存**（m=19456）。
+//! 早期实现对**每个请求**都完整校验一次，于是内存峰值 ≈ `并发请求数 × 19MiB`
+//! （实测：8 并发同 key 请求 → RSS 8.7MB→160.8MB；vmmap 里正好 8 块 19.0MB；
+//! 换用无效 key（sha256 未命中、不跑 argon2）则零增长）。云端 2 核/1.6G 上 32 并发
+//! 到 654MB 即由此而来，并因此被 OOM 杀掉。
+//!
+//! 现在走 [`verified::VerifiedCache`]：**缓存 + 单飞 + 凭据版本校验**——
+//! argon2 降到"每(凭据版本)一次"，每请求只做 O(1) 的 enabled/版本核对，
+//! 且吊销依然即时生效（版本不一致或记录消失即拒）。`verified_cache_max: 0` 可关闭。
 
 use std::{
     collections::HashMap,
@@ -21,12 +28,14 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, RwLock,
     },
+    time::Duration,
 };
 
 use rusqlite::Connection;
 use serde::Serialize;
 
 pub mod hash;
+pub mod verified;
 
 use crate::keystore::hash::{generate_id_key, hash_argon2, lookup_of, now_secs, verify_argon2};
 
@@ -42,6 +51,14 @@ struct KeyStoreInner {
     db: Mutex<Option<Connection>>,
     /// per-key 用量（key = key id；吊销 key 后记录保留，可审计）。
     usage: RwLock<HashMap<String, Arc<KeyUsageCell>>>,
+    /// 已验证身份缓存（argon2 结果复用）+ 单飞；容量 0 = 关闭（每请求都校验）。
+    verified: verified::VerifiedCache,
+    /// 已验证缓存的容量上限与有效期。
+    verified_max: usize,
+    verified_ttl: Duration,
+    /// 凭据代数：**只在凭据相关变更时**自增（创建/吊销/轮换）。
+    /// 每条记录带一个 `cred_version`，变更后旧缓存条目的版本对不上 → 立即失效。
+    cred_generation: AtomicU64,
 }
 
 #[derive(Clone, Debug)]
@@ -54,6 +71,9 @@ pub struct KeyRecord {
     pub name: String,
     pub created_at: u64,
     pub enabled: bool,
+    /// 凭据版本：写入时取当时代数。任何凭据相关变更（吊销/轮换）都会让代数自增，
+    /// 从而让基于旧版本建立的已验证缓存**立即失效**（见 `verified` 模块）。
+    pub cred_version: u64,
 }
 
 /// `create()` 的返回：记录 + 仅此一次的明文 key（之后不再可获取）。
@@ -110,13 +130,20 @@ pub struct UsageDelta {
     pub estimated: bool,
 }
 
+/// 已验证身份缓存的默认容量：每条 ~100 字节，1650 条约 165KB。
+pub const DEFAULT_VERIFIED_MAX: usize = 1650;
+/// 已验证身份的默认有效期。注意：**吊销不依赖它**（版本校验优先），
+/// 它只决定"多久之后重新付一次 argon2 的钱"。
+pub const DEFAULT_VERIFIED_TTL: Duration = Duration::from_secs(30 * 60);
+
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS api_keys (
     id TEXT PRIMARY KEY,
     lookup TEXT NOT NULL UNIQUE,
     key_hash TEXT NOT NULL,
     name TEXT NOT NULL,
     created_at INTEGER NOT NULL,
-    enabled INTEGER NOT NULL DEFAULT 1
+    enabled INTEGER NOT NULL DEFAULT 1,
+    cred_version INTEGER NOT NULL DEFAULT 1
 )";
 
 const USAGE_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS key_usage (
@@ -130,13 +157,26 @@ const USAGE_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS key_usage (
 )";
 
 impl KeyStore {
+    /// 默认：1650 条缓存、30 分钟有效期（够覆盖"同一批客户端持续打"的场景；
+    /// 吊销仍然是即时的——版本校验在缓存之前，不依赖 TTL）。
     pub fn new(file: Option<PathBuf>) -> Self {
+        Self::with_verified(file, DEFAULT_VERIFIED_MAX, DEFAULT_VERIFIED_TTL)
+    }
+
+    /// 指定已验证缓存容量与有效期；`max = 0` 关闭缓存（恢复"每请求都跑 argon2"的旧行为）。
+    pub fn with_verified(file: Option<PathBuf>, max: usize, ttl: Duration) -> Self {
         let db = match &file {
             Some(path) => match Connection::open(path) {
                 Ok(mut conn) => {
                     let init = (|| {
                         conn.execute_batch(SCHEMA)?;
                         conn.execute_batch(USAGE_SCHEMA)?;
+                        // 老库（无 cred_version 列）→ 补列；新库上 SCHEMA 已建好，这里跳过。
+                        if !table_has_column(&conn, "api_keys", "cred_version")? {
+                            conn.execute_batch(
+                                "ALTER TABLE api_keys ADD COLUMN cred_version INTEGER NOT NULL DEFAULT 1",
+                            )?;
+                        }
                         Ok::<_, rusqlite::Error>(())
                     })();
                     match init {
@@ -197,8 +237,21 @@ impl KeyStore {
                 runtime: RwLock::new(runtime),
                 db: Mutex::new(db),
                 usage: RwLock::new(usage),
+                verified: verified::VerifiedCache::default(),
+                verified_max: max,
+                verified_ttl: ttl,
+                cred_generation: AtomicU64::new(1),
             }),
         }
+    }
+
+    /// 推进凭据代数并返回新值。**任何**改变"某个 key 是否有效/其哈希"的写路径
+    /// 都必须调用它，否则已验证缓存会继续放行旧身份（见 `verified` 模块的安全性说明）。
+    fn bump_cred_generation(&self) -> u64 {
+        self.inner
+            .cred_generation
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1)
     }
 
     /// 校验 token 是否为启用中的动态 key（sha256 定位 + argon2 校验）。
@@ -211,14 +264,83 @@ impl KeyStore {
         self.authorize_record(token).map(|r| r.id.clone())
     }
 
-    /// 校验并返回 key 记录（argon2 一次）。
+    /// 校验并返回 key 记录。
+    ///
+    /// 热路径（有缓存时）只做三件事：`sha256(token)` → O(1) 查表 → 比对凭据版本，
+    /// **不跑 argon2**；只有缓存未命中（首次见到该 token、版本变了、或缓存关闭）才校验。
+    ///
+    /// 单飞：同一个 token 的并发请求串行化，只有第一个真正跑 argon2，其余等它的结果——
+    /// 这是把内存峰值从 `并发数 × 19MiB` 压到 `同时首用的不同 token 数 × 19MiB` 的关键。
     pub fn authorize_record(&self, token: &str) -> Option<KeyRecord> {
         let lookup = lookup_of(token);
-        let runtime = self.inner.runtime.read().unwrap();
-        match runtime.get(&lookup) {
-            Some(rec) if rec.enabled && verify_argon2(token, &rec.key_hash) => Some(rec.clone()),
-            _ => None,
+
+        // ① 快路径：记录在、启用中、缓存里有同版本的身份 → 直接放行（不跑 argon2）
+        if self.inner.verified_max > 0 {
+            let runtime = self.inner.runtime.read().unwrap();
+            let rec = runtime.get(&lookup)?;
+            if !rec.enabled {
+                return None;
+            }
+            let version = rec.cred_version;
+            drop(runtime);
+            if let Some(hit) = self
+                .inner
+                .verified
+                .get(&lookup, version, self.inner.verified_ttl)
+            {
+                return Some(hit);
+            }
         }
+
+        // ② 缓存关闭：保持旧语义（每次请求都完整校验）
+        if self.inner.verified_max == 0 {
+            let runtime = self.inner.runtime.read().unwrap();
+            return match runtime.get(&lookup) {
+                Some(rec) if rec.enabled && verify_argon2(token, &rec.key_hash) => {
+                    Some(rec.clone())
+                }
+                _ => None,
+            };
+        }
+
+        // ③ 未命中：单飞 + 校验
+        let slot = self.inner.verified.flight(&lookup);
+        let out = {
+            let _guard = slot.lock().unwrap();
+            // 双检：等锁期间可能已被同 token 的并发请求填好了
+            let runtime = self.inner.runtime.read().unwrap();
+            let rec = match runtime.get(&lookup) {
+                Some(r) if r.enabled => r,
+                _ => {
+                    drop(runtime);
+                    self.inner.verified.release_flight(&lookup);
+                    return None;
+                }
+            };
+            if let Some(hit) =
+                self.inner
+                    .verified
+                    .get(&lookup, rec.cred_version, self.inner.verified_ttl)
+            {
+                Some(hit)
+            } else if verify_argon2(token, &rec.key_hash) {
+                let rec = rec.clone();
+                drop(runtime);
+                self.inner
+                    .verified
+                    .put(&lookup, rec.clone(), self.inner.verified_max);
+                Some(rec)
+            } else {
+                None
+            }
+        };
+        self.inner.verified.release_flight(&lookup);
+        out
+    }
+
+    /// (缓存命中, 未命中/校验次数)：供 `/metrics` 观察 argon2 复用情况。
+    pub fn verified_counters(&self) -> (u64, u64) {
+        self.inner.verified.counters()
     }
 
     /// 创建动态 key 并持久化；返回记录与仅此一次的明文 key。
@@ -233,6 +355,7 @@ impl KeyStore {
             name,
             created_at: now_secs(),
             enabled: true,
+            cred_version: self.bump_cred_generation(),
         };
         self.inner
             .runtime
@@ -289,6 +412,10 @@ impl KeyStore {
             });
         }
         if removed {
+            // 记录已从 runtime 表消失（查找直接 miss），这里再失效缓存并推进代数：
+            // 双保险，且保证"任何凭据变更都会让旧身份失效"这条不变量成立。
+            self.inner.verified.invalidate_by_id(id);
+            self.bump_cred_generation();
             if let Some(conn) = self.inner.db.lock().unwrap().as_mut() {
                 let r = conn.execute("DELETE FROM api_keys WHERE id = ?1", rusqlite::params![id]);
                 if let Err(e) = r {
@@ -526,8 +653,9 @@ fn table_has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::R
 
 /// 从 SQLite 加载全部动态 key（key = lookup）。
 fn load_keys(conn: &Connection) -> rusqlite::Result<HashMap<String, KeyRecord>> {
-    let mut stmt =
-        conn.prepare("SELECT id, lookup, key_hash, name, created_at, enabled FROM api_keys")?;
+    let mut stmt = conn.prepare(
+        "SELECT id, lookup, key_hash, name, created_at, enabled, cred_version FROM api_keys",
+    )?;
     let rows = stmt.query_map([], |r| {
         Ok(KeyRecord {
             id: r.get(0)?,
@@ -536,6 +664,8 @@ fn load_keys(conn: &Connection) -> rusqlite::Result<HashMap<String, KeyRecord>> 
             name: r.get(3)?,
             created_at: r.get::<_, i64>(4)? as u64,
             enabled: r.get::<_, i64>(5)? != 0,
+            // 迁移前的老行是 NULL → 0；0 不是合法代数（代数从 1 起），归一到 1
+            cred_version: r.get::<_, Option<i64>>(6)?.unwrap_or(1).max(1) as u64,
         })
     })?;
     let mut map = HashMap::new();
@@ -551,6 +681,7 @@ fn load_keys(conn: &Connection) -> rusqlite::Result<HashMap<String, KeyRecord>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use tempfile::tempdir;
 
     #[test]
@@ -753,6 +884,82 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn migrates_db_without_cred_version_column() {
+        // 本次改动给 api_keys 加了 cred_version 列：已部署的库没有它，
+        // 启动时必须**自动补列**，且旧 key 仍能通过校验（不能因为迁移把用户锁在门外）。
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keys.db");
+        let hash = {
+            // 用同一套 argon2 参数造一条"升级前"的记录（表里没有 cred_version 列）
+            let h = crate::keystore::hash::hash_argon2("sk-upgrade-secret");
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE api_keys (
+                    id TEXT PRIMARY KEY,
+                    lookup TEXT NOT NULL UNIQUE,
+                    key_hash TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 1
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO api_keys (id, lookup, key_hash, name, created_at, enabled)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+                rusqlite::params![
+                    "old-id",
+                    crate::keystore::hash::lookup_of("sk-upgrade-secret"),
+                    h,
+                    "old",
+                    1700000000i64
+                ],
+            )
+            .unwrap();
+            let cols: Vec<String> = Connection::open(&path)
+                .unwrap()
+                .prepare("PRAGMA table_info(api_keys)")
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            assert!(
+                !cols.iter().any(|c| c == "cred_version"),
+                "前提：旧库确实没有 cred_version 列，实际列 {cols:?}"
+            );
+            h
+        };
+        drop(hash);
+
+        // 用新代码打开旧库 → 应自动补列，且旧 key 依旧可用
+        let store = KeyStore::new(Some(path.clone()));
+        assert!(
+            store.authorize("sk-upgrade-secret"),
+            "升级后旧 key 必须仍然有效"
+        );
+        assert!(!store.authorize("sk-wrong"));
+        {
+            let conn = Connection::open(&path).unwrap();
+            assert!(
+                table_has_column(&conn, "api_keys", "cred_version").unwrap(),
+                "启动时应自动给旧库补上 cred_version 列"
+            );
+        }
+        // 迁移后的记录代数有效（0 会被当成"从未校验过"，这里必须是 >=1）
+        let rec = store
+            .inner
+            .runtime
+            .read()
+            .unwrap()
+            .get(&lookup_of("sk-upgrade-secret"))
+            .cloned()
+            .unwrap();
+        assert!(rec.cred_version >= 1, "cred_version 应为有效代数");
+    }
+
+    #[test]
     fn verify_rejects_malformed_hash() {
         // 存储的哈希不是合法 PHC 格式 → 校验直接拒绝（不 panic）
         assert!(!verify_argon2("sk-anything", "not-a-phc-hash"));
@@ -831,5 +1038,198 @@ mod tests {
         drop(store);
         let reloaded = KeyStore::new(Some(path.clone()));
         assert!(reloaded.authorize(&created.plaintext));
+    }
+}
+
+#[cfg(test)]
+mod verified_tests {
+    use super::*;
+    use crate::keystore::hash::{argon2_calls, CheapArgon2};
+    use serial_test::serial;
+    use std::sync::{Arc, Barrier};
+
+    // 这些测试都要读**进程级**的 argon2 调用计数器，彼此会互相污染 →
+    // 全部标 `#[serial]`（仓库 e2e 也是同一套约定）。
+
+    /// 并发压同一个 token；返回 (argon2 调用次数增量, 全部请求的结果)。
+    /// `cache_max = 0` 时代表"关闭缓存"（旧行为）。
+    fn hammer(store: &KeyStore, token: &str, threads: usize) -> (usize, Vec<bool>) {
+        let before = argon2_calls();
+        let barrier = Arc::new(Barrier::new(threads));
+        let results = Arc::new(Mutex::new(Vec::new()));
+        let mut handles = Vec::new();
+        for _ in 0..threads {
+            let store = store.clone();
+            let token = token.to_string();
+            let barrier = barrier.clone();
+            let results = results.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                let ok = store.authorize(&token);
+                results.lock().unwrap().push(ok);
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let calls = argon2_calls() - before;
+        let out = results.lock().unwrap().clone();
+        (calls, out)
+    }
+
+    #[test]
+    #[serial]
+    fn concurrent_same_token_hashes_once() {
+        let _cheap = CheapArgon2::install();
+        // 这是把内存峰值从 `并发数 × 19MiB` 压到 `1 × 19MiB` 的核心契约
+        let store = KeyStore::new(None);
+        let key = store.create("one".into());
+        let (calls, results) = hammer(&store, &key.plaintext, 8);
+        assert_eq!(calls, 1, "同一个 token 的 8 个并发请求只应跑 1 次 argon2");
+        assert!(results.iter().all(|ok| *ok), "所有并发请求都应当通过");
+    }
+
+    #[test]
+    #[serial]
+    fn warm_token_never_hashes_again() {
+        let _cheap = CheapArgon2::install();
+        let store = KeyStore::new(None);
+        let key = store.create("warm".into());
+        assert!(store.authorize(&key.plaintext)); // 首次：算一次（create 那次不算）
+        let before = argon2_calls();
+        for _ in 0..50 {
+            assert!(store.authorize(&key.plaintext));
+        }
+        assert_eq!(argon2_calls() - before, 0, "命中缓存不应再跑 argon2");
+        let (hits, _) = store.verified_counters();
+        assert!(hits >= 50, "命中计数应当累加，实际 {hits}");
+    }
+
+    #[test]
+    #[serial]
+    fn disabled_cache_keeps_old_behaviour() {
+        let _cheap = CheapArgon2::install();
+        // cache_max = 0 → 每个请求都完整校验（与改造前语义一致）
+        let key = KeyStore::with_verified(None, 0, DEFAULT_VERIFIED_TTL);
+        let token = key.create("nocache".into()).plaintext;
+        let before = argon2_calls();
+        for _ in 0..3 {
+            assert!(key.authorize(&token));
+        }
+        let off = argon2_calls() - before;
+
+        // 对照：开启缓存时，首个请求填缓存（1 次 argon2），之后不再跑
+        let warm = KeyStore::new(None);
+        let token2 = warm.create("cached".into()).plaintext;
+        assert!(warm.authorize(&token2)); // 预热：这一次是缓存未命中
+        let before2 = argon2_calls();
+        for _ in 0..3 {
+            assert!(warm.authorize(&token2));
+        }
+        let on = argon2_calls() - before2;
+
+        assert_eq!(off, 3, "关闭缓存时每请求各跑一次，实际 {off}");
+        assert_eq!(on, 0, "开启缓存且已预热后不应再跑 argon2，实际 {on}");
+    }
+
+    #[test]
+    #[serial]
+    fn revoke_takes_effect_immediately() {
+        let _cheap = CheapArgon2::install();
+        // 缓存**不得**延长吊销窗口：delete 后必须立刻 401
+        let store = KeyStore::new(None);
+        let key = store.create("revoke".into());
+        assert!(store.authorize(&key.plaintext));
+        assert!(store.authorize(&key.plaintext)); // 已进缓存
+        assert!(store.delete(&key.record.id));
+        assert!(
+            !store.authorize(&key.plaintext),
+            "吊销后必须立即失效（不允许缓存放行）"
+        );
+        assert!(
+            !store.authorize_id(&key.plaintext).is_some(),
+            "吊销后 authorize_id 同样应为 None"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn credential_version_bump_invalidates_cache() {
+        let _cheap = CheapArgon2::install();
+        // 模拟"改 key 但不 bump 版本"以外的正确路径：bump 之后旧缓存条目必须失效
+        let store = KeyStore::new(None);
+        let key = store.create("bump".into());
+        assert!(store.authorize(&key.plaintext));
+        let before = argon2_calls();
+        assert!(store.authorize(&key.plaintext));
+        assert_eq!(argon2_calls() - before, 0, "命中缓存");
+
+        // 直接改记录里的 cred_version（等价于"凭据变更走了正确路径"）
+        {
+            let mut runtime = store.inner.runtime.write().unwrap();
+            let rec = runtime.get_mut(&key.record.lookup).unwrap();
+            rec.cred_version += 1;
+        }
+        let before = argon2_calls();
+        assert!(
+            store.authorize(&key.plaintext),
+            "版本变了应当重新校验，而不是拒绝"
+        );
+        assert_eq!(argon2_calls() - before, 1, "版本变更后必须重跑一次 argon2");
+    }
+
+    #[test]
+    #[serial]
+    fn expired_entry_is_revalidated() {
+        let _cheap = CheapArgon2::install();
+        // TTL 到期后重算（不改变"吊销即时"这条，只影响多久重付一次 argon2 的钱）
+        let store = KeyStore::with_verified(None, DEFAULT_VERIFIED_MAX, Duration::from_millis(50));
+        let key = store.create("ttl".into());
+        assert!(store.authorize(&key.plaintext));
+        std::thread::sleep(Duration::from_millis(80));
+        let before = argon2_calls();
+        assert!(store.authorize(&key.plaintext));
+        assert_eq!(argon2_calls() - before, 1, "TTL 到期应重算一次");
+    }
+
+    #[test]
+    #[serial]
+    fn cache_is_bounded_and_never_stores_plaintext() {
+        let _cheap = CheapArgon2::install();
+        let store = KeyStore::with_verified(None, 2, DEFAULT_VERIFIED_TTL);
+        let mut tokens = Vec::new();
+        for i in 0..5 {
+            let k = store.create(format!("k{i}"));
+            assert!(store.authorize(&k.plaintext));
+            tokens.push(k.plaintext);
+        }
+        assert!(
+            store.inner.verified.len() <= 2,
+            "缓存条目数不得超过配置上限，实际 {}",
+            store.inner.verified.len()
+        );
+        // 缓存**只键于 sha256(token)**：拿明文 token 当键永远查不到，也不该存明文
+        for t in &tokens {
+            assert!(
+                store
+                    .inner
+                    .verified
+                    .get(t, 1, DEFAULT_VERIFIED_TTL)
+                    .is_none(),
+                "缓存不得以明文 token 为键"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn wrong_token_still_rejected_with_cache() {
+        let _cheap = CheapArgon2::install();
+        // 命中路径不得绕过校验：拿别人的 token 永远进不去
+        let store = KeyStore::new(None);
+        let good = store.create("good".into());
+        assert!(store.authorize(&good.plaintext));
+        assert!(!store.authorize("sk-deadbeef"));
+        assert!(!store.authorize(&format!("{}x", good.plaintext)));
     }
 }

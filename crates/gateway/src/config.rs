@@ -35,6 +35,13 @@ pub struct ConfigFile {
     /// 单次转发空闲超时秒数（逐帧，SSE 长流不受影响）
     #[serde(default = "default_timeout_secs")]
     timeout_secs: u64,
+    /// 已验证身份缓存的容量（条）。0 = 关闭缓存（每个请求都完整跑 argon2）。
+    ///
+    /// argon2 每次校验同时占 19MiB 工作内存，所以"每请求一次"的代价是
+    /// `并发数 × 19MiB`（实测 32 并发 → 654MB，并因此 OOM）。缓存 + 单飞把它降到
+    /// "每(凭据版本)一次"：每请求只做 O(1) 的 enabled/版本核对，而吊销仍然即时。
+    #[serde(default = "default_verified_cache_max")]
+    verified_cache_max: usize,
     /// agent 失联判定秒数
     #[serde(default = "default_agent_stale_secs")]
     agent_stale_secs: u64,
@@ -96,6 +103,9 @@ fn default_timeout_secs() -> u64 {
 fn default_agent_stale_secs() -> u64 {
     15
 }
+fn default_verified_cache_max() -> usize {
+    crate::keystore::DEFAULT_VERIFIED_MAX
+}
 fn default_tunnel_op_secs() -> u64 {
     2
 }
@@ -148,6 +158,7 @@ pub fn from_file(cfg: ConfigFile) -> anyhow::Result<GatewayConfig> {
             .with_context(|| format!("config: cannot load key {}", cfg.key.display()))?,
         admin_token: cfg.admin_token,
         keys_file: cfg.keys_file,
+        verified_cache_max: cfg.verified_cache_max,
         request_timeout: Duration::from_secs(cfg.timeout_secs),
         agent_stale_after: Duration::from_secs(cfg.agent_stale_secs),
         tunnel_op_timeout: Duration::from_secs(cfg.tunnel_op_secs),

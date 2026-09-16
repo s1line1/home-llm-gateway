@@ -311,7 +311,12 @@ async fn metrics_route(State(state): State<AppState>, headers: HeaderMap) -> Res
             }
         }
     }
-    state.metrics.render(state.registry.len()).into_response()
+    // 已验证身份缓存的命中/未命中：命中多说明 argon2 复用良好（内存/CPU 都省）
+    let (verify_hits, verify_misses) = state.key_store.verified_counters();
+    state
+        .metrics
+        .render(state.registry.len(), verify_hits, verify_misses)
+        .into_response()
 }
 
 /// 记录请求状态码与耗时（/metrics 自身不计入），并为每个请求生成/透传
