@@ -141,7 +141,7 @@ async fn e2e_gateway_timeout_cancels_upstream() {
     use futures_util::StreamExt;
 
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
-    // 网关**逐帧空闲**超时 150ms，而 mock 的 /v1/slow_body 立刻回响应头、正文睡 800ms。
+    // 网关**逐帧空闲**超时 300ms，而 mock 的 /v1/slow_body 立刻回响应头、正文停 3s。
     //
     // 注意用 /v1/slow_body 而不是 /v1/slow：后者卡的是**响应头**，归 `head_timeout` 管
     // （另一个语义，默认 15s —— 上游"思考"是合法的）。这里测的是"响应头已到、正文不走"
@@ -149,7 +149,7 @@ async fn e2e_gateway_timeout_cancels_upstream() {
     //
     // 契约：响应头已经发出去了，状态码不可能再变，所以**不能**断言 504；正确契约是
     // 正文在超时点被截断（收不到 [DONE]，流以错误结束），而不是让客户端一直挂着。
-    let (gw, agent, base, key) = start_stack(Duration::from_millis(150), 0, 4, None).await;
+    let (gw, agent, base, key) = start_stack(Duration::from_millis(300), 0, 4, None).await;
     let client = reqwest::Client::new();
 
     let t0 = std::time::Instant::now();
@@ -162,7 +162,7 @@ async fn e2e_gateway_timeout_cancels_upstream() {
         .unwrap();
     assert_eq!(resp.status(), 200, "响应头应当正常到达");
 
-    // 读正文：150ms 空闲超时后网关发 Cancel 并结束这条流 —— 应远早于上游的 800ms
+    // 读正文：300ms 空闲超时后网关发 Cancel 并结束这条流 —— 应远早于上游的 3s
     let mut got = Vec::new();
     let mut stream = resp.bytes_stream();
     let read_all = async {
@@ -179,9 +179,12 @@ async fn e2e_gateway_timeout_cancels_upstream() {
         !text.contains("[DONE]"),
         "上游还没出字就被空闲超时截断，不应收到 [DONE]；实际正文：{text:?}"
     );
+    // 断言窗口 2s：相对 300ms 的空闲超时有 6 倍余量（够覆盖 argon2 校验 + 建连 + CI 抖动），
+    // 又远小于上游 3s 的停顿 —— 所以"超时没生效"时必然失败，"机器慢"时不会假失败。
+    // （之前是 150ms 超时配 800ms 停顿 + 700ms 断言，只有 ~95ms 余量，CI 上直接翻车。）
     assert!(
-        t0.elapsed() < Duration::from_millis(700),
-        "应在 150ms 空闲超时量级结束，而不是等上游 800ms 出字；实际 {:?}",
+        t0.elapsed() < Duration::from_secs(2),
+        "应在空闲超时（300ms）量级结束，而不是等上游 3s 出字；实际 {:?}",
         t0.elapsed()
     );
 

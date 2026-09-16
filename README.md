@@ -188,6 +188,8 @@ oha -z 30s -c 50 -m POST -H "Authorization: Bearer $KEY" \
 
 > 压测前建议 `cargo build --release` 用 release 二进制（debug 构建性能差一个数量级）；
 > 压纯吞吐时调大 `agent-config.yml` 的 `max_concurrency`，否则高并发会被 admission control 返回 429（设计行为）。
+> ⚠️ 但它不能无限调大：每个在途流式请求要吃掉网关约 15–20MB，**这个值应当由网关内存倒推**
+> （见《并发上限与内存》，`max_concurrency ≈ MemoryMax / 20MB`）——设得过大，高并发会把网关推到 OOM。
 
 ## 接入真实 LLM
 
@@ -236,6 +238,8 @@ agent 配置里 `max_concurrency: 2`（声明最多 2 个并发请求）。
 
 网关按 agent 声明的上限做并发占位，超限回 429，避免把 edge 的 GPU 打爆。
 
+**这个值该给多少，由网关侧内存决定**（每个在途流式请求约 15–20MB，见下节《并发上限与内存》）：`max_concurrency ≈ MemoryMax / 20MB` 再留三成余量。设得过大等于关掉这道闸门——请求全进隧道后网关自己会被 OOM 杀掉。网关侧的 `max_concurrent_requests` 是同一件事的总闸门，也要按同一公式收口。
+
 ### 多 agent（多台 LLM 机器，edge 异构模型）
 
 多个 agent 指向同一个网关即可。网关按**请求的 model 路由到能服务它的 edge**：
@@ -283,6 +287,31 @@ max_concurrency: 4
 - `hlmg_agents` 掉到 0，但 agent 侧日志显示"已连接"（说明两侧对连接死活的判断不一致）。
 
 排查顺序：① 看 agent 侧日志（有没有 `agent error` / 重连退避）；② 看网关 `edge connected` / `agent removed` 时间点；③ 连接数对不上时按上表把超时调小以更快失败，而不是靠重启网关。
+
+### 并发上限与内存（1.6GB 机器实测）
+
+网关的内存在途成本很高：**每个在途流式请求约 15–20MB**（响应体 buffered 在隧道帧 → 通道 → socket 之间，加上每流任务栈）。所以真正限制并发的是**内存**，不是 `max_concurrent_requests`（默认 100 根本到不了）。
+
+一台 2 vCPU / 1.6GB 的云机，网关 `MemoryMax=1G`，100 字符 SSE（102 事件，每条流约 1.0s 地板）、agent `max_concurrency: 32`：
+
+| 并发 | 网关 RSS | 吞吐 | 中位延迟 | p95 |
+|---|---|---|---|---|
+| 5 | 107MB | 3.9 req/s | 1275ms | 1302ms |
+| 16 | 443–450MB | 12.0 req/s | 1288ms | 1418ms |
+| 32 | 654MB（峰值 749–786MB） | 16.0 req/s | 1346ms | 3708ms |
+
+四条结论：
+
+- **`MemoryMax=1G` ≈ 40 个在途请求**。32 并发已到峰值 749MB（73%）；不要靠继续加并发提吞吐——16→32 并发翻倍只换来 +33% 吞吐，而 p95 从 1.4s 抬到 3.7s（瓶颈已不在网关）。
+- **`agent-config.yml` 的 `max_concurrency` 按内存定**：32 并发配 1G 上限是安全档位（≈ `MemoryMax / 20MB`，再留 30% 余量）。设成 `5000` 之类等于关掉 admission control，会把网关推到 OOM（实测 40 并发 620–780MB）。
+- **内存不随请求数累积，只随在途数**：停负载后回落到几百 MB 就不再降（分配器保留的高水位池），但持续跑几千个短请求不会继续涨。所以 `MemoryMax` 不要设成小值（见 `deploy/gateway.service` 里 `MemoryHigh` 的警告：会被冻死而不是被杀）。
+- **`max_concurrent_requests` 要收在内存之下，否则那道闸等于没有**。它管的是「所有路径的在途 HTTP 请求总数」（只有 `/metrics` 豁免，SSE 长流从开头占到最后一块 body 送完），超限返回 `429 + Retry-After`。默认/示例给 100，而 1G 内存只撑得住约 40 个在途——于是**先撞的是 `MemoryMax`（网关被 OOM 杀掉、连接中断），而不是这里优雅地 429**。按同一公式收口：
+
+  ```yaml
+  max_concurrent_requests: 32    # ≈ MemoryMax / 20MB，与 agent 的 max_concurrency 对齐
+  ```
+
+  三者职责不同、不能互相替代：`rate_limit_per_min` 管**每个 key 的速率**，agent 的 `max_concurrency` 管**每个 edge 的在途数**（保 GPU），这个字段管**整个网关的在途总数**（保网关自己）。
 
 ### 可观测性
 
