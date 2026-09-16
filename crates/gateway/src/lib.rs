@@ -61,7 +61,6 @@ pub struct Gateway {
     pub http_addr: SocketAddr,
     pub quic_addr: SocketAddr,
     registry: Registry,
-    _endpoint: quinn::Endpoint,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -73,7 +72,7 @@ impl Gateway {
 
         let registry = Registry::default();
 
-        let server_config = tls::server_config(&cfg.ca_cert, cfg.server_cert, cfg.server_key)?;
+        let tls = tls::rustls_server_tls(&cfg.ca_cert, cfg.server_cert, cfg.server_key)?;
         // HTTPS 侧的 TLS 材料同样在**碰任何资源之前**校验：构建不出 rustls 配置就必须
         // 让启动失败（fail fast）。否则进程会"启动成功"却从未监听公网端口——systemd
         // 显示 active(running)、日志写着 Gateway ready，而端口是 connection refused；
@@ -88,8 +87,15 @@ impl Gateway {
             )),
             None => None,
         };
-        let endpoint = quinn::Endpoint::server(server_config, cfg.quic_bind)?;
-        let quic_addr = endpoint.local_addr()?;
+        // let endpoint = quinn::Endpoint::server(server_config, cfg.quic_bind)?;
+        // let quic_addr = endpoint.local_addr()?;
+
+        let server = s2n_quic::Server::builder()
+            .with_tls(s2n_quic::provider::tls::rustls::Server::from(Arc::new(tls)))?
+            .with_io(cfg.quic_bind)?
+            .start()?;
+
+        let quic_addr = server.local_addr()?;
 
         let listener = tokio::net::TcpListener::bind(cfg.http_bind).await?;
         let http_addr = listener.local_addr()?;
@@ -137,8 +143,9 @@ impl Gateway {
                 }));
             }
         }
+
         tasks.push(tokio::spawn(quic::accept_loop(
-            endpoint.clone(),
+            server,
             registry.clone(),
             metrics,
         )));
@@ -147,7 +154,6 @@ impl Gateway {
             http_addr,
             quic_addr,
             registry,
-            _endpoint: endpoint,
             tasks,
         })
     }
