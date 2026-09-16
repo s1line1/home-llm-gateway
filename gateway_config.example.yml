@@ -3,6 +3,9 @@
 #       gateway --config gateway-config.yml
 # 所有字段都有默认值；cert / key / ca 为必填。
 
+# listen_addr: "[::]:8080"
+# quic_addr: "[::]:4433"
+
 # HTTP(S) 公网入口监听地址（客户端连接入口，TCP）
 listen_addr: "0.0.0.0:8443"
 
