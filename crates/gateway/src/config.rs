@@ -56,7 +56,15 @@ pub struct ConfigFile {
     /// 每个 API Key 每分钟请求上限（0 = 不限流）
     #[serde(default)]
     rate_limit_per_min: u32,
-    /// HTTP 全局在途请求上限（0 = 不限；防多 key 总和压垮单实例）
+    /// HTTP 全局在途请求上限（0 = 不限；防多 key 总和压垮单实例）。
+    ///
+    /// 计数口径：所有路径的在途 HTTP 请求（只有 `/metrics` 豁免），SSE 长流从开始占到
+    /// 最后一块 body 送完；超限返回 429 + Retry-After。
+    ///
+    /// **该值应按网关内存倒推**：每个在途流式请求约吃 15–20MB（实测见 README
+    /// 《并发上限与内存》），即 `≈ MemoryMax / 20MB` 再留三成余量（1G → 约 32）。
+    /// 给得过大的话，先撞的是 cgroup 的 `MemoryMax`——网关被 OOM 杀掉、连接被中断，
+    /// 而不是在这里优雅地返回 429，那道闸就形同虚设。
     #[serde(default)]
     max_concurrent_requests: u32,
     /// 公网入口 HTTPS 证书 PEM（提供后启用 TLS，与 tls_key 成对）
@@ -321,6 +329,11 @@ rate_limit_per_min: 60
         }
         assert_eq!(cfg.tunnel_op_secs, default_tunnel_op_secs());
         assert_eq!(cfg.head_timeout_secs, default_head_timeout_secs());
+        // 示例把总闸门按内存收口（见 README《并发上限与内存》），不能改回不限
+        assert_eq!(
+            cfg.max_concurrent_requests, 32,
+            "示例应保持 max_concurrent_requests 与内存上限挂钩的取值"
+        );
     }
 
     #[test]

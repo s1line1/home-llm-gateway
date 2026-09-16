@@ -48,9 +48,17 @@ agent_stale_secs: 15
 # 每个 API Key 每分钟请求上限（0 = 不限流）
 rate_limit_per_min: 60
 
-# HTTP 全局在途请求上限（0 = 不限；per-key 限流之外的总闸门，
-# 防止多 key 并发总和压垮单实例；SSE 长流每个连接计 1）
-# max_concurrent_requests: 100
+# HTTP 全局在途请求上限（0 = 不限；per-key 限流之外的总闸门）。
+#
+# 计数口径：所有路径的**在途 HTTP 请求**，每个计 1（只有 /metrics 豁免）；
+# SSE 长流从开始占到位到最后一块 body 送完才归还。超限返回 429 + Retry-After。
+#
+# ⚠️ 这个值必须按**网关内存**来定，而不是随便给个大数：每个在途流式请求要吃掉
+# 网关约 15–20MB（实测。见 README《并发上限与内存》），所以：
+#     max_concurrent_requests ≈ MemoryMax / 20MB，再留三成余量
+# 例如 cgroup 上限 1G → 约 40，取 32。设得太大（如 100）时，先撞的会是
+# MemoryMax 把网关 OOM 杀掉，而不是这里返回 429——那就失去了"优雅拒绝"的意义。
+max_concurrent_requests: 32
 
 # 公网入口 HTTPS 证书（提供后公网入口启用 TLS，客户端用 https:// 访问；
 # 与 tls_key 成对，去掉即明文 HTTP）
