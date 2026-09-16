@@ -1044,7 +1044,7 @@ mod tests {
 #[cfg(test)]
 mod verified_tests {
     use super::*;
-    use crate::keystore::hash::argon2_calls;
+    use crate::keystore::hash::{argon2_calls, CheapArgon2};
     use serial_test::serial;
     use std::sync::{Arc, Barrier};
 
@@ -1080,6 +1080,7 @@ mod verified_tests {
     #[test]
     #[serial]
     fn concurrent_same_token_hashes_once() {
+        let _cheap = CheapArgon2::install();
         // 这是把内存峰值从 `并发数 × 19MiB` 压到 `1 × 19MiB` 的核心契约
         let store = KeyStore::new(None);
         let key = store.create("one".into());
@@ -1091,6 +1092,7 @@ mod verified_tests {
     #[test]
     #[serial]
     fn warm_token_never_hashes_again() {
+        let _cheap = CheapArgon2::install();
         let store = KeyStore::new(None);
         let key = store.create("warm".into());
         assert!(store.authorize(&key.plaintext)); // 首次：算一次（create 那次不算）
@@ -1106,6 +1108,7 @@ mod verified_tests {
     #[test]
     #[serial]
     fn disabled_cache_keeps_old_behaviour() {
+        let _cheap = CheapArgon2::install();
         // cache_max = 0 → 每个请求都完整校验（与改造前语义一致）
         let key = KeyStore::with_verified(None, 0, DEFAULT_VERIFIED_TTL);
         let token = key.create("nocache".into()).plaintext;
@@ -1132,6 +1135,7 @@ mod verified_tests {
     #[test]
     #[serial]
     fn revoke_takes_effect_immediately() {
+        let _cheap = CheapArgon2::install();
         // 缓存**不得**延长吊销窗口：delete 后必须立刻 401
         let store = KeyStore::new(None);
         let key = store.create("revoke".into());
@@ -1151,6 +1155,7 @@ mod verified_tests {
     #[test]
     #[serial]
     fn credential_version_bump_invalidates_cache() {
+        let _cheap = CheapArgon2::install();
         // 模拟"改 key 但不 bump 版本"以外的正确路径：bump 之后旧缓存条目必须失效
         let store = KeyStore::new(None);
         let key = store.create("bump".into());
@@ -1176,6 +1181,7 @@ mod verified_tests {
     #[test]
     #[serial]
     fn expired_entry_is_revalidated() {
+        let _cheap = CheapArgon2::install();
         // TTL 到期后重算（不改变"吊销即时"这条，只影响多久重付一次 argon2 的钱）
         let store = KeyStore::with_verified(None, DEFAULT_VERIFIED_MAX, Duration::from_millis(50));
         let key = store.create("ttl".into());
@@ -1189,6 +1195,7 @@ mod verified_tests {
     #[test]
     #[serial]
     fn cache_is_bounded_and_never_stores_plaintext() {
+        let _cheap = CheapArgon2::install();
         let store = KeyStore::with_verified(None, 2, DEFAULT_VERIFIED_TTL);
         let mut tokens = Vec::new();
         for i in 0..5 {
@@ -1217,6 +1224,7 @@ mod verified_tests {
     #[test]
     #[serial]
     fn wrong_token_still_rejected_with_cache() {
+        let _cheap = CheapArgon2::install();
         // 命中路径不得绕过校验：拿别人的 token 永远进不去
         let store = KeyStore::new(None);
         let good = store.create("good".into());
