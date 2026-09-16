@@ -70,6 +70,38 @@ bench: ## 基准测试（Criterion）：make bench BENCH="-p proto -p gateway"
 bench-k6: ## k6 宏观压测（SSE 长流）：make bench-k6 KEY=sk-xxx GATEWAY_URL=http://IP:9090
 	k6 run -e GATEWAY_URL=$(GATEWAY_URL) -e GATEWAY_KEY=$(KEY) -e VUS=$(VUS) -e DURATION=$(DUR) scripts/bench-k6/sse.js
 
+# ---------------------------------------------------------------------------
+# 出图接线（方案 1：把 k6 的 --summary-export 接到 report.py）——**故意注释掉**，
+# 需要时去掉注释即可。默认不启用，原因：
+#   1) 它只能自动化最后一步：一次 bench-k6 = 一轮跑批 = 图只能是"单轮模式"，
+#      分离不出固定开销 F 与每事件开销 e（而这恰恰是 SSE 压测真正要回答的问题）。
+#   2) 要分离 F/e 得手工跑两轮不同 CONTENT_LEN、再手工拼 manifest —— 摩擦在这里。
+#   3) 往现有 bench-k6 里塞 --summary-export 会改变它的行为（多写一个文件）。
+# 所以默认走 scripts/bench-k6/sweep.sh（方案 2）：两组扫描 + manifest + 出图 +
+# 汇总表一次做完，下面留了对应的 target，取消注释即可用。
+#
+# CONTENT_LEN ?= 100
+#
+# bench-k6-export: ## 同上，但导出 summary JSON（单轮，供 report.py 用）
+# 	k6 run --summary-export=.tmp/bench/k6-summary.json \
+# 		-e GATEWAY_URL=$(GATEWAY_URL) -e GATEWAY_KEY=$(KEY) \
+# 		-e VUS=$(VUS) -e DURATION=$(DUR) -e CONTENT_LEN=$(CONTENT_LEN) \
+# 		scripts/bench-k6/sse.js
+#
+# bench-report: ## 用已有 export 出图：make bench-report RUNS=.tmp/bench/manifest-n.json
+# 	python3 scripts/bench-k6/report.py --runs $(RUNS) -o sse-bench-report.svg \
+# 		--where "$(GATEWAY_URL)" --vus "VUS=1" --dur "$(DUR)"
+# 	rsvg-convert -o sse-bench-report.png sse-bench-report.svg
+#
+# LENS ?= 10 100
+# VUSS ?= 1 5 20 40
+# DUR_N ?= 30s
+#
+# bench-sweep: ## 两组扫描（N@VUS=1 与 VUS@固定流长）+ 出图 + 汇总表
+# 	GATEWAY_URL=$(GATEWAY_URL) GATEWAY_KEY=$(KEY) LENS="$(LENS)" VUSS="$(VUSS)" \
+# 		DUR=$(DUR) DUR_N=$(DUR_N) scripts/bench-k6/sweep.sh
+# ---------------------------------------------------------------------------
+
 bench-admission: ## 验证 HTTP 闸门（打外部 gateway /v1/slow）：make bench-admission KEY=sk-xxx GATEWAY_URL=http://IP:9090 VUS=200
 	## 前置：被测 gateway 已配 max_concurrent_requests；agent 上游能响应 /v1/slow
 	## （慢端点放大在途窗口）。429 占比突增点 = 闸门阈值；看 k6 报告 + 网关

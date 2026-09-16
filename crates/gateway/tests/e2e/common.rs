@@ -175,6 +175,24 @@ pub async fn start_stack(
     max_concurrency: u32,
     admin_token: Option<&str>,
 ) -> (Gateway, Agent, String, String) {
+    start_stack_with_tunnel_timeout(
+        request_timeout,
+        Duration::from_secs(2),
+        rate_limit_per_min,
+        max_concurrency,
+        admin_token,
+    )
+    .await
+}
+
+/// 同上，但可指定隧道控制操作超时（测"隧道卡死 → 快速失败"用短值）。
+pub async fn start_stack_with_tunnel_timeout(
+    request_timeout: Duration,
+    tunnel_op_timeout: Duration,
+    rate_limit_per_min: u32,
+    max_concurrency: u32,
+    admin_token: Option<&str>,
+) -> (Gateway, Agent, String, String) {
     let (ca, server_cert, server_key, client_cert, client_key) = gen_certs();
     let mock_addr = start_mock_llm("mock-llm").await;
     let (keys_path, test_key) = seed_keys_db();
@@ -188,6 +206,8 @@ pub async fn start_stack(
         admin_token: admin_token.map(|s| s.to_string()),
         keys_file: Some(keys_path),
         request_timeout,
+        tunnel_op_timeout,
+        head_timeout: Duration::from_secs(5),
         agent_stale_after: Duration::from_secs(10),
         rate_limit_per_min,
         max_concurrent_requests: 0,

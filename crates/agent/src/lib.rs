@@ -11,7 +11,7 @@ use proto::{
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use s2n_quic::{client::Connect, provider::limits::Limits};
 use tokio::io::AsyncWriteExt;
-use tracing::{info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::stream::handle_stream;
 
@@ -51,12 +51,37 @@ impl Agent {
             cfg.client_cert.clone(),
             cfg.client_key.clone_key(),
         )?;
-        let task = tokio::spawn(run(cfg, client_config));
+        // 外层包一层守护：run 正常**永不返回**，一旦返回（panic / 被取消），进程就只是
+        // "看起来还在运行"——main 停在 shutdown_signal()，既不重连也不退出，日志里也
+        // 什么都没有。所以这里喊出来并让进程退出，交给外部守护重新拉起
+        // （deploy/agent.service 是 Restart=always / RestartSec=3）。静默的僵尸进程
+        // 比一次崩溃难查得多。
+        let task = tokio::spawn(async move {
+            let mut inner = AbortOnDrop(tokio::spawn(run(cfg, client_config)));
+            match (&mut inner.0).await {
+                Ok(()) => error!("agent run loop exited; exiting so the supervisor restarts us"),
+                Err(e) if e.is_panic() => {
+                    error!("agent run loop panicked: {e}; exiting so the supervisor restarts us")
+                }
+                Err(e) => warn!("agent run loop cancelled: {e}"),
+            }
+            std::process::exit(1);
+        });
         Ok(Self { task })
     }
 
     pub async fn shutdown(self) {
         self.task.abort();
+    }
+}
+
+/// 内层 run 任务的 Drop 兜底：外层被 abort（`Agent::shutdown`）时连带把它也 abort。
+/// 没有这层，`shutdown()` 只会停掉包装任务，真正的连接循环会变成孤儿继续跑。
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -80,7 +105,9 @@ async fn connect_once(
     client_config: rustls::ClientConfig,
 ) -> anyhow::Result<()> {
     // let limits = Limits::new().with_max_idle_timeout(Duration::from_secs(20))?; // 对齐 quinn 时代的 20s
-    let limits = Limits::new().with_max_open_remote_bidirectional_streams(1000)?;
+    let limits = Limits::new()
+        .with_max_idle_timeout(Duration::from_secs(20))?
+        .with_max_open_remote_bidirectional_streams(1000)?;
 
     // 不设 with_max_idle_timeout 时默认 30s（MaxIdleTimeout::RECOMMENDED）
     let client = s2n_quic::Client::builder()
@@ -109,28 +136,46 @@ async fn connect_once(
     info!(agent_id = %cfg.agent_id, models = ?cfg.models,max_concurrenty = cfg.max_concurrency,"registered with cloud gateway");
 
     // ③ 心跳任务拿到 handle 的 clone（各任务一份，互不冲突）
-    let hb = tokio::spawn(heartbeat_loop(
+    let mut hb = tokio::spawn(heartbeat_loop(
         handle.clone(),
         cfg.agent_id.clone(),
         cfg.heartbeat_interval,
     ));
 
+    let http = reqwest::Client::new();
     // ④ accept 循环用 acceptor（单消费者，独占）
+    //
+    // 和心跳**并跑**，而不是各跑各的：心跳是网关判定"这个 agent 还活着"的唯一依据
+    // （网关侧 stale 判定默认 15s，agent 侧心跳默认 5s 一次）。心跳任务一旦结束，
+    // 哪怕 QUIC 连接本身还开着，这条连接在网关眼里也已经死了 —— 表现是"agent 自认为
+    // 连着、网关把所有请求判 503、两侧都没有日志、只能人工重启"的静默态。
+    // 所以必须观察它：它一结束就结束这条连接，交回 run() 的重连循环。
     loop {
-        match acceptor.accept_bidirectional_stream().await {
-            Ok(Some(stream)) => {
-                tokio::spawn(handle_stream(
-                    stream,
-                    reqwest::Client::new(),
-                    cfg.upstream_base.clone(),
-                    cfg.request_log,
-                ));
-            }
-            Ok(None) => break, // 连接正常关闭
-            Err(e) => {
-                warn!("accept stream failed: {e}");
+        tokio::select! {
+            r = &mut hb => {
+                match r {
+                    Ok(Ok(())) => warn!("heartbeat loop exited; forcing reconnect"),
+                    Ok(Err(e)) => warn!("heartbeat loop failed: {e}; forcing reconnect"),
+                    Err(e) if e.is_panic() => error!("heartbeat loop panicked: {e}; forcing reconnect"),
+                    Err(e) => warn!("heartbeat task cancelled: {e}; forcing reconnect"),
+                }
                 break;
             }
+            accepted = acceptor.accept_bidirectional_stream() => match accepted {
+                Ok(Some(stream)) => {
+                    tokio::spawn(handle_stream(
+                        stream,
+                        http.clone(),
+                        cfg.upstream_base.clone(),
+                        cfg.request_log,
+                    ));
+                }
+                Ok(None) => break, // 连接正常关闭
+                Err(e) => {
+                    warn!("accept stream failed: {e}");
+                    break;
+                }
+            },
         }
     }
 
@@ -142,7 +187,9 @@ async fn register(mut conn: s2n_quic::connection::Handle, cfg: &AgentConfig) -> 
     // open a new stream and split the receiving and sending sides
     let stream = conn.open_bidirectional_stream().await?;
     let client_id = stream.id();
-    println!("Register Server, client stream id : {client_id}");
+    // 曾经是 println!：没有时间戳、没有级别，混在日志里像噪声，措辞也不对
+    // （注册的是 agent，不是 server）。
+    debug!(client_id, "registering with cloud gateway");
 
     let (recv, mut send) = stream.split();
 
@@ -356,6 +403,63 @@ mod tests {
         (addr, rx)
     }
 
+    /// 假网关：接受连接后**只服务注册流**（读一帧 → finish，让 agent 的 register 拿到 EOF），
+    /// 此后的流（心跳）一律 `reset` 掉 —— 心跳读立刻报错，于是心跳任务结束。
+    ///
+    /// 每条接入连接都会往 channel 发一个信号：测试用它数"重连了几次"。用 reset 而不是
+    /// 干脆不读，是为了避开 `heartbeat_loop` 里那个 5s 的 ack 超时，测试才跑得快。
+    async fn test_server_that_only_serves_register(
+        ca: &CertificateDer<'static>,
+        cert: CertificateDer<'static>,
+        key: PrivateKeyDer<'static>,
+    ) -> (SocketAddr, tokio::sync::mpsc::Receiver<()>) {
+        proto::install_ring_crypto_provider();
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca.clone()).unwrap();
+        let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+            .build()
+            .unwrap();
+        let mut stls = rustls::ServerConfig::builder()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(vec![cert], key)
+            .unwrap();
+        stls.alpn_protocols = vec![ALPN.to_vec()];
+
+        let mut server = s2n_quic::Server::builder()
+            .with_tls(s2n_quic::provider::tls::rustls::Server::from(Arc::new(
+                stls,
+            )))
+            .unwrap()
+            .with_io("127.0.0.1:0")
+            .unwrap()
+            .start()
+            .unwrap();
+        let addr = server.local_addr().unwrap();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tokio::spawn(async move {
+            while let Some(conn) = server.accept().await {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let (_handle, mut acceptor) = conn.split();
+                    if let Ok(Some(stream)) = acceptor.accept_bidirectional_stream().await {
+                        let (mut recv, mut send) = stream.split();
+                        let _ = proto::io::read_frame(&mut recv).await; // 注册帧
+                        let _ = send.finish(); // 让 agent 侧读到 EOF，注册成功
+                    }
+                    let _ = tx.send(()).await; // "这条连接已经注册完成"
+                                               // 之后的心跳流：reset 掉，让 agent 的心跳任务立刻失败
+                    while let Ok(Some(stream)) = acceptor.accept_bidirectional_stream().await {
+                        let (_recv, mut send) = stream.split();
+                        let _ = send.reset(0u32.into());
+                    }
+                });
+            }
+        });
+        (addr, rx)
+    }
+
     fn test_agent_config(
         cloud_addr: SocketAddr,
         ca: CertificateDer<'static>,
@@ -375,6 +479,37 @@ mod tests {
             heartbeat_interval: Duration::from_millis(50),
             request_log: true,
         }
+    }
+
+    #[tokio::test]
+    async fn dead_heartbeat_forces_a_reconnect() {
+        let (ca, srv_cert, srv_key, cli_cert, cli_key) = gen_pki();
+        let (addr, mut rx) = test_server_that_only_serves_register(&ca, srv_cert, srv_key).await;
+        let cfg = test_agent_config(addr, ca.clone(), cli_cert, cli_key);
+        let cc = tls::rustls_client_tls(
+            &cfg.ca_cert,
+            cfg.client_cert.clone(),
+            cfg.client_key.clone_key(),
+        )
+        .unwrap();
+        let task = tokio::spawn(run(cfg, cc));
+
+        // 第一条连接：注册流被服务端读掉并 finish，所以注册能正常完成
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("agent should connect")
+            .expect("first connection");
+
+        // 之后的心跳流会被服务端 reset → 心跳任务结束。这条连接此时在网关眼里已经死了
+        // （心跳是网关判定存活状态的唯一依据），所以 agent 必须主动断开重连 ——
+        // 而不是抱着一条"看起来还开着"的连接静默等下去（那种状态下网关会把所有请求判 503，
+        // 两侧都没有日志，只能人工重启）。没有这个断言，这条静默路径可以再次溜回去。
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a dead heartbeat must force a reconnect, not a silent zombie")
+            .expect("second connection");
+
+        task.abort();
     }
 
     #[tokio::test]

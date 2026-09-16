@@ -31,6 +31,10 @@ pub struct AppState {
     pub admin_token: Option<String>,
     pub timeout: Duration,
     pub agent_stale_after: Duration,
+    /// 隧道控制操作超时（打开流 / 发送请求头 / 取消帧）。见 [`crate::GatewayConfig`] 的说明。
+    pub tunnel_op_timeout: Duration,
+    /// 等待上游响应头（首字节）的超时。见 [`crate::GatewayConfig`] 的说明。
+    pub head_timeout: Duration,
     pub rate_limiter: Option<RateLimiter>,
     /// HTTP 全局在途请求上限（0 = 不限；per-key 限流之外的总闸门）。
     pub max_concurrent_requests: u32,
@@ -434,6 +438,8 @@ mod tests {
             admin_token: None,
             timeout: Duration::from_secs(10),
             agent_stale_after: Duration::from_secs(10),
+            tunnel_op_timeout: Duration::from_secs(2),
+            head_timeout: Duration::from_secs(5),
             rate_limiter: RateLimiter::new(0),
             max_concurrent_requests: 0,
             metrics: Metrics::default(),
