@@ -23,11 +23,13 @@ use tracing::{info, warn};
 use crate::{keystore::KeyStore, metrics::Metrics, ratelimit::RateLimiter, registry::Registry};
 
 /// HTTPS 证书 PEM 内容。
+#[derive(Debug)]
 pub struct TlsPem {
     pub cert: Vec<u8>,
     pub key: Vec<u8>,
 }
 
+#[derive(Debug)]
 pub struct GatewayConfig {
     /// HTTP(S) 公网入口监听地址。
     pub http_bind: SocketAddr,
@@ -65,8 +67,9 @@ pub struct Gateway {
 
 impl Gateway {
     pub async fn start(cfg: GatewayConfig) -> Result<Self, crate::error::GatewayError> {
-        // 显式安装 ring 为进程默认 crypto provider，保证各 rustls 使用方一致
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        // 显式安装 ring 为进程默认 crypto provider（见 proto::install_ring_crypto_provider 的说明：
+        // workspace 同时链接了 ring 与 aws-lc-rs，不安装 rustls 会 panic）
+        proto::install_ring_crypto_provider();
 
         let registry = Registry::default();
 

@@ -105,6 +105,7 @@ mod tests {
         use rcgen::{CertificateParams, KeyPair};
         use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 
+        proto::install_ring_crypto_provider();
         let key = KeyPair::generate().unwrap();
         let cert = CertificateParams::new(vec!["localhost".to_string()])
             .unwrap()

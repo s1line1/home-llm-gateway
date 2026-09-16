@@ -11,8 +11,9 @@ pub enum AgentError {
     #[error("TLS/证书错误: {0}")]
     Tls(#[from] rustls::Error),
 
+    /// s2n-quic 连接/流操作错误（`Connection` 本身不是错误类型，不能用它做 source）。
     #[error("QUIC 连接错误: {0}")]
-    Quic(#[from] quinn::ConnectError),
+    Quic(#[from] s2n_quic::connection::Error),
 
     #[error("IO 错误: {0}")]
     Io(#[from] io::Error),

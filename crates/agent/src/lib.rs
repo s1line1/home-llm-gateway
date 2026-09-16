@@ -2,16 +2,22 @@
 
 pub mod tls;
 
-use std::{net::SocketAddr, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
-use futures_util::StreamExt;
 use proto::{
-    io::{read_frame, write_frame, FrameReader},
+    io::{write_frame, FrameReader},
     Frame,
 };
-use quinn::Connection;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use s2n_quic::{client::Connect, provider::limits::Limits};
+use tokio::io::AsyncWriteExt;
 use tracing::{info, warn};
+
+use crate::stream::handle_stream;
+
+pub mod config;
+pub mod error;
+pub mod stream;
 
 pub struct AgentConfig {
     /// 云端网关 QUIC 地址。
@@ -38,7 +44,9 @@ pub struct Agent {
 
 impl Agent {
     pub fn start(cfg: AgentConfig) -> anyhow::Result<Self> {
-        let client_config = tls::client_config(
+        // 双 provider（ring + aws-lc-rs）共存时必须显式安装，见 proto::install_ring_crypto_provider
+        proto::install_ring_crypto_provider();
+        let client_config = tls::rustls_client_config(
             &cfg.ca_cert,
             cfg.client_cert.clone(),
             cfg.client_key.clone_key(),
@@ -52,7 +60,7 @@ impl Agent {
     }
 }
 
-async fn run(cfg: AgentConfig, client_config: quinn::ClientConfig) {
+async fn run(cfg: AgentConfig, client_config: rustls::ClientConfig) {
     let mut delay = Duration::from_millis(500);
     loop {
         match connect_once(&cfg, client_config.clone()).await {
@@ -67,49 +75,75 @@ async fn run(cfg: AgentConfig, client_config: quinn::ClientConfig) {
     }
 }
 
-async fn connect_once(cfg: &AgentConfig, client_config: quinn::ClientConfig) -> anyhow::Result<()> {
-    let mut endpoint = quinn::Endpoint::client(SocketAddr::from(([0, 0, 0, 0], 0)))?;
-    endpoint.set_default_client_config(client_config);
-    let conn = endpoint.connect(cfg.cloud_addr, &cfg.server_name)?.await?;
+async fn connect_once(
+    cfg: &AgentConfig,
+    client_config: rustls::ClientConfig,
+) -> anyhow::Result<()> {
+    // let limits = Limits::new().with_max_idle_timeout(Duration::from_secs(20))?; // 对齐 quinn 时代的 20s
+    let limits = Limits::new().with_max_open_remote_bidirectional_streams(1000)?;
+
+    // limits默认是 30s
+    let client = s2n_quic::Client::builder()
+        .with_tls(s2n_quic::provider::tls::rustls::Client::from(Arc::new(
+            client_config,
+        )))?
+        .with_io("0.0.0.0:0")?
+        .with_limits(limits)?
+        .start()?;
+    let mut conn = client
+        .connect(Connect::new(cfg.cloud_addr).with_server_name(cfg.server_name.clone()))
+        .await?;
+
+    conn.keep_alive(true)?;
+
+    // ① 先拆：Handle 用来"开流"（Register/Heartbeat），acceptor 用来"收流"（代理请求）
+    let (handle, mut acceptor) = conn.split();
+
     info!("connected to cloud gateway at {}", cfg.cloud_addr);
 
-    register(&conn, cfg).await?;
-    info!(
-        agent_id = %cfg.agent_id,
-        models = ?cfg.models,
-        max_concurrency = cfg.max_concurrency,
-        "registered with cloud gateway"
-    );
+    // ② Register 用 handle 开一条流发注册帧
+    register(handle.clone(), cfg).await?;
 
+    info!(agent_id = %cfg.agent_id, models = ?cfg.models,max_concurrenty = cfg.max_concurrency,"registered with cloud gateway");
+
+    // ③ 心跳任务拿到 handle 的 clone（各任务一份，互不冲突）
     let hb = tokio::spawn(heartbeat_loop(
-        conn.clone(),
+        handle.clone(),
         cfg.agent_id.clone(),
         cfg.heartbeat_interval,
     ));
 
-    let http = reqwest::Client::new();
-    let upstream = cfg.upstream_base.clone();
+    // ④ accept 循环用 acceptor（单消费者，独占）
     loop {
-        let (send, recv) = match conn.accept_bi().await {
-            Ok(s) => s,
-            Err(_) => break,
-        };
-        let http = http.clone();
-        let upstream = upstream.clone();
-        let request_log = cfg.request_log;
-        tokio::spawn(async move {
-            if let Err(e) = handle_stream(send, recv, &http, &upstream, request_log).await {
-                warn!("proxy stream error: {e}");
+        match acceptor.accept_bidirectional_stream().await {
+            Ok(Some(stream)) => {
+                tokio::spawn(handle_stream(
+                    stream,
+                    reqwest::Client::new(),
+                    cfg.upstream_base.clone(),
+                    cfg.request_log,
+                ));
             }
-        });
+            Ok(None) => break, // 连接正常关闭
+            Err(e) => {
+                warn!("accept stream failed: {e}");
+                break;
+            }
+        }
     }
 
     hb.abort();
     Ok(())
 }
 
-async fn register(conn: &Connection, cfg: &AgentConfig) -> anyhow::Result<()> {
-    let (mut send, mut recv) = conn.open_bi().await?;
+async fn register(mut conn: s2n_quic::connection::Handle, cfg: &AgentConfig) -> anyhow::Result<()> {
+    // open a new stream and split the receiving and sending sides
+    let stream = conn.open_bidirectional_stream().await?;
+    let client_id = stream.id();
+    println!("Register Server, client stream id : {client_id}");
+
+    let (recv, mut send) = stream.split();
+
     write_frame(
         &mut send,
         &Frame::Register {
@@ -121,205 +155,56 @@ async fn register(conn: &Connection, cfg: &AgentConfig) -> anyhow::Result<()> {
     )
     .await?;
     send.finish()?;
-    // 网关不发 ack；读到 EOF 即可
-    while read_frame(&mut recv).await?.is_some() {}
+    // // 网关不发 ack；读到 EOF 即可
+    let mut reader = FrameReader::new(recv);
+    tokio::time::timeout(Duration::from_secs(10), reader.next())
+        .await
+        .map_err(|_| anyhow::anyhow!("register timed out waiting for gateway EOF"))? // 超时
+        .map_err(|e| anyhow::anyhow!("register read failed: {e}"))?; // io::Error
+
     Ok(())
 }
 
-async fn heartbeat_loop(conn: Connection, agent_id: String, interval: Duration) {
+async fn heartbeat_loop(
+    mut conn: s2n_quic::connection::Handle,
+    agent_id: String,
+    interval: Duration,
+) -> anyhow::Result<()> {
     loop {
         tokio::time::sleep(interval).await;
-        match conn.open_bi().await {
-            Ok((mut send, mut recv)) => {
-                let _ = write_frame(
-                    &mut send,
-                    &Frame::Heartbeat {
-                        agent_id: agent_id.clone(),
-                        inflight: 0,
-                    },
-                )
-                .await;
-                let _ = send.finish();
-                let _ = read_frame(&mut recv).await; // 等 EOF
-            }
-            Err(_) => break,
-        }
-    }
-}
+        let stream = conn.open_bidirectional_stream().await?;
+        let (recv, mut send) = stream.split();
+        write_frame(
+            &mut send,
+            &Frame::Heartbeat {
+                agent_id: agent_id.clone(),
+                inflight: 0,
+            },
+        )
+        .await?;
+        send.shutdown().await?;
 
-/// 处理一条代理流：读 ProxyRequest → 转发本地 LLM → 流式回传响应帧。
-/// `request_log` 控制每请求的 INFO 日志（received/responded/done/cancelled）。
-async fn handle_stream(
-    mut send: quinn::SendStream,
-    recv: quinn::RecvStream,
-    http: &reqwest::Client,
-    upstream: &str,
-    request_log: bool,
-) -> anyhow::Result<()> {
-    // 帧读取一律走 FrameReader：`next()` 可安全取消（半读状态在它自己身上），
-    // 因此下面两处 select! 落败时不会丢字节。用裸 `read_frame` 会把半读的帧
-    // 连同局部缓冲一起丢掉 → 长度前缀错位 → 网关发来的 Cancel 被静默丢弃、
-    // 取消传播失效（上游 token 继续白烧）。
-    let mut reader = FrameReader::new(recv);
-
-    let Some(Frame::ProxyRequest {
-        request_id,
-        method,
-        path,
-        headers,
-        body,
-    }) = reader.next().await?
-    else {
-        anyhow::bail!("expected ProxyRequest frame");
-    };
-    let started = std::time::Instant::now();
-    if request_log {
-        info!(request_id, method = %method, path = %path, body_bytes = body.len(), "proxy request received");
+        let mut reader = FrameReader::new(recv);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while reader.next().await?.is_some() {}
+            Ok::<(), std::io::Error>(())
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("heartbeat wait timed out"))?
+        .map_err(|e| anyhow::anyhow!("heartbeat read failed: {e}"))?;
     }
-
-    let url = format!("{upstream}{path}");
-    let mut rb = http.request(reqwest::Method::from_bytes(method.as_bytes())?, &url);
-    for (k, v) in headers {
-        // 逐跳头 + 调用方凭据都不转发：凭据只属于「客户端 ↔ 网关」那一跳，不该到上游
-        // （网关侧已经剥过一层，这里是纵深防御，也覆盖"新 agent 配旧网关"的混版本场景）。
-        let name = k.as_str();
-        if !proto::headers::is_hop_by_hop(name) && !proto::headers::is_client_credential(name) {
-            if let Ok(v) = reqwest::header::HeaderValue::from_str(&v) {
-                rb = rb.header(k, v);
-            }
-        }
-    }
-    rb = rb.body(body);
-
-    // 发送上游请求；期间可收到 Cancel 帧 → 立即取消
-    let send_fut = rb.send();
-    tokio::pin!(send_fut);
-    let resp = loop {
-        tokio::select! {
-            r = &mut send_fut => break r?,
-            f = reader.next() => {
-                match f? {
-                    Some(Frame::Cancel { .. }) | None => {
-                        return send_cancelled(&mut send, request_id, started, request_log).await;
-                    }
-                    Some(_) => {}
-                }
-            }
-        }
-    };
-
-    let status = resp.status().as_u16();
-    let mut out_headers = Vec::new();
-    for (k, v) in resp.headers() {
-        let name = k.as_str();
-        if proto::headers::is_hop_by_hop(name) {
-            continue;
-        }
-        if let Ok(v) = v.to_str() {
-            out_headers.push((name.to_string(), v.to_string()));
-        }
-    }
-    write_frame(
-        &mut send,
-        &Frame::ProxyResponseHead {
-            request_id,
-            status,
-            headers: out_headers,
-        },
-    )
-    .await?;
-    if request_log {
-        info!(
-            request_id,
-            status,
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "upstream responded"
-        );
-    }
-
-    // M2：流式透传——上游 body 逐块转 ProxyResponseBody 帧（SSE 天然支持），
-    // 期间持续监听 Cancel，收到即中止，避免白算 token。
-    let body_stream = resp.bytes_stream();
-    tokio::pin!(body_stream);
-    let mut ok = true;
-    let mut bytes_out = 0u64;
-    loop {
-        tokio::select! {
-            chunk = body_stream.next() => {
-                match chunk {
-                    Some(Ok(bytes)) => {
-                        bytes_out += bytes.len() as u64;
-                        write_frame(&mut send, &Frame::ProxyResponseBody { request_id, chunk: bytes.to_vec() }).await?;
-                    }
-                    Some(Err(e)) => {
-                        warn!(request_id, "upstream stream error: {e}");
-                        ok = false;
-                        break;
-                    }
-                    None => break,
-                }
-            }
-            f = reader.next() => {
-                match f? {
-                    Some(Frame::Cancel { .. }) | None => {
-                        return send_cancelled(&mut send, request_id, started, request_log).await;
-                    }
-                    Some(_) => {}
-                }
-            }
-        }
-    }
-
-    write_frame(&mut send, &Frame::ProxyResponseEnd { request_id, ok }).await?;
-    send.finish()?;
-    if request_log {
-        info!(
-            request_id,
-            status,
-            ok,
-            bytes_out,
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "proxy request done"
-        );
-    }
-    Ok(())
-}
-
-async fn send_cancelled(
-    send: &mut quinn::SendStream,
-    request_id: u64,
-    started: std::time::Instant,
-    request_log: bool,
-) -> anyhow::Result<()> {
-    if request_log {
-        info!(
-            request_id,
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "request cancelled by gateway"
-        );
-    }
-    let _ = write_frame(
-        send,
-        &Frame::Error {
-            request_id: Some(request_id),
-            code: 499,
-            message: "cancelled by client".into(),
-        },
-    )
-    .await;
-    let _ = send.finish();
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
+    use proto::ALPN;
     use rcgen::{
         BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
         KeyUsagePurpose, SanType,
     };
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use s2n_quic::connection::Handle;
     use std::sync::Arc;
 
     /// 生成 (CA, 服务端证书, 服务端私钥, 客户端证书, 客户端私钥) 的 DER。
@@ -365,8 +250,12 @@ mod tests {
         )
     }
 
-    /// 建立一对本地 QUIC 端点并返回客户端连接（无 mTLS）。
-    async fn test_connection() -> Connection {
+    /// 建立一个本地的 s2n-quic 连接对（无 mTLS），返回客户端 [`Handle`]。
+    /// 服务端只保活连接、不读流。
+    async fn test_connection() -> Handle {
+        proto::install_ring_crypto_provider();
+
+        // 服务端：自签证书 + 无客户端认证
         let key = KeyPair::generate().unwrap();
         let cert = CertificateParams::new(vec!["localhost".to_string()])
             .unwrap()
@@ -375,77 +264,91 @@ mod tests {
         let cert_der = cert.der().clone();
         let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
 
-        let tls = rustls::ServerConfig::builder()
+        let mut stls = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(vec![cert_der.clone()], key_der)
             .unwrap();
-        let quic = QuicServerConfig::try_from(tls).unwrap();
-        let mut scfg = quinn::ServerConfig::with_crypto(Arc::new(quic));
-        let mut transport = quinn::TransportConfig::default();
-        transport.max_idle_timeout(Some(Duration::from_secs(10).try_into().unwrap()));
-        scfg.transport_config(Arc::new(transport));
-        let server = quinn::Endpoint::server(scfg, "127.0.0.1:0".parse().unwrap()).unwrap();
+        stls.alpn_protocols = vec![ALPN.to_vec()];
+
+        let mut server = s2n_quic::Server::builder()
+            .with_tls(s2n_quic::provider::tls::rustls::Server::from(Arc::new(
+                stls,
+            )))
+            .unwrap()
+            .with_io("127.0.0.1:0")
+            .unwrap()
+            .start()
+            .unwrap();
         let server_addr = server.local_addr().unwrap();
+
+        // 服务端 accept 一条连接并保活：别返回，返回会 drop 句柄导致连接关闭
         tokio::spawn(async move {
-            while let Some(incoming) = server.accept().await {
-                tokio::spawn(async move {
-                    // 保持连接存活到测试结束，避免服务端 drop 导致连接提前关闭
-                    if let Ok(conn) = incoming.await {
-                        conn.closed().await;
-                    }
-                });
-            }
+            let conn = server.accept().await.expect("client should connect");
+            let (_handle, _acceptor) = conn.split();
+            std::future::pending::<()>().await;
         });
 
+        // 客户端：信任自签证书，无客户端证书
         let mut roots = rustls::RootCertStore::empty();
         roots.add(cert_der).unwrap();
-        let client_tls = rustls::ClientConfig::builder()
+        let mut ctls = rustls::ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
-        let client_cfg =
-            quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(client_tls).unwrap()));
-        let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
-        client.set_default_client_config(client_cfg);
-        client
-            .connect(server_addr, "localhost")
+        ctls.alpn_protocols = vec![ALPN.to_vec()];
+
+        let client = s2n_quic::Client::builder()
+            .with_tls(s2n_quic::provider::tls::rustls::Client::from(Arc::new(
+                ctls,
+            )))
             .unwrap()
+            .with_io("0.0.0.0:0")
+            .unwrap()
+            .start()
+            .unwrap();
+        let conn = client
+            .connect(s2n_quic::client::Connect::new(server_addr).with_server_name("localhost"))
             .await
-            .unwrap()
+            .unwrap();
+        let (handle, _acceptor) = conn.split();
+        handle
     }
 
-    /// 用 CA 签发的服务端证书建 mTLS QUIC server，把接到的连接发给测试。
+    /// 用 CA 签发的服务端证书建 mTLS s2n-quic server，把每条接入连接的 [`Handle`] 发给测试。
     async fn test_server(
         ca: &CertificateDer<'static>,
         cert: CertificateDer<'static>,
         key: PrivateKeyDer<'static>,
-    ) -> (SocketAddr, tokio::sync::mpsc::Receiver<Connection>) {
+    ) -> (SocketAddr, tokio::sync::mpsc::Receiver<Handle>) {
+        proto::install_ring_crypto_provider();
+
         let mut roots = rustls::RootCertStore::empty();
         roots.add(ca.clone()).unwrap();
         let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
             .build()
             .unwrap();
-        let mut tls = rustls::ServerConfig::builder()
+        let mut stls = rustls::ServerConfig::builder()
             .with_client_cert_verifier(verifier)
             .with_single_cert(vec![cert], key)
             .unwrap();
-        tls.alpn_protocols = vec![b"h3".to_vec()]; // 与 agent 客户端 ALPN 匹配
-        let quic = QuicServerConfig::try_from(tls).unwrap();
-        let mut scfg = quinn::ServerConfig::with_crypto(Arc::new(quic));
-        let mut transport = quinn::TransportConfig::default();
-        transport.max_idle_timeout(Some(Duration::from_secs(10).try_into().unwrap()));
-        scfg.transport_config(Arc::new(transport));
-        let server = quinn::Endpoint::server(scfg, "127.0.0.1:0".parse().unwrap()).unwrap();
+        stls.alpn_protocols = vec![ALPN.to_vec()];
+
+        let mut server = s2n_quic::Server::builder()
+            .with_tls(s2n_quic::provider::tls::rustls::Server::from(Arc::new(
+                stls,
+            )))
+            .unwrap()
+            .with_io("127.0.0.1:0")
+            .unwrap()
+            .start()
+            .unwrap();
         let addr = server.local_addr().unwrap();
+
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         tokio::spawn(async move {
-            while let Some(incoming) = server.accept().await {
+            while let Some(conn) = server.accept().await {
                 let tx = tx.clone();
-                tokio::spawn(async move {
-                    if let Ok(conn) = incoming.await {
-                        let _ = tx.send(conn.clone()).await;
-                        conn.closed().await;
-                    }
-                });
+                let (handle, _acceptor) = conn.split();
+                let _ = tx.send(handle).await;
             }
         });
         (addr, rx)
@@ -474,24 +377,28 @@ mod tests {
 
     #[tokio::test]
     async fn heartbeat_loop_breaks_when_connection_closed() {
-        let conn = test_connection().await;
-        // 显式关闭连接：之后 open_bi 必然失败 → 心跳循环 break 退出
-        conn.close(0u32.into(), b"test close");
-        heartbeat_loop(conn, "agent-x".into(), Duration::from_millis(10)).await;
+        let handle = test_connection().await;
+        // 关闭连接：之后 open_bidirectional_stream 必然失败 → 心跳循环返回 Err
+        handle.close(0u32.into());
+        let result = heartbeat_loop(handle, "agent-x".into(), Duration::from_millis(10)).await;
+        assert!(
+            result.is_err(),
+            "heartbeat should fail after connection closed"
+        );
     }
 
     #[tokio::test]
     async fn heartbeat_loop_sends_frames_on_live_connection() {
-        let conn = test_connection().await;
-        // 间隔 20ms、运行 100ms：应至少成功发送几次心跳（写帧 + 读 EOF）
+        let mut handle = test_connection().await;
+        // 间隔 20ms、运行 120ms：心跳任务会反复开流（写帧 + 等 EOF）
         let task = tokio::spawn(heartbeat_loop(
-            conn.clone(),
+            handle.clone(),
             "agent-y".into(),
             Duration::from_millis(20),
         ));
         tokio::time::sleep(Duration::from_millis(120)).await;
         // 连接仍存活（未被心跳逻辑破坏）
-        assert!(conn.open_bi().await.is_ok());
+        assert!(handle.open_bidirectional_stream().await.is_ok());
         task.abort();
     }
 
@@ -504,7 +411,7 @@ mod tests {
             cli_cert,
             cli_key,
         );
-        let cc = tls::client_config(
+        let cc = tls::rustls_client_config(
             &cfg.ca_cert,
             cfg.client_cert.clone(),
             cfg.client_key.clone_key(),
@@ -522,7 +429,7 @@ mod tests {
         let (ca, srv_cert, srv_key, cli_cert, cli_key) = gen_pki();
         let (addr, mut rx) = test_server(&ca, srv_cert, srv_key).await;
         let cfg = test_agent_config(addr, ca.clone(), cli_cert, cli_key);
-        let cc = tls::client_config(
+        let cc = tls::rustls_client_config(
             &cfg.ca_cert,
             cfg.client_cert.clone(),
             cfg.client_key.clone_key(),
@@ -530,12 +437,12 @@ mod tests {
         .unwrap();
         let task = tokio::spawn(run(cfg, cc));
         // 等 agent 连上
-        let server_conn = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        let server_handle = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
             .expect("agent should connect")
             .unwrap();
         // 服务端主动关闭连接 → agent 干净断开（Ok 分支）→ 退避重连
-        server_conn.close(0u32.into(), b"bye");
+        server_handle.close(0u32.into());
         tokio::time::sleep(Duration::from_millis(900)).await;
         assert!(
             !task.is_finished(),
@@ -566,5 +473,3 @@ mod tests {
         assert!(Agent::start(cfg).is_err(), "invalid key should fail start");
     }
 }
-pub mod config;
-pub mod error;
