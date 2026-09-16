@@ -30,5 +30,16 @@ RestartSec=3
 StandardOutput=append:/var/log/home-llm-gateway/gateway.log
 StandardError=append:/var/log/home-llm-gateway/gateway.log
 
+# 内存：默认**不设上限**。想让网关超限时只杀自己（而不是触发整机 OOM 把别的进程一起
+# 带走），把 MemoryMax 改成具体值，例如 1G（低于实测的 ~1.09GB 死亡水位）：
+#     MemoryMax=1G
+# ⚠️ 不要把 MemoryHigh 设成小值：网关内存以匿名页为主（实测 99.5%），没有 swap 可回收时
+#    MemoryHigh 会让所有 worker 线程卡在 mem_cgroup_handle_over_high 里——进程还活着、
+#    systemd 显示 active，但完全不再处理任何请求（实战踩过：500M 直接把服务冻死）。
+#    它不触发 Restart=on-failure，因为进程根本没退出。要么留空，要么配合真实可用的 swap。
+MemoryHigh=infinity
+MemorySwapMax=infinity
+OOMPolicy=stop
+
 [Install]
 WantedBy=multi-user.target

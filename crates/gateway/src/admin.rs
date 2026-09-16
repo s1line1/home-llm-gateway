@@ -188,6 +188,8 @@ mod tests {
             admin_token: Some("admin-token".into()),
             timeout: Duration::from_secs(10),
             agent_stale_after: Duration::from_secs(10),
+            tunnel_op_timeout: Duration::from_secs(2),
+            head_timeout: Duration::from_secs(5),
             rate_limiter: None,
             max_concurrent_requests: 0,
             metrics: Metrics::default(),

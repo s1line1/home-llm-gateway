@@ -38,6 +38,21 @@ pub struct ConfigFile {
     /// agent 失联判定秒数
     #[serde(default = "default_agent_stale_secs")]
     agent_stale_secs: u64,
+    /// 隧道「控制操作」超时秒数：打开流 + 发送请求头（+ 取消帧）。
+    ///
+    /// 健康隧道这些操作是**毫秒级**（本机实测全部固定开销 ≈56ms），2s 已极宽松。
+    /// 为什么要设：隧道坏掉时这些 await 可能**长时间不返回**，请求就一直挂在那里占着
+    /// 连接、并发槽位和缓冲区；超时即判定连接已死 → 摘掉注册表条目，请求快速失败
+    /// （502），后续请求也不会再选中这条死连接。
+    #[serde(default = "default_tunnel_op_secs")]
+    tunnel_op_secs: u64,
+    /// 等待上游**响应头**（首字节）的秒数 —— 与 `timeout_secs` 的区别很重要：
+    /// 上游"思考"多久是合法的（本地大模型 1–3s 很常见），所以不能拿隧道控制超时（2s）
+    /// 去卡它；但它也绝不该像 `timeout_secs` 那样等 120s —— agent 卡死（注册着但什么都
+    /// 不回）时每个请求都会把连接、并发槽位和缓冲区占满那么久（实测 40 并发钉住约
+    /// 620MB，客户端早已断开却无人发现）。**这里是实测确认的主要挂起点**。
+    #[serde(default = "default_head_timeout_secs")]
+    head_timeout_secs: u64,
     /// 每个 API Key 每分钟请求上限（0 = 不限流）
     #[serde(default)]
     rate_limit_per_min: u32,
@@ -71,6 +86,12 @@ fn default_timeout_secs() -> u64 {
     120
 }
 fn default_agent_stale_secs() -> u64 {
+    15
+}
+fn default_tunnel_op_secs() -> u64 {
+    2
+}
+fn default_head_timeout_secs() -> u64 {
     15
 }
 
@@ -121,6 +142,8 @@ pub fn from_file(cfg: ConfigFile) -> anyhow::Result<GatewayConfig> {
         keys_file: cfg.keys_file,
         request_timeout: Duration::from_secs(cfg.timeout_secs),
         agent_stale_after: Duration::from_secs(cfg.agent_stale_secs),
+        tunnel_op_timeout: Duration::from_secs(cfg.tunnel_op_secs),
+        head_timeout: Duration::from_secs(cfg.head_timeout_secs),
         rate_limit_per_min: cfg.rate_limit_per_min,
         max_concurrent_requests: cfg.max_concurrent_requests,
         tls,
@@ -274,6 +297,30 @@ rate_limit_per_min: 60
     #[test]
     fn unknown_fields_rejected() {
         assert!(serde_yaml_ng::from_str::<ConfigFile>("nonsense_field: 1").is_err());
+    }
+
+    /// `gateway_config.example.yml` 必须始终能解析，并且**覆盖到新增的字段**。
+    ///
+    /// 为什么值得一条测试：`ConfigFile` 开了 `deny_unknown_fields`，示例文件写错字段名
+    /// 会直接导致「照抄示例 → 网关起不来」；反过来新增字段若忘了写进示例，用户也看不到
+    /// 这个开关的存在（`tunnel_op_secs` / `head_timeout_secs` 就是这类旋钮）。
+    #[test]
+    fn example_config_parses_and_documents_knobs() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../gateway_config.example.yml");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("读不到 {}: {e}", path.display()));
+        let cfg: ConfigFile = serde_yaml_ng::from_str(&text)
+            .unwrap_or_else(|e| panic!("{} 解析失败（字段名写错？）: {e}", path.display()));
+        // 每个超时开关都必须出现在示例里，否则用户无从知道
+        for key in ["timeout_secs", "tunnel_op_secs", "head_timeout_secs"] {
+            assert!(
+                text.contains(key),
+                "gateway_config.example.yml 缺少配置项说明：{key}"
+            );
+        }
+        assert_eq!(cfg.tunnel_op_secs, default_tunnel_op_secs());
+        assert_eq!(cfg.head_timeout_secs, default_head_timeout_secs());
     }
 
     #[test]

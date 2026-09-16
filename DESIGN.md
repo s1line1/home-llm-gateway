@@ -105,7 +105,14 @@
 3. **限流**：token bucket 按 Key 限流；按 agent 并发上限 admission control（429）。
 4. **Agent 路由**：维护 agent 注册表（agent_id → 当前 QUIC 连接 + 健康状态）；按请求 `model` 过滤候选（精确声明优先、`models: ["*"]` 通配兜底），同组内取在途最少者（见 `MODEL_ROUTING.md`）；无健康 agent → 503，有健康 agent 但无人能服务该模型 → 404。
 5. **QUIC Server**：接受边缘端连接，校验 mTLS 证书，处理 Register/Heartbeat，更新注册表，踢掉同一 agent_id 的旧连接（防重复拨号）。
-6. **请求转发**：HTTP → `ProxyRequest` 帧 → 等 `ProxyResponse*` 帧流式回写；**逐帧空闲超时**（`timeout_secs`，默认 120s）→ `Cancel`。（总超时未实现——SSE 长流不能被整请求时限误杀，故只保留逐帧空闲超时。）
+6. **请求转发**：HTTP → `ProxyRequest` 帧 → 等 `ProxyResponse*` 帧流式回写。三条超时各管一段，**不要混用**：
+   | 超时 | 默认 | 覆盖范围 | 超时动作 |
+   |---|---|---|---|
+   | `tunnel_op_secs` | 2s | 隧道控制操作：打开流 / 发请求帧 / 取消帧 | 判定连接已死 → `502` + **摘除 agent 条目** |
+   | `head_timeout_secs` | 15s | 等上游**响应头**（首字节） | `504` + 摘除条目（请求已发出却什么都没回） |
+   | `timeout_secs` | 120s | 响应体**逐帧空闲**（SSE 靠"有帧就不超时"活着） | 发 `Cancel`，结束该流 |
+
+   （总超时仍未实现——SSE 长流不能被整请求时限误杀。响应头等待**不**能沿用 `timeout_secs`：agent 卡死时每个请求都会把连接、并发槽位与缓冲区占满那么久，实测 40 并发钉住约 620MB、客户端早已断开却无人发现。）
 7. **可观测性**：`tracing` 结构化日志 + `metrics`（请求数、延迟、token 量、在线 agent 数）。
 
 ## 6. 边缘端（edge-agent）设计

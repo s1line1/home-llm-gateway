@@ -138,22 +138,51 @@ async fn e2e_sse_streaming_passthrough() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn e2e_gateway_timeout_cancels_upstream() {
+    use futures_util::StreamExt;
+
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
-    // 网关空闲超时 150ms，而 mock 的 /v1/slow 要睡 800ms 才响应 → 应触发超时 + Cancel
+    // 网关**逐帧空闲**超时 150ms，而 mock 的 /v1/slow_body 立刻回响应头、正文睡 800ms。
+    //
+    // 注意用 /v1/slow_body 而不是 /v1/slow：后者卡的是**响应头**，归 `head_timeout` 管
+    // （另一个语义，默认 15s —— 上游"思考"是合法的）。这里测的是"响应头已到、正文不走"
+    // 这条路径，即 `forward_body` 的逐帧空闲超时。
+    //
+    // 契约：响应头已经发出去了，状态码不可能再变，所以**不能**断言 504；正确契约是
+    // 正文在超时点被截断（收不到 [DONE]，流以错误结束），而不是让客户端一直挂着。
     let (gw, agent, base, key) = start_stack(Duration::from_millis(150), 0, 4, None).await;
     let client = reqwest::Client::new();
 
+    let t0 = std::time::Instant::now();
     let resp = client
-        .post(format!("{base}/v1/slow"))
+        .post(format!("{base}/v1/slow_body"))
         .header("Authorization", format!("Bearer {key}"))
         .json(&serde_json::json!({ "model": "mock-llm" }))
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        resp.status(),
-        504,
-        "slow upstream should be cut off by idle timeout"
+    assert_eq!(resp.status(), 200, "响应头应当正常到达");
+
+    // 读正文：150ms 空闲超时后网关发 Cancel 并结束这条流 —— 应远早于上游的 800ms
+    let mut got = Vec::new();
+    let mut stream = resp.bytes_stream();
+    let read_all = async {
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(b) => got.extend_from_slice(&b),
+                Err(_) => break, // 流被截断
+            }
+        }
+    };
+    let _ = tokio::time::timeout(Duration::from_secs(5), read_all).await;
+    let text = String::from_utf8_lossy(&got);
+    assert!(
+        !text.contains("[DONE]"),
+        "上游还没出字就被空闲超时截断，不应收到 [DONE]；实际正文：{text:?}"
+    );
+    assert!(
+        t0.elapsed() < Duration::from_millis(700),
+        "应在 150ms 空闲超时量级结束，而不是等上游 800ms 出字；实际 {:?}",
+        t0.elapsed()
     );
 
     // Cancel 不应影响 agent 连接本身，之后仍能正常服务（/v1/models 由网关聚合回答）
@@ -281,6 +310,8 @@ async fn e2e_upstream_never_receives_client_credentials() {
         admin_token: None,
         keys_file: Some(keys_path),
         request_timeout: Duration::from_secs(10),
+        tunnel_op_timeout: Duration::from_secs(2),
+        head_timeout: Duration::from_secs(5),
         agent_stale_after: Duration::from_secs(10),
         rate_limit_per_min: 0,
         max_concurrent_requests: 0,

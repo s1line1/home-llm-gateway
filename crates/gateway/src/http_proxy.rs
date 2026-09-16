@@ -17,7 +17,7 @@ use proto::{
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crate::http::AppState;
 use crate::keystore::UsageDelta;
@@ -123,6 +123,64 @@ fn extract_model(body: &[u8]) -> Result<String, ()> {
     }
 }
 
+/// 打开一条隧道流（带超时）。
+///
+/// **为什么必须有超时**：健康隧道这一步是毫秒级（本机实测端到端固定开销 F≈56ms），
+/// 但隧道坏掉时开流/写帧可能长时间不返回——请求就一直挂在那里，占着连接、并发槽位和
+/// 缓冲区，客户端早已断开也发现不了。超时即判定连接已死，交给调用方摘除条目。
+///
+/// 实测补充：真正长时间卡住的是**等响应头**（见 [`proxy`] 里的 `head_timeout`）；
+/// s2n-quic 在连接已被判定关闭后，写会较快返回错误。两个超时都保留——两者互为兜底，
+/// 且触发时都必须摘除坏连接，否则后续请求会继续选中它。
+async fn open_tunnel(
+    entry: &mut crate::registry::Entry,
+    op_timeout: Duration,
+) -> Result<s2n_quic::stream::BidirectionalStream, String> {
+    match tokio::time::timeout(op_timeout, entry.conn.open_bidirectional_stream()).await {
+        Ok(Ok(s)) => Ok(s),
+        Ok(Err(e)) => Err(format!("tunnel open failed: {e}")),
+        Err(_) => {
+            warn!(agent = %entry.agent_id, timeout_ms = op_timeout.as_millis(), "tunnel open timed out; evicting agent");
+            Err("tunnel open timed out".into())
+        }
+    }
+}
+
+/// 往隧道写一个帧（带超时），并把超时记为 ERROR 级 —— 这是"隧道已死"的唯一可靠信号。
+///
+/// 同理：一个几 KB 的帧在健康隧道上是微秒级，`op_timeout` 内写不完就只能是连接坏了。
+async fn tunnel_write(
+    send: &mut s2n_quic::stream::SendStream,
+    frame: &Frame,
+    op_timeout: Duration,
+    request_id: u64,
+    agent_id: &str,
+) -> Result<(), String> {
+    match tokio::time::timeout(op_timeout, write_frame(send, frame)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(format!("tunnel write failed: {e}")),
+        Err(_) => {
+            error!(
+                request_id,
+                agent = %agent_id,
+                timeout_ms = op_timeout.as_millis(),
+                "tunnel write timed out; evicting agent"
+            );
+            Err("tunnel write timed out".into())
+        }
+    }
+}
+
+/// 尽力发一个取消帧：**失败就算了**，绝不在这里阻塞（它本身可能就是卡住的那条路）。
+async fn tunnel_cancel(
+    send: &mut s2n_quic::stream::SendStream,
+    request_id: u64,
+    op_timeout: Duration,
+) {
+    let cancel = Frame::Cancel { request_id };
+    let _ = tokio::time::timeout(op_timeout, write_frame(send, &cancel)).await;
+}
+
 pub async fn proxy(
     State(state): State<AppState>,
     method: Method,
@@ -173,10 +231,13 @@ pub async fn proxy(
         .and_then(|n| n.parse::<u64>().ok())
         .unwrap_or_else(|| NEXT_REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
 
-    let (mut recv, mut send) = match entry.conn.open_bidirectional_stream().await {
+    let (mut recv, mut send) = match open_tunnel(&mut entry, state.tunnel_op_timeout).await {
         Ok(s) => s.split(),
         Err(e) => {
-            return error_response(StatusCode::BAD_GATEWAY, format!("tunnel open failed: {e}"))
+            // 打不开流 = 这条连接已经死了 → 摘掉条目，后续请求立刻失败（或换别的 agent），
+            // 而不是每个请求都白等一次超时。
+            state.registry.evict(entry.stable_id);
+            return error_response(StatusCode::BAD_GATEWAY, e);
         }
     };
 
@@ -187,13 +248,27 @@ pub async fn proxy(
         headers: filter_headers(&headers),
         body: body.to_vec(),
     };
-    if let Err(e) = write_frame(&mut send, &request).await {
-        return error_response(StatusCode::BAD_GATEWAY, format!("tunnel write failed: {e}"));
+    if let Err(e) = tunnel_write(
+        &mut send,
+        &request,
+        state.tunnel_op_timeout,
+        request_id,
+        &entry.agent_id,
+    )
+    .await
+    {
+        state.registry.evict(entry.stable_id);
+        return error_response(StatusCode::BAD_GATEWAY, e);
     }
     debug!(request_id, "proxying request to agent");
 
-    // 读取响应头（带空闲超时）
-    let head = tokio::time::timeout(state.timeout, read_head(&mut recv)).await;
+    // 读取响应头（用 head_timeout，不是 request_timeout）。
+    //
+    // 以前这里用 `state.timeout`（默认 120s）：agent 一旦卡住（注册着但什么都不回），
+    // 每个请求都要把连接、并发槽位和缓冲区占满两分钟；客户端早就超时断开，而网关还停在
+    // 读上，连"客户端已断开"都发现不了（实测 40 并发 → 620MB 内存被钉住、日志停更）。
+    // 也不能用 `tunnel_op_timeout`（2s）：上游"思考"是合法的，本地模型 1–3s 很常见。
+    let head = tokio::time::timeout(state.head_timeout, read_head(&mut recv)).await;
     let (status, mut out_headers) = match head {
         Ok(Ok(HeadOutcome::Head(s, h))) => (s, h),
         Ok(Ok(HeadOutcome::Error(code, message))) => {
@@ -208,8 +283,16 @@ pub async fn proxy(
             return error_response(StatusCode::BAD_GATEWAY, format!("tunnel read failed: {e}"));
         }
         Err(_) => {
-            warn!(request_id, "upstream head timeout, sending cancel");
-            let _ = write_frame(&mut send, &Frame::Cancel { request_id }).await;
+            // 响应头超时：请求已经发出去了、对端却什么都没回 → 这条隧道已坏。
+            // 必须摘掉条目，否则后续每个请求都要再白等一次超时（"agent 注册着但卡住"
+            // 这个状态在对端进程消失时会一直保持，accept 循环不会返回、条目不会自己消失）。
+            warn!(
+                request_id,
+                agent = %entry.agent_id,
+                "upstream head timeout; evicting agent"
+            );
+            state.registry.evict(entry.stable_id);
+            tunnel_cancel(&mut send, request_id, state.tunnel_op_timeout).await;
             let _ = send.finish();
             return error_response(StatusCode::GATEWAY_TIMEOUT, "upstream timed out");
         }
@@ -222,6 +305,7 @@ pub async fn proxy(
     // usage 收集：提取上游 usage；无 usage（估算/取消/断流）→ 估算降级。
     let (tx, rx) = mpsc::channel::<Result<Bytes, String>>(32);
     let idle = state.timeout;
+    let op_timeout = state.tunnel_op_timeout;
     let metrics = state.metrics.clone();
     let key_store = state.key_store.clone();
     // 请求 body 的 prompt 估算（仅在无 usage 时使用）
@@ -232,8 +316,8 @@ pub async fn proxy(
         .any(|(k, v)| k.eq_ignore_ascii_case("content-type") && v.contains("text/event-stream"));
     tokio::spawn(async move {
         forward_body(
-            &mut recv, &mut send, request_id, tx, idle, slot, metrics, key_store, key_id, key_name,
-            prompt_est, is_stream,
+            &mut recv, &mut send, request_id, tx, idle, op_timeout, slot, metrics, key_store,
+            key_id, key_name, prompt_est, is_stream,
         )
         .await;
     });
@@ -398,6 +482,10 @@ impl UsageCollector {
 
 /// 把响应体帧流转发到通道；任一端关闭时向对端发 Cancel。
 /// `slot` 持有期间占用 agent 并发槽位，随任务结束释放。
+///
+/// `idle_timeout` 是**逐帧空闲**超时（响应阶段，SSE 长流靠"有帧就不超时"活着）；
+/// `op_timeout` 只用于取消帧的写——隧道坏掉时连 Cancel 都可能写不出去，绝不能在这里
+/// 阻塞（这正是"客户端已断开却发现不了"的死角）。
 #[allow(clippy::too_many_arguments)]
 async fn forward_body(
     recv: &mut s2n_quic::stream::ReceiveStream,
@@ -405,6 +493,7 @@ async fn forward_body(
     request_id: u64,
     tx: mpsc::Sender<Result<Bytes, String>>,
     idle_timeout: Duration,
+    op_timeout: Duration,
     _slot: crate::registry::SlotGuard,
     metrics: crate::metrics::Metrics,
     key_store: crate::keystore::KeyStore,
@@ -422,7 +511,7 @@ async fn forward_body(
                     // 客户端已断开 → 取消上游；仍结算已转发部分
                     warn!(request_id, "client disconnected, cancelling upstream");
                     usage.observe(&chunk);
-                    let _ = write_frame(send, &Frame::Cancel { request_id }).await;
+                    tunnel_cancel(send, request_id, op_timeout).await;
                     let _ = send.finish();
                     usage.finish();
                     return;
@@ -460,7 +549,7 @@ async fn forward_body(
                 // 空闲超时 → 取消上游；结算已转发部分
                 warn!(request_id, "upstream idle timeout, cancelling");
                 let _ = tx.send(Err("upstream idle timeout".into())).await;
-                let _ = write_frame(send, &Frame::Cancel { request_id }).await;
+                tunnel_cancel(send, request_id, op_timeout).await;
                 let _ = send.finish();
                 usage.finish();
                 return;

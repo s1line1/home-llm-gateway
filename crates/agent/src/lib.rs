@@ -105,7 +105,9 @@ async fn connect_once(
     client_config: rustls::ClientConfig,
 ) -> anyhow::Result<()> {
     // let limits = Limits::new().with_max_idle_timeout(Duration::from_secs(20))?; // 对齐 quinn 时代的 20s
-    let limits = Limits::new().with_max_open_remote_bidirectional_streams(1000)?;
+    let limits = Limits::new()
+        .with_max_idle_timeout(Duration::from_secs(20))?
+        .with_max_open_remote_bidirectional_streams(1000)?;
 
     // 不设 with_max_idle_timeout 时默认 30s（MaxIdleTimeout::RECOMMENDED）
     let client = s2n_quic::Client::builder()

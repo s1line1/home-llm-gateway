@@ -45,6 +45,19 @@ pub struct GatewayConfig {
     pub keys_file: Option<PathBuf>,
     /// 单次请求转发空闲超时（逐帧）。
     pub request_timeout: Duration,
+    /// 隧道控制操作超时（打开流 / 发送请求头 / 取消帧）。
+    ///
+    /// 与 `request_timeout` 的区别：后者是**逐帧空闲**超时，覆盖整个响应阶段（SSE 长流
+    /// 靠"有帧就不超时"活着，不能收紧）；前者只覆盖"响应头到达之前"那几步——健康隧道
+    /// 毫秒级完成，一旦超时即判定该 agent 的连接已死并摘除条目。没有它，隧道坏掉时
+    /// 这些 await 可能长时间不返回，请求会一直挂在那里占着连接与缓冲。
+    pub tunnel_op_timeout: Duration,
+    /// 等待上游响应头（首字节）的超时。
+    ///
+    /// 独立于 `tunnel_op_timeout`：上游"思考"时间是合法的（本地大模型 1–3s 常见），
+    /// 用 2s 的隧道控制超时去卡会误杀正常请求；但也不该沿用 `request_timeout`（120s），
+    /// 否则 agent 卡死时每个请求都把连接与缓冲占满两分钟（实测 40 并发钉住约 620MB）。
+    pub head_timeout: Duration,
     /// 超过该时长未心跳的 agent 视为失联。
     pub agent_stale_after: Duration,
     /// 每个 API Key 每分钟请求上限（0 = 不限流）。
@@ -135,6 +148,8 @@ impl Gateway {
             admin_token: cfg.admin_token,
             timeout: cfg.request_timeout,
             agent_stale_after: cfg.agent_stale_after,
+            tunnel_op_timeout: cfg.tunnel_op_timeout,
+            head_timeout: cfg.head_timeout,
             rate_limiter: RateLimiter::new(cfg.rate_limit_per_min),
             max_concurrent_requests: cfg.max_concurrent_requests,
             metrics: metrics.clone(),
