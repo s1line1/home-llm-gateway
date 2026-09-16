@@ -40,8 +40,11 @@ export default function () {
     { headers: { Authorization: `Bearer ${KEY}`, 'Content-Type': 'application/json' } },
   );
 
-  const events = (res.body.match(/data: /g) || []).length; // SSE 事件数（≈ token 数）
-  const done = res.body.includes('[DONE]');                // 流是否完整结束
+  // 请求失败（连不上/DNS/TLS 出错）时 res.body 是 null：直接 .match/.includes 会抛
+  // TypeError，k6 报 "script exception"，把"成功率 0"这个清晰信号糊成脚本异常。
+  const body = res.body || '';
+  const events = (body.match(/data: /g) || []).length; // SSE 事件数（≈ token 数）
+  const done = body.includes('[DONE]');                // 流是否完整结束
   const ok = res.status === 200 && done;
 
   sseDur.add(res.timings.duration);
