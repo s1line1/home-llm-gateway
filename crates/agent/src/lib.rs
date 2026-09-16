@@ -11,7 +11,7 @@ use proto::{
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use s2n_quic::{client::Connect, provider::limits::Limits};
 use tokio::io::AsyncWriteExt;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::stream::handle_stream;
 
@@ -185,7 +185,9 @@ async fn register(mut conn: s2n_quic::connection::Handle, cfg: &AgentConfig) -> 
     // open a new stream and split the receiving and sending sides
     let stream = conn.open_bidirectional_stream().await?;
     let client_id = stream.id();
-    println!("Register Server, client stream id : {client_id}");
+    // 曾经是 println!：没有时间戳、没有级别，混在日志里像噪声，措辞也不对
+    // （注册的是 agent，不是 server）。
+    debug!(client_id, "registering with cloud gateway");
 
     let (recv, mut send) = stream.split();
 
