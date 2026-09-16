@@ -115,13 +115,14 @@ async fn connect_once(
         cfg.heartbeat_interval,
     ));
 
+    let http = reqwest::Client::new();
     // ④ accept 循环用 acceptor（单消费者，独占）
     loop {
         match acceptor.accept_bidirectional_stream().await {
             Ok(Some(stream)) => {
                 tokio::spawn(handle_stream(
                     stream,
-                    reqwest::Client::new(),
+                    http.clone(),
                     cfg.upstream_base.clone(),
                     cfg.request_log,
                 ));
