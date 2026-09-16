@@ -238,7 +238,7 @@ agent 配置里 `max_concurrency: 2`（声明最多 2 个并发请求）。
 
 网关按 agent 声明的上限做并发占位，超限回 429，避免把 edge 的 GPU 打爆。
 
-**这个值该给多少，由网关侧内存决定**（每个在途流式请求约 15–20MB，见下节《并发上限与内存》）：`max_concurrency ≈ MemoryMax / 20MB` 再留三成余量。设得过大等于关掉这道闸门——请求全进隧道后网关自己会被 OOM 杀掉。
+**这个值该给多少，由网关侧内存决定**（每个在途流式请求约 15–20MB，见下节《并发上限与内存》）：`max_concurrency ≈ MemoryMax / 20MB` 再留三成余量。设得过大等于关掉这道闸门——请求全进隧道后网关自己会被 OOM 杀掉。网关侧的 `max_concurrent_requests` 是同一件事的总闸门，也要按同一公式收口。
 
 ### 多 agent（多台 LLM 机器，edge 异构模型）
 
@@ -300,11 +300,18 @@ max_concurrency: 4
 | 16 | 443–450MB | 12.0 req/s | 1288ms | 1418ms |
 | 32 | 654MB（峰值 749–786MB） | 16.0 req/s | 1346ms | 3708ms |
 
-三条结论：
+四条结论：
 
 - **`MemoryMax=1G` ≈ 40 个在途请求**。32 并发已到峰值 749MB（73%）；不要靠继续加并发提吞吐——16→32 并发翻倍只换来 +33% 吞吐，而 p95 从 1.4s 抬到 3.7s（瓶颈已不在网关）。
 - **`agent-config.yml` 的 `max_concurrency` 按内存定**：32 并发配 1G 上限是安全档位（≈ `MemoryMax / 20MB`，再留 30% 余量）。设成 `5000` 之类等于关掉 admission control，会把网关推到 OOM（实测 40 并发 620–780MB）。
 - **内存不随请求数累积，只随在途数**：停负载后回落到几百 MB 就不再降（分配器保留的高水位池），但持续跑几千个短请求不会继续涨。所以 `MemoryMax` 不要设成小值（见 `deploy/gateway.service` 里 `MemoryHigh` 的警告：会被冻死而不是被杀）。
+- **`max_concurrent_requests` 要收在内存之下，否则那道闸等于没有**。它管的是「所有路径的在途 HTTP 请求总数」（只有 `/metrics` 豁免，SSE 长流从开头占到最后一块 body 送完），超限返回 `429 + Retry-After`。默认/示例给 100，而 1G 内存只撑得住约 40 个在途——于是**先撞的是 `MemoryMax`（网关被 OOM 杀掉、连接中断），而不是这里优雅地 429**。按同一公式收口：
+
+  ```yaml
+  max_concurrent_requests: 32    # ≈ MemoryMax / 20MB，与 agent 的 max_concurrency 对齐
+  ```
+
+  三者职责不同、不能互相替代：`rate_limit_per_min` 管**每个 key 的速率**，agent 的 `max_concurrency` 管**每个 edge 的在途数**（保 GPU），这个字段管**整个网关的在途总数**（保网关自己）。
 
 ### 可观测性
 
