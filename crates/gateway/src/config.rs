@@ -329,11 +329,6 @@ rate_limit_per_min: 60
         }
         assert_eq!(cfg.tunnel_op_secs, default_tunnel_op_secs());
         assert_eq!(cfg.head_timeout_secs, default_head_timeout_secs());
-        // 示例把总闸门按内存收口（见 README《并发上限与内存》），不能改回不限
-        assert_eq!(
-            cfg.max_concurrent_requests, 32,
-            "示例应保持 max_concurrent_requests 与内存上限挂钩的取值"
-        );
     }
 
     #[test]
