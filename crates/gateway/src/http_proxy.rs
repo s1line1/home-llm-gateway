@@ -13,6 +13,7 @@ use proto::{
     io::{read_frame, write_frame},
     Frame,
 };
+
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -145,7 +146,7 @@ pub async fn proxy(
             return error_response(StatusCode::BAD_REQUEST, "model is required in request body")
         }
     };
-    let (entry, slot) = match state.registry.try_acquire(state.agent_stale_after, &model) {
+    let (mut entry, slot) = match state.registry.try_acquire(state.agent_stale_after, &model) {
         Ok(x) => x,
         Err(AcquireError::NoAgent) => {
             return error_response(StatusCode::SERVICE_UNAVAILABLE, "no edge available");
@@ -172,12 +173,13 @@ pub async fn proxy(
         .and_then(|n| n.parse::<u64>().ok())
         .unwrap_or_else(|| NEXT_REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
 
-    let (mut send, mut recv) = match entry.conn.open_bi().await {
-        Ok(s) => s,
+    let (mut recv, mut send) = match entry.conn.open_bidirectional_stream().await {
+        Ok(s) => s.split(),
         Err(e) => {
             return error_response(StatusCode::BAD_GATEWAY, format!("tunnel open failed: {e}"))
         }
     };
+
     let request = Frame::ProxyRequest {
         request_id,
         method: method.to_string(),
@@ -257,7 +259,7 @@ enum HeadOutcome {
 }
 
 /// 读取响应头帧（或错误帧）。
-async fn read_head(recv: &mut quinn::RecvStream) -> anyhow::Result<HeadOutcome> {
+async fn read_head(recv: &mut s2n_quic::stream::ReceiveStream) -> anyhow::Result<HeadOutcome> {
     loop {
         match read_frame(recv).await? {
             Some(Frame::ProxyResponseHead {
@@ -398,8 +400,8 @@ impl UsageCollector {
 /// `slot` 持有期间占用 agent 并发槽位，随任务结束释放。
 #[allow(clippy::too_many_arguments)]
 async fn forward_body(
-    recv: &mut quinn::RecvStream,
-    send: &mut quinn::SendStream,
+    recv: &mut s2n_quic::stream::ReceiveStream,
+    send: &mut s2n_quic::stream::SendStream,
     request_id: u64,
     tx: mpsc::Sender<Result<Bytes, String>>,
     idle_timeout: Duration,

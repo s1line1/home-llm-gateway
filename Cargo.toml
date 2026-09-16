@@ -16,13 +16,15 @@ futures-util = "0.3"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 postcard = { version = "1", features = ["alloc"] }
-quinn = { version = "0.11", default-features = false, features = ["rustls-ring", "runtime-tokio", "log"] }
 rcgen = "0.13"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
 rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# s2n-quic：默认 feature 走 s2n-tls（C 库）→ 显式关默认，只开 rustls provider；
+# provider-address-token-default 顺带带出 crypto/zerocopy/zeroize（关默认后必须显式开）
+s2n-quic = { version = "1.88", default-features = false, features = ["provider-address-token-default", "provider-tls-rustls"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync", "signal","io-std"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 tokio-util = { version = "0.7.19", features = ["rt"] }
@@ -32,9 +34,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "time"] }
 # time crate：日志时间戳固定东八区（UTC+8，无夏令时），不依赖系统时区设置
 time = { version = "0.3", features = ["formatting"] }
-# s2n-quic：默认 feature 走 s2n-tls（C 库）→ 显式关默认，只开 rustls provider；
-# provider-address-token-default 顺带带出 crypto/zerocopy/zeroize（关默认后必须显式开）
-s2n-quic = { version = "1.88", default-features = false, features = ["provider-address-token-default", "provider-tls-rustls"] }
 
 [workspace.dependencies.criterion]
 version = "0.8"

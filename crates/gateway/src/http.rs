@@ -1,6 +1,9 @@
 //! 公网 HTTP 入口：认证 → 路由 → 编码为隧道帧转发。
 
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use axum::{
     extract::{DefaultBodyLimit, Request, State},
@@ -34,6 +37,9 @@ pub struct AppState {
     pub metrics: Metrics,
     /// React UI 静态目录（None = `/` 显示构建提示页）。
     pub ui: Option<PathBuf>,
+    /// `ui_dir` 不可用的具体原因（None = 没配 ui_dir，或配了且可用）。
+    /// 由启动时 [`check_ui_dir`] 判定后写入，占位页会把它显示出来——否则用户只看到白屏/通用文案。
+    pub ui_problem: Option<String>,
 }
 
 pub fn app(state: AppState) -> Router {
@@ -139,9 +145,102 @@ async fn ui_fallback(State(state): State<AppState>, headers: HeaderMap, uri: Uri
     }
 }
 
-/// UI 未构建（ui_dir 缺失）时的占位提示页——不再内嵌任何管理功能。
-async fn ui_missing() -> Html<&'static str> {
-    Html(UI_MISSING)
+/// UI 未构建 / ui_dir 不可用时的占位提示页——不再内嵌任何管理功能。
+/// `state.ui_problem` 有值时把具体原因一并显示：浏览器本身就是诊断面。
+async fn ui_missing(State(state): State<AppState>) -> Html<String> {
+    Html(render_ui_missing(state.ui_problem.as_deref()))
+}
+
+/// `ui_dir` 是否真的能拿来托管。
+///
+/// 原来的判断只问"目录里有 index.html 吗"，而前端**源码**目录同样有——Vite 的
+/// `web/index.html` 里是 `<script type="module" src="/src/main.tsx">`，网关会把 TSX 当
+/// `application/octet-stream` 发出去，浏览器执行不了 → 页面全白且**一条错误都没有**。
+/// 所以这里问的是"这是一份能用的产物吗"。
+#[derive(Debug, PartialEq, Eq)]
+pub enum UiDirCheck {
+    /// 可用：index.html 在，且它引用的本地资源都能在磁盘上找到。
+    Usable,
+    /// 目录里没有 index.html（还没构建）。
+    NoIndex,
+    /// index.html 是前端**源码**入口（引用 /src/*），浏览器必然白屏。
+    SourceEntry,
+    /// index.html 引用的产物文件不存在（构建过期或 ui_dir 指错）。附上是哪一个。
+    MissingAsset(String),
+}
+
+/// 判定 `ui_dir` 是否是一份可托管的产物。放在 http.rs：只有这个模块知道
+/// "一份前端产物长什么样、怎么被托管"，lib.rs 只负责在启动时按结果编排。
+pub fn check_ui_dir(dir: &Path) -> UiDirCheck {
+    let Ok(html) = std::fs::read_to_string(dir.join("index.html")) else {
+        return UiDirCheck::NoIndex;
+    };
+    // Vite 的源码入口特征；换框架要跟着改（CRA 是 /static/js/…、Next export 是 /_next/…），
+    // 真正框架无关的兜底是下面的产物存在性检查。
+    if html.contains("src=\"/src/") || html.contains("src='/src/") {
+        return UiDirCheck::SourceEntry;
+    }
+    for asset in local_asset_refs(&html) {
+        if !dir.join(asset.trim_start_matches('/')).is_file() {
+            return UiDirCheck::MissingAsset(asset);
+        }
+    }
+    UiDirCheck::Usable
+}
+
+/// 抓 index.html 里 `src="/…"` / `href="/…"` 这类**本地静态资源**路径（去重、去掉 query/fragment）。
+///
+/// 只收"末段带扩展名"的引用，这条判据与 [`ui_fallback`] 的 `has_extension` 一致：
+/// SPA 前端路由（`/keys`、`/metrics`）会 fallback 到 index.html，磁盘上本来就没有对应文件，
+/// 误判成"缺失"会把一个**能用**的 UI 关掉——宁可漏报也不能误报。
+/// 同样跳过 http(s)://、协议相对的 //cdn、data:：那些不归 ui_dir 管。
+///
+/// 手写扫描而非引 HTML parser：只为一次启动自检不值得加依赖（metrics.rs 同样是手写无依赖）。
+fn local_asset_refs(html: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for attr in ["src=\"", "href=\"", "src='", "href='"] {
+        let quote = attr.chars().last().expect("attr ends with a quote");
+        let mut rest = html;
+        while let Some(idx) = rest.find(attr) {
+            rest = &rest[idx + attr.len()..];
+            let Some(end) = rest.find(quote) else { break };
+            let value = &rest[..end];
+            rest = &rest[end + quote.len_utf8()..];
+            if !value.starts_with('/') || value.starts_with("//") {
+                continue;
+            }
+            let path = value.split(['?', '#']).next().unwrap_or(value);
+            let looks_like_file = path.rsplit('/').next().is_some_and(|seg| seg.contains('.'));
+            if !looks_like_file {
+                continue;
+            }
+            if !out.iter().any(|p| p == path) {
+                out.push(path.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// 渲染占位页：`reason` 有值时插到最上面。
+/// 用 `replace` 而不是 `format!`，省得给 HTML 里那堆 CSS 花括号做转义。
+fn render_ui_missing(reason: Option<&str>) -> String {
+    let reason = match reason {
+        Some(r) => format!(
+            "<p class=\"problem\"><strong>ui_dir 不可用：</strong>{}</p>",
+            html_escape(r)
+        ),
+        None => String::new(),
+    };
+    UI_MISSING.replace("{reason}", &reason)
+}
+
+/// 原因串里含配置路径，属于外部输入，插进 HTML 前转义。
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 const UI_MISSING: &str = r#"<!doctype html>
@@ -153,10 +252,12 @@ const UI_MISSING: &str = r#"<!doctype html>
 <style>
   body { font-family: system-ui, -apple-system, "PingFang SC", sans-serif; max-width: 640px; margin: 64px auto; padding: 0 16px; line-height: 1.6; color: #1f2937; }
   code { background: #f1f5f9; padding: 1px 6px; border-radius: 4px; }
+  .problem { background: #fef2f2; border-left: 4px solid #dc2626; padding: 8px 12px; }
 </style>
 </head>
 <body>
 <h1>Home LLM Gateway</h1>
+{reason}
 <p>Web 管理面板尚未构建。构建前端后配置 <code>ui_dir</code> 并重启网关：</p>
 <pre>cd web &amp;&amp; pnpm install &amp;&amp; pnpm build</pre>
 <p>API 端点（<code>/v1/*</code>、<code>/admin/*</code>、<code>/metrics</code>、<code>/healthz</code>）不受影响。</p>
@@ -337,6 +438,7 @@ mod tests {
             max_concurrent_requests: 0,
             metrics: Metrics::default(),
             ui,
+            ui_problem: None,
         }
     }
 
@@ -671,6 +773,122 @@ mod tests {
             resp.status(),
             StatusCode::OK,
             "aborted in-flight request leaked the concurrency slot"
+        );
+    }
+
+    // ---- ui_dir 可用性判定 ----
+    // 曾经的事故：ui_dir 配成前端**源码**目录，index.html 照样在，于是被当成"已构建"托管出去，
+    // 浏览器拿到 application/octet-stream 的 TSX，页面全白且没有任何错误可查。
+
+    #[test]
+    fn check_ui_dir_reports_no_index() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(check_ui_dir(dir.path()), UiDirCheck::NoIndex);
+    }
+
+    #[test]
+    fn check_ui_dir_detects_vite_source_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("index.html"),
+            r#"<div id="root"></div><script type="module" src="/src/main.tsx"></script>"#,
+        )
+        .unwrap();
+        assert_eq!(check_ui_dir(dir.path()), UiDirCheck::SourceEntry);
+    }
+
+    #[test]
+    fn check_ui_dir_accepts_built_dist() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+        std::fs::write(dir.path().join("assets/index-abc.js"), "//built").unwrap();
+        std::fs::write(dir.path().join("assets/index-abc.css"), "/*built*/").unwrap();
+        std::fs::write(
+            dir.path().join("index.html"),
+            r#"<script type="module" crossorigin src="/assets/index-abc.js"></script>
+<link rel="stylesheet" crossorigin href="/assets/index-abc.css">"#,
+        )
+        .unwrap();
+        assert_eq!(check_ui_dir(dir.path()), UiDirCheck::Usable);
+    }
+
+    #[test]
+    fn check_ui_dir_flags_missing_asset() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("index.html"),
+            r#"<script type="module" src="/assets/index-abc.js"></script>"#,
+        )
+        .unwrap();
+        // 构建过期 / 目录指错：产物文件不在
+        assert_eq!(
+            check_ui_dir(dir.path()),
+            UiDirCheck::MissingAsset("/assets/index-abc.js".into())
+        );
+    }
+
+    #[test]
+    fn check_ui_dir_ignores_non_asset_refs() {
+        // 外部资源（http://、//cdn、data:）和 SPA 前端路由（无扩展名）都不是"缺失的产物"，
+        // 误判会把一个能用的 UI 关掉。
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+        std::fs::write(dir.path().join("assets/ok.css"), "/*x*/").unwrap();
+        std::fs::write(dir.path().join("favicon.ico"), "x").unwrap();
+        std::fs::write(
+            dir.path().join("index.html"),
+            r#"<link rel="stylesheet" href="/assets/ok.css">
+<link rel="preconnect" href="https://fonts.example.com">
+<link rel="icon" href="//cdn.example.com/favicon.ico">
+<link rel="icon" href="/favicon.ico">
+<img src="data:image/png;base64,AAAA">
+<a href="/keys">keys</a>
+<a href="/metrics">metrics</a>"#,
+        )
+        .unwrap();
+        assert_eq!(check_ui_dir(dir.path()), UiDirCheck::Usable);
+    }
+
+    #[test]
+    fn placeholder_page_shows_the_reason() {
+        let reason = "ui_dir 指向的是前端**源码**目录，不是构建产物（默认 web/dist）：web";
+        let html = render_ui_missing(Some(reason));
+        assert!(html.contains(reason), "占位页必须写出具体原因");
+        // 没原因时保持通用文案，且不残留占位符
+        let plain = render_ui_missing(None);
+        assert!(!plain.contains("{reason}"));
+        assert!(plain.contains("Web 管理面板尚未构建"));
+    }
+
+    #[test]
+    fn placeholder_page_escapes_the_reason() {
+        // reason 里含配置路径，属于外部输入
+        let html = render_ui_missing(Some("路径 <script>alert(1)</script>"));
+        assert!(!html.contains("<script>alert(1)</script>"));
+        assert!(html.contains("&lt;script&gt;"));
+    }
+
+    #[tokio::test]
+    async fn ui_missing_route_serves_the_problem() {
+        let mut state = test_state(None);
+        state.ui_problem = Some("ui_dir 指向源码目录：web".into());
+        let resp = app(state)
+            .oneshot(
+                axum::extract::Request::builder()
+                    .uri("/")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("ui_dir 指向源码目录：web"),
+            "浏览器打开 / 就该看到原因，而不是白屏/通用文案"
         );
     }
 }

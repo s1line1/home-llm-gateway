@@ -9,8 +9,11 @@ use rustls::{
 use crate::error::AgentError;
 
 /// 构造 s2n-quic ClientConfig：信任云端 CA，并携带 agent 客户端证书（mTLS）。
-/// 配置 keepalive + 空闲超时，保证网关重启后能及时发现断线并重连。
-pub fn rustls_client_config(
+///
+/// 这里只管 TLS。keepalive 和空闲超时都不是 TLS 配置项：前者是每连接的
+/// `conn.keep_alive(true)`，后者是端点侧的 `Limits::with_max_idle_timeout(..)`，
+/// 两者都在 `crate::connect_once` 里设置。
+pub fn rustls_client_tls(
     ca: &[CertificateDer<'static>],
     cert: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,

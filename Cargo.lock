@@ -761,7 +761,6 @@ dependencies = [
  "hyper-util",
  "mock-llm",
  "proto",
- "quinn",
  "rcgen",
  "reqwest",
  "rusqlite",

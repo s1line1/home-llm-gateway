@@ -192,6 +192,7 @@ mod tests {
             max_concurrent_requests: 0,
             metrics: Metrics::default(),
             ui: None,
+            ui_problem: None,
         }
     }
 

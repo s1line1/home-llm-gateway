@@ -141,7 +141,7 @@ async fn e2e_quic_control_stream_edge_frames() {
     // 裸 s2n-quic 客户端（复用 agent 的 mTLS 配置），不走 agent crate 逻辑
     let client = s2n_quic::Client::builder()
         .with_tls(s2n_quic::provider::tls::rustls::Client::from(Arc::new(
-            agent::tls::rustls_client_config(
+            agent::tls::rustls_client_tls(
                 std::slice::from_ref(&ca),
                 vec![client_cert.clone()],
                 client_key.clone_key(),
@@ -262,7 +262,7 @@ async fn e2e_quic_control_stream_edge_frames() {
     let bad_cli_cert = bad_cli
         .signed_by(&bad_key, &bad_ca_cert, &bad_ca_key)
         .unwrap();
-    let bad_cfg = agent::tls::rustls_client_config(
+    let bad_cfg = agent::tls::rustls_client_tls(
         &[bad_ca_cert.der().clone()],
         vec![bad_cli_cert.der().clone()],
         PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(bad_key.serialize_der())),
@@ -315,7 +315,7 @@ async fn e2e_proxy_protocol_edge_cases() {
     // 裸 s2n-quic 客户端：注册后按场景应答网关的代理请求
     let client = s2n_quic::Client::builder()
         .with_tls(s2n_quic::provider::tls::rustls::Client::from(Arc::new(
-            agent::tls::rustls_client_config(
+            agent::tls::rustls_client_tls(
                 std::slice::from_ref(&ca),
                 vec![client_cert.clone()],
                 client_key.clone_key(),
