@@ -51,12 +51,37 @@ impl Agent {
             cfg.client_cert.clone(),
             cfg.client_key.clone_key(),
         )?;
-        let task = tokio::spawn(run(cfg, client_config));
+        // 外层包一层守护：run 正常**永不返回**，一旦返回（panic / 被取消），进程就只是
+        // "看起来还在运行"——main 停在 shutdown_signal()，既不重连也不退出，日志里也
+        // 什么都没有。所以这里喊出来并让进程退出，交给外部守护重新拉起
+        // （deploy/agent.service 是 Restart=always / RestartSec=3）。静默的僵尸进程
+        // 比一次崩溃难查得多。
+        let task = tokio::spawn(async move {
+            let mut inner = AbortOnDrop(tokio::spawn(run(cfg, client_config)));
+            match (&mut inner.0).await {
+                Ok(()) => error!("agent run loop exited; exiting so the supervisor restarts us"),
+                Err(e) if e.is_panic() => {
+                    error!("agent run loop panicked: {e}; exiting so the supervisor restarts us")
+                }
+                Err(e) => warn!("agent run loop cancelled: {e}"),
+            }
+            std::process::exit(1);
+        });
         Ok(Self { task })
     }
 
     pub async fn shutdown(self) {
         self.task.abort();
+    }
+}
+
+/// 内层 run 任务的 Drop 兜底：外层被 abort（`Agent::shutdown`）时连带把它也 abort。
+/// 没有这层，`shutdown()` 只会停掉包装任务，真正的连接循环会变成孤儿继续跑。
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
