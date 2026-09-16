@@ -3,15 +3,24 @@
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicU32, AtomicUsize, Ordering},
         Arc, RwLock,
     },
     time::{Duration, Instant},
 };
 
-use quinn::Connection;
 use serde::Serialize;
 use tracing::{info, warn};
+
+/// 连接身份发号器：给每条注册进来的连接发一个**进程内唯一且永不复用**的编号。
+///
+/// 为什么不用 `Handle::id()`：那是 s2n-quic 的**端点内部**连接序号，源码注释写的是
+/// "stable and internally identifies a connection over the whole lifetime of **an endpoint**"，
+/// 而生成器是每个端点各自从 0 开始（s2n-quic-transport/src/endpoint/mod.rs:79,323、
+/// src/connection/internal_connection_id.rs:26-32）——跨端点必然撞号：注册表的单元测试
+/// 里每次新建一对端点，两条连接的 id 都是 0，于是 `remove_if_same` 会误删同名新连接的条目。
+/// 注册表要的是"同一进程内、对一条连接稳定、且不复用"的编号（复用同样会导致误删），自己发号最稳。
+static NEXT_CONN_ID: AtomicUsize = AtomicUsize::new(1);
 
 /// agent 明细快照（供 /admin/agents 管理接口序列化）。
 #[derive(Debug, Clone, Serialize)]
@@ -30,9 +39,9 @@ pub struct Registry {
     inner: Arc<RwLock<HashMap<String, Entry>>>,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Entry {
-    pub conn: Connection,
+    pub conn: s2n_quic::connection::Handle,
     pub stable_id: usize,
     pub models: Vec<String>,
     pub max_concurrency: u32,
@@ -43,19 +52,23 @@ pub struct Entry {
 
 impl Registry {
     /// 注册 agent；若同名 agent 已有其他连接，关闭旧连接。
+    ///
+    /// 返回本次注册分配的 `stable_id`：调用方之后要用它调 [`Self::remove_if_same`] 摘除条目，
+    /// 所以**必须用这个返回值**，不要自己另算一份——`Entry.stable_id` 由这里独占决定，
+    /// 两处各算一次就会对不上，连接结束时条目永远摘不掉（注册表只增不减）。
     pub fn register(
         &self,
         agent_id: String,
         models: Vec<String>,
         max_concurrency: u32,
-        conn: Connection,
-    ) {
-        let stable_id = conn.stable_id();
+        conn: s2n_quic::connection::Handle,
+    ) -> usize {
+        let stable_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
         let mut inner = self.inner.write().unwrap();
         if let Some(old) = inner.get(&agent_id) {
             if old.stable_id != stable_id {
                 warn!(agent = %agent_id, "duplicate agent connection, closing old one");
-                old.conn.close(0u32.into(), b"duplicate agent");
+                old.conn.close(0u32.into())
             }
         }
         inner.insert(
@@ -69,6 +82,7 @@ impl Registry {
                 last_seen: Instant::now(),
             },
         );
+        stable_id
     }
 
     pub fn heartbeat(&self, agent_id: &str) {
@@ -202,15 +216,23 @@ impl Drop for SlotGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
     use rcgen::{CertificateParams, KeyPair};
     use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 
-    /// 建立一对本地 QUIC 端点并返回客户端连接（无 mTLS，仅用于构造 Connection）。
-    /// 返回后端点随作用域结束 drop，连接被关闭，但 stable_id / inflight 字段仍可读，
-    /// 注册表测试不依赖连接可用性。
-    async fn test_connection() -> Connection {
+    /// 建一对本地 s2n-quic 端点，返回**客户端连接句柄**（无 mTLS，只为构造 Handle）。
+    ///
+    /// 返回 `Handle` 而不是 `Connection`，因为注册表里存的就是 Handle（`Entry.conn`）：
+    /// Handle 是 `#[derive(Clone, Debug)]`（s2n-quic/src/connection/handle.rs:431），
+    /// 既能进 HashMap 也能被 `try_acquire` clone 出来；而 `Connection` 没有 Clone。
+    ///
+    /// 返回后端点随作用域结束 drop、连接随之关闭，但测试只读 `id()` 与 `inflight`：
+    /// `Handle::id()` 是无锁的字段读取、也不返回 Result
+    /// （s2n-quic-transport/src/connection/connection_container.rs:319-321），
+    /// 所以连接死掉之后读 id 依然有效——注册表测试不依赖连接可用性。
+    async fn test_connection() -> s2n_quic::connection::Handle {
         proto::install_ring_crypto_provider();
+
+        // 服务端：自签证书；ALPN 两端必须一致，否则握手协商不上
         let key = KeyPair::generate().unwrap();
         let cert = CertificateParams::new(vec!["localhost".to_string()])
             .unwrap()
@@ -219,54 +241,71 @@ mod tests {
         let cert_der = cert.der().clone();
         let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
 
-        let tls = rustls::ServerConfig::builder()
+        let mut stls = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(vec![cert_der.clone()], key_der)
             .unwrap();
-        let quic = QuicServerConfig::try_from(tls).unwrap();
-        let mut scfg = quinn::ServerConfig::with_crypto(Arc::new(quic));
-        let mut transport = quinn::TransportConfig::default();
-        transport.max_idle_timeout(Some(Duration::from_secs(10).try_into().unwrap()));
-        scfg.transport_config(Arc::new(transport));
-        let server = quinn::Endpoint::server(scfg, "127.0.0.1:0".parse().unwrap()).unwrap();
+        stls.alpn_protocols = vec![proto::ALPN.to_vec()];
+
+        let mut server = s2n_quic::Server::builder()
+            .with_tls(s2n_quic::provider::tls::rustls::Server::from(Arc::new(
+                stls,
+            )))
+            .unwrap()
+            .with_io("127.0.0.1:0")
+            .unwrap()
+            .start()
+            .unwrap();
         let server_addr = server.local_addr().unwrap();
-        // 必须驱动服务端 accept 循环，否则 QUIC 握手永远无法完成
+
+        // 必须驱动服务端 accept，否则 QUIC 握手永远无法完成；
+        // 握完把两半句柄挂在 pending 上——返回会 drop 句柄、立刻关掉连接。
         tokio::spawn(async move {
-            while let Some(incoming) = server.accept().await {
-                tokio::spawn(async move {
-                    let _ = incoming.await;
-                });
+            if let Some(conn) = server.accept().await {
+                let (_handle, _acceptor) = conn.split();
+                std::future::pending::<()>().await;
             }
         });
 
+        // 客户端：信任自签证书（无 mTLS），ALPN 与服务端一致
         let mut roots = rustls::RootCertStore::empty();
         roots.add(cert_der).unwrap();
-        let client_tls = rustls::ClientConfig::builder()
+        let mut ctls = rustls::ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
-        let client_cfg =
-            quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(client_tls).unwrap()));
-        let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
-        client.set_default_client_config(client_cfg);
-        client
-            .connect(server_addr, "localhost")
+        ctls.alpn_protocols = vec![proto::ALPN.to_vec()];
+
+        let client = s2n_quic::Client::builder()
+            .with_tls(s2n_quic::provider::tls::rustls::Client::from(Arc::new(
+                ctls,
+            )))
             .unwrap()
+            .with_io("0.0.0.0:0")
+            .unwrap()
+            .start()
+            .unwrap();
+
+        let conn = client
+            .connect(s2n_quic::client::Connect::new(server_addr).with_server_name("localhost"))
             .await
-            .unwrap()
+            .unwrap();
+        let (handle, _acceptor) = conn.split();
+        handle
     }
 
     #[tokio::test]
     async fn register_duplicate_replaces_and_len() {
         let reg = Registry::default();
         let c1 = test_connection().await;
-        reg.register("home-1".into(), vec!["m".into()], 2, c1.clone());
+        let id1 = reg.register("home-1".into(), vec!["m".into()], 2, c1.clone());
         assert_eq!(reg.len(), 1);
         // 同名重复注册：旧连接被关闭，条目替换为新连接，长度仍为 1
         let c2 = test_connection().await;
-        reg.register("home-1".into(), vec!["m".into()], 2, c2.clone());
+        let id2 = reg.register("home-1".into(), vec!["m".into()], 2, c2.clone());
         assert_eq!(reg.len(), 1);
         let entry = reg.inner.read().unwrap().get("home-1").cloned().unwrap();
-        assert_eq!(entry.stable_id, c2.stable_id());
+        assert_ne!(id1, id2, "每次注册都必须拿到新的 stable_id");
+        assert_eq!(entry.stable_id, id2, "条目应属于后注册的那条连接");
     }
 
     #[tokio::test]
@@ -274,16 +313,16 @@ mod tests {
         let reg = Registry::default();
         let c1 = test_connection().await;
         let c2 = test_connection().await;
-        reg.register("x".into(), vec![], 4, c1.clone());
-        reg.register("x".into(), vec![], 4, c2.clone()); // 条目换成 c2，c1 被关
-                                                         // 用旧连接的 stable_id 移除 → 不删除（条目现在属于 c2）
-        reg.remove_if_same("x", c1.stable_id());
+        let id1 = reg.register("x".into(), vec![], 4, c1.clone());
+        let id2 = reg.register("x".into(), vec![], 4, c2.clone()); // 条目换成 c2，c1 被关
+                                                                   // 用旧连接的 stable_id 移除 → 不删除（条目现在属于 c2）
+        reg.remove_if_same("x", id1);
         assert_eq!(reg.len(), 1);
         // 用当前连接的 stable_id 移除 → 删除
-        reg.remove_if_same("x", c2.stable_id());
+        reg.remove_if_same("x", id2);
         assert_eq!(reg.len(), 0);
         // 对不存在的 agent 移除 → 无害
-        reg.remove_if_same("ghost", c2.stable_id());
+        reg.remove_if_same("ghost", id2);
     }
 
     #[tokio::test]

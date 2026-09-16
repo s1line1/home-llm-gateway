@@ -46,7 +46,7 @@ impl Agent {
     pub fn start(cfg: AgentConfig) -> anyhow::Result<Self> {
         // 双 provider（ring + aws-lc-rs）共存时必须显式安装，见 proto::install_ring_crypto_provider
         proto::install_ring_crypto_provider();
-        let client_config = tls::rustls_client_config(
+        let client_config = tls::rustls_client_tls(
             &cfg.ca_cert,
             cfg.client_cert.clone(),
             cfg.client_key.clone_key(),
@@ -82,7 +82,7 @@ async fn connect_once(
     // let limits = Limits::new().with_max_idle_timeout(Duration::from_secs(20))?; // 对齐 quinn 时代的 20s
     let limits = Limits::new().with_max_open_remote_bidirectional_streams(1000)?;
 
-    // limits默认是 30s
+    // 不设 with_max_idle_timeout 时默认 30s（MaxIdleTimeout::RECOMMENDED）
     let client = s2n_quic::Client::builder()
         .with_tls(s2n_quic::provider::tls::rustls::Client::from(Arc::new(
             client_config,
@@ -94,6 +94,8 @@ async fn connect_once(
         .connect(Connect::new(cfg.cloud_addr).with_server_name(cfg.server_name.clone()))
         .await?;
 
+    // 保活：周期 = (协商后的空闲超时 × 3/4) 与 max_keep_alive_period（默认 30s）取小
+    // —— 这里是 min(10s × 3/4, 30s) = 7.5s，小于 10s 的空闲超时，网关才不会把连接判空闲关掉。
     conn.keep_alive(true)?;
 
     // ① 先拆：Handle 用来"开流"（Register/Heartbeat），acceptor 用来"收流"（代理请求）
@@ -411,7 +413,7 @@ mod tests {
             cli_cert,
             cli_key,
         );
-        let cc = tls::rustls_client_config(
+        let cc = tls::rustls_client_tls(
             &cfg.ca_cert,
             cfg.client_cert.clone(),
             cfg.client_key.clone_key(),
@@ -429,7 +431,7 @@ mod tests {
         let (ca, srv_cert, srv_key, cli_cert, cli_key) = gen_pki();
         let (addr, mut rx) = test_server(&ca, srv_cert, srv_key).await;
         let cfg = test_agent_config(addr, ca.clone(), cli_cert, cli_key);
-        let cc = tls::rustls_client_config(
+        let cc = tls::rustls_client_tls(
             &cfg.ca_cert,
             cfg.client_cert.clone(),
             cfg.client_key.clone_key(),

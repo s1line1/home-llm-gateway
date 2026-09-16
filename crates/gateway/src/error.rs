@@ -22,6 +22,13 @@ pub enum GatewayError {
 
     #[error("证书校验器构造失败: {0}")]
     Verifier(#[from] rustls::client::VerifierBuilderError),
+
+    /// s2n-quic 端点启动失败（`Server::builder().start()`）。
+    #[error("QUIC 端点启动失败: {0}")]
+    QuicStart(#[from] s2n_quic::provider::StartError),
+
+    #[error("不可达（Infallible 不可构造）")]
+    Infallible(#[from] std::convert::Infallible),
 }
 
 impl From<String> for GatewayError {
