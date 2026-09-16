@@ -18,7 +18,7 @@ use hyper_util::rt::TokioIo;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::TlsAcceptor;
 use tower::Service as TowerService;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::{keystore::KeyStore, metrics::Metrics, ratelimit::RateLimiter, registry::Registry};
 
@@ -100,15 +100,35 @@ impl Gateway {
         let listener = tokio::net::TcpListener::bind(cfg.http_bind).await?;
         let http_addr = listener.local_addr()?;
 
-        // UI 静态目录：仅当目录内存在 index.html 时启用（否则 `/` 显示构建提示页）
-        let ui = cfg.ui_dir.as_ref().and_then(|p| {
-            if p.join("index.html").is_file() {
-                Some(p.clone())
-            } else {
-                warn!(path = %p.display(), "ui_dir set but index.html not found; GET / will show a placeholder");
-                None
-            }
-        });
+        // UI 静态目录：必须确认它是**一份能用的产物**，而不只是"有 index.html"——
+        // Vite 的源码目录同样有 index.html，托管出去只会让浏览器白屏（见 http::check_ui_dir）。
+        // 判定不通过就降级到占位页，并把具体原因写进 state，让页面自己说清楚。
+        let (ui, ui_problem) = match cfg.ui_dir.as_deref() {
+            None => (None, None),
+            Some(p) => match http::check_ui_dir(p) {
+                http::UiDirCheck::Usable => (Some(p.to_path_buf()), None),
+                // 还没构建：占位页自带的通用文案（"构建前端后配置 ui_dir"）正好适用
+                http::UiDirCheck::NoIndex => {
+                    warn!(path = %p.display(), "ui_dir 下没有 index.html；GET / 显示构建提示页");
+                    (None, None)
+                }
+                http::UiDirCheck::SourceEntry => {
+                    let msg = format!(
+                        "ui_dir 指向的是前端**源码**目录，不是构建产物（默认 web/dist）：{}",
+                        p.display()
+                    );
+                    error!(path = %p.display(), "{msg}；浏览器只会白屏，GET / 已改显示本提示页");
+                    (None, Some(msg))
+                }
+                http::UiDirCheck::MissingAsset(asset) => {
+                    let msg = format!(
+                        "index.html 引用的产物不存在：{asset}（构建过期，或 ui_dir 指向了别处）"
+                    );
+                    warn!(path = %p.display(), missing = %asset, "{msg}；GET / 显示构建提示页");
+                    (None, Some(msg))
+                }
+            },
+        };
 
         let metrics = Metrics::default();
         let state = http::AppState {
@@ -121,6 +141,7 @@ impl Gateway {
             max_concurrent_requests: cfg.max_concurrent_requests,
             metrics: metrics.clone(),
             ui,
+            ui_problem,
         };
         let app = http::app(state);
 
