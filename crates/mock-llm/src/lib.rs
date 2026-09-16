@@ -27,6 +27,9 @@ pub fn router(name: &str) -> Router {
         .route("/v1/chat/completions", post(chat))
         .route("/v1/embeddings", post(embeddings))
         .route("/v1/slow", post(slow))
+        // 立刻回响应头、但正文迟迟不出：用来测**响应体空闲超时**（/v1/slow 卡的是响应头，
+        // 属于另一条超时——网关的 head_timeout；两者语义不同，必须分开测）。
+        .route("/v1/slow_body", post(slow_body))
         .with_state(AppState {
             name: Arc::from(name),
         })
@@ -135,4 +138,28 @@ async fn embeddings(
 async fn slow(State(st): State<AppState>) -> Json<serde_json::Value> {
     tokio::time::sleep(Duration::from_millis(800)).await;
     Json(serde_json::json!({ "ok": true, "slow": true, "server": st.name.as_ref() }))
+}
+
+/// 慢**正文**端点：响应头立刻返回（SSE），正文在 800ms 后才出第一块。
+/// 用于测「响应体逐帧空闲超时」——与 /v1/slow（卡响应头）语义不同。
+async fn slow_body(State(st): State<AppState>) -> Response {
+    let name = st.name.clone();
+    let s = stream! {
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let chunk = serde_json::json!({
+            "id": "chatcmpl-slow-body",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "mock-llm",
+            "server": name.as_ref(),
+            "choices": [{ "index": 0, "delta": { "content": "x" }, "finish_reason": null }]
+        });
+        yield Ok::<_, Infallible>(Bytes::from(format!("data: {chunk}\n\n")));
+        yield Ok::<_, Infallible>(Bytes::from("data: [DONE]\n\n".to_string()));
+    };
+    Response::builder()
+        .header(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"))
+        .header(CACHE_CONTROL, HeaderValue::from_static("no-cache"))
+        .body(Body::from_stream(s))
+        .unwrap()
 }

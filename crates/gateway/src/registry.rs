@@ -43,6 +43,10 @@ pub struct Registry {
 pub struct Entry {
     pub conn: s2n_quic::connection::Handle,
     pub stable_id: usize,
+    /// 注册时的 agent_id。`try_acquire` 只交出 `Entry`（HashMap 的 key 不在其中），
+    /// 而隧道写超时后需要按 stable_id 把这条坏连接摘掉（见 [`Registry::evict`]），
+    /// 所以 id 必须随条目一起带出来。
+    pub agent_id: String,
     pub models: Vec<String>,
     pub max_concurrency: u32,
     /// 当前在途请求数（admission control）。
@@ -72,10 +76,11 @@ impl Registry {
             }
         }
         inner.insert(
-            agent_id,
+            agent_id.clone(),
             Entry {
                 conn,
                 stable_id,
+                agent_id,
                 models,
                 max_concurrency,
                 inflight: Arc::new(AtomicU32::new(0)),
@@ -99,6 +104,31 @@ impl Registry {
                 inner.remove(agent_id);
                 info!(agent = %agent_id, "agent removed (connection closed)");
             }
+        }
+    }
+
+    /// 按 stable_id 摘除条目：用于"隧道控制操作超时 = 这条连接已经死了"的场合
+    /// （打开流 / 写请求帧 / 等响应头任一超时）。
+    ///
+    /// 为什么必须有这条路径：注册表条目原本只在 `accept_bidirectional_stream()` 返回时
+    /// 才被摘掉，而对端进程消失（没有 CONNECTION_CLOSE）时那个循环不会返回——条目会一直
+    /// 留着，后续请求继续选中同一条死连接，每个都白等一次超时。超时是"连接已死"的
+    /// 可靠信号，据此摘掉，后续请求才会立刻落到 `NoAgent`（503）或别的 agent 上。
+    ///
+    /// 返回是否真的摘掉了（false = 已经被别人摘掉/已被新连接替换）。
+    pub fn evict(&self, stable_id: usize) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        let hit = inner
+            .iter()
+            .find(|(_, e)| e.stable_id == stable_id)
+            .map(|(k, _)| k.clone());
+        match hit {
+            Some(agent_id) => {
+                inner.remove(&agent_id);
+                info!(agent = %agent_id, "agent evicted (tunnel op timed out)");
+                true
+            }
+            None => false,
         }
     }
 

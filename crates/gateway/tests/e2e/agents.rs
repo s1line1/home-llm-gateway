@@ -64,6 +64,8 @@ async fn e2e_multi_agent_least_loaded() {
         admin_token: None,
         keys_file: Some(keys_path),
         request_timeout: Duration::from_secs(10),
+        tunnel_op_timeout: Duration::from_secs(2),
+        head_timeout: Duration::from_secs(5),
         agent_stale_after: Duration::from_secs(10),
         rate_limit_per_min: 0,
         max_concurrent_requests: 0,
@@ -184,6 +186,8 @@ async fn e2e_model_routing_and_models_endpoint() {
         admin_token: None,
         keys_file: Some(keys_path),
         request_timeout: Duration::from_secs(10),
+        tunnel_op_timeout: Duration::from_secs(2),
+        head_timeout: Duration::from_secs(5),
         agent_stale_after: Duration::from_secs(10),
         rate_limit_per_min: 0,
         max_concurrent_requests: 0,
@@ -346,6 +350,8 @@ async fn e2e_client_cancel_does_not_leak_concurrency_slot() {
         admin_token: None,
         keys_file: Some(keys_path),
         request_timeout: Duration::from_secs(30),
+        tunnel_op_timeout: Duration::from_secs(2),
+        head_timeout: Duration::from_secs(5),
         agent_stale_after: Duration::from_secs(10),
         rate_limit_per_min: 0,
         max_concurrent_requests: 1,
@@ -446,6 +452,8 @@ async fn e2e_streaming_holds_concurrency_slot_until_body_ends() {
         admin_token: None,
         keys_file: Some(keys_path),
         request_timeout: Duration::from_secs(30),
+        tunnel_op_timeout: Duration::from_secs(2),
+        head_timeout: Duration::from_secs(5),
         agent_stale_after: Duration::from_secs(10),
         rate_limit_per_min: 0,
         max_concurrent_requests: 1,
@@ -554,6 +562,8 @@ async fn e2e_mid_stream_cancel_releases_concurrency_slot() {
         admin_token: None,
         keys_file: Some(keys_path),
         request_timeout: Duration::from_secs(30),
+        tunnel_op_timeout: Duration::from_secs(2),
+        head_timeout: Duration::from_secs(5),
         agent_stale_after: Duration::from_secs(10),
         rate_limit_per_min: 0,
         max_concurrent_requests: 1,
@@ -662,6 +672,8 @@ async fn e2e_http_concurrent_request_limit() {
         admin_token: None,
         keys_file: Some(keys_path),
         request_timeout: Duration::from_secs(10),
+        tunnel_op_timeout: Duration::from_secs(2),
+        head_timeout: Duration::from_secs(5),
         agent_stale_after: Duration::from_secs(10),
         rate_limit_per_min: 0,
         max_concurrent_requests: 1,
@@ -713,5 +725,133 @@ async fn e2e_http_concurrent_request_limit() {
     let _ = rb.bytes().await;
 
     agent.shutdown().await;
+    gw.shutdown().await;
+}
+
+/// 隧道卡死（对端在、但不回任何东西）时，请求必须**快速失败**，而不是永久挂起。
+///
+/// 这是现网踩过的坑：agent 进程消失（没有 CONNECTION_CLOSE）后，网关的
+/// `open_bidirectional_stream` / `write_frame` 永远不返回 → 请求永久挂起、
+/// 客户端断开也发现不了、缓冲区被钉住（实测 40 并发钉住 620MB）、连新的 QUIC
+/// 握手都不再处理。回归点有两个：
+///   ① 首个请求在 tunnel_op_timeout 量级内返回（不是 request_timeout，更不是永不返回）；
+///   ② 坏连接被摘掉，**后续请求立刻 503**（否则每个请求都要白等一次超时）。
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn e2e_dead_tunnel_fails_fast_instead_of_hanging() {
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    let (ca, server_cert, server_key, client_cert, client_key) = gen_certs();
+    let (keys_path, key) = seed_keys_db();
+
+    // request_timeout 给 5s：如果失败来自"读到响应头才超时"（504）就会花 5s，
+    // 而隧道**写**超时是 500ms —— 两者在时间上可区分，断言才不会失真。
+    let gw = Gateway::start(GatewayConfig {
+        http_bind: "127.0.0.1:0".parse().unwrap(),
+        quic_bind: "127.0.0.1:0".parse().unwrap(),
+        ca_cert: vec![ca.clone()],
+        server_cert: vec![server_cert.clone()],
+        server_key,
+        admin_token: None,
+        keys_file: Some(keys_path),
+        request_timeout: Duration::from_secs(5),
+        tunnel_op_timeout: Duration::from_millis(500),
+        head_timeout: Duration::from_millis(400),
+        agent_stale_after: Duration::from_secs(10),
+        rate_limit_per_min: 0,
+        max_concurrent_requests: 0,
+        tls: None,
+        ui_dir: None,
+    })
+    .await
+    .unwrap();
+
+    // 裸 QUIC 客户端冒充 agent：注册成功后就**什么都不做**（不读流、不回帧、不出字）。
+    let client = s2n_quic::Client::builder()
+        .with_tls(s2n_quic::provider::tls::rustls::Client::from(
+            std::sync::Arc::new(
+                agent::tls::rustls_client_tls(
+                    std::slice::from_ref(&ca),
+                    vec![client_cert.clone()],
+                    client_key.clone_key(),
+                )
+                .unwrap(),
+            ),
+        ))
+        .unwrap()
+        .with_io("0.0.0.0:0")
+        .unwrap()
+        .start()
+        .unwrap();
+    let mut conn = client
+        .connect(s2n_quic::client::Connect::new(gw.quic_addr).with_server_name("localhost"))
+        .await
+        .unwrap();
+    let stream = conn.open_bidirectional_stream().await.unwrap();
+    let (mut reg_recv, mut reg_send) = stream.split();
+    write_frame(
+        &mut reg_send,
+        &Frame::Register {
+            agent_id: "stuck-edge".into(),
+            models: vec!["mock-llm".into()],
+            max_concurrency: 4,
+            version: "test".into(),
+        },
+    )
+    .await
+    .unwrap();
+    reg_send.finish().unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut reg_recv)).await;
+    wait_for_agents(&gw, 1, Duration::from_secs(5)).await;
+
+    let http = reqwest::Client::new();
+    let url = format!("http://{}/v1/chat/completions", gw.http_addr);
+    let send = || {
+        http.post(&url)
+            .header("Authorization", format!("Bearer {key}"))
+            .json(&serde_json::json!({ "model": "mock-llm", "stream": true,
+                                      "messages": [{ "role": "user", "content": "hi" }] }))
+    };
+
+    // ① 第一个请求：必须在 500ms 超时量级返回，绝不能挂到 5s（更不能永不返回）
+    let t0 = std::time::Instant::now();
+    let resp = tokio::time::timeout(Duration::from_secs(4), send().send())
+        .await
+        .expect("请求必须在 4s 内结束：隧道写没有超时保护时会永久挂起")
+        .unwrap();
+    let elapsed = t0.elapsed();
+    // 卡死发生在"等响应头"这一步 → 504 GATEWAY_TIMEOUT（对端什么都没回）
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::GATEWAY_TIMEOUT,
+        "隧道卡死应快速返回 504，而不是挂在读上等满 request_timeout"
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "必须在隧道操作超时（500ms）量级失败，实际 {elapsed:?}——说明用的是 request_timeout（5s）而非隧道超时"
+    );
+    let body = resp.text().await.unwrap_or_default();
+    assert!(
+        body.contains("upstream timed out"),
+        "错误信息应说明是上游/隧道超时，实际：{body}"
+    );
+
+    // ② 坏连接必须已被摘掉 → 后续请求立刻 503，而不是每个都白等一次超时
+    let t1 = std::time::Instant::now();
+    let resp2 = tokio::time::timeout(Duration::from_secs(2), send().send())
+        .await
+        .expect("第二个请求也必须快速结束")
+        .unwrap();
+    assert_eq!(
+        resp2.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        "坏 agent 摘除后应立刻 503 no edge available"
+    );
+    assert!(
+        t1.elapsed() < Duration::from_millis(800),
+        "第二个请求应几乎立即失败（不该再等一次隧道超时），实际 {:?}",
+        t1.elapsed()
+    );
+    assert_eq!(gw.agent_count(), 0, "卡死的 agent 条目应已被摘除");
+
     gw.shutdown().await;
 }

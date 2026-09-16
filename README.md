@@ -267,6 +267,23 @@ max_concurrency: 4
 - 超过 `agent_stale_secs`（网关配置，默认 15s）未心跳的 agent **不再参与路由**（503/404）；注册表条目要等连接真正关闭才摘除，因此 `/metrics hlmg_agents` 与 `/admin/agents` 在失联期间仍会把它算作在线
 - 全部占满时返回 429
 
+### 超时与"隧道卡死"排障
+
+三条超时各管一段（详见 `DESIGN.md` §5.6），配置项都在 `gateway-config.yml`：
+
+| 配置 | 默认 | 覆盖范围 | 超时后 |
+|---|---|---|---|
+| `tunnel_op_secs` | 2s | 打开隧道流 / 发请求帧 / 取消帧 | `502` + 摘除该 agent 条目 |
+| `head_timeout_secs` | 15s | 等上游响应头（首字节） | `504` + 摘除条目 |
+| `timeout_secs` | 120s | 响应体逐帧空闲（SSE 有帧就不超时） | 发 `Cancel`，结束该流 |
+
+**隧道坏掉时的典型症状**（都踩过）：`/healthz` 正常但**所有 API 请求挂住不返回**、日志停在最后一行的 `agent registered`、内存只涨不落 —— 因为请求卡在"等响应头"上，占着连接、并发槽位与缓冲区，客户端早已断开也发现不了。监控可关注：
+
+- 日志出现 `upstream head timeout; evicting agent` / `tunnel write timed out; evicting agent`；
+- `hlmg_agents` 掉到 0，但 agent 侧日志显示"已连接"（说明两侧对连接死活的判断不一致）。
+
+排查顺序：① 看 agent 侧日志（有没有 `agent error` / 重连退避）；② 看网关 `edge connected` / `agent removed` 时间点；③ 连接数对不上时按上表把超时调小以更快失败，而不是靠重启网关。
+
 ### 可观测性
 
 - **`GET /metrics`**：Prometheus 文本格式指标（按状态码计数、在途请求、在线 agent 数、转发字节、累计耗时），可直接被 Prometheus/Grafana 抓取
