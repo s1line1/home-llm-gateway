@@ -43,6 +43,11 @@ pub struct GatewayConfig {
     pub admin_token: Option<String>,
     /// 动态 API Key 持久化文件（None = 仅内存）。
     pub keys_file: Option<PathBuf>,
+    /// 已验证身份缓存容量（0 = 关闭，每请求都跑 argon2 校验）。
+    ///
+    /// 见 `keystore::verified` 的说明：argon2 每次占 19MiB 工作内存，缓存 + 单飞
+    /// 把它的成本从"每请求"降到"每(凭据版本)"，且不影响吊销即时性。
+    pub verified_cache_max: usize,
     /// 单次请求转发空闲超时（逐帧）。
     pub request_timeout: Duration,
     /// 隧道控制操作超时（打开流 / 发送请求头 / 取消帧）。
@@ -144,7 +149,11 @@ impl Gateway {
         let metrics = Metrics::default();
         let state = http::AppState {
             registry: registry.clone(),
-            key_store: KeyStore::new(cfg.keys_file.clone()),
+            key_store: KeyStore::with_verified(
+                cfg.keys_file.clone(),
+                cfg.verified_cache_max,
+                crate::keystore::DEFAULT_VERIFIED_TTL,
+            ),
             admin_token: cfg.admin_token,
             timeout: cfg.request_timeout,
             agent_stale_after: cfg.agent_stale_after,

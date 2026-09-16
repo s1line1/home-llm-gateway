@@ -312,6 +312,7 @@ async fn e2e_upstream_never_receives_client_credentials() {
         server_key,
         admin_token: None,
         keys_file: Some(keys_path),
+        verified_cache_max: gateway::keystore::DEFAULT_VERIFIED_MAX,
         request_timeout: Duration::from_secs(10),
         tunnel_op_timeout: Duration::from_secs(2),
         head_timeout: Duration::from_secs(5),
@@ -368,6 +369,131 @@ async fn e2e_upstream_never_receives_client_credentials() {
     assert!(
         !names.iter().any(|n| n == "cookie"),
         "上游不得收到调用方的 Cookie: {names:?}"
+    );
+
+    agent.shutdown().await;
+    gw.shutdown().await;
+}
+
+/// 已验证身份缓存**端到端**生效：同一 key 连续请求只跑一次 argon2。
+///
+/// 为什么值得一条 e2e：单元测试证明的是 `KeyStore` 的契约，而这里走的是
+/// **HTTP → api_key() → spawn_blocking → KeyStore** 整条真实路径；同时它把
+/// "每请求一次 argon2（19MiB）" 换成 "每凭据版本一次" 的收益钉在可观测指标上
+/// （`hlmg_key_verify_misses_total` 只涨 1）。
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn e2e_verified_cache_reuses_argon2_across_requests() {
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    let (gw, agent, base, key) = start_stack_with_verify_cache(
+        Duration::from_secs(10),
+        gateway::keystore::DEFAULT_VERIFIED_MAX,
+        0,
+        4,
+        None,
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let req = || {
+        client
+            .post(format!("{base}/v1/chat/completions"))
+            .header("Authorization", format!("Bearer {key}"))
+            .json(&serde_json::json!({ "model": "mock-llm" }))
+    };
+
+    // 冷启动一发（会跑一次 argon2），随后 9 发都应命中缓存
+    for _ in 0..10 {
+        let resp = req().send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let _ = resp.bytes().await;
+    }
+
+    let metrics = client
+        .get(format!("{base}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let hits: u64 = metrics
+        .lines()
+        .find_map(|l| l.strip_prefix("hlmg_key_verify_hits_total "))
+        .and_then(|v| v.trim().parse().ok())
+        .expect("metrics 应包含 hlmg_key_verify_hits_total");
+    let misses: u64 = metrics
+        .lines()
+        .find_map(|l| l.strip_prefix("hlmg_key_verify_misses_total "))
+        .and_then(|v| v.trim().parse().ok())
+        .expect("metrics 应包含 hlmg_key_verify_misses_total");
+
+    assert_eq!(
+        misses, 1,
+        "10 个请求只应跑 1 次 argon2（缓存 + 单飞），实际 {misses}"
+    );
+    assert!(hits >= 9, "其余请求应命中缓存，实际 hits={hits}");
+
+    agent.shutdown().await;
+    gw.shutdown().await;
+}
+
+/// e2e 层的**并发单飞**：8 个请求同时首用同一个 key，也只应跑 1 次 argon2。
+///
+/// 为什么必须单独测：单元测试（`concurrent_same_token_hashes_once`）证明的是 KeyStore 的
+/// 契约；这里走的是真实 HTTP + 真实并发（8 个连接同时打进来），也就是现网那个
+/// "32 并发 → 654MB" 的形态。misses 计数是确定性的证据（内存数字太脆）。
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn e2e_concurrent_cold_requests_hash_once() {
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    let (gw, agent, base, key) = start_stack_with_verify_cache(
+        Duration::from_secs(10),
+        gateway::keystore::DEFAULT_VERIFIED_MAX,
+        0,
+        8,
+        None,
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    // 8 个并发请求同时到达（同一个 key，从未校验过）
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let client = client.clone();
+        let base = base.clone();
+        let key = key.clone();
+        handles.push(tokio::spawn(async move {
+            client
+                .post(format!("{base}/v1/chat/completions"))
+                .header("Authorization", format!("Bearer {key}"))
+                .json(&serde_json::json!({ "model": "mock-llm" }))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        }));
+    }
+    for h in handles {
+        assert_eq!(h.await.unwrap(), 200);
+    }
+
+    let metrics = client
+        .get(format!("{base}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let misses: u64 = metrics
+        .lines()
+        .find_map(|l| l.strip_prefix("hlmg_key_verify_misses_total "))
+        .and_then(|v| v.trim().parse().ok())
+        .expect("metrics 应包含 hlmg_key_verify_misses_total");
+    assert_eq!(
+        misses, 1,
+        "8 个并发冷请求只应跑 1 次 argon2（单飞），实际 {misses}——否则内存峰值就是 N × 19MiB"
     );
 
     agent.shutdown().await;

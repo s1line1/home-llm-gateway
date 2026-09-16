@@ -12,10 +12,41 @@ pub fn hash_argon2(token: &str) -> String {
     let mut salt_bytes = [0u8; 16];
     getrandom::fill(&mut salt_bytes).expect("os rng");
     let salt = SaltString::encode_b64(&salt_bytes).expect("16-byte salt is valid b64");
+    let _in_flight = Argon2InFlight::enter();
     Argon2::default()
         .hash_password(token.as_bytes(), &salt)
         .expect("argon2 hashing with default params cannot fail")
         .to_string()
+}
+
+/// 当前**正在运行**的 argon2 调用数（测试用）。
+///
+/// argon2 是内存硬的（m_cost = 19MiB），所以"同时在跑几个"直接等于内存峰值。
+/// 测试用它断言"同一个 token 的 N 个并发请求只跑 1 次 argon2"——用内存数字断言太脆，
+/// 用调用计数才是确定性证据。
+#[cfg(test)]
+pub(crate) static ARGON2_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// argon2 调用次数（测试用计数器，断言"只算一次"这类契约）。
+#[cfg(test)]
+pub(crate) fn argon2_calls() -> usize {
+    ARGON2_CALLS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// RAII：进入 argon2 时计数（测试构建下用于断言调用次数）。
+struct Argon2InFlight;
+
+impl Argon2InFlight {
+    #[cfg(test)]
+    fn enter() -> Self {
+        ARGON2_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self
+    }
+    #[cfg(not(test))]
+    fn enter() -> Self {
+        Self
+    }
 }
 
 /// 校验 token 是否匹配存储的 argon2 哈希（PHC 字符串内嵌参数，未来调参不影响旧记录）。
@@ -24,6 +55,7 @@ pub fn verify_argon2(token: &str, encoded: &str) -> bool {
         Ok(p) => p,
         Err(_) => return false,
     };
+    let _in_flight = Argon2InFlight::enter();
     Argon2::default()
         .verify_password(token.as_bytes(), &parsed)
         .is_ok()
