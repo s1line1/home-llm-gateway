@@ -19,6 +19,9 @@ pub enum GatewayError {
 
     #[error("未知错误: {0}")]
     Other(String),
+
+    #[error("证书校验器构造失败: {0}")]
+    Verifier(#[from] rustls::client::VerifierBuilderError),
 }
 
 impl From<String> for GatewayError {
