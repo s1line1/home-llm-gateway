@@ -140,12 +140,17 @@ async fn slow(State(st): State<AppState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({ "ok": true, "slow": true, "server": st.name.as_ref() }))
 }
 
-/// 慢**正文**端点：响应头立刻返回（SSE），正文在 800ms 后才出第一块。
+/// `/v1/slow_body` 的正文停顿：故意取得比常见空闲超时（100–300ms）**长一个数量级**，
+/// 这样"超时是否生效"与"机器快慢"就能明确区分开——如果测试里把超时调大，
+/// 断言窗口（2s）仍远小于这个停顿（3s），不会因为 CI 机器慢而假失败。
+pub const SLOW_BODY_STALL: Duration = Duration::from_secs(3);
+
+/// 慢**正文**端点：响应头立刻返回（SSE），正文在 [`SLOW_BODY_STALL`] 后才出第一块。
 /// 用于测「响应体逐帧空闲超时」——与 /v1/slow（卡响应头）语义不同。
 async fn slow_body(State(st): State<AppState>) -> Response {
     let name = st.name.clone();
     let s = stream! {
-        tokio::time::sleep(Duration::from_millis(800)).await;
+        tokio::time::sleep(SLOW_BODY_STALL).await;
         let chunk = serde_json::json!({
             "id": "chatcmpl-slow-body",
             "object": "chat.completion.chunk",
