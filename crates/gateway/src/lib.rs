@@ -87,8 +87,6 @@ impl Gateway {
             )),
             None => None,
         };
-        // let endpoint = quinn::Endpoint::server(server_config, cfg.quic_bind)?;
-        // let quic_addr = endpoint.local_addr()?;
 
         let server = s2n_quic::Server::builder()
             .with_tls(s2n_quic::provider::tls::rustls::Server::from(Arc::new(tls)))?

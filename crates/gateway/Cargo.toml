@@ -14,7 +14,6 @@ http-body-util = "0.1"
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 proto = { path = "../proto" }
-# quinn = { workspace = true }
 rusqlite = { version = "0.40", features = ["bundled"] }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }

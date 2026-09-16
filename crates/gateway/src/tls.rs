@@ -3,7 +3,6 @@
 use std::{io::Cursor, sync::Arc};
 
 use proto::ALPN;
-// use quinn::crypto::rustls::QuicServerConfig;
 use rustls::{
     pki_types::{CertificateDer, PrivateKeyDer},
     server::WebPkiClientVerifier,
