@@ -52,6 +52,10 @@ pub struct Entry {
     /// 当前在途请求数（admission control）。
     pub inflight: Arc<AtomicU32>,
     pub last_seen: Instant,
+    /// 连续"隧道控制操作超时"次数。只有**连续**超时才判定连接已死——
+    /// 单次超时在高并发下是排队造成的假象（开流/写帧要过连接级流管理器）。
+    /// 任何一次成功都会把它清零（见 `note_tunnel_op_ok`）。
+    pub tunnel_op_timeouts: Arc<AtomicU32>,
 }
 
 impl Registry {
@@ -84,6 +88,7 @@ impl Registry {
                 models,
                 max_concurrency,
                 inflight: Arc::new(AtomicU32::new(0)),
+                tunnel_op_timeouts: Arc::new(AtomicU32::new(0)),
                 last_seen: Instant::now(),
             },
         );
@@ -107,29 +112,57 @@ impl Registry {
         }
     }
 
-    /// 按 stable_id 摘除条目：用于"隧道控制操作超时 = 这条连接已经死了"的场合
-    /// （打开流 / 写请求帧 / 等响应头任一超时）。
+    /// 连续隧道操作超时的阈值：达到它才认为"这条连接真的死了"。
     ///
-    /// 为什么必须有这条路径：注册表条目原本只在 `accept_bidirectional_stream()` 返回时
-    /// 才被摘掉，而对端进程消失（没有 CONNECTION_CLOSE）时那个循环不会返回——条目会一直
-    /// 留着，后续请求继续选中同一条死连接，每个都白等一次超时。超时是"连接已死"的
-    /// 可靠信号，据此摘掉，后续请求才会立刻落到 `NoAgent`（503）或别的 agent 上。
+    /// 取 3 而不是 1：单次超时在高并发下是**排队假象**——开流/写帧都要过连接级流管理器，
+    /// 768 并发时很容易超过 `tunnel_op_secs`。实测（2026-09-17，双 agent/768 并发）：
+    /// 第一次超时就把条目摘掉，而连接其实完好、agent 也毫不知情，于是每 5s 心跳继续
+    /// 刷新 `last_seen`、注册表里却没有它，所有请求 `503 registry-empty`（占比 92.6%）。
+    pub const TUNNEL_TIMEOUTS_BEFORE_EVICT: u32 = 3;
+
+    /// 一次隧道控制操作成功：清掉连续超时计数。
+    pub fn note_tunnel_op_ok(&self, stable_id: usize) {
+        let inner = self.inner.read().unwrap();
+        if let Some(e) = inner.values().find(|e| e.stable_id == stable_id) {
+            e.tunnel_op_timeouts.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// 记录一次隧道控制操作超时，并在**连续**超时达到阈值时摘除条目。
     ///
-    /// 返回是否真的摘掉了（false = 已经被别人摘掉/已被新连接替换）。
+    /// 关键：摘除时**同时关闭连接**。只删条目不关连接会留下"僵尸"——agent 侧看不到
+    /// 任何异常（心跳照通、连接照开），却永远无法再被路由；agent 只有等到自己判断
+    /// 连接不可用才会重连，而那一刻可能永远不来。
+    ///
+    /// 返回是否真的摘掉了（false = 计数未达阈值，或条目已被别人摘掉/替换）。
     pub fn evict(&self, stable_id: usize) -> bool {
         let mut inner = self.inner.write().unwrap();
         let hit = inner
             .iter()
             .find(|(_, e)| e.stable_id == stable_id)
-            .map(|(k, _)| k.clone());
-        match hit {
-            Some(agent_id) => {
-                inner.remove(&agent_id);
-                info!(agent = %agent_id, "agent evicted (tunnel op timed out)");
-                true
-            }
-            None => false,
+            .map(|(k, e)| (k.clone(), e.clone()));
+        let Some((agent_id, entry)) = hit else {
+            return false;
+        };
+        let n = entry.tunnel_op_timeouts.fetch_add(1, Ordering::Relaxed) + 1;
+        if n < Self::TUNNEL_TIMEOUTS_BEFORE_EVICT {
+            warn!(
+                agent = %agent_id,
+                consecutive = n,
+                threshold = Self::TUNNEL_TIMEOUTS_BEFORE_EVICT,
+                "tunnel op timed out; keeping the entry for now"
+            );
+            return false;
         }
+        inner.remove(&agent_id);
+        warn!(
+            agent = %agent_id,
+            consecutive = n,
+            "agent evicted (tunnel op timed out repeatedly); closing connection so one side notices"
+        );
+        // 真正关掉连接：让 agent 立刻看到断开并重连，而不是变成只有网关知道的僵尸。
+        entry.conn.close(0u32.into());
+        true
     }
 
     pub fn len(&self) -> usize {
@@ -401,6 +434,35 @@ mod tests {
         assert_eq!(reg.len(), 0);
         // 对不存在的 agent 移除 → 无害
         reg.remove_if_same("ghost", id2);
+    }
+
+    /// 契约：**单次隧道操作超时不得摘除条目**（高并发下那是排队假象），
+    /// 连续超时达阈值才摘除；任何一次成功都要清零计数。
+    ///
+    /// 实测背景：768 并发下第一次超时就把条目摘掉，而连接完好、agent 不知情，
+    /// 于是注册表里没有它、请求全部 503（占 92.6%），agent 因为心跳仍能通而永远
+    /// 不重连 —— "僵尸"态。
+    #[tokio::test]
+    async fn tunnel_timeouts_evict_only_after_consecutive_failures() {
+        let reg = Registry::default();
+        let conn = test_connection().await;
+        let id = reg.register("t".into(), vec!["*".into()], 4, conn.clone());
+
+        // 前两次超时：条目保留
+        assert!(!reg.evict(id), "第一次超时不应摘除");
+        assert_eq!(reg.len(), 1);
+        assert!(!reg.evict(id), "第二次超时仍不应摘除");
+        assert_eq!(reg.len(), 1);
+        // 中途一次成功 → 计数清零，重新从头累计
+        reg.note_tunnel_op_ok(id);
+        assert!(!reg.evict(id), "清零后这一次只算第一次");
+        assert_eq!(reg.len(), 1);
+        // 再来两次（累计到 3）→ 摘除
+        assert!(!reg.evict(id));
+        assert!(reg.evict(id), "连续第 3 次超时应摘除");
+        assert_eq!(reg.len(), 0);
+        // 已摘除后再调用：无害
+        assert!(!reg.evict(id));
     }
 
     /// 可观测性契约：**注册条目数**与**可路由数**必须能分开看。

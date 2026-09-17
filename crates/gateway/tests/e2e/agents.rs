@@ -842,11 +842,36 @@ async fn e2e_dead_tunnel_fails_fast_instead_of_hanging() {
         "错误信息应说明是上游/隧道超时，实际：{body}"
     );
 
-    // ② 坏连接必须已被摘掉 → 后续请求立刻 503，而不是每个都白等一次超时
+    // ② 摘除需要**连续**超时（默认 3 次）：单次超时在高并发下是排队假象，一次就摘
+    //    会留下"连接还开着、agent 不知情"的僵尸条目（实测 768 并发下 92.6% 请求 503）。
+    //    所以这里验证：前两次仍然快速失败（每次都是隧道超时量级，不等满 request_timeout），
+    //    第三次才摘除；摘除后立刻 503。
+    for attempt in 2..=3 {
+        let t = std::time::Instant::now();
+        let resp = tokio::time::timeout(Duration::from_secs(4), send().send())
+            .await
+            .unwrap_or_else(|_| panic!("第 {attempt} 次请求也必须快速结束"))
+            .unwrap();
+        assert!(
+            t.elapsed() < Duration::from_secs(3),
+            "第 {attempt} 次请求也应在隧道超时量级失败，实际 {:?}",
+            t.elapsed()
+        );
+        if attempt == 2 {
+            assert_eq!(
+                resp.status(),
+                reqwest::StatusCode::GATEWAY_TIMEOUT,
+                "未达摘除阈值时应仍然返回隧道超时（而不是别的错误）"
+            );
+            assert_eq!(gw.agent_count(), 1, "连续超时未达阈值前不应摘除条目");
+        }
+    }
+
+    // ③ 达到连续超时阈值后：立即 503，条目被摘除
     let t1 = std::time::Instant::now();
     let resp2 = tokio::time::timeout(Duration::from_secs(2), send().send())
         .await
-        .expect("第二个请求也必须快速结束")
+        .expect("摘除后的请求也必须快速结束")
         .unwrap();
     assert_eq!(
         resp2.status(),
@@ -855,10 +880,10 @@ async fn e2e_dead_tunnel_fails_fast_instead_of_hanging() {
     );
     assert!(
         t1.elapsed() < Duration::from_millis(800),
-        "第二个请求应几乎立即失败（不该再等一次隧道超时），实际 {:?}",
+        "摘除后的请求应几乎立即失败（不该再等一次隧道超时），实际 {:?}",
         t1.elapsed()
     );
-    assert_eq!(gw.agent_count(), 0, "卡死的 agent 条目应已被摘除");
+    assert_eq!(gw.agent_count(), 0, "连续超时达阈值后条目应已被摘除");
 
     gw.shutdown().await;
 }
