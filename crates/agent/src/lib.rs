@@ -511,7 +511,7 @@ mod tests {
         ca: &CertificateDer<'static>,
         cert: CertificateDer<'static>,
         key: PrivateKeyDer<'static>,
-        reply_delay: Arc<std::sync::Mutex<Duration>>,
+        first_reply_delay: Duration,
     ) -> SocketAddr {
         proto::install_ring_crypto_provider();
 
@@ -539,24 +539,29 @@ mod tests {
 
         tokio::spawn(async move {
             while let Some(conn) = server.accept().await {
-                let reply_delay = reply_delay.clone();
                 tokio::spawn(async move {
                     let (_handle, mut acceptor) = conn.split();
                     let mut first = true;
+                    let mut first_hb = true;
                     while let Ok(Some(stream)) = acceptor.accept_bidirectional_stream().await {
-                        let (mut recv, mut send) = stream.split();
-                        let _ = proto::io::read_frame(&mut recv).await;
-                        if first {
-                            first = false; // 注册流：立刻 finish，注册成功
-                            let _ = send.finish();
+                        // ⚠️ 每条流**独立**处理：若在 accept 循环里串行 sleep，第一次
+                        // 心跳的延迟会把后续心跳的回包一起堵住，导致连续多次超时。
+                        let registration = std::mem::take(&mut first);
+                        let delay_long = if registration {
+                            None
                         } else {
-                            // 心跳流：按当前设置延迟回包（0 = 立刻回，模拟正常）
-                            let d = *reply_delay.lock().unwrap();
-                            if !d.is_zero() {
-                                tokio::time::sleep(d).await;
+                            Some(std::mem::take(&mut first_hb))
+                        };
+                        tokio::spawn(async move {
+                            let (mut recv, mut send) = stream.split();
+                            let _ = proto::io::read_frame(&mut recv).await;
+                            match delay_long {
+                                None => {}                                                 // 注册流：立刻回
+                                Some(true) => tokio::time::sleep(first_reply_delay).await, // 首次心跳：拖长
+                                Some(false) => {} // 其后心跳：立刻回
                             }
                             let _ = send.finish();
-                        }
+                        });
                     }
                 });
             }
@@ -570,17 +575,21 @@ mod tests {
     /// 视为致命 → 主动断开 → 重连又撞握手限时，实测在高并发下形成风暴，期间网关没有
     /// 任何健康 agent（所有请求 503）。
     ///
-    /// 时间轴（间隔 10ms、等待上限 30ms、服务端把回包拖到 70ms）：
-    /// - t≈10ms 发心跳 1 → 服务端 70ms 才回 → t≈40ms 超时（第 1 次失败）
-    /// - 旧实现：t≈40ms 循环返回 Err → 任务结束
-    /// - 新实现：容忍失败继续，下一次心跳 t≈50ms，因服务端仍在睡而很快失败……
-    /// 所以"在 t≈60ms 时任务仍在运行"就足以证明容忍生效，且此时失败数（≤2）尚未到上限。
+    /// 服务器只把**第一次**心跳的回包拖长（> 等待上限），之后一律立刻回包；于是
+    /// "成功会重置失败计数"这一点与测试里掐的时刻无关：第一次必超时、其后必成功。
+    /// 若容忍逻辑被改回"一次失败即退出"，循环会在第一次超时后结束，断言立刻失败。
     #[tokio::test]
     async fn a_single_heartbeat_timeout_does_not_immediately_tear_down_the_connection() {
         let (ca, srv_cert, srv_key, cli_cert, cli_key) = gen_pki();
-        let delay = Arc::new(std::sync::Mutex::new(Duration::from_millis(70)));
-        let addr =
-            test_server_that_delays_heartbeat_reply(&ca, srv_cert, srv_key, delay.clone()).await;
+        let addr = test_server_that_delays_heartbeat_reply(
+            &ca,
+            srv_cert,
+            srv_key,
+            // 远大于等待上限（interval 40ms × 3 = 120ms），保证第一次心跳必然超时；
+            // 注意服务器每条流独立处理，所以这次延迟只影响第一次心跳。
+            Duration::from_millis(200),
+        )
+        .await;
         let cfg = test_agent_config(addr, ca.clone(), cli_cert, cli_key);
         let cc = tls::rustls_client_tls(
             &cfg.ca_cert,
@@ -590,20 +599,19 @@ mod tests {
         .unwrap();
 
         let mut handle = connect_for_test(&cfg, cc).await;
-        let interval = Duration::from_millis(10);
-        let task = tokio::spawn(heartbeat_loop(handle.clone(), "agent-z".into(), interval));
+        let task = tokio::spawn(heartbeat_loop(
+            handle.clone(),
+            "agent-z".into(),
+            Duration::from_millis(40),
+        ));
 
-        // 第一次超时发生在 t≈interval+wait=40ms；旧实现在那之后就结束了
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        // 第一次心跳在 ≈160ms 超时；其后每次心跳都在 40ms 内立刻回包并重置计数。
+        // 跨到 1.2s：若"单次失败就退出"的旧行为回来了，任务早已结束。
+        tokio::time::sleep(Duration::from_millis(1200)).await;
         assert!(
             !task.is_finished(),
             "单次心跳超时就拆了连接：应当容忍失败，把「连接是否真死」交给网关 stale 判定"
         );
-
-        // 服务端恢复正常回包 → 心跳应重新成功、循环继续存活、连接仍可用
-        *delay.lock().unwrap() = Duration::ZERO;
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        assert!(!task.is_finished(), "心跳恢复正常后循环不应退出");
         assert!(
             handle.open_bidirectional_stream().await.is_ok(),
             "连接应当仍然可用"
