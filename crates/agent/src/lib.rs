@@ -107,7 +107,13 @@ async fn connect_once(
     // let limits = Limits::new().with_max_idle_timeout(Duration::from_secs(20))?; // 对齐 quinn 时代的 20s
     let limits = Limits::new()
         .with_max_idle_timeout(Duration::from_secs(20))?
-        .with_max_open_remote_bidirectional_streams(1000)?;
+        .with_max_open_remote_bidirectional_streams(1000)?
+        // s2n-quic 默认握手限时 10s（`MAX_HANDSHAKE_DURATION_DEFAULT`）。实测在网关
+        // 高并发（数百条流在途）时新连接握不上手，日志是
+        // `MaxHandshakeDurationExceeded { max_handshake_duration: 10s }`，
+        // 于是"心跳超时→断开→重连→握手又超时"形成风暴。放到 30s 给拥塞留余地；
+        // 真正的重连退避由 `run()` 的指数退避负责（上限 30s）。
+        .with_max_handshake_duration(Duration::from_secs(30))?;
 
     // 不设 with_max_idle_timeout 时默认 30s（MaxIdleTimeout::RECOMMENDED）
     let client = s2n_quic::Client::builder()
@@ -219,29 +225,66 @@ async fn heartbeat_loop(
     agent_id: String,
     interval: Duration,
 ) -> anyhow::Result<()> {
+    // 单次心跳的等待上限：**与心跳间隔解耦**。原来是硬编码 5s，恰好等于默认的
+    // 5s 心跳间隔、零余量；而满负载时 `open_bidirectional_stream()` 要抢连接级流
+    // 管理器，稍一排队就超时——一次超时就把整条连接拆掉，代价是此后十几秒内网关
+    // 没有任何健康 agent（所有请求 503）。取 3× 间隔（默认 15s）留出排队余量。
+    let wait = interval.saturating_mul(3);
+    // 允许连续失败次数：一次超时不代表连接坏了，但也不能无限忍——否则网关早已按
+    // stale 判死（默认 15s），agent 还抱着连接不动。
+    //
+    // 取 2 的算式（默认 interval=5s、wait=15s）：容忍窗口 ≈
+    // `2 × interval + wait` = 10 + 15 = 25s，略大于网关的 stale 窗口 15s，
+    // 即"还在容忍"期间网关最多已经判了 10s 的 stale —— 再长就等于装死。
+    const MAX_CONSECUTIVE_FAILURES: u32 = 2;
+    let mut failures = 0u32;
     loop {
         tokio::time::sleep(interval).await;
+        match heartbeat_once(&mut conn, &agent_id, wait).await {
+            Ok(()) => failures = 0,
+            Err(e) => {
+                failures += 1;
+                warn!(
+                    failures,
+                    max = MAX_CONSECUTIVE_FAILURES,
+                    "heartbeat failed: {e}; will keep the connection until failures accumulate"
+                );
+                if failures >= MAX_CONSECUTIVE_FAILURES {
+                    return Err(anyhow::anyhow!(
+                        "heartbeat failed {failures} times in a row: {e}"
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// 发一次心跳并等网关回包；整体（开流 + 写帧 + 收帧）受 `wait` 约束。
+async fn heartbeat_once(
+    conn: &mut s2n_quic::connection::Handle,
+    agent_id: &str,
+    wait: Duration,
+) -> anyhow::Result<()> {
+    let exchange = async {
+        // 心跳走一条独立短流（开→写→半关→读完），不与业务流共用编码状态
         let stream = conn.open_bidirectional_stream().await?;
         let (recv, mut send) = stream.split();
         write_frame(
             &mut send,
             &Frame::Heartbeat {
-                agent_id: agent_id.clone(),
+                agent_id: agent_id.to_string(),
                 inflight: 0,
             },
         )
         .await?;
         send.shutdown().await?;
-
         let mut reader = FrameReader::new(recv);
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while reader.next().await?.is_some() {}
-            Ok::<(), std::io::Error>(())
-        })
+        while reader.next().await?.is_some() {}
+        Ok::<(), anyhow::Error>(())
+    };
+    tokio::time::timeout(wait, exchange)
         .await
-        .map_err(|_| anyhow::anyhow!("heartbeat wait timed out"))?
-        .map_err(|e| anyhow::anyhow!("heartbeat read failed: {e}"))?;
-    }
+        .map_err(|_| anyhow::anyhow!("heartbeat timed out after {wait:?}"))?
 }
 
 #[cfg(test)]
@@ -458,6 +501,144 @@ mod tests {
             }
         });
         (addr, rx)
+    }
+
+    /// 假网关：服务注册流，之后**消费心跳流但不回包**（读到帧后按 `reply_delay` 决定何时 finish）。
+    ///
+    /// 用途是复现"心跳等待超时"：`reply_delay` > 心跳等待上限时，这次心跳必然超时，
+    /// 但**连接本身是健康的**（没有 reset、没有断开）——这正是要区分的那条路径。
+    async fn test_server_that_delays_heartbeat_reply(
+        ca: &CertificateDer<'static>,
+        cert: CertificateDer<'static>,
+        key: PrivateKeyDer<'static>,
+        first_reply_delay: Duration,
+    ) -> SocketAddr {
+        proto::install_ring_crypto_provider();
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca.clone()).unwrap();
+        let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+            .build()
+            .unwrap();
+        let mut stls = rustls::ServerConfig::builder()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(vec![cert], key)
+            .unwrap();
+        stls.alpn_protocols = vec![ALPN.to_vec()];
+
+        let mut server = s2n_quic::Server::builder()
+            .with_tls(s2n_quic::provider::tls::rustls::Server::from(Arc::new(
+                stls,
+            )))
+            .unwrap()
+            .with_io("127.0.0.1:0")
+            .unwrap()
+            .start()
+            .unwrap();
+        let addr = server.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            while let Some(conn) = server.accept().await {
+                tokio::spawn(async move {
+                    let (_handle, mut acceptor) = conn.split();
+                    let mut first = true;
+                    let mut first_hb = true;
+                    while let Ok(Some(stream)) = acceptor.accept_bidirectional_stream().await {
+                        // ⚠️ 每条流**独立**处理：若在 accept 循环里串行 sleep，第一次
+                        // 心跳的延迟会把后续心跳的回包一起堵住，导致连续多次超时。
+                        let registration = std::mem::take(&mut first);
+                        let delay_long = if registration {
+                            None
+                        } else {
+                            Some(std::mem::take(&mut first_hb))
+                        };
+                        tokio::spawn(async move {
+                            let (mut recv, mut send) = stream.split();
+                            let _ = proto::io::read_frame(&mut recv).await;
+                            match delay_long {
+                                None => {}                                                 // 注册流：立刻回
+                                Some(true) => tokio::time::sleep(first_reply_delay).await, // 首次心跳：拖长
+                                Some(false) => {} // 其后心跳：立刻回
+                            }
+                            let _ = send.finish();
+                        });
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// 回归测试：**单次心跳超时不得立刻拆掉连接**。
+    ///
+    /// 旧实现把心跳等待硬编码成 5s（等于默认心跳间隔），一次超时就返回 Err → `run()`
+    /// 视为致命 → 主动断开 → 重连又撞握手限时，实测在高并发下形成风暴，期间网关没有
+    /// 任何健康 agent（所有请求 503）。
+    ///
+    /// 服务器只把**第一次**心跳的回包拖长（> 等待上限），之后一律立刻回包；于是
+    /// "成功会重置失败计数"这一点与测试里掐的时刻无关：第一次必超时、其后必成功。
+    /// 若容忍逻辑被改回"一次失败即退出"，循环会在第一次超时后结束，断言立刻失败。
+    #[tokio::test]
+    async fn a_single_heartbeat_timeout_does_not_immediately_tear_down_the_connection() {
+        let (ca, srv_cert, srv_key, cli_cert, cli_key) = gen_pki();
+        let addr = test_server_that_delays_heartbeat_reply(
+            &ca,
+            srv_cert,
+            srv_key,
+            // 远大于等待上限（interval 40ms × 3 = 120ms），保证第一次心跳必然超时；
+            // 注意服务器每条流独立处理，所以这次延迟只影响第一次心跳。
+            Duration::from_millis(200),
+        )
+        .await;
+        let cfg = test_agent_config(addr, ca.clone(), cli_cert, cli_key);
+        let cc = tls::rustls_client_tls(
+            &cfg.ca_cert,
+            cfg.client_cert.clone(),
+            cfg.client_key.clone_key(),
+        )
+        .unwrap();
+
+        let mut handle = connect_for_test(&cfg, cc).await;
+        let task = tokio::spawn(heartbeat_loop(
+            handle.clone(),
+            "agent-z".into(),
+            Duration::from_millis(40),
+        ));
+
+        // 第一次心跳在 ≈160ms 超时；其后每次心跳都在 40ms 内立刻回包并重置计数。
+        // 跨到 1.2s：若"单次失败就退出"的旧行为回来了，任务早已结束。
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(
+            !task.is_finished(),
+            "单次心跳超时就拆了连接：应当容忍失败，把「连接是否真死」交给网关 stale 判定"
+        );
+        assert!(
+            handle.open_bidirectional_stream().await.is_ok(),
+            "连接应当仍然可用"
+        );
+        task.abort();
+    }
+
+    /// 建立一条到假网关的连接（注册已在 `connect_once` 之外单独调用，这里只连）。
+    async fn connect_for_test(
+        cfg: &AgentConfig,
+        client_config: rustls::ClientConfig,
+    ) -> s2n_quic::connection::Handle {
+        let client = s2n_quic::Client::builder()
+            .with_tls(s2n_quic::provider::tls::rustls::Client::from(Arc::new(
+                client_config,
+            )))
+            .unwrap()
+            .with_io("0.0.0.0:0")
+            .unwrap()
+            .start()
+            .unwrap();
+        let conn = client
+            .connect(Connect::new(cfg.cloud_addr).with_server_name(cfg.server_name.clone()))
+            .await
+            .unwrap();
+        let (handle, _acceptor) = conn.split();
+        handle
     }
 
     fn test_agent_config(
