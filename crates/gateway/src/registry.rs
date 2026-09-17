@@ -135,14 +135,14 @@ impl Registry {
     /// 连接不可用才会重连，而那一刻可能永远不来。
     ///
     /// 返回是否真的摘掉了（false = 计数未达阈值，或条目已被别人摘掉/替换）。
-    pub fn evict(&self, stable_id: usize) -> bool {
+    pub fn evict(&self, stable_id: usize) -> EvictOutcome {
         let mut inner = self.inner.write().unwrap();
         let hit = inner
             .iter()
             .find(|(_, e)| e.stable_id == stable_id)
             .map(|(k, e)| (k.clone(), e.clone()));
         let Some((agent_id, entry)) = hit else {
-            return false;
+            return EvictOutcome::NotFound;
         };
         let n = entry.tunnel_op_timeouts.fetch_add(1, Ordering::Relaxed) + 1;
         if n < Self::TUNNEL_TIMEOUTS_BEFORE_EVICT {
@@ -152,17 +152,41 @@ impl Registry {
                 threshold = Self::TUNNEL_TIMEOUTS_BEFORE_EVICT,
                 "tunnel op timed out; keeping the entry for now"
             );
-            return false;
+            return EvictOutcome::BelowThreshold { consecutive: n };
         }
+
+        // ① 先移出路由：后续请求不会再选中它（这一步与关闭时机无关）。
         inner.remove(&agent_id);
-        warn!(
-            agent = %agent_id,
-            consecutive = n,
-            "agent evicted (tunnel op timed out repeatedly); closing connection so one side notices"
-        );
-        // 真正关掉连接：让 agent 立刻看到断开并重连，而不是变成只有网关知道的僵尸。
-        entry.conn.close(0u32.into());
-        true
+
+        // ② 再决定何时关闭连接。**不能立刻关**：这条连接上往往还有别的在途请求，
+        //    而它们**已经把请求完整送达 agent、模型正在生成**——这些请求早就过了
+        //    响应头那一关，不属于"建立阶段可重试"的范围，被连带打断就是纯损失
+        //    （客户的这次生成白花钱、还拿不到结果）。
+        //    所以在途归零后再关；超过宽限期也强制关，否则 agent 永远是僵尸。
+        let inflight = entry.inflight.load(Ordering::Relaxed);
+        let outcome = if inflight <= 1 {
+            // 只有当前这个失败请求占着槽位 → 关掉不会牵连别人。
+            entry.conn.close(0u32.into());
+            EvictOutcome::RemovedClosed
+        } else {
+            warn!(
+                agent = %agent_id,
+                consecutive = n,
+                inflight,
+                grace_secs = EVICT_CLOSE_GRACE.as_secs(),
+                "agent evicted; deferring connection close until in-flight requests drain"
+            );
+            close_when_drained(entry);
+            EvictOutcome::RemovedClosedLater { inflight }
+        };
+        if outcome == EvictOutcome::RemovedClosed {
+            warn!(
+                agent = %agent_id,
+                consecutive = n,
+                "agent evicted (tunnel op timed out repeatedly); closing connection so one side notices"
+            );
+        }
+        outcome
     }
 
     pub fn len(&self) -> usize {
@@ -307,6 +331,46 @@ impl Registry {
     }
 }
 
+/// 摘除后的收尾方式。存在的意义有二：让调用方/测试能区分"立刻关闭"与"等在途收尾"，
+/// 以及把"为什么不能立刻关"这件事写进类型里（见 [`Registry::evict`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvictOutcome {
+    /// 连续超时未达阈值：条目保留，只累计计数。
+    BelowThreshold { consecutive: u32 },
+    /// 已摘除且连接已立即关闭（没有别的在途请求会被牵连）。
+    RemovedClosed,
+    /// 已摘除，连接会在在途请求收尾后（或超过宽限期）关闭。
+    RemovedClosedLater { inflight: u32 },
+    /// 条目已不存在（被别人摘掉，或已被新连接替换）。
+    NotFound,
+}
+
+/// 摘除后等待在途请求收尾的宽限期上限。超过它就强制关闭——宁可打断，
+/// 也不能让一条已被摘除的连接永远留着（那样 agent 又变回"自认为在线的僵尸"）。
+pub const EVICT_CLOSE_GRACE: Duration = Duration::from_secs(5);
+
+/// 等在途请求收尾（或超过宽限期）再关闭连接，避免打断已经送达上游的请求。
+fn close_when_drained(entry: Entry) {
+    tokio::spawn(async move {
+        let deadline = tokio::time::Instant::now() + EVICT_CLOSE_GRACE;
+        loop {
+            if entry.inflight.load(Ordering::Relaxed) == 0 {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                warn!(
+                    agent = %entry.agent_id,
+                    inflight = entry.inflight.load(Ordering::Relaxed),
+                    "evicted connection still had in-flight requests at the grace deadline; closing anyway"
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        entry.conn.close(0u32.into());
+    });
+}
+
 /// 拒绝请求时的注册表诊断快照（仅日志/指标用）。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RegistryStatus {
@@ -449,6 +513,58 @@ mod tests {
         reg.remove_if_same("ghost", id2);
     }
 
+    /// 契约：**摘除时若还有别的在途请求，不得立刻关闭连接**。
+    ///
+    /// 那些请求已经把请求帧完整送达 agent、模型正在生成——它们不满足"建立阶段失败"
+    /// 的重试条件，被打断就是纯损失（客户花了算力还拿不到结果）。所以摘除只做
+    /// "移出路由"，连接等 drain 完（或过宽限期）再关。
+    ///
+    /// 反过来，若只剩当前这一个失败请求占槽位，立刻关闭是安全的——而且要立刻关，
+    /// 好让 agent 察觉并重连，别变回僵尸。
+    #[tokio::test]
+    async fn eviction_defers_close_while_other_requests_are_in_flight() {
+        let stale = Duration::from_secs(10);
+
+        // 情形一：还有别的在途请求（这里手工把 inflight 顶到 3）
+        let reg = Registry::default();
+        let conn = test_connection().await;
+        let id = reg.register("busy".into(), vec!["*".into()], 8, conn.clone());
+        let (_e, g1) = reg.try_acquire(stale, "m").unwrap();
+        let (_e2, g2) = reg.try_acquire(stale, "m").unwrap();
+        let (_e3, g3) = reg.try_acquire(stale, "m").unwrap();
+        assert_eq!(
+            reg.evict(id),
+            EvictOutcome::BelowThreshold { consecutive: 1 }
+        );
+        assert_eq!(
+            reg.evict(id),
+            EvictOutcome::BelowThreshold { consecutive: 2 }
+        );
+        match reg.evict(id) {
+            EvictOutcome::RemovedClosedLater { inflight } => {
+                assert!(inflight >= 3, "应报出当时的在途数，实际 {inflight}")
+            }
+            other => panic!("还有在途请求时不应立即关闭连接，实际 {other:?}"),
+        }
+        assert_eq!(reg.len(), 0, "无论是否延迟关闭，条目都必须先移出路由");
+        drop((g1, g2, g3));
+
+        // 情形二：只剩当前请求 → 立即关闭
+        let reg2 = Registry::default();
+        let conn2 = test_connection().await;
+        let id2 = reg2.register("idle".into(), vec!["*".into()], 8, conn2.clone());
+        let (_e4, _g4) = reg2.try_acquire(stale, "m").unwrap();
+        assert!(matches!(
+            reg2.evict(id2),
+            EvictOutcome::BelowThreshold { .. }
+        ));
+        assert!(matches!(
+            reg2.evict(id2),
+            EvictOutcome::BelowThreshold { .. }
+        ));
+        assert_eq!(reg2.evict(id2), EvictOutcome::RemovedClosed);
+    }
+
     /// 契约：**换 agent 重试时必须排除刚失败的那条连接**。
     ///
     /// 否则"重试"会再次选中同一条坏连接，等于没重试——这在生产表现为"重试了但还是
@@ -493,20 +609,29 @@ mod tests {
         let id = reg.register("t".into(), vec!["*".into()], 4, conn.clone());
 
         // 前两次超时：条目保留
-        assert!(!reg.evict(id), "第一次超时不应摘除");
+        assert!(matches!(
+            reg.evict(id),
+            EvictOutcome::BelowThreshold { consecutive: 1 }
+        ));
         assert_eq!(reg.len(), 1);
-        assert!(!reg.evict(id), "第二次超时仍不应摘除");
+        assert!(matches!(
+            reg.evict(id),
+            EvictOutcome::BelowThreshold { consecutive: 2 }
+        ));
         assert_eq!(reg.len(), 1);
         // 中途一次成功 → 计数清零，重新从头累计
         reg.note_tunnel_op_ok(id);
-        assert!(!reg.evict(id), "清零后这一次只算第一次");
+        assert!(matches!(
+            reg.evict(id),
+            EvictOutcome::BelowThreshold { consecutive: 1 }
+        ));
         assert_eq!(reg.len(), 1);
-        // 再来两次（累计到 3）→ 摘除
-        assert!(!reg.evict(id));
-        assert!(reg.evict(id), "连续第 3 次超时应摘除");
+        // 再来两次（累计到 3）→ 摘除；此时只有本请求占槽位 → 立即关闭
+        assert!(matches!(reg.evict(id), EvictOutcome::BelowThreshold { .. }));
+        assert!(matches!(reg.evict(id), EvictOutcome::RemovedClosed));
         assert_eq!(reg.len(), 0);
         // 已摘除后再调用：无害
-        assert!(!reg.evict(id));
+        assert_eq!(reg.evict(id), EvictOutcome::NotFound);
     }
 
     /// 可观测性契约：**注册条目数**与**可路由数**必须能分开看。
