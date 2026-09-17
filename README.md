@@ -278,9 +278,43 @@ max_concurrency: 4
 
 | 配置 | 默认 | 覆盖范围 | 超时后 |
 |---|---|---|---|
-| `tunnel_op_secs` | 10s | 打开隧道流 / 发请求帧 / 取消帧 | `502`；**连续 3 次**才摘除该 agent 条目（单次超时在高并发下是排队假象） |
-| `head_timeout_secs` | 15s | 等上游响应头（首字节） | `504` + 摘除条目 |
+| `tunnel_op_secs` | 10s | 打开隧道流 / 发请求帧 / 取消帧 | **先换一个 agent 重试**（见下）；仍失败才 `502`，并计入"连续超时" |
+| `head_timeout_secs` | 15s | 等上游响应头（首字节） | `504`（**不重试**）+ 计入"连续超时" |
 | `timeout_secs` | 120s | 响应体逐帧空闲（SSE 有帧就不超时） | 发 `Cancel`，结束该流 |
+
+判"连接已死"要**连续 3 次**隧道操作超时（`registry::TUNNEL_TIMEOUTS_BEFORE_EVICT`）：单次超时在高并发下
+是排队假象——开流/写帧都要过连接级流管理器。任何一次**收到响应头**都会把计数清零
+（开流成功不算，因为卡死的 agent 照样能被开流）。
+
+### 失败处理：重试、摘除与延迟关闭
+
+**能重试什么、不能重试什么**（`http_proxy.rs` 的重试循环，`MAX_TUNNEL_ATTEMPTS = 2`）：
+
+| 失败点 | 是否重试 | 依据 |
+|---|---|---|
+| 打开隧道流失败 | **重试**（换另一个 agent） | 还没写过任何字节，请求帧必然**未送达** |
+| 写请求帧失败 | **重试**（换另一个 agent） | `write_frame` 是一整块 `write_all`，只有**全部字节被接受**才返回；超时 ⇒ 帧不完整 ⇒ agent 读不到完整帧（`FrameReader` 先读满长度前缀+载荷）⇒ 它不会调用上游 |
+| **等响应头超时** | **不重试** | 请求帧已完整送达，**模型可能已经在执行**；重试会重复计费、重复生成（`temperature > 0` 时结果还不一样）。宁可报错，也不做不安全的静默重放 |
+| 响应体中途断流/超时 | 不重试 | 已经产出字节，无法重放 |
+
+重试会**排除刚失败的那条连接**（`try_acquire_excluding`），否则"重试"会再次选中同一条坏连接；
+没有别的候选时，把**真正的失败原因**报给客户端（`502 ... no other agent available to retry`），
+而不是一个会把人引向"注册问题"的 503。
+
+> 想把"响应头超时"也做成可安全重试（不产生第二次模型调用），需要协议级去重：
+> 全局唯一 `request_uid` + agent 侧去重表。完整设计、取舍与不解决的问题见
+> [`EXACTLY_ONCE.md`](EXACTLY_ONCE.md)（**提案，未实现**）。
+
+**摘除与延迟关闭**：达到连续超时阈值后，
+
+1. **先移出路由** —— 后续请求不再选中它（这一步与何时关连接无关）；
+2. **再决定何时关闭连接**：若这条连接上还有别的在途请求（`inflight > 1`），
+   它们**已经把请求送达 agent、模型正在生成**，立刻关就是白扔客户的钱，
+   所以等在途归零后再关，**最多等 5s**（`EVICT_CLOSE_GRACE`）后强制关；
+   只剩当前这个失败请求时才立刻关。
+
+延迟关闭既避免打断正常请求，又保证连接最终会关——否则 agent 会退化成
+"自认为在线、网关侧不存在"的僵尸（实测这种状态下 503 占 92.6%）。
 
 **隧道坏掉时的典型症状**（都踩过）：`/healthz` 正常但**所有 API 请求挂住不返回**、日志停在最后一行的 `agent registered`、内存只涨不落 —— 因为请求卡在"等响应头"上，占着连接、并发槽位与缓冲区，客户端早已断开也发现不了。监控可关注：
 
@@ -496,6 +530,14 @@ if !store.usage_has_pending() { continue; }                // 无变化 → 整�
 - **`GET /metrics`**：Prometheus 文本格式指标（按状态码计数、在途请求、在线 agent 数、转发字节、累计耗时），可直接被 Prometheus/Grafana 抓取
   - 浏览器直接访问（`Accept: text/html`）时返回 Dashboard 页面而非文本，便于点进指标页；Prometheus 抓取（`Accept: */*`）不受影响
   - `hlmg_quic_accepting`：隧道入口是否仍在接受新 agent（1/0）。UDP 驱动失效时入口会停止接受新连接，而进程与 HTTP 入口照常运行——**建议对该指标为 0 告警**（这是唯一能发现该故障的信号）
+  - **`hlmg_agents` 与 `hlmg_agents_healthy`**：前者是**注册条目数**（含心跳已过期、连接还没关的），
+    后者是**心跳未过期、真正可路由**的数量。排查"所有请求 503"时只有后者能说明问题——
+    `hlmg_agents=2` 而 `hlmg_agents_healthy=0` 意味着"有人注册，但全部不健康"，与"没人注册"完全不同
+  - `hlmg_agent_rejections_total{reason=...}`：因挑不出可路由 agent 而拒绝的请求数，按原因分：
+    `registry-empty`（没人注册）/ `all-candidates-stale`（有人但心跳全过期）/
+    `no-agent-serves-model` / `all-candidates-at-capacity`。**503 的成因看这个，不要靠状态码猜**
+  - `hlmg_tunnel_retries_total{outcome=...}`：因隧道建立失败而换 agent 重试的次数——
+    `ok`（重试成功的**自愈**次数）/ `failed`（换了仍失败）/ `no-alternative`（没有别的 agent 可换）
   - `hlmg_key_verify_hits_total` / `hlmg_key_verify_misses_total`：key 校验命中已验证缓存 / **真正跑了 argon2**的次数。misses 的**增量**就是内存与 CPU 的风险信号（一次 miss 峰值 +19MiB，见《并发上限与内存》），稳态下应接近 0；突然上涨说明凭据被吊销/新增，或缓存容量 `verified_cache_max` 不够。⚠️ **`verified_cache_max: 0` 时这两个计数器恒为 0**（走的是不走缓存的旧路径，两个数都不加）——看到 0 要先确认缓存是否被关掉，别当成"没有校验"
 - **结构化日志**：`tracing`，每个请求带 `request_id` / 状态码 / 耗时（`tower-http` TraceLayer）
 - **`/healthz`**：存活探针
@@ -551,4 +593,6 @@ curl -X DELETE http://127.0.0.1:8080/admin/keys/<id> -H "Authorization: Bearer <
 
 ## 设计文档
 
-架构设计、帧协议细节、里程碑见 [`DESIGN.md`](DESIGN.md)。
+- [`DESIGN.md`](DESIGN.md)：架构设计、帧协议细节、里程碑
+- [`EXACTLY_ONCE.md`](EXACTLY_ONCE.md)：**提案**——让"响应头超时"也能安全重试所需的协议级去重
+  （全局唯一 `request_uid` + agent 侧去重表），含取舍、内存边界与不解决的问题
