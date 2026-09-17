@@ -38,6 +38,12 @@ pub struct AppState {
     pub rate_limiter: Option<RateLimiter>,
     /// HTTP 全局在途请求上限（0 = 不限；per-key 限流之外的总闸门）。
     pub max_concurrent_requests: u32,
+    /// 每条 agent 连接允许的同时在途隧道流数（QUIC 双向流额度）。
+    ///
+    /// 两个用途：① 建 QUIC 端点时作为双向流额度（见 `Gateway::start`）；
+    /// ② 开流超时时用来区分"忙"（额度排满，排队超时）与"死"（见
+    /// `registry::Entry::open_timeout_is_fatal`）。
+    pub max_open_tunnel_streams: u32,
     pub metrics: Metrics,
     /// React UI 静态目录（None = `/` 显示构建提示页）。
     pub ui: Option<PathBuf>,
@@ -450,6 +456,7 @@ mod tests {
             head_timeout: Duration::from_secs(5),
             rate_limiter: RateLimiter::new(0),
             max_concurrent_requests: 0,
+            max_open_tunnel_streams: 1024,
             metrics: Metrics::default(),
             ui,
             ui_problem: None,

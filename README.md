@@ -316,9 +316,35 @@ max_concurrency: 4
 延迟关闭既避免打断正常请求，又保证连接最终会关——否则 agent 会退化成
 "自认为在线、网关侧不存在"的僵尸（实测这种状态下 503 占 92.6%）。
 
+**但"超时"不等于"已死"：忙与死必须分开处置**（`registry::Entry::open_timeout_is_fatal`）。
+
+开流超时有两种成因，动作完全不同：
+
+| 成因 | 判据 | 处置 |
+|---|---|---|
+| **忙**（背压） | 在途请求数已达这条连接的承载上限 `min(agent 声明的 max_concurrency, 每连接流额度)` | **不摘除**：排队等额度是正常背压。记 `hlmg_tunnel_open_timeouts_total{class="busy"}`，换下一条连接重试；都满了返回 **429**（容量不足），而不是 502 |
+| **死** | 没到承载上限却开不出流（没有任何排队理由） | 走上面的摘除流程（连续 3 次 + 延迟关闭），记 `class="dead"` |
+
+把"忙"当"死"会**把局部过载放大成全站不可用**：摘除 → 连接被关 → agent 重连（退避最长 30s）
+→ 期间注册表里一个可路由 agent 都没有 → 所有请求 503。云端实测（2026-09-17，4 agent、768 并发）：
+`tunnel open timed out` 9345 次，一次 30s 压测 `hlmg_agent_rejections_total{reason="registry-empty"}`
+**+6835**、503 **+6057**。两个 class 分开暴露，是为了让"该扩容"与"该查网络"一眼可分。
+
+**每连接流额度必须显式设置**（`max_open_tunnel_streams`，默认 1024）：
+
+s2n-quic 的 `initial_max_streams_bidi` 默认只有 **100**（`InitialMaxStreamsBidi::RECOMMENDED`），
+实际可用额度取 `min(本地额度, 对端额度)`。agent 侧已经给了 1000（`agent::connect_once`），
+**但网关自己的本地额度以前从没设过 = 100**：一条 agent 连接最多只能有 100 条在途请求，
+第 101 条起就在排队等额度回收，上游一慢（首字节超过 `tunnel_op_secs`）就排队超时。
+取值必须 **≥ 每个 agent 声明的 `max_concurrency`**，声明超过本值时网关注册时会打 WARN
+（这类配置不一致表现为"隧道随机超时"，比容量不足难查得多）。
+回归测试：`e2e_more_concurrent_tunnels_than_the_default_quic_stream_ceiling`
+（120 条并发慢流；把额度改回 100 时正好 20/120 失败，且失败的是 503——正是上面那条放大链）。
+
 **隧道坏掉时的典型症状**（都踩过）：`/healthz` 正常但**所有 API 请求挂住不返回**、日志停在最后一行的 `agent registered`、内存只涨不落 —— 因为请求卡在"等响应头"上，占着连接、并发槽位与缓冲区，客户端早已断开也发现不了。监控可关注：
 
 - 日志出现 `upstream head timeout; evicting agent` / `tunnel write timed out; evicting agent`；
+- 日志出现 `tunnel open timed out while agent is at capacity; not evicting` = 容量不足（该扩容或调 `max_concurrency`），不是故障；
 - `hlmg_agents` 掉到 0，但 agent 侧日志显示"已连接"（说明两侧对连接死活的判断不一致）。
 
 排查顺序：① 看 agent 侧日志（有没有 `agent error` / 重连退避）；② 看网关 `edge connected` / `agent removed` 时间点；③ 连接数对不上时按上表把超时调小以更快失败，而不是靠重启网关。
@@ -538,6 +564,9 @@ if !store.usage_has_pending() { continue; }                // 无变化 → 整�
     `no-agent-serves-model` / `all-candidates-at-capacity`。**503 的成因看这个，不要靠状态码猜**
   - `hlmg_tunnel_retries_total{outcome=...}`：因隧道建立失败而换 agent 重试的次数——
     `ok`（重试成功的**自愈**次数）/ `failed`（换了仍失败）/ `no-alternative`（没有别的 agent 可换）
+  - `hlmg_tunnel_open_timeouts_total{class=...}`：开流超过 `tunnel_op_secs` 的次数，按判定分——
+    `busy`（在途已顶到承载上限，**背压**，不摘除，改换 agent 或 429）/ `dead`（没到上限却开不出流，
+    坏连接，摘除）。**`busy` 陡增 = 该扩容或调 agent 的 `max_concurrency`；`dead` 陡增才是隧道/网络故障**
   - `hlmg_key_verify_hits_total` / `hlmg_key_verify_misses_total`：key 校验命中已验证缓存 / **真正跑了 argon2**的次数。misses 的**增量**就是内存与 CPU 的风险信号（一次 miss 峰值 +19MiB，见《并发上限与内存》），稳态下应接近 0；突然上涨说明凭据被吊销/新增，或缓存容量 `verified_cache_max` 不够。⚠️ **`verified_cache_max: 0` 时这两个计数器恒为 0**（走的是不走缓存的旧路径，两个数都不加）——看到 0 要先确认缓存是否被关掉，别当成"没有校验"
 - **结构化日志**：`tracing`，每个请求带 `request_id` / 状态码 / 耗时（`tower-http` TraceLayer）
 - **`/healthz`**：存活探针

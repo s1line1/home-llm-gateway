@@ -123,6 +123,25 @@ fn extract_model(body: &[u8]) -> Result<String, ()> {
     }
 }
 
+/// 打开一条隧道流失败的两类原因。**必须分开**：它们的处置完全不同
+/// （超时可能是"忙"，错误一定是"坏"）。
+enum OpenFailure {
+    /// 在 `op_timeout` 内没能开出流。可能是对端死了，也可能只是**流额度排满在排队**
+    /// ——后者由调用方用 [`crate::registry::Entry::open_timeout_is_fatal`] 判定。
+    TimedOut,
+    /// 开流直接返回错误：连接确已不可用。
+    Failed(String),
+}
+
+impl OpenFailure {
+    fn message(&self) -> String {
+        match self {
+            OpenFailure::TimedOut => "tunnel open timed out".into(),
+            OpenFailure::Failed(e) => e.clone(),
+        }
+    }
+}
+
 /// 打开一条隧道流（带超时）。
 ///
 /// **为什么必须有超时**：健康隧道这一步是毫秒级（本机实测端到端固定开销 F≈56ms），
@@ -135,14 +154,11 @@ fn extract_model(body: &[u8]) -> Result<String, ()> {
 async fn open_tunnel(
     entry: &mut crate::registry::Entry,
     op_timeout: Duration,
-) -> Result<s2n_quic::stream::BidirectionalStream, String> {
+) -> Result<s2n_quic::stream::BidirectionalStream, OpenFailure> {
     match tokio::time::timeout(op_timeout, entry.conn.open_bidirectional_stream()).await {
         Ok(Ok(s)) => Ok(s),
-        Ok(Err(e)) => Err(format!("tunnel open failed: {e}")),
-        Err(_) => {
-            warn!(agent = %entry.agent_id, timeout_ms = op_timeout.as_millis(), "tunnel open timed out; evicting agent");
-            Err("tunnel open timed out".into())
-        }
+        Ok(Err(e)) => Err(OpenFailure::Failed(format!("tunnel open failed: {e}"))),
+        Err(_) => Err(OpenFailure::TimedOut),
     }
 }
 
@@ -297,21 +313,71 @@ pub async fn proxy(
 
         let stream = match open_tunnel(&mut entry, state.tunnel_op_timeout).await {
             Ok(s) => s,
-            Err(e) => {
-                // 打不开流 = 这条连接已经死了 → 摘掉条目（连续超时足够才会真摘），
-                // 然后换个 agent 重试；没有别的候选时把错误报给客户端。
-                state.registry.evict(entry.stable_id);
+            Err(failure) => {
+                // 开流超时有两种成因，**不能用同一个动作处置**：
+                //
+                //   忙：这条连接的在途请求已经顶到它的承载上限（声明的 max_concurrency
+                //       与端点流额度取小），开流是在排队等额度回收 → 排队超时是正常背压。
+                //       此时摘除等于把"局部过载"升级成"整台 agent 下线"：连接被关 →
+                //       agent 重连 → 注册表瞬间为空 → 期间所有请求 503。实测过一次
+                //       30s 压测 +6835 次 registry-empty，根因就在这里。
+                //   死：并没到承载上限却开不出流 → 没有任何排队理由，这才是坏连接。
+                //
+                // 所以只有"死"才摘除；"忙"只记指标 + 换下一条连接（重试逻辑与下面共用）。
+                let busy = matches!(failure, OpenFailure::TimedOut)
+                    && !entry.open_timeout_is_fatal(state.max_open_tunnel_streams);
+                let err = failure.message();
+                if busy {
+                    state.metrics.record_tunnel_open_timeout("busy");
+                    warn!(
+                        request_id,
+                        agent = %entry.agent_id,
+                        inflight = entry.inflight.load(std::sync::atomic::Ordering::Relaxed),
+                        max_concurrency = entry.max_concurrency,
+                        stream_ceiling = state.max_open_tunnel_streams,
+                        timeout_ms = state.tunnel_op_timeout.as_millis(),
+                        "tunnel open timed out while agent is at capacity; not evicting, trying another agent"
+                    );
+                } else {
+                    state.metrics.record_tunnel_open_timeout("dead");
+                    warn!(
+                        agent = %entry.agent_id,
+                        timeout_ms = state.tunnel_op_timeout.as_millis(),
+                        "tunnel open timed out; evicting agent"
+                    );
+                    // 打不开流 = 这条连接已经死了 → 摘掉条目（连续超时足够才会真摘），
+                    // 然后换个 agent 重试；没有别的候选时把错误报给客户端。
+                    state.registry.evict(entry.stable_id);
+                }
                 if tried.len() >= MAX_TUNNEL_ATTEMPTS {
                     state.metrics.record_tunnel_retry("failed");
-                    return error_response(StatusCode::BAD_GATEWAY, e);
+                    return error_response(
+                        if busy {
+                            StatusCode::TOO_MANY_REQUESTS
+                        } else {
+                            StatusCode::BAD_GATEWAY
+                        },
+                        if busy {
+                            "agent at capacity".to_string()
+                        } else {
+                            err
+                        },
+                    );
                 }
                 warn!(
                     request_id,
                     agent = %entry.agent_id,
-                    error = %e,
+                    error = %err,
                     "tunnel open failed; retrying on another agent"
-                );
-                last_failure = Some(e);
+                ); // "忙"不算隧道故障：不写进 last_failure，这样即使最后挑不出别的 agent，
+                   // 客户端拿到的是"容量不足（429）"而不是误导性的"隧道坏了（502）"。
+                   //
+                   // 也**不**在这里记 agent_rejections——那个计数器统计的是"最终没被服务的请求"
+                   // （按原因分）。这次重试可能成功，提前记会虚增容量告警；真正挑不出候选时，
+                   // 下一轮 `try_acquire_excluding` 会自己记 `all-candidates-at-capacity`。
+                if !busy {
+                    last_failure = Some(err);
+                }
                 continue;
             }
         };

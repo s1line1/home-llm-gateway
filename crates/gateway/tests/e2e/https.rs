@@ -28,6 +28,7 @@ async fn e2e_https_public_entry() {
         agent_stale_after: Duration::from_secs(10),
         rate_limit_per_min: 0,
         max_concurrent_requests: 0,
+        max_open_tunnel_streams: 1024,
         tls: Some(TlsPem {
             cert: srv_pem.clone().into_bytes(),
             key: srv_key_pem.clone().into_bytes(),
@@ -138,6 +139,7 @@ async fn e2e_quic_control_stream_edge_frames() {
         agent_stale_after: Duration::from_secs(10),
         rate_limit_per_min: 0,
         max_concurrent_requests: 0,
+        max_open_tunnel_streams: 1024,
         tls: None,
         ui_dir: None,
     })
@@ -315,6 +317,7 @@ async fn e2e_proxy_protocol_edge_cases() {
         agent_stale_after: Duration::from_secs(10),
         rate_limit_per_min: 0,
         max_concurrent_requests: 0,
+        max_open_tunnel_streams: 1024,
         tls: None,
         ui_dir: None,
     })
@@ -665,6 +668,7 @@ async fn gateway_start_fails_fast_on_unusable_tls() {
             agent_stale_after: Duration::from_secs(10),
             rate_limit_per_min: 0,
             max_concurrent_requests: 0,
+            max_open_tunnel_streams: 1024,
             tls: Some(tls),
             ui_dir: None,
         })

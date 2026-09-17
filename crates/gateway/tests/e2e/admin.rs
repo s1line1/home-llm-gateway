@@ -316,6 +316,7 @@ async fn e2e_openai_error_semantics() {
         agent_stale_after: Duration::from_secs(10),
         rate_limit_per_min: 0,
         max_concurrent_requests: 0,
+        max_open_tunnel_streams: 1024,
         tls: None,
         ui_dir: None,
     })
@@ -367,6 +368,7 @@ async fn e2e_usage_write_does_not_stall_the_response() {
         agent_stale_after: Duration::from_secs(10),
         rate_limit_per_min: 0,
         max_concurrent_requests: 0,
+        max_open_tunnel_streams: 1024,
         tls: None,
         ui_dir: None,
     })

@@ -78,6 +78,22 @@ rate_limit_per_min: 60
 # 峰值 7.5MB），这个值按业务量给即可，它就是一道防雪崩的总闸。
 max_concurrent_requests: 32
 
+# 每条 agent 连接允许**同时在途**的隧道流数（QUIC 双向流额度）。
+#
+# 为什么必须显式设置：s2n-quic 的 `initial_max_streams_bidi` 默认只有 **100**，
+# 而实际可用额度取 `min(本地额度, 对端额度)`。agent 侧已经给了 1000，但网关自己的
+# 本地额度从没设过 = 100 —— 于是一条 agent 连接最多只能有 100 条在途请求。超过之后
+# `open_bidirectional_stream()` 只能**排队等额度回收**，上游一慢就排过 tunnel_op_secs，
+# 被误判成"隧道已死" → 摘除**健康但繁忙**的 agent → 连接被关 → agent 重连 → 注册表
+# 瞬间为空 → 其间所有请求 503。
+# 实测（2026-09-17，云端 4 agent、768 并发）：`tunnel open timed out` 9345 次，
+# 一次 30s 压测 `agent_rejections_total{reason="registry-empty"}` +6835。
+#
+# 取值必须 **≥ 每个 agent 声明的 max_concurrency**（agent 注册时若声明超过本值，网关会打 WARN）。
+# 0 = 用默认值 1024。注意这只是**上限**：真正的在途量由注册表按 agent 的
+# max_concurrency 做准入控制，所以给大不会放大并发，也不会放大内存。
+max_open_tunnel_streams: 1024
+
 # 公网入口 HTTPS 证书（提供后公网入口启用 TLS，客户端用 https:// 访问；
 # 与 tls_key 成对，去掉即明文 HTTP）
 # tls_cert: /etc/home-llm-gateway/server.crt

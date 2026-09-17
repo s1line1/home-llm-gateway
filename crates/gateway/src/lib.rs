@@ -69,6 +69,15 @@ pub struct GatewayConfig {
     pub rate_limit_per_min: u32,
     /// HTTP 全局在途请求上限（0 = 不限）。
     pub max_concurrent_requests: u32,
+    /// 每条 agent 连接上允许同时在途的隧道流数（QUIC 双向流额度）。
+    ///
+    /// s2n-quic 的 `initial_max_streams_bidi` 默认 **100**，实际可用额度取
+    /// `min(本地, 对端)`。两侧都不设时，一条 agent 连接最多只有 100 条在途请求——
+    /// 超过就**排队等额度回收**，上游一慢便等过 `tunnel_op_timeout`，被误判成
+    /// "隧道已死"并摘除整条连接（agent 重连期间注册表为空 → 全量 503）。
+    ///
+    /// 必须 **≥ agent 声明的 max_concurrency**；注册时声明超限会打 WARN（见 `quic`）。
+    pub max_open_tunnel_streams: u32,
     /// 提供后，公网入口启用 HTTPS（rustls）。
     pub tls: Option<TlsPem>,
     /// React UI 静态目录（含 index.html；存在时 `/` 托管 Dashboard，否则显示构建提示页）。
@@ -108,9 +117,28 @@ impl Gateway {
             None => None,
         };
 
+        // 隧道流额度：网关**自己**能同时开多少条双向流（每个 agent 连接一份）。
+        //
+        // 必须显式设置，且必须 ≥ agent 声明的 max_concurrency。默认的
+        // `InitialMaxStreamsBidi::RECOMMENDED = 100` 是给"一条连接跑少量请求"的场景定的；
+        // 我们一条连接就是一整台 agent 的流量，100 会让第 101 条请求去排队等额度，
+        // 上游慢时排过 `tunnel_op_timeout` → 被当成坏隧道摘除（见 GatewayConfig 字段注释）。
+        //
+        // 幂等性/安全性：这只是**上限**，真正的在途量由注册表按 agent 声明的
+        // max_concurrency 做准入控制（`try_acquire`），所以这里给大不会放大并发。
+        let limits = s2n_quic::provider::limits::Limits::new()
+            .with_max_open_local_bidirectional_streams(u64::from(cfg.max_open_tunnel_streams))
+            .map_err(|e| {
+                crate::error::GatewayError::Config(format!(
+                    "max_open_tunnel_streams={} 不是合法的 QUIC 流额度: {e}",
+                    cfg.max_open_tunnel_streams
+                ))
+            })?;
+
         let server = s2n_quic::Server::builder()
             .with_tls(s2n_quic::provider::tls::rustls::Server::from(Arc::new(tls)))?
             .with_io(cfg.quic_bind)?
+            .with_limits(limits)?
             .start()?;
 
         let quic_addr = server.local_addr()?;
@@ -168,6 +196,7 @@ impl Gateway {
             head_timeout: cfg.head_timeout,
             rate_limiter: RateLimiter::new(cfg.rate_limit_per_min),
             max_concurrent_requests: cfg.max_concurrent_requests,
+            max_open_tunnel_streams: cfg.max_open_tunnel_streams,
             metrics: metrics.clone(),
             ui,
             ui_problem,
@@ -198,6 +227,7 @@ impl Gateway {
             server,
             registry.clone(),
             metrics,
+            cfg.max_open_tunnel_streams,
         )));
 
         tasks.push(usage_flusher);
