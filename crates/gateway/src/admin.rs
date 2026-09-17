@@ -192,6 +192,7 @@ mod tests {
             head_timeout: Duration::from_secs(5),
             rate_limiter: None,
             max_concurrent_requests: 0,
+            max_open_tunnel_streams: 1024,
             metrics: Metrics::default(),
             ui: None,
             ui_problem: None,

@@ -58,6 +58,33 @@ pub struct Entry {
     pub tunnel_op_timeouts: Arc<AtomicU32>,
 }
 
+impl Entry {
+    /// 一次「开流超时」是否足以判定这条连接**已死**（该摘除）。
+    ///
+    /// 为什么不能一律摘除：`open_bidirectional_stream()` 在**连接级流额度**排满时会
+    /// 排队等回收（s2n-quic 的额度声明，实际可用取 `min(本地, 对端)`）。这条路径上的
+    /// 超时既可能是"对端死了"，也可能只是"对端忙"：在途请求数已经顶到这条连接能承载的
+    /// 上限时，排队超时是**正常背压**的表现。
+    ///
+    /// 把它一律当"死"的代价在云端实测过：上游一慢 → 开流排队超时 → 摘除**健康但繁忙**的
+    /// agent → 连接被关 → agent 重连 → 注册表瞬间为空 → 其间所有请求 503
+    /// （单次 30s 压测 +6835 次 `registry-empty`），是"局部过载"被放大成"全站不可用"。
+    ///
+    /// 判定口径：在途数是否已达到这条连接的实际承载上限
+    /// （`min(声明的 max_concurrency, 端点流额度)`；`max_concurrency == 0` = 不限，
+    /// 此时上限就是端点流额度）。达到 → 忙，不摘除；未达到 → 说明并不是没额度，
+    /// 那就是真死了。
+    pub fn open_timeout_is_fatal(&self, stream_ceiling: u32) -> bool {
+        let ceiling = stream_ceiling.max(1);
+        let effective = if self.max_concurrency == 0 {
+            ceiling
+        } else {
+            self.max_concurrency.min(ceiling)
+        };
+        self.inflight.load(Ordering::Relaxed) < effective
+    }
+}
+
 impl Registry {
     /// 注册 agent；若同名 agent 已有其他连接，关闭旧连接。
     ///
@@ -851,5 +878,66 @@ mod tests {
         assert_eq!(snap[0].agent_id, "agent-a");
         assert_eq!(snap[1].agent_id, "home-1");
         assert!(Registry::default().snapshot().is_empty());
+    }
+
+    /// 规格：**"开流超时"不等于"连接已死"**。
+    ///
+    /// `open_bidirectional_stream()` 在连接级流额度排满时会排队等回收，所以超时有两种
+    /// 成因：对端死了（该摘除），或对端忙、在途已经顶到承载上限（正常背压，摘除就是
+    /// 把局部过载放大成全站不可用）。
+    ///
+    /// 云端实测的代价（2026-09-17，4 agent、768 并发）：一律摘除 → `tunnel open timed out`
+    /// 9345 次、健康 agent 被关掉重连 → 单次 30s 压测 `registry-empty` +6835 → 全量 503。
+    #[tokio::test]
+    async fn open_timeout_is_fatal_only_when_the_connection_is_not_at_capacity() {
+        let reg = Registry::default();
+        let conn = test_connection().await;
+        reg.register("busy".into(), vec!["*".into()], 1, conn.clone());
+        let (entry, guard) = reg.try_acquire(Duration::from_secs(10), "qwen2.5").unwrap();
+
+        // 在途 1 > 0：没到这条连接的上限（max_concurrency = 1 时 1 就是满）
+        entry.inflight.store(0, Ordering::Relaxed);
+        assert!(
+            entry.open_timeout_is_fatal(1024),
+            "没有任何在途请求却开不出流 = 连接确实坏了，必须摘除"
+        );
+
+        // 在途 1 = max_concurrency：额度排满后的排队超时是背压，不是死亡
+        entry.inflight.store(1, Ordering::Relaxed);
+        assert!(
+            !entry.open_timeout_is_fatal(1024),
+            "在途已达声明的 max_concurrency → 超时是排队等额度，不能摘除健康连接"
+        );
+        drop(guard);
+
+        // 声明不限并发（max_concurrency = 0）时，上限就是端点流额度
+        let conn2 = test_connection().await;
+        reg.register("unbounded".into(), vec!["*".into()], 0, conn2);
+        let (entry2, _g2) = reg.try_acquire(Duration::from_secs(10), "qwen2.5").unwrap();
+        assert_eq!(entry2.agent_id, "unbounded");
+        entry2.inflight.store(3, Ordering::Relaxed);
+        assert!(
+            entry2.open_timeout_is_fatal(4),
+            "在途 3 < 额度 4 → 还有额度却开不出流 = 坏连接"
+        );
+        entry2.inflight.store(4, Ordering::Relaxed);
+        assert!(
+            !entry2.open_timeout_is_fatal(4),
+            "在途 = 额度 → 超时是额度排队，不是死亡"
+        );
+
+        // 配置不一致（agent 声明 256 > 端点额度 100）：以更小的那个为准，
+        // 否则"忙"会被判成"死"，又回到摘除健康 agent 的老路。
+        let conn3 = test_connection().await;
+        reg.register("over-declared".into(), vec!["*".into()], 256, conn3);
+        let (entry3, _g3) = reg.try_acquire(Duration::from_secs(10), "qwen2.5").unwrap();
+        assert_eq!(entry3.agent_id, "over-declared");
+        entry3.inflight.store(99, Ordering::Relaxed);
+        assert!(entry3.open_timeout_is_fatal(100));
+        entry3.inflight.store(100, Ordering::Relaxed);
+        assert!(
+            !entry3.open_timeout_is_fatal(100),
+            "额度先于容量耗尽时，超时同样是背压（这正是要告警的配置不一致）"
+        );
     }
 }

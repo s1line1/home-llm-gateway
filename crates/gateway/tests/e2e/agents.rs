@@ -70,6 +70,7 @@ async fn e2e_multi_agent_least_loaded() {
         agent_stale_after: Duration::from_secs(10),
         rate_limit_per_min: 0,
         max_concurrent_requests: 0,
+        max_open_tunnel_streams: 1024,
         tls: None,
         ui_dir: None,
     })
@@ -193,6 +194,7 @@ async fn e2e_model_routing_and_models_endpoint() {
         agent_stale_after: Duration::from_secs(10),
         rate_limit_per_min: 0,
         max_concurrent_requests: 0,
+        max_open_tunnel_streams: 1024,
         tls: None,
         ui_dir: None,
     })
@@ -358,6 +360,7 @@ async fn e2e_client_cancel_does_not_leak_concurrency_slot() {
         agent_stale_after: Duration::from_secs(10),
         rate_limit_per_min: 0,
         max_concurrent_requests: 1,
+        max_open_tunnel_streams: 1024,
         tls: None,
         ui_dir: None,
     })
@@ -461,6 +464,7 @@ async fn e2e_streaming_holds_concurrency_slot_until_body_ends() {
         agent_stale_after: Duration::from_secs(10),
         rate_limit_per_min: 0,
         max_concurrent_requests: 1,
+        max_open_tunnel_streams: 1024,
         tls: None,
         ui_dir: None,
     })
@@ -572,6 +576,7 @@ async fn e2e_mid_stream_cancel_releases_concurrency_slot() {
         agent_stale_after: Duration::from_secs(10),
         rate_limit_per_min: 0,
         max_concurrent_requests: 1,
+        max_open_tunnel_streams: 1024,
         tls: None,
         ui_dir: None,
     })
@@ -683,6 +688,7 @@ async fn e2e_http_concurrent_request_limit() {
         agent_stale_after: Duration::from_secs(10),
         rate_limit_per_min: 0,
         max_concurrent_requests: 1,
+        max_open_tunnel_streams: 1024,
         tls: None,
         ui_dir: None,
     })
@@ -766,6 +772,7 @@ async fn e2e_dead_tunnel_fails_fast_instead_of_hanging() {
         agent_stale_after: Duration::from_secs(10),
         rate_limit_per_min: 0,
         max_concurrent_requests: 0,
+        max_open_tunnel_streams: 1024,
         tls: None,
         ui_dir: None,
     })
@@ -885,5 +892,88 @@ async fn e2e_dead_tunnel_fails_fast_instead_of_hanging() {
     );
     assert_eq!(gw.agent_count(), 0, "连续超时达阈值后条目应已被摘除");
 
+    gw.shutdown().await;
+}
+
+/// 规格：**一条 agent 连接上的同时在途请求数，不该被 QUIC 流额度悄悄卡在 100**。
+///
+/// s2n-quic 的 `initial_max_streams_bidi` 默认只有 100，而实际可用额度取
+/// `min(本地额度, 对端额度)`。网关不设 `max_open_tunnel_streams` 时，第 101 条请求
+/// 只能**排队等额度回收**：上游一慢（这里正文停 3s）就排过 `tunnel_op_timeout`（1s），
+/// 于是被误判成"隧道卡住"→ 摘除**健康但繁忙**的 agent → 连接被关、注册表瞬间为空
+/// → 其余请求 502/503。云端实测（2026-09-17，4 agent、768 并发）：
+/// `tunnel open timed out` 9345 次，一次 30s 压测 `registry-empty` +6835。
+///
+/// 本测试用 120 > 100 条并发慢流把它钉住：修好前会在 100 条处排队并超时，
+/// 修好后全部 200，且 agent 一直在注册表里。
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn e2e_more_concurrent_tunnels_than_the_default_quic_stream_ceiling() {
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    // max_concurrency=256（远大于 120，所以失败只可能来自流额度而不是容量闸）
+    // tunnel_op_timeout=1s：远小于上游正文停顿 3s，凡"排队等额度"必然超时。
+    let (gw, agent, base, key) = start_stack_with_tunnel_timeout(
+        Duration::from_secs(30),
+        Duration::from_secs(1),
+        0,
+        256,
+        None,
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    const CONCURRENCY: usize = 120;
+    let mut handles = Vec::new();
+    for _ in 0..CONCURRENCY {
+        let client = client.clone();
+        let base = base.clone();
+        let key = key.clone();
+        handles.push(tokio::spawn(async move {
+            client
+                .post(format!("{base}/v1/slow_body"))
+                .header("Authorization", format!("Bearer {key}"))
+                .json(&serde_json::json!({ "model": "mock-llm" }))
+                .send()
+                .await
+                .map(|r| r.status().as_u16())
+        }));
+    }
+    let mut statuses = Vec::new();
+    for h in handles {
+        // 传输层失败（连接被重置等）也要落进 statuses，用 0 表示，否则会被断言漏掉
+        statuses.push(h.await.unwrap().unwrap_or(0));
+    }
+    let bad: Vec<_> = statuses.iter().filter(|s| **s != 200).collect();
+    assert!(
+        bad.is_empty(),
+        "{} / {CONCURRENCY} 条并发隧道失败（流额度排满后开流超时会被当成坏隧道摘除）：{statuses:?}",
+        bad.len()
+    );
+
+    // 健康但繁忙的 agent 绝不能被摘除（摘除 → 连接关闭 → agent 重连 → 注册表空 → 全量 503）
+    assert_eq!(
+        gw.agent_count(),
+        1,
+        "agent 被摘除了：忙 ≠ 死，摘除会把局部过载放大成全站不可用"
+    );
+
+    let text = client
+        .get(format!("{base}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        text.contains("hlmg_agents_healthy 1"),
+        "agent 必须仍然可路由: {text}"
+    );
+    assert!(
+        !text.contains("hlmg_tunnel_open_timeouts_total{class=\"dead\"}"),
+        "不该出现 class=dead 的开流超时（那意味着健康连接被判成坏连接）: {text}"
+    );
+
+    agent.shutdown().await;
     gw.shutdown().await;
 }

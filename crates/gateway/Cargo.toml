@@ -49,3 +49,6 @@ harness = false
 
 [lints]
 workspace = true
+
+[target."cfg(unix)".dependencies]
+rlimit = "0.11"
