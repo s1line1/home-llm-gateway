@@ -107,7 +107,10 @@ fn default_verified_cache_max() -> usize {
     crate::keystore::DEFAULT_VERIFIED_MAX
 }
 fn default_tunnel_op_secs() -> u64 {
-    2
+    // 2s 在高并发下过短：开流/写帧要过连接级流管理器，768 并发时排队很容易超过 2s，
+    // 于是被误判成"连接已死"。配合"连续 3 次才摘除 + 摘除时关连接"（见 registry::evict），
+    // 默认放宽到 5s。
+    5
 }
 fn default_head_timeout_secs() -> u64 {
     15

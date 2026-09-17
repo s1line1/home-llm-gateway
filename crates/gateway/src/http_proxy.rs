@@ -296,7 +296,12 @@ pub async fn proxy(
     // 也不能用 `tunnel_op_timeout`（2s）：上游"思考"是合法的，本地模型 1–3s 很常见。
     let head = tokio::time::timeout(state.head_timeout, read_head(&mut recv)).await;
     let (status, mut out_headers) = match head {
-        Ok(Ok(HeadOutcome::Head(s, h))) => (s, h),
+        Ok(Ok(HeadOutcome::Head(s, h))) => {
+            // 对端真的回了响应头 = 这条隧道是活的 → 清掉连续超时计数。
+            // （开流成功不能作为判据：agent 卡死时流照样能开，只是永远不回帧。）
+            state.registry.note_tunnel_op_ok(entry.stable_id);
+            (s, h)
+        }
         Ok(Ok(HeadOutcome::Error(code, message))) => {
             let _ = send.finish();
             return error_response(
