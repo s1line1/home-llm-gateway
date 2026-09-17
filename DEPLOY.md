@@ -272,3 +272,13 @@ curl -N -k -H "Authorization: Bearer <你的key>" \
   大规模生产升级请先备份 `keys.db`，改用离线迁移工具（演进方案见 `TODO.md` P1「keys.db 迁移规模化」），
   不要依赖启动时的自动迁移
 - 无论量级，升级前都建议 `cp keys.db keys.db.bak` 备份；迁移是幂等的，失败后可安全重试
+
+**上面是"明文 → argon2"的大迁移。另有一次轻量迁移**（已验证身份缓存引入时新增 `api_keys.cred_version` 列）：
+启动时检查该列是否存在，缺则 `ALTER TABLE ... ADD COLUMN cred_version INTEGER NOT NULL DEFAULT 1`，
+**只加列、不重建表、不重算哈希，旧 key 全部继续可用**。升级后建议确认一下：
+
+```bash
+sqlite3 /etc/home-llm-gateway/keys.db "PRAGMA table_info(api_keys);"   # 应含 cred_version
+curl -s localhost:8080/metrics | grep -E 'hlmg_key_verify_(hits|misses)_total'
+# 稳态下 hits 快速累积、misses 几乎不动（每个不同 token 只付一次 argon2）
+```
