@@ -37,6 +37,11 @@ async fn e2e_metrics_endpoint() {
         text.contains("hlmg_agents 1"),
         "missing agents gauge: {text}"
     );
+    // 注册条目数 与 可路由数必须分别暴露：只报前者会把"全部 stale"误读成"agent 在线"
+    assert!(
+        text.contains("hlmg_agents_healthy 1"),
+        "missing healthy agents gauge: {text}"
+    );
     assert!(
         text.contains("hlmg_quic_connections 1"),
         "missing quic connections gauge: {text}"

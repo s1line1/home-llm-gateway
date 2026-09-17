@@ -136,6 +136,43 @@ impl Registry {
         self.inner.read().unwrap().len()
     }
 
+    /// 注册表里 **心跳未过期** 的 agent 数（= 真正能被路由的候选数）。
+    ///
+    /// 与 [`Self::len`] 的区别很要紧：条目要等连接真正关闭才摘除，所以失联 agent
+    /// 会继续被 `len()`（以及 `/metrics hlmg_agents`、`/admin/agents`）算作"在线"，
+    /// 但它**不参与路由**。排查"所有请求 503"时必须能区分这两者——否则会误判为
+    /// "agent 掉了"，实际是"注册表里有、但全部不健康"。
+    pub fn healthy_count(&self, stale_after: Duration) -> usize {
+        let inner = self.inner.read().unwrap();
+        inner
+            .values()
+            .filter(|e| e.last_seen.elapsed() < stale_after)
+            .count()
+    }
+
+    /// 挑不出候选时的诊断快照（只用于失败路径的日志/指标，不进热路径）。
+    pub fn status(&self, stale_after: Duration) -> RegistryStatus {
+        let inner = self.inner.read().unwrap();
+        let now = Instant::now();
+        let mut healthy = 0usize;
+        let mut oldest: Option<Duration> = None;
+        for e in inner.values() {
+            let age = now.duration_since(e.last_seen);
+            if age < stale_after {
+                healthy += 1;
+            }
+            oldest = Some(match oldest {
+                Some(o) if o >= age => o,
+                _ => age,
+            });
+        }
+        RegistryStatus {
+            registered: inner.len(),
+            healthy,
+            oldest_last_seen_ago: oldest,
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.inner.read().unwrap().is_empty()
     }
@@ -222,6 +259,17 @@ impl Registry {
         }
         Err(AcquireError::AtCapacity)
     }
+}
+
+/// 拒绝请求时的注册表诊断快照（仅日志/指标用）。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RegistryStatus {
+    /// 注册表条目数（含失联但连接未关的）。
+    pub registered: usize,
+    /// 心跳未过期、真正可路由的条目数。
+    pub healthy: usize,
+    /// 最久没有心跳的条目距今多久（None = 注册表为空）。
+    pub oldest_last_seen_ago: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -353,6 +401,46 @@ mod tests {
         assert_eq!(reg.len(), 0);
         // 对不存在的 agent 移除 → 无害
         reg.remove_if_same("ghost", id2);
+    }
+
+    /// 可观测性契约：**注册条目数**与**可路由数**必须能分开看。
+    ///
+    /// 失联 agent 的条目要等连接真正关闭才摘除，所以 `len()` 会把它算作"在线"，
+    /// 而 `try_acquire` 会把它过滤掉。两者混为一谈时，"所有请求 503"会被误读成
+    /// "agent 掉了"——线上排查正是卡在这里（/metrics 显示 2 个 agent，实际全部 stale）。
+    #[tokio::test]
+    async fn healthy_count_separates_registered_from_routable() {
+        let reg = Registry::default();
+        let c1 = test_connection().await;
+        let c2 = test_connection().await;
+        reg.register("fresh".into(), vec!["*".into()], 4, c1.clone());
+        reg.register("stale".into(), vec!["*".into()], 4, c2.clone());
+
+        let stale_after = Duration::from_millis(30);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // 两条都过期
+        assert_eq!(reg.len(), 2, "条目仍在注册表里（连接没关）");
+        assert_eq!(reg.healthy_count(stale_after), 0, "但没有一条可路由");
+        let st = reg.status(stale_after);
+        assert_eq!((st.registered, st.healthy), (2, 0));
+        assert!(st.oldest_last_seen_ago.unwrap() >= Duration::from_millis(50));
+        assert!(matches!(
+            reg.try_acquire(stale_after, "qwen2.5"),
+            Err(AcquireError::NoAgent)
+        ));
+
+        // 一条心跳恢复 → 只有它可路由
+        reg.heartbeat("fresh");
+        assert_eq!(reg.len(), 2);
+        assert_eq!(reg.healthy_count(stale_after), 1);
+        assert_eq!(reg.status(stale_after).healthy, 1);
+        assert!(reg.try_acquire(stale_after, "qwen2.5").is_ok());
+
+        // 空注册表：两个数都是 0，且没有 last_seen 可报
+        let empty = Registry::default();
+        assert_eq!(empty.healthy_count(stale_after), 0);
+        assert_eq!(empty.status(stale_after).registered, 0);
+        assert!(empty.status(stale_after).oldest_last_seen_ago.is_none());
     }
 
     #[tokio::test]

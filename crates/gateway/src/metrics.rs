@@ -32,6 +32,12 @@ struct MetricsInner {
     agent_connections_total: AtomicU64,
     /// QUIC 隧道入口是否仍在接受新连接（1/0）。入口停止后进程照常运行，这是唯一的告警信号。
     quic_accepting: AtomicU64,
+    /// 因"挑不出可路由的 agent"而拒绝的请求数，按原因分（reason → count）。
+    ///
+    /// 与 HTTP 状态码计数是两件事：客户端只看到 503/404/429，而这里回答的是
+    /// **为什么**——尤其是 `registry-empty`（真没人注册）与 `all-candidates-stale`
+    /// （有人注册但心跳全过期）必须分开：两者都表现为 503，处置方式却完全不同。
+    agent_rejections: Mutex<HashMap<&'static str, u64>>,
 }
 
 impl Metrics {
@@ -69,6 +75,17 @@ impl Metrics {
     }
 
     /// 记录被 admission 拒绝的请求（不计 active/耗时，但计入请求数与状态码分布）。
+    /// 记录一次"无可路由 agent"的拒绝及其原因（原因常量见 `http_proxy` 的调用点）。
+    pub fn record_agent_rejection(&self, reason: &'static str) {
+        *self
+            .inner
+            .agent_rejections
+            .lock()
+            .unwrap()
+            .entry(reason)
+            .or_insert(0) += 1;
+    }
+
     pub fn record_rejected(&self, status: u16) {
         self.inner.request_count.fetch_add(1, Ordering::Relaxed);
         self.record_status(status);
@@ -114,9 +131,16 @@ impl Metrics {
 
     /// 渲染为 Prometheus 文本格式。
     ///
-    /// - `agent_count`：注册表实时值（由调用方传入）
+    /// - `agent_count`：注册表条目数（含失联但连接未关的）
+    /// - `agents_healthy`：其中**心跳未过期、真正可路由**的数量
     /// - `verify_hits` / `verify_misses`：已验证身份缓存的命中/未命中（来自 KeyStore）
-    pub fn render(&self, agent_count: usize, verify_hits: u64, verify_misses: u64) -> String {
+    pub fn render(
+        &self,
+        agent_count: usize,
+        agents_healthy: usize,
+        verify_hits: u64,
+        verify_misses: u64,
+    ) -> String {
         let inner = &self.inner;
         let mut out = String::with_capacity(512);
         out.push_str("# HELP hlmg_requests_total Total gateway requests by HTTP status.\n");
@@ -136,9 +160,29 @@ impl Metrics {
             "hlmg_active_requests {}\n",
             inner.active.load(Ordering::Relaxed)
         ));
-        out.push_str("# HELP hlmg_agents Registered healthy agents.\n");
+        // 语义说明（旧 HELP 文案写的是 "Registered healthy agents"，但该值不过滤心跳，
+        // 失联 agent 也会算进去——排查"全部请求 503"时极易误判，这里按实际语义改正）。
+        out.push_str("# HELP hlmg_agents Registered agent entries, including ones whose heartbeats have expired.\n");
         out.push_str("# TYPE hlmg_agents gauge\n");
         out.push_str(&format!("hlmg_agents {agent_count}\n"));
+        out.push_str("# HELP hlmg_agents_healthy Registered agents whose last heartbeat is within agent_stale_secs (routable candidates).\n");
+        out.push_str("# TYPE hlmg_agents_healthy gauge\n");
+        out.push_str(&format!("hlmg_agents_healthy {agents_healthy}\n"));
+        {
+            let rej = inner.agent_rejections.lock().unwrap();
+            if !rej.is_empty() {
+                out.push_str("# HELP hlmg_agent_rejections_total Requests rejected because no routable agent was available, by reason.\n");
+                out.push_str("# TYPE hlmg_agent_rejections_total counter\n");
+                let mut reasons: Vec<&&str> = rej.keys().collect();
+                reasons.sort_unstable();
+                for r in reasons {
+                    out.push_str(&format!(
+                        "hlmg_agent_rejections_total{{reason=\"{r}\"}} {}\n",
+                        rej[*r]
+                    ));
+                }
+            }
+        }
         out.push_str("# HELP hlmg_bytes_out Bytes forwarded to clients.\n");
         out.push_str("# TYPE hlmg_bytes_out counter\n");
         out.push_str(&format!(
