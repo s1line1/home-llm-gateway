@@ -34,8 +34,8 @@ edge-agent（LLM 所在机器）  主动拨号 + 心跳 + 断线重连，转发�
 ```
 crates/
 ├── proto/      隧道帧协议（Register/Heartbeat/ProxyRequest/Response*/Cancel/Error）
-├── gateway/    cloud-gateway 二进制（axum + quinn server）
-├── agent/      edge-agent 二进制（quinn client + reqwest）
+├── gateway/    cloud-gateway 二进制（axum + s2n-quic server）
+├── agent/      edge-agent 二进制（s2n-quic client + reqwest）
 └── mock-llm/   模拟 OpenAI 兼容接口的假 LLM（无真实模型时打通链路用）
 web/            React + TS 管理面板（Dashboard；网关启动即托管，见下）
 certs/          证书生成脚本（开发用）
@@ -187,9 +187,10 @@ oha -z 30s -c 50 -m POST -H "Authorization: Bearer $KEY" \
 ```
 
 > 压测前建议 `cargo build --release` 用 release 二进制（debug 构建性能差一个数量级）；
-> 压纯吞吐时调大 `agent-config.yml` 的 `max_concurrency`，否则高并发会被 admission control 返回 429（设计行为）。
-> ⚠️ 但它不能无限调大：每个在途流式请求要吃掉网关约 15–20MB，**这个值应当由网关内存倒推**
-> （见《并发上限与内存》，`max_concurrency ≈ MemoryMax / 20MB`）——设得过大，高并发会把网关推到 OOM。
+> 压纯吞吐时调大 `agent-config.yml` 的 `max_concurrency`，否则高并发会被 admission control 返回 429（设计行为）；
+> 高事件速率的流式压测还有第二道天花板在 **agent 的 CPU**（见《agent 每事件的 CPU 成本》）。
+> ⚠️ 网关侧的内存要看是否开了校验缓存：**关闭时**每个在途请求要吃约 19MiB（argon2 工作内存），
+> `max_concurrency ≈ MemoryMax / 20MB`；**默认开启时**内存不再随在途数线性增长（见《并发上限与内存》）。
 
 ## 接入真实 LLM
 
@@ -238,7 +239,7 @@ agent 配置里 `max_concurrency: 2`（声明最多 2 个并发请求）。
 
 网关按 agent 声明的上限做并发占位，超限回 429，避免把 edge 的 GPU 打爆。
 
-**这个值该给多少，由网关侧内存决定**（每个在途流式请求约 15–20MB，见下节《并发上限与内存》）：`max_concurrency ≈ MemoryMax / 20MB` 再留三成余量。设得过大等于关掉这道闸门——请求全进隧道后网关自己会被 OOM 杀掉。网关侧的 `max_concurrent_requests` 是同一件事的总闸门，也要按同一公式收口。
+**这个值该给多少**：主要看 edge 的 GPU/模型吞吐（这是它的本职），网关侧内存只在**缓存关闭时**才跟着并发走——那种情况下每个在途请求约 19MiB，`max_concurrency ≈ MemoryMax / 20MB`（见下节《并发上限与内存》）。**默认开启校验缓存后，网关内存不再随 `max_concurrency` 线性增长**，所以这个值可以放心按 GPU 能力给。网关侧的 `max_concurrent_requests` 是同一件事的总闸门，也按同一思路收口。
 
 ### 多 agent（多台 LLM 机器，edge 异构模型）
 
@@ -288,13 +289,30 @@ max_concurrency: 4
 
 排查顺序：① 看 agent 侧日志（有没有 `agent error` / 重连退避）；② 看网关 `edge connected` / `agent removed` 时间点；③ 连接数对不上时按上表把超时调小以更快失败，而不是靠重启网关。
 
-### 并发上限与内存（1.6GB 机器实测）
+### 并发上限与内存（实测）
 
-网关的内存在途成本很高：**每个"同时在跑的 key 校验"约 19MiB** —— 这是 argon2 的工作内存（`m=19456 KiB`，内存硬是它的设计目标），**不是**转发缓冲。所以真正限制并发的是**内存**，不是 `max_concurrent_requests`。
+网关的内存有两笔账，**必须分开算**——过去把它们混在一起，才导致"内存随并发爆炸"的误判：
 
-> 实测确认过：8 并发同 key 请求 → RSS 8.7MB→160.8MB，vmmap 里正好 **8 块 `MALLOC_LARGE` × 19.0MB**；换成**无效 key**（sha256 未命中、根本不跑 argon2）同样压力下**零增长**；固定 8 条连接压 60 秒 / 16829 请求 → 5 秒后锁死不动（**不是泄漏**，是每并发一份工作内存）。
+| | 单笔成本 | 何时发生 | 缓存开启后的总量 |
+|---|---|---|---|
+| **冷启动校验**（argon2 工作内存） | **19MiB**（`m=19456 KiB`，内存硬是它的设计目标） | 每个**首次出现**的凭据（每次缓存 miss） | `同时首用的不同 token 数 × 19MiB` |
+| **转发缓冲**（HTTP/TLS + chunk） | **约 0.2MB**（100 字符短流实测；长响应按响应大小加） | 每个在途请求 | `在途请求数 × ~0.2MB` |
 
-一台 2 vCPU / 1.6GB 的云机，网关 `MemoryMax=1G`，100 字符 SSE（102 事件，每条流约 1.0s 地板）、agent `max_concurrency: 32`：
+**默认配置开着校验缓存**（`verified_cache_max: 1650`），所以稳态下 19MiB 那笔账几乎不发生：云端真实流量 21 516 个 200 请求 → `hits` 22 426 / `misses` **3**，网关 `memory.peak` 仅 7.5MB。
+
+> **同一台机器、同一把 key、同一负载，只改 `verified_cache_max` 的对照实测**（本地全栈 release 网关，100 字符流，每档 15 秒）：
+>
+> | 在途并发 | 缓存关闭（`0`）峰值 | 缓存开启（`1650`）峰值 |
+> |---|---|---|
+> | 8 | 172.8MB（+144.0MB，**每请求 ≈19MB** = argon2） | 31.6MB（+2.8MB，**仅一次冷启动**的 argon2） |
+> | 64 | **1 236.5MB**（+1 063.6MB，1GB 上限必然 OOM） | 27.1MB（+13.4MB，净增对应 **每请求 ≈0.2MB** 缓冲） |
+> | 128 | **1 633.8MB** 且 **45% 请求失败**（被打爆） | 未测（无必要） |
+>
+> 缓存关闭时计数器保持 0（该路径不算缓存命中/未命中，见《可观测性》）。
+>
+> 另一组确认测量（缓存关闭口径）：8 并发同 key 请求 → RSS 8.7MB→160.8MB，vmmap 里正好 **8 块 `MALLOC_LARGE` × 19.0MB**；换成**无效 key**（sha256 未命中、根本不跑 argon2）同样压力下**零增长**；固定 8 条连接压 60 秒 / 16829 请求 → 5 秒后锁死不动（**不是泄漏**，是每并发一份工作内存）。缓存开关的长期对照（404 路径）：**关闭 = 峰值 +153.4MB / 2 962 个请求**；**开启 = 峰值 +1.6MB / 24 654 个请求**。
+
+下面这台 2 vCPU / 1.6GB 云机（网关 `MemoryMax=1G`，100 字符 SSE、102 事件、每流约 1.0s 地板、agent `max_concurrency: 32`）的表，跑在缓存**已生效**的状态：
 
 | 并发 | 网关 RSS | 吞吐 | 中位延迟 | p95 |
 |---|---|---|---|---|
@@ -302,25 +320,54 @@ max_concurrency: 4
 | 16 | 443–450MB | 12.0 req/s | 1288ms | 1418ms |
 | 32 | 654MB（峰值 749–786MB） | 16.0 req/s | 1346ms | 3708ms |
 
-五条结论：
+> 这组 RSS 远高于上面本地对照的 27MB，差异来自**机器与历史**：它包含缓存生效前（旧版本）留下的分配器高水位与更多在途流，不能当作"每请求成本"来读。要规划内存请用上面那张对照表。
 
-- **`MemoryMax=1G` ≈ 40 个在途请求**。32 并发已到峰值 749MB（73%）；不要靠继续加并发提吞吐——16→32 并发翻倍只换来 +33% 吞吐，而 p95 从 1.4s 抬到 3.7s（瓶颈已不在网关）。
-- **`agent-config.yml` 的 `max_concurrency` 按内存定**：32 并发配 1G 上限是安全档位（≈ `MemoryMax / 19MiB`，再留余量）。设成 `5000` 之类等于关掉 admission control，会把网关推到 OOM（实测 40 并发 620–780MB）。
-- **`verified_cache_max`（默认 1650）把校验成本从"每请求"降到"每凭据版本"**：已验证身份缓存 + **单飞**（同一 token 的并发请求串行化，只跑一次 argon2）+ **凭据版本核对**（吊销即时生效，不靠 TTL）。峰值随之变成 `同时首用的不同 token 数 × 19MiB`：单 key 场景下从 40×19MiB≈760MB 变成 19MiB。设 0 可回到"每请求都校验"的旧行为。
+四条结论：
+
+- **吞吐拐点在 16→32 并发之间**：翻倍并发只换来 +33% 吞吐（12.0 → 16.0 req/s），而 p95 从 1.4s 抬到 3.7s——**瓶颈已不在网关**。要继续加并发前，先确认瓶颈在哪一侧（网关 CPU / 出口带宽 / agent 的每事件 CPU，见下节）。
+- **`agent-config.yml` 的 `max_concurrency` 只在缓存关闭时才需要按内存倒推**：那种情况下 32 并发配 1G 上限是安全档位（≈ `MemoryMax / 19MiB`，再留余量），设成 `5000` 之类等于关掉 admission control，会把网关推到 OOM（实测 40 并发 620–780MB）。**默认开启缓存后，这个值按 edge 的 GPU/模型吞吐给即可**。
+- **`verified_cache_max`（默认 1650）把校验成本从"每请求"降到"每凭据版本"**：已验证身份缓存 + **单飞**（同一 token 的并发请求串行化，只跑一次 argon2）+ **凭据版本核对**（吊销即时生效，不靠 TTL）。峰值随之变成 `同时首用的不同 token 数 × 19MiB`：64 并发从 **1 236.5MB 降到 27.1MB**（上面那张对照表）。设 0 可回到"每请求都校验"的旧行为。
+
+  > 生产实测（云端 2 vCPU / 1.6GB，同一 key）：缓存生效后 **21 516 个 200 + 941 个 429** 的负载下，`hlmg_key_verify_hits_total` = 22 426、`misses` = 3（命中率 99.99%），网关写入期间内存峰值仅 7.5MB、CPU 峰值 15%。
 - **内存不随请求数累积，只随在途数**：停负载后回落到几百 MB 就不再降（分配器保留的高水位池），但持续跑几千个短请求不会继续涨。所以 `MemoryMax` 不要设成小值（见 `deploy/gateway.service` 里 `MemoryHigh` 的警告：会被冻死而不是被杀）。
-- **`max_concurrent_requests` 要收在内存之下，否则那道闸等于没有**。它管的是「所有路径的在途 HTTP 请求总数」（只有 `/metrics` 豁免，SSE 长流从开头占到最后一块 body 送完），超限返回 `429 + Retry-After`。默认/示例给 100，而 1G 内存只撑得住约 40 个在途——于是**先撞的是 `MemoryMax`（网关被 OOM 杀掉、连接中断），而不是这里优雅地 429**。按同一公式收口：
+- **`max_concurrent_requests` 是并发总量闸门，与内存脱钩**。它管的是「所有路径的在途 HTTP 请求总数」（只有 `/metrics` 豁免，SSE 长流从开头占到最后一块 body 送完），超限返回 `429 + Retry-After`。缓存关闭时它必须收在 `MemoryMax / 19MiB` 之下，否则那道闸等于没有——**先撞的是 `MemoryMax`（网关被 OOM 杀掉、连接中断），而不是这里优雅地 429**；缓存开启后按业务量给即可：
 
   ```yaml
-  max_concurrent_requests: 32    # ≈ MemoryMax / 20MB，与 agent 的 max_concurrency 对齐
+  max_concurrent_requests: 32    # 缓存关闭时 ≈ MemoryMax / 20MB；开启后按业务量给
   ```
 
   三者职责不同、不能互相替代：`rate_limit_per_min` 管**每个 key 的速率**，agent 的 `max_concurrency` 管**每个 edge 的在途数**（保 GPU），这个字段管**整个网关的在途总数**（保网关自己）。
+
+### agent 每事件的 CPU 成本
+
+网关的内存成本由"在途 key 校验"决定（上一节），**agent 的成本则由 SSE 事件速率决定**。给定一个 token 一个 SSE 事件的流，agent 的开销几乎全部是"事件派发"本身：唤醒 → 组帧 → 发包，**与事件里有多少字节无关**。
+
+实测（云端网关 + release agent `max_concurrency: 32` + 本机 mock，16 条并发流、每条流一个事件一个 chunk）：
+
+| 事件/秒 | 字节/事件 | agent CPU | user / sys | csw/s | CPU/事件 |
+|---|---|---|---|---|---|
+| 154 | 116 | 1.0 核 | 9.5s / 23.4s | 639 | 6 800µs |
+| 1 009 | 55 | 3.8 核 | 31.9s / **88.7s** | 3 506 | 3 790µs |
+| 1 173 | 153 | 4.4 核 | 36.9s / **102.8s** | 4 067 | 3 780µs |
+| 5 121 | 55 | 9.5 核 | 73.4s / 226.9s | 11 913 | 1 861µs |
+| 6 003（饱和） | 55 | 11.7 核 | 55.3s / 196.1s | 12 736 | 1 947µs |
+
+三条实测结论：
+
+- **成本跟事件数走，跟字节数无关**：payload 从 1 字节提到 101 字节（事件数、节奏不变），CPU/事件 3 790µs → 3 780µs，纹丝不动；而这些档位的字节速率只有 0.2–0.3 MB/s。收益在"合并事件"而不在"合并字节"——上游一个 chunk 里塞 10 个 token，比 10 个独立 chunk 省近一个数量级的 CPU。
+- **内核态是主要开销**：sys 占 73–78%，上下文切换 ≈ 3× 事件/秒。`sample` 采到的热点只有 `__sendmsg`，调用栈完整落在 s2n-quic 的发送队列 → 包编码 → 丢包恢复路径上；其余采样都停在 `__psynch_cvwait` / `kevent`。**所以别往"解析 JSON / 序列化帧更省"的方向优化**，要减少的是事件派发次数与套接字往返。
+- **单 agent 的事件速率上限 ≈ 6 000 事件/秒**（约 12 核，几乎全是内核态），到顶后流开始排队：p95 5.6s、max 12.2s。**30 秒级长尾多半出现在这里**，不是网关的问题——用 `top` 看 agent 是否跑满即可区分。
+
+换算到真实流量就不必紧张：真实模型 20–100 token/s，即约 1.9–3.8ms CPU/token，**单条流只吃 0.04–0.4 核**（单核可撑 3–23 条流，8 核机器对应上百条并发流）。6 000 事件/秒相当于 120 条流同时以 50 token/s 输出，所以"每事件 CPU"在生产 token 速率下不是瓶颈；真正先撞到的是密钥校验（见上一节）与网络出口。
+
+> 测量方法：agent 侧 CPU 取自 `proc_pidinfo(PROC_PIDTASKINFO)`，热点用系统自带 `sample`。⚠️ 该结构体字段有坑：`pti_threads_user` / `pti_threads_system` 也是 `u64`，漏掉它们会让 `pti_csw` 读错位（我们一开始把线程数当成了上下文切换数，量级差 400 倍）。
 
 ### 可观测性
 
 - **`GET /metrics`**：Prometheus 文本格式指标（按状态码计数、在途请求、在线 agent 数、转发字节、累计耗时），可直接被 Prometheus/Grafana 抓取
   - 浏览器直接访问（`Accept: text/html`）时返回 Dashboard 页面而非文本，便于点进指标页；Prometheus 抓取（`Accept: */*`）不受影响
   - `hlmg_quic_accepting`：隧道入口是否仍在接受新 agent（1/0）。UDP 驱动失效时入口会停止接受新连接，而进程与 HTTP 入口照常运行——**建议对该指标为 0 告警**（这是唯一能发现该故障的信号）
+  - `hlmg_key_verify_hits_total` / `hlmg_key_verify_misses_total`：key 校验命中已验证缓存 / **真正跑了 argon2**的次数。misses 的**增量**就是内存与 CPU 的风险信号（一次 miss 峰值 +19MiB，见《并发上限与内存》），稳态下应接近 0；突然上涨说明凭据被吊销/新增，或缓存容量 `verified_cache_max` 不够。⚠️ **`verified_cache_max: 0` 时这两个计数器恒为 0**（走的是不走缓存的旧路径，两个数都不加）——看到 0 要先确认缓存是否被关掉，别当成"没有校验"
 - **结构化日志**：`tracing`，每个请求带 `request_id` / 状态码 / 耗时（`tower-http` TraceLayer）
 - **`/healthz`**：存活探针
 
