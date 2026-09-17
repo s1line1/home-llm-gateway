@@ -94,6 +94,15 @@
 
 - 每个活跃请求占一个 QUIC stream，天然并行；
 - agent 上报 `并发上限`（由本地 GPU/内存决定），云端按该上限做 admission control，超限直接回 429。
+- **但"并发上限"不是唯一闸门**：QUIC 连接本身还有一层**双向流额度**，实际可用额度是
+  `min(本地额度, 对端额度)`，s2n-quic 的默认值只有 **100**（`InitialMaxStreamsBidi::RECOMMENDED`）。
+  额度排满时 `open_bidirectional_stream()` 不报错，而是**排队等额度回收**——所以两边都要显式设置
+  （网关 `max_open_tunnel_streams`，默认 1024；agent 侧 `with_max_open_remote_bidirectional_streams(1000)`），
+  且 `流额度 ≥ agent 声明的并发上限`。否则第 `额度+1` 条请求就在排队，上游一慢便排过
+  `tunnel_op_secs`，被误判成"隧道已死"→ 摘除健康 agent → 重连期间注册表为空 → 全量 503
+  （实测一次 30s 压测 `registry-empty` +6835；见 README《失败处理：重试、摘除与延迟关闭》）。
+- 同一原因还决定了**摘除判据**：开流超时只有在"在途未达承载上限"时才说明连接坏了；
+  已达上限时的排队超时是背压，绝不能摘除（`registry::Entry::open_timeout_is_fatal`）。
 
 ## 5. 云端（cloud-gateway）设计
 
@@ -108,7 +117,7 @@
 6. **请求转发**：HTTP → `ProxyRequest` 帧 → 等 `ProxyResponse*` 帧流式回写。三条超时各管一段，**不要混用**：
    | 超时 | 默认 | 覆盖范围 | 超时动作 |
    |---|---|---|---|
-   | `tunnel_op_secs` | 10s | 隧道控制操作：打开流 / 发请求帧 / 取消帧 | `502`；**连续 3 次**才判定连接已死 → **摘除条目并关闭连接** |
+   | `tunnel_op_secs` | 10s | 隧道控制操作：打开流 / 发请求帧 / 取消帧 | **忙**（在途已达承载上限）→ `429` 并换 agent，**不摘除**；**死**（未达上限）→ `502`，**连续 3 次**才判定连接已死 → **摘除条目并关闭连接** |
    | `head_timeout_secs` | 15s | 等上游**响应头**（首字节） | `504` + 摘除条目（请求已发出却什么都没回） |
    | `timeout_secs` | 120s | 响应体**逐帧空闲**（SSE 靠"有帧就不超时"活着） | 发 `Cancel`，结束该流 |
 
@@ -124,6 +133,14 @@
    **摘除连接时延迟关闭**：达到"连续 3 次隧道操作超时"后先移出路由，再决定何时关连接——
    若还有别的在途请求（它们已送达 agent、模型正在生成，不属于可重试范围），
    等在途归零或超过 5s 宽限期再关，避免为了修一条坏流而打断正常请求。
+
+   **"忙"与"死"必须分开**（`registry::Entry::open_timeout_is_fatal`）：
+   `open_bidirectional_stream()` 在连接级流额度排满时是**排队**而非报错（见 §4.4），
+   所以超时可能只是背压。判据 = 在途数是否已达 `min(agent 声明的 max_concurrency, 流额度)`。
+   一律按"死"处理的代价在云端实测过：摘除健康 agent → 连接被关 → agent 重连（退避最长 30s）
+   → 期间无任何可路由 agent → 全量 503（一次 30s 压测 `registry-empty` +6835、503 +6057、
+   `tunnel open timed out` 累计 9345 次）。分类计数暴露为
+   `hlmg_tunnel_open_timeouts_total{class="busy"|"dead"}`。
 
    **已验证身份缓存**（`gateway/src/keystore/verified.rs`，配置项 `verified_cache_max`，默认 1650）：
 

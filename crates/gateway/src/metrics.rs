@@ -40,6 +40,12 @@ struct MetricsInner {
     agent_rejections: Mutex<HashMap<&'static str, u64>>,
     /// "隧道建立失败后换 agent 重试"的次数，按结果分（ok = 重试成功，failed = 换过仍失败）。
     tunnel_retries: Mutex<HashMap<&'static str, u64>>,
+    /// 开流超时的次数，按判定分：`busy` = 在途已顶到承载上限（背压，不摘除）、
+    /// `dead` = 未到上限却开不出流（坏连接，摘除）。
+    ///
+    /// 这个区分是排障的关键：`busy` 陡增说明容量不足（该扩容或调 `max_concurrency`），
+    /// `dead` 陡增才是隧道/网络故障。两者在状态码上都会表现为 5xx/429。
+    tunnel_open_timeouts: Mutex<HashMap<&'static str, u64>>,
 }
 
 impl Metrics {
@@ -96,6 +102,17 @@ impl Metrics {
             .lock()
             .unwrap()
             .entry(outcome)
+            .or_insert(0) += 1;
+    }
+
+    /// 记录一次开流超时（`kind`：`busy` = 背压排队，`dead` = 坏连接）。
+    pub fn record_tunnel_open_timeout(&self, kind: &'static str) {
+        *self
+            .inner
+            .tunnel_open_timeouts
+            .lock()
+            .unwrap()
+            .entry(kind)
             .or_insert(0) += 1;
     }
 
@@ -207,6 +224,21 @@ impl Metrics {
                     out.push_str(&format!(
                         "hlmg_agent_rejections_total{{reason=\"{r}\"}} {}\n",
                         rej[*r]
+                    ));
+                }
+            }
+        }
+        {
+            let to = inner.tunnel_open_timeouts.lock().unwrap();
+            if !to.is_empty() {
+                out.push_str("# HELP hlmg_tunnel_open_timeouts_total Tunnel stream opens that exceeded tunnel_op_secs; class=busy means the agent was at capacity (backpressure, not evicted), class=dead means the connection was treated as broken and evicted.\n");
+                out.push_str("# TYPE hlmg_tunnel_open_timeouts_total counter\n");
+                let mut kinds: Vec<&&str> = to.keys().collect();
+                kinds.sort_unstable();
+                for k in kinds {
+                    out.push_str(&format!(
+                        "hlmg_tunnel_open_timeouts_total{{class=\"{k}\"}} {}\n",
+                        to[*k]
                     ));
                 }
             }

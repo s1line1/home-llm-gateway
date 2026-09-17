@@ -43,6 +43,43 @@
 
 ## P1 — 运维与健壮性
 
+- [x] **网关 fd 软上限只有 1024（2026-09-17 实测；已由进程启动时自愈）**：
+      云端 `gateway.service` **没有**设 `LimitNOFILE`，于是吃 systemd 的全局默认
+      （`/etc/systemd/system.conf` 的 `#DefaultLimitNOFILE=1024:524288`，注释状态=内置默认），
+      `/proc/<gateway>/limits` 显示 `Max open files 1024 524288`。**不是内核限制**：
+      `fs.nr_open = 1048576`，同机 `cron` 也是 1024（同一个默认），`sshd` 则自己抬到了 1048576。
+      撞上时的症状是**新连接被拒**而进程健康：`accept error: Too many open files (os error 24)`
+      （实测日志里已有 296 次，与压测窗口吻合），客户端表现为 `connection reset by peer`；
+      同时内核 accept 队列（128，见下一条）被卡住 → `Possible SYN flooding ... Sending cookies`。
+      实测口径：768 并发客户端连接时网关 fd 峰值 **785**（≈ 每连接 1 fd + QUIC/DB/日志十余个），
+      所以**安全水位约 900 并发连接**（按 16384 的新上限则是 16000+）。
+      **已实施**：`gateway/src/nofile.rs` 在启动时（绑 socket 之前）把 soft 抬到
+      `min(hard, 16384)`，失败只 WARN 不阻止启动；**没有**选择"抬到 hard"（云端 524288）——
+      上限给到几十万会把 fd 泄漏的引爆点从本进程 `EMFILE` 推到整机 `fs.file-max`/内存。
+      ⚠️ 实现上**不要**改用 `rlimit::increase_nofile_limit`：它在 macOS 上会把 soft 设成
+      `min(lim, hard, kern.maxfilesperproc)`，而后者可能低于当前 soft（实测 1048575 → 61440），
+      等于把额度改小。回归测试：`nofile::tests::raises_soft_from_the_systemd_default_to_the_target_and_is_idempotent`
+      （先把 soft 降到 1024 复现 systemd 默认，断言抬到 16384、只抬不降、hard 不动、幂等；
+      已验证过红）。**编译期保险**：`install()` 返回一个只能由它产出的凭证（`nofile::Raised`），
+      而 `Gateway` 结构体带一个该类型的 `pub` 字段——于是"删掉 install 调用"会变成
+      `missing field nofile` 编译错误，而不是静默退回 1024（已验证过红；
+      `pub fn` + 忘了调用本来**不会**有任何 dead_code 警告）。
+      **运行期保险**：e2e `e2e_startup_raises_the_nofile_soft_limit_in_the_real_process`
+      先把本进程 soft 降到 1024 复现 systemd 处境，再起真实网关，然后读**进程自己的**
+      `/proc/self/limits` 核对生效值（不以自家日志为准），并断言 hard 未被改动
+      （同样已验证过红）。**仍可选的加强**：unit 里写 `LimitNOFILE=65536` 抬高天花板——
+      不写也不会再撞那个 1024，但日志里 `limited_by_hard=true` 表示天花板比目标值低。
+- [ ] **监听 backlog 被硬编码成 128**：`tokio::net::TcpListener::bind` 走 mio，而 mio 为对齐 std
+      写死 `listen(.., 128)`（`mio-1.2.2/src/net/tcp/listener.rs`），云端 `net.core.somaxconn=4096`
+      完全用不上。实测 `ss -lnt` 的 Send-Q 就是 128；dmesg 里 10 次
+      `Possible SYN flooding on port 0.0.0.0:9090`（全机 164 天里只出现在网关端口）。
+      修法：用 `socket2` 建 socket → `listen(4096)` → `TcpListener::from_std`。
+      属**次要因素**（accept 被上面那条 EMFILE 卡住时才会放大），故排在 fd 之后。
+- [ ] **网关日志无轮转、体量失控**：`StandardOutput=append:/var/log/home-llm-gateway/gateway.log`，
+      每请求至少一行 INFO，实测单日 **652MB**（`tail -c 6000000` 只覆盖约 20 秒，
+      排查时按时间 grep 会误以为"日志里什么都没有"）。修法：`logrotate` + 降级为
+      `RUST_LOG=info,gateway::access=debug` 之类的分级，或按请求采样。
+
 - [ ] **同名 `agent_id` 会让网关静默不可用（2026-09 发现，已实测；修法已验证但代码已撤回）**：
       两台 edge 用同一个 `agent_id` 时，网关对同名注册会**关掉旧连接**（`registry.rs`，本意是
       让同一台机器重连时接管），而 agent 把"被踢"当成干净断开、把退避重置回 500ms

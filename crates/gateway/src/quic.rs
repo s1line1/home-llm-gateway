@@ -7,7 +7,15 @@ use tracing::{debug, error, info, warn};
 use crate::metrics::Metrics;
 use crate::registry::Registry;
 
-pub async fn accept_loop(mut server: s2n_quic::Server, registry: Registry, metrics: Metrics) {
+/// `stream_ceiling` = 每条连接允许的在途隧道流数（见 `GatewayConfig::max_open_tunnel_streams`）。
+/// 它只用于**注册时的一致性告警**：agent 声明的 `max_concurrency` 超过这个额度时，网关侧
+/// 会先撞流额度而不是先撞容量闸——表现是"开流排队超时"，排查起来比容量不足隐蔽得多。
+pub async fn accept_loop(
+    mut server: s2n_quic::Server,
+    registry: Registry,
+    metrics: Metrics,
+    stream_ceiling: u32,
+) {
     let _accepting = metrics.mark_accepting();
     while let Some(conn) = server.accept().await {
         let registry = registry.clone();
@@ -24,7 +32,7 @@ pub async fn accept_loop(mut server: s2n_quic::Server, registry: Registry, metri
 
         tokio::spawn(async move {
             metrics.agent_connected();
-            if let Err(e) = handle_conn(conn, registry).await {
+            if let Err(e) = handle_conn(conn, registry, stream_ceiling).await {
                 warn!("agent connection error: {e}");
             }
             metrics.agent_disconnected();
@@ -41,12 +49,23 @@ pub async fn accept_loop(mut server: s2n_quic::Server, registry: Registry, metri
     );
 }
 
-async fn handle_conn(conn: Connection, registry: Registry) -> anyhow::Result<()> {
+async fn handle_conn(
+    conn: Connection,
+    registry: Registry,
+    stream_ceiling: u32,
+) -> anyhow::Result<()> {
     // split 消耗连接，只能一次。Handle: Clone（给 registry 存一份）；
     // StreamAcceptor: 单消费者且不可 Clone（acceptor.rs:182 只有 Debug），按 &mut 传下去。
     let (handle, mut acceptor) = conn.split();
     let mut agent_id: Option<(String, usize)> = None;
-    let result = handle_conn_inner(&handle, &mut acceptor, &registry, &mut agent_id).await;
+    let result = handle_conn_inner(
+        &handle,
+        &mut acceptor,
+        &registry,
+        &mut agent_id,
+        stream_ceiling,
+    )
+    .await;
     // 无论正常/异常退出，都尝试摘除（仅当仍是同一连接）
     if let Some((id, sid)) = &agent_id {
         registry.remove_if_same(id, *sid);
@@ -59,6 +78,7 @@ async fn handle_conn_inner(
     acceptor: &mut s2n_quic::connection::StreamAcceptor,
     registry: &Registry,
     agent_id: &mut Option<(String, usize)>,
+    stream_ceiling: u32,
 ) -> anyhow::Result<()> {
     loop {
         match acceptor.accept_bidirectional_stream().await {
@@ -73,6 +93,18 @@ async fn handle_conn_inner(
                     }) => {
                         // stable_id 由 register 发号并返回——不能自己再算一个（如 handle.id()），
                         // 否则与 Entry.stable_id 对不上，连接结束时 remove_if_same 永远摘不掉条目。
+                        // 声明容量 > 端点流额度 = 配置不一致：网关会先撞流额度，把
+                        // "排队等额度"误解成"隧道卡住"。这里必须吵一声，否则复现路径极难查。
+                        if max_concurrency > stream_ceiling {
+                            warn!(
+                                agent = %id,
+                                max_concurrency,
+                                stream_ceiling,
+                                "agent declares more concurrency than the gateway's per-connection stream ceiling; \
+                                 raise max_open_tunnel_streams (gateway) or lower max_concurrency (agent), \
+                                 otherwise tunnel opens will queue and time out before capacity is reached"
+                            );
+                        }
                         let stable_id =
                             registry.register(id.clone(), models, max_concurrency, handle.clone());
                         *agent_id = Some((id.clone(), stable_id));
@@ -162,6 +194,7 @@ mod tests {
             test_server(),
             Registry::default(),
             metrics.clone(),
+            1024,
         ));
 
         // 循环进入等待后应标记为「接受中」

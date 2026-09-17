@@ -5,6 +5,7 @@ pub mod error;
 pub mod http;
 pub mod keystore;
 pub mod metrics;
+pub mod nofile;
 pub mod quic;
 pub mod ratelimit;
 pub mod registry;
@@ -69,6 +70,15 @@ pub struct GatewayConfig {
     pub rate_limit_per_min: u32,
     /// HTTP 全局在途请求上限（0 = 不限）。
     pub max_concurrent_requests: u32,
+    /// 每条 agent 连接上允许同时在途的隧道流数（QUIC 双向流额度）。
+    ///
+    /// s2n-quic 的 `initial_max_streams_bidi` 默认 **100**，实际可用额度取
+    /// `min(本地, 对端)`。两侧都不设时，一条 agent 连接最多只有 100 条在途请求——
+    /// 超过就**排队等额度回收**，上游一慢便等过 `tunnel_op_timeout`，被误判成
+    /// "隧道已死"并摘除整条连接（agent 重连期间注册表为空 → 全量 503）。
+    ///
+    /// 必须 **≥ agent 声明的 max_concurrency**；注册时声明超限会打 WARN（见 `quic`）。
+    pub max_open_tunnel_streams: u32,
     /// 提供后，公网入口启用 HTTPS（rustls）。
     pub tls: Option<TlsPem>,
     /// React UI 静态目录（含 index.html；存在时 `/` 托管 Dashboard，否则显示构建提示页）。
@@ -82,6 +92,13 @@ pub struct Gateway {
     /// 用量落库需要在关闭前强制 flush 一次（见 `Gateway::flush_usage_on_shutdown`）。
     key_store: KeyStore,
     tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// 「启动时抬过 NOFILE 额度」的凭证，见 [`nofile::Raised`] 与 [`nofile::install`]。
+    ///
+    /// **它没有任何运行时用途，唯一作用是编译期保险**：这个字段只能由
+    /// `nofile::install()` 的返回值填上，所以删掉那次调用就构造不出 `Gateway`
+    /// （`missing field` 编译错误），而不是静默地把 fd 额度留在 1024 上——
+    /// 那种失败只会在高并发时以 `Too many open files` 的形式冒出来，单测/clippy 全绿。
+    pub nofile: nofile::Raised,
 }
 
 impl Gateway {
@@ -89,6 +106,13 @@ impl Gateway {
         // 显式安装 ring 为进程默认 crypto provider（见 proto::install_ring_crypto_provider 的说明：
         // workspace 同时链接了 ring 与 aws-lc-rs，不安装 rustls 会 panic）
         proto::install_ring_crypto_provider();
+
+        // 在**绑任何 socket 之前**把 NOFILE 的 soft 抬到目标值（默认 16384）：systemd 给的默认
+        // soft 是 1024，生产水位（768 并发连接 → fd 峰值 785）下是贴脸的，撞上时表现为
+        // "新连接被拒但进程健康"（`accept error: Too many open files`）。
+        // 失败只告警，不阻止启动——见 `nofile` 模块注释；返回值存进结构体是**编译期保险**
+        // （删掉这行就构造不出 Gateway），不要为了"省一个字段"把它丢掉。
+        let nofile = nofile::install();
 
         let registry = Registry::default();
 
@@ -108,9 +132,28 @@ impl Gateway {
             None => None,
         };
 
+        // 隧道流额度：网关**自己**能同时开多少条双向流（每个 agent 连接一份）。
+        //
+        // 必须显式设置，且必须 ≥ agent 声明的 max_concurrency。默认的
+        // `InitialMaxStreamsBidi::RECOMMENDED = 100` 是给"一条连接跑少量请求"的场景定的；
+        // 我们一条连接就是一整台 agent 的流量，100 会让第 101 条请求去排队等额度，
+        // 上游慢时排过 `tunnel_op_timeout` → 被当成坏隧道摘除（见 GatewayConfig 字段注释）。
+        //
+        // 幂等性/安全性：这只是**上限**，真正的在途量由注册表按 agent 声明的
+        // max_concurrency 做准入控制（`try_acquire`），所以这里给大不会放大并发。
+        let limits = s2n_quic::provider::limits::Limits::new()
+            .with_max_open_local_bidirectional_streams(u64::from(cfg.max_open_tunnel_streams))
+            .map_err(|e| {
+                crate::error::GatewayError::Config(format!(
+                    "max_open_tunnel_streams={} 不是合法的 QUIC 流额度: {e}",
+                    cfg.max_open_tunnel_streams
+                ))
+            })?;
+
         let server = s2n_quic::Server::builder()
             .with_tls(s2n_quic::provider::tls::rustls::Server::from(Arc::new(tls)))?
             .with_io(cfg.quic_bind)?
+            .with_limits(limits)?
             .start()?;
 
         let quic_addr = server.local_addr()?;
@@ -168,6 +211,7 @@ impl Gateway {
             head_timeout: cfg.head_timeout,
             rate_limiter: RateLimiter::new(cfg.rate_limit_per_min),
             max_concurrent_requests: cfg.max_concurrent_requests,
+            max_open_tunnel_streams: cfg.max_open_tunnel_streams,
             metrics: metrics.clone(),
             ui,
             ui_problem,
@@ -198,6 +242,7 @@ impl Gateway {
             server,
             registry.clone(),
             metrics,
+            cfg.max_open_tunnel_streams,
         )));
 
         tasks.push(usage_flusher);
@@ -208,6 +253,7 @@ impl Gateway {
             registry,
             key_store,
             tasks,
+            nofile,
         })
     }
 

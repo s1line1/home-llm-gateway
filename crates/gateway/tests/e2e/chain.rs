@@ -319,6 +319,7 @@ async fn e2e_upstream_never_receives_client_credentials() {
         agent_stale_after: Duration::from_secs(10),
         rate_limit_per_min: 0,
         max_concurrent_requests: 0,
+        max_open_tunnel_streams: 1024,
         tls: None,
         ui_dir: None,
     })

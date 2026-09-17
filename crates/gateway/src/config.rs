@@ -74,6 +74,26 @@ pub struct ConfigFile {
     /// 而不是在这里优雅地返回 429，那道闸就形同虚设。
     #[serde(default)]
     max_concurrent_requests: u32,
+    /// 每条 agent 连接上允许**同时在途**的隧道流数（QUIC 双向流额度）。
+    ///
+    /// 为什么需要它：s2n-quic 的 `initial_max_streams_bidi` 默认只有 **100**
+    /// （`InitialMaxStreamsBidi::RECOMMENDED`），而实际可用额度取
+    /// `min(本地额度, 对端额度)`。agent 侧已经显式给了 1000
+    /// （`agent::connect_once` 的 `with_max_open_remote_bidirectional_streams(1000)`），
+    /// **但网关自己的本地额度从没设过 = 100**，于是每条 agent 连接最多只能有
+    /// 100 条在途请求——对端 agent 却按 `max_concurrency`（部署里是 256）对外声明
+    /// 容量。超过 100 条时 `open_bidirectional_stream()` 会**排队等额度回收**，
+    /// 上游一慢就等过 `tunnel_op_secs`，被误判成"隧道已死"→ 摘除整条连接 →
+    /// agent 重连 → 注册表瞬间空 → 全量 503（实测一次 30s 压测 +6835 次
+    /// `reason="registry-empty"`、`tunnel open timed out` 累计 9345 次）。
+    ///
+    /// 取值必须 **≥ 任何 agent 声明的 max_concurrency**；注册时若发现 agent 声明超了，
+    /// 网关会打 WARN（否则同样的排队超时会以更难查的形式复现）。0 = 用默认值。
+    ///
+    /// 取值必须 **≥ 任何 agent 声明的 max_concurrency**；注册时若发现 agent 声明超了，
+    /// 网关会打 WARN（否则同样的排队超时会以更难查的形式复现）。0 = 用默认值。
+    #[serde(default = "default_max_open_tunnel_streams")]
+    max_open_tunnel_streams: u32,
     /// 公网入口 HTTPS 证书 PEM（提供后启用 TLS，与 tls_key 成对）
     #[serde(default)]
     tls_cert: Option<PathBuf>,
@@ -118,6 +138,17 @@ fn default_tunnel_op_secs() -> u64 {
 }
 fn default_head_timeout_secs() -> u64 {
     15
+}
+/// 每连接隧道流额度默认值。
+///
+/// 1024 的依据：agent 的 `max_concurrency` 默认只有 4（见 `agent::default_max_concurrency`），
+/// 实测部署里手填的是 256；1024 对"单连接 256 并发"留了 4 倍余量，又远小于
+/// 一个连接能承受的流数上限（s2n-quic 的 VarInt 上限是 2^60，真正的约束是内存）。
+/// 想让网关收紧每 agent 在途量时，**调 `max_concurrent_requests` 或 agent 的
+/// `max_concurrency`**，而不是靠把这里调小去当限流闸——调小只会让开流排队超时，
+/// 表现为"隧道随机超时"（见字段注释）。
+fn default_max_open_tunnel_streams() -> u32 {
+    1024
 }
 
 /// 从 YAML 文件加载并映射为网关配置。
@@ -172,6 +203,11 @@ pub fn from_file(cfg: ConfigFile) -> anyhow::Result<GatewayConfig> {
         head_timeout: Duration::from_secs(cfg.head_timeout_secs),
         rate_limit_per_min: cfg.rate_limit_per_min,
         max_concurrent_requests: cfg.max_concurrent_requests,
+        max_open_tunnel_streams: if cfg.max_open_tunnel_streams == 0 {
+            default_max_open_tunnel_streams()
+        } else {
+            cfg.max_open_tunnel_streams
+        },
         tls,
         ui_dir: cfg.ui_dir,
     })
@@ -339,7 +375,12 @@ rate_limit_per_min: 60
         let cfg: ConfigFile = serde_yaml_ng::from_str(&text)
             .unwrap_or_else(|e| panic!("{} 解析失败（字段名写错？）: {e}", path.display()));
         // 每个超时开关都必须出现在示例里，否则用户无从知道
-        for key in ["timeout_secs", "tunnel_op_secs", "head_timeout_secs"] {
+        for key in [
+            "timeout_secs",
+            "tunnel_op_secs",
+            "head_timeout_secs",
+            "max_open_tunnel_streams",
+        ] {
             assert!(
                 text.contains(key),
                 "gateway_config.example.yml 缺少配置项说明：{key}"
@@ -347,6 +388,66 @@ rate_limit_per_min: 60
         }
         assert_eq!(cfg.tunnel_op_secs, default_tunnel_op_secs());
         assert_eq!(cfg.head_timeout_secs, default_head_timeout_secs());
+        assert_eq!(
+            cfg.max_open_tunnel_streams,
+            default_max_open_tunnel_streams()
+        );
+    }
+
+    /// 规格：**流额度不能是 0**。
+    ///
+    /// 0 在 s2n-quic 里意味着"一条双向流都不许开"，而不是"不限"——直接照抄进
+    /// `with_max_open_local_bidirectional_streams` 会让网关连注册流都开不出来，
+    /// 表现是"agent 永远注册不上"，与配置字面意思（0 = 不限/默认）完全相反。
+    #[test]
+    fn zero_max_open_tunnel_streams_falls_back_to_the_default() {
+        assert!(default_max_open_tunnel_streams() >= 256);
+        let dir = tempfile::tempdir().unwrap();
+        let (ca, cert, key) = gen_cert_files(dir.path());
+        // YAML 里显式写 0 必须能解析，且不能原样传给 s2n-quic ——
+        // 在 s2n-quic 里 0 的意思是"一条双向流都不许开"（不是"不限"），
+        // 照抄进去会让网关连 agent 的注册流都开不出来，表现是"agent 永远注册不上"。
+        let yaml = format!(
+            "cert: {}\nkey: {}\nca: {}\nmax_open_tunnel_streams: 0\n",
+            cert.to_str().unwrap(),
+            key.to_str().unwrap(),
+            ca.to_str().unwrap(),
+        );
+        assert_eq!(parse_yaml(&yaml).max_open_tunnel_streams, 0);
+        assert_eq!(
+            from_file(parse_yaml(&yaml))
+                .unwrap()
+                .max_open_tunnel_streams,
+            default_max_open_tunnel_streams()
+        );
+
+        // 显式给非 0 值时按原值生效（运维要能收紧/放宽额度）
+        let yaml = format!(
+            "cert: {}\nkey: {}\nca: {}\nmax_open_tunnel_streams: 300\n",
+            cert.to_str().unwrap(),
+            key.to_str().unwrap(),
+            ca.to_str().unwrap(),
+        );
+        assert_eq!(
+            from_file(parse_yaml(&yaml))
+                .unwrap()
+                .max_open_tunnel_streams,
+            300
+        );
+
+        // 省略时用默认值
+        let yaml = format!(
+            "cert: {}\nkey: {}\nca: {}\n",
+            cert.to_str().unwrap(),
+            key.to_str().unwrap(),
+            ca.to_str().unwrap(),
+        );
+        assert_eq!(
+            from_file(parse_yaml(&yaml))
+                .unwrap()
+                .max_open_tunnel_streams,
+            default_max_open_tunnel_streams()
+        );
     }
 
     #[test]

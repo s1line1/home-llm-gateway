@@ -41,5 +41,13 @@ MemoryHigh=infinity
 MemorySwapMax=infinity
 OOMPolicy=stop
 
+# 文件描述符：**可以不设**。不设时 systemd 给的是全局默认 soft=1024/hard=524288，
+# 而网关启动时会自己把 soft 抬到 min(hard, 16384)（见 gateway/src/nofile.rs、README
+# 《文件描述符上限》），所以默认 1024 那个坑已经被代码兜住。
+# 只有当你需要**超过 16384 个并发连接**时，才需要在这里抬高天花板（hard），
+# 例如： LimitNOFILE=65536
+# 注意 `LimitNOFILE=` 会同时设置 soft 与 hard；启动日志里 `limited_by_hard=true`
+# 就表示"天花板比目标值低"，即此处需要调整。
+
 [Install]
 WantedBy=multi-user.target
