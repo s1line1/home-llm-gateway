@@ -204,45 +204,6 @@ pub async fn proxy(
             return error_response(StatusCode::BAD_REQUEST, "model is required in request body")
         }
     };
-    let (mut entry, slot) = match state.registry.try_acquire(state.agent_stale_after, &model) {
-        Ok(x) => x,
-        // 三种拒绝**必须分开记录**：它们的运维含义完全不同，而客户端看到的
-        // 503/404/429 不足以区分。尤其"NoAgent"有两种成因——注册表空，或注册表里
-        // 有人但全部心跳超时（stale）——只看状态码会把后者误判成"agent 掉了"。
-        Err(
-            reason @ (AcquireError::NoAgent | AcquireError::NoModel | AcquireError::AtCapacity),
-        ) => {
-            let st = state.registry.status(state.agent_stale_after);
-            let why = match reason {
-                AcquireError::NoAgent if st.registered == 0 => "registry-empty",
-                AcquireError::NoAgent => "all-candidates-stale",
-                AcquireError::NoModel => "no-agent-serves-model",
-                _ => "all-candidates-at-capacity",
-            };
-            state.metrics.record_agent_rejection(why);
-            warn!(
-                model = %model,
-                reason = why,
-                registered = st.registered,
-                healthy = st.healthy,
-                stale_after_secs = state.agent_stale_after.as_secs(),
-                oldest_last_seen_secs = st.oldest_last_seen_ago.map(|d| d.as_secs()),
-                "no agent to route to"
-            );
-            return match reason {
-                AcquireError::NoAgent => {
-                    error_response(StatusCode::SERVICE_UNAVAILABLE, "no edge available")
-                }
-                AcquireError::NoModel => {
-                    error_response(StatusCode::NOT_FOUND, "model not found on any agent")
-                }
-                AcquireError::AtCapacity => {
-                    error_response(StatusCode::TOO_MANY_REQUESTS, "agent at capacity")
-                }
-            };
-        }
-    };
-
     // 保留原始完整路径（如 /v1/chat/completions），原样转发给上游
     let path = match uri.query() {
         Some(q) => format!("{}?{q}", uri.path()),
@@ -256,17 +217,7 @@ pub async fn proxy(
         .and_then(|s| s.strip_prefix("req-"))
         .and_then(|n| n.parse::<u64>().ok())
         .unwrap_or_else(|| NEXT_REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
-
-    let (mut recv, mut send) = match open_tunnel(&mut entry, state.tunnel_op_timeout).await {
-        Ok(s) => s.split(),
-        Err(e) => {
-            // 打不开流 = 这条连接已经死了 → 摘掉条目，后续请求立刻失败（或换别的 agent），
-            // 而不是每个请求都白等一次超时。
-            state.registry.evict(entry.stable_id);
-            return error_response(StatusCode::BAD_GATEWAY, e);
-        }
-    };
-
+    // 请求帧在选路之前就构造好：重试换的是连接，请求内容不变（body 已整包在手，可重放）。
     let request = Frame::ProxyRequest {
         request_id,
         method: method.to_string(),
@@ -274,18 +225,129 @@ pub async fn proxy(
         headers: filter_headers(&headers),
         body: body.to_vec(),
     };
-    if let Err(e) = tunnel_write(
-        &mut send,
-        &request,
-        state.tunnel_op_timeout,
-        request_id,
-        &entry.agent_id,
-    )
-    .await
-    {
-        state.registry.evict(entry.stable_id);
-        return error_response(StatusCode::BAD_GATEWAY, e);
-    }
+
+    // 隧道建立阶段允许**换一个 agent 重试**。
+    //
+    // 只有"开流 / 写请求帧"失败才重试：那时**请求帧从未送达 agent**，换一条连接重放
+    // 是安全的（body 已整包在手，可重放）。**响应头超时（504）不在其中**——请求可能
+    // 已在模型侧执行，重试会重复计费、重复生成，所以那条仍然直接把错误返回客户端：
+    // 宁可报错，也不做不安全的重复。
+    //
+    // 实测（云端 2 vCPU、4 agent、768 并发）失败**全部**是 502（开流/写帧超时）、
+    // 504 为 0，所以这条重试正好覆盖实际发生的失败。
+    const MAX_TUNNEL_ATTEMPTS: usize = 2;
+    let mut tried: Vec<usize> = Vec::with_capacity(MAX_TUNNEL_ATTEMPTS);
+    let mut last_failure: Option<String> = None;
+
+    let (entry, slot, mut recv, mut send) = loop {
+        let acquired =
+            state
+                .registry
+                .try_acquire_excluding(state.agent_stale_after, &model, &tried);
+        let (mut entry, slot) = match acquired {
+            Ok(x) => x,
+            // 三种拒绝**必须分开记录**：它们的运维含义完全不同，而客户端看到的
+            // 503/404/429 不足以区分。尤其"NoAgent"有两种成因——注册表空，或注册表里
+            // 有人但全部心跳超时（stale）——只看状态码会把后者误判成"agent 掉了"。
+            Err(
+                reason @ (AcquireError::NoAgent | AcquireError::NoModel | AcquireError::AtCapacity),
+            ) => {
+                let st = state.registry.status(state.agent_stale_after);
+                let why = match reason {
+                    AcquireError::NoAgent if st.registered == 0 => "registry-empty",
+                    AcquireError::NoAgent => "all-candidates-stale",
+                    AcquireError::NoModel => "no-agent-serves-model",
+                    _ => "all-candidates-at-capacity",
+                };
+                state.metrics.record_agent_rejection(why);
+                warn!(
+                    model = %model,
+                    reason = why,
+                    registered = st.registered,
+                    healthy = st.healthy,
+                    stale_after_secs = state.agent_stale_after.as_secs(),
+                    oldest_last_seen_secs = st.oldest_last_seen_ago.map(|d| d.as_secs()),
+                    "no agent to route to"
+                );
+                // 已经试过连接却挑不出下一条 → 把**真正的失败原因**（隧道错误）报给客户端，
+                // 而不是报一个会误导的 503/404。
+                if let Some(err) = last_failure {
+                    state.metrics.record_tunnel_retry("no-alternative");
+                    return error_response(
+                        StatusCode::BAD_GATEWAY,
+                        format!("{err}; no other agent available to retry"),
+                    );
+                }
+                return match reason {
+                    AcquireError::NoAgent => {
+                        error_response(StatusCode::SERVICE_UNAVAILABLE, "no edge available")
+                    }
+                    AcquireError::NoModel => {
+                        error_response(StatusCode::NOT_FOUND, "model not found on any agent")
+                    }
+                    AcquireError::AtCapacity => {
+                        error_response(StatusCode::TOO_MANY_REQUESTS, "agent at capacity")
+                    }
+                };
+            }
+        };
+
+        // 记下本次选中的连接：重试时不会再选它（否则重试没有意义）。
+        tried.push(entry.stable_id);
+
+        let stream = match open_tunnel(&mut entry, state.tunnel_op_timeout).await {
+            Ok(s) => s,
+            Err(e) => {
+                // 打不开流 = 这条连接已经死了 → 摘掉条目（连续超时足够才会真摘），
+                // 然后换个 agent 重试；没有别的候选时把错误报给客户端。
+                state.registry.evict(entry.stable_id);
+                if tried.len() >= MAX_TUNNEL_ATTEMPTS {
+                    state.metrics.record_tunnel_retry("failed");
+                    return error_response(StatusCode::BAD_GATEWAY, e);
+                }
+                warn!(
+                    request_id,
+                    agent = %entry.agent_id,
+                    error = %e,
+                    "tunnel open failed; retrying on another agent"
+                );
+                last_failure = Some(e);
+                continue;
+            }
+        };
+        let (recv, mut send) = stream.split();
+
+        if let Err(e) = tunnel_write(
+            &mut send,
+            &request,
+            state.tunnel_op_timeout,
+            request_id,
+            &entry.agent_id,
+        )
+        .await
+        {
+            state.registry.evict(entry.stable_id);
+            if tried.len() >= MAX_TUNNEL_ATTEMPTS {
+                state.metrics.record_tunnel_retry("failed");
+                return error_response(StatusCode::BAD_GATEWAY, e);
+            }
+            warn!(
+                request_id,
+                agent = %entry.agent_id,
+                error = %e,
+                "request frame write failed; retrying on another agent"
+            );
+            last_failure = Some(e);
+            continue;
+        }
+
+        if tried.len() > 1 {
+            // 这次是重试成功的：对客户端是一次不可见的自愈。
+            state.metrics.record_tunnel_retry("ok");
+        }
+        break (entry, slot, recv, send);
+    };
+
     debug!(request_id, "proxying request to agent");
 
     // 读取响应头（用 head_timeout，不是 request_timeout）。
