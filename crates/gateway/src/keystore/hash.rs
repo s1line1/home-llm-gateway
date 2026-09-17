@@ -75,31 +75,16 @@ pub fn hash_argon2(token: &str) -> String {
         .to_string()
 }
 
-/// 当前**正在运行**的 argon2 调用数（测试用）。
+/// RAII：标记"一次 argon2 正在运行"。
 ///
-/// argon2 是内存硬的（m_cost = 19MiB），所以"同时在跑几个"直接等于内存峰值。
-/// 测试用它断言"同一个 token 的 N 个并发请求只跑 1 次 argon2"——用内存数字断言太脆，
-/// 用调用计数才是确定性证据。
-#[cfg(test)]
-pub(crate) static ARGON2_CALLS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-/// argon2 调用次数（测试用计数器，断言"只算一次"这类契约）。
-#[cfg(test)]
-pub(crate) fn argon2_calls() -> usize {
-    ARGON2_CALLS.load(std::sync::atomic::Ordering::SeqCst)
-}
-
-/// RAII：进入 argon2 时计数（测试构建下用于断言调用次数）。
+/// 保留它是因为它标出了并发校验的边界（argon2 内存硬，同时在跑几个 = 内存峰值）。
+/// **注意不要再用全局计数断言调用次数**：计数器是进程级的，会被同一测试进程里其他
+/// 测试的 argon2 调用污染（实测并行跑全量 lib 时，一个只应 1 次的断言被顶到 2 次）。
+/// 调用次数改由 `KeyStore` 各实例自己统计（`KeyStore::argon2_runs`）。
+#[derive(Default)]
 struct Argon2InFlight;
 
 impl Argon2InFlight {
-    #[cfg(test)]
-    fn enter() -> Self {
-        ARGON2_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Self
-    }
-    #[cfg(not(test))]
     fn enter() -> Self {
         Self
     }

@@ -79,6 +79,8 @@ pub struct Gateway {
     pub http_addr: SocketAddr,
     pub quic_addr: SocketAddr,
     registry: Registry,
+    /// 用量落库需要在关闭前强制 flush 一次（见 `Gateway::flush_usage_on_shutdown`）。
+    key_store: KeyStore,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -147,13 +149,18 @@ impl Gateway {
         };
 
         let metrics = Metrics::default();
+        let key_store = KeyStore::with_verified(
+            cfg.keys_file.clone(),
+            cfg.verified_cache_max,
+            crate::keystore::DEFAULT_VERIFIED_TTL,
+        );
+        // 用量落库：后台按周期把各 key 的累计值批量写一次（热路径只做内存累加，
+        // 见 `http_proxy::UsageCollector::finish`）。关闭前由
+        // `flush_usage_on_shutdown` 补最后一刀，保证不丢。
+        let usage_flusher = usage_flush::spawn(key_store.clone());
         let state = http::AppState {
             registry: registry.clone(),
-            key_store: KeyStore::with_verified(
-                cfg.keys_file.clone(),
-                cfg.verified_cache_max,
-                crate::keystore::DEFAULT_VERIFIED_TTL,
-            ),
+            key_store: key_store.clone(),
             admin_token: cfg.admin_token,
             timeout: cfg.request_timeout,
             agent_stale_after: cfg.agent_stale_after,
@@ -193,10 +200,13 @@ impl Gateway {
             metrics,
         )));
 
+        tasks.push(usage_flusher);
+
         Ok(Self {
             http_addr,
             quic_addr,
             registry,
+            key_store,
             tasks,
         })
     }
@@ -204,6 +214,16 @@ impl Gateway {
     /// 当前在线 agent 数（测试/可观测性用）。
     pub fn agent_count(&self) -> usize {
         self.registry.len()
+    }
+
+    /// 关闭前把内存里的用量强制落库（**必须成功一次**再退出）。
+    ///
+    /// 落库已改成"后台按周期批量写"，所以进程退出前必须补最后这一刀，否则最后
+    /// 一个周期内的用量会丢。这里返回写入的 key 数，便于日志与测试断言。
+    pub fn flush_usage_on_shutdown(&self) -> usize {
+        let n = self.key_store.flush_usage_blocking();
+        tracing::info!(keys = n, "usage flushed before shutdown");
+        n
     }
 
     pub async fn shutdown(self) {
@@ -248,3 +268,4 @@ async fn serve_https(
 pub mod config;
 pub mod http_proxy;
 pub mod usage;
+pub mod usage_flush;
