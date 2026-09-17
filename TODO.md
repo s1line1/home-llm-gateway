@@ -60,7 +60,14 @@
       `min(lim, hard, kern.maxfilesperproc)`，而后者可能低于当前 soft（实测 1048575 → 61440），
       等于把额度改小。回归测试：`nofile::tests::raises_soft_from_the_systemd_default_to_the_target_and_is_idempotent`
       （先把 soft 降到 1024 复现 systemd 默认，断言抬到 16384、只抬不降、hard 不动、幂等；
-      已验证过红）。**仍可选的加强**：unit 里写 `LimitNOFILE=65536` 抬高天花板——
+      已验证过红）。**编译期保险**：`install()` 返回一个只能由它产出的凭证（`nofile::Raised`），
+      而 `Gateway` 结构体带一个该类型的 `pub` 字段——于是"删掉 install 调用"会变成
+      `missing field nofile` 编译错误，而不是静默退回 1024（已验证过红；
+      `pub fn` + 忘了调用本来**不会**有任何 dead_code 警告）。
+      **运行期保险**：e2e `e2e_startup_raises_the_nofile_soft_limit_in_the_real_process`
+      先把本进程 soft 降到 1024 复现 systemd 处境，再起真实网关，然后读**进程自己的**
+      `/proc/self/limits` 核对生效值（不以自家日志为准），并断言 hard 未被改动
+      （同样已验证过红）。**仍可选的加强**：unit 里写 `LimitNOFILE=65536` 抬高天花板——
       不写也不会再撞那个 1024，但日志里 `limited_by_hard=true` 表示天花板比目标值低。
 - [ ] **监听 backlog 被硬编码成 128**：`tokio::net::TcpListener::bind` 走 mio，而 mio 为对齐 std
       写死 `listen(.., 128)`（`mio-1.2.2/src/net/tcp/listener.rs`），云端 `net.core.somaxconn=4096`

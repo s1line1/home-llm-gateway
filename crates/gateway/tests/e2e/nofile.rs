@@ -1,0 +1,72 @@
+//! 启动期资源上限的 e2e 断言。
+//!
+//! 单测只能证明 `nofile::raise_to_target` 这个函数本身是对的；它证明不了
+//! **`Gateway::start` 真的调用了它**。而"没调用"恰好是本仓库最危险的一类失败：
+//! `install()` 是 `pub fn`，删掉调用没有任何编译警告、单测与 clippy 全绿，
+//! 只有高并发时才会以 `Too many open files` 的形式冒出来。
+//!
+//! 所以这里起一套真实网关，然后读**进程自己**的 `/proc/self/limits` 核对实际生效额度——
+//! 不以网关日志为准（日志是我们自己写的，写错也照样"通过"）。
+
+use super::common::*;
+
+/// 规格：**起一套网关之后，进程的 NOFILE 软上限必须已经达到目标值**（而不是 systemd 默认的 1024）。
+///
+/// 做法是先把本进程的 soft 手动降到 1024（复现云端 `gateway.service` 未设 `LimitNOFILE` 时的
+/// 处境），再走生产路径起栈。
+///
+/// 平台差异：`/proc` 只有 Linux 有，macOS 上这一步会跳过；但"返回值必须是抬过/或本来就够高"
+/// 的断言在任何 unix 上都跑，所以本用例在本机也有意义（能抓到"install 没被调用"）。
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn e2e_startup_raises_the_nofile_soft_limit_in_the_real_process() {
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+
+    let (original_soft, hard) = rlimit::getrlimit(rlimit::Resource::NOFILE).unwrap();
+    let target = hard.min(gateway::nofile::TARGET_SOFT_LIMIT);
+    // 环境太紧（hard 本身就很小）时只跑通用断言，别把环境影响当成失败
+    let lowered = target > 1024 && rlimit::setrlimit(rlimit::Resource::NOFILE, 1024, hard).is_ok();
+    let soft_before = rlimit::getrlimit(rlimit::Resource::NOFILE).unwrap().0;
+
+    let (gw, agent, _base, _key) = start_stack(Duration::from_secs(10), 0, 4, None).await;
+
+    // ① 网关自己报告的结论（必须与启动日志一致）
+    let outcome = gw.nofile.outcome();
+    match outcome {
+        gateway::nofile::NoFileOutcome::Raised { from, to, .. } => {
+            assert_eq!(from, soft_before, "from 必须是抬之前的实际 soft");
+            assert!(to > from, "Raised 必须是真的变大：{from} → {to}");
+        }
+        gateway::nofile::NoFileOutcome::Unchanged { soft, .. } => {
+            assert!(
+                soft >= target,
+                "报告 Unchanged 就必须已经达到目标：soft={soft} target={target}"
+            );
+        }
+        other => panic!("本机不该出现这种启动结论：{other:?}"),
+    }
+
+    // ② 不看日志，直接读进程实际生效的额度（Linux）
+    if let Ok(text) = std::fs::read_to_string("/proc/self/limits") {
+        let (soft, hard_now) =
+            gateway::nofile::parse_proc_limits(&text).expect("/proc/self/limits 里必须有该行");
+        assert_eq!(hard_now, hard, "hard 不该被改动");
+        assert!(
+            soft >= target,
+            "/proc 里实际生效的 soft 是 {soft}，低于目标 {target} —— 说明 install 没真正生效"
+        );
+        if lowered {
+            assert_eq!(
+                soft, target,
+                "复现了 systemd 的 1024 之后，必须正好抬到 min(hard, TARGET)"
+            );
+        }
+    }
+
+    agent.shutdown().await;
+    gw.shutdown().await;
+
+    // 收尾：还原进来时的 soft，避免影响同一二进制里的其他用例
+    let _ = rlimit::setrlimit(rlimit::Resource::NOFILE, original_soft, hard);
+}

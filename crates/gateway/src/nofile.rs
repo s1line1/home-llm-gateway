@@ -57,6 +57,9 @@ pub enum NoFileOutcome {
     Raised { from: u64, to: u64, hard: u64 },
     /// 该平台没有 `RLIMIT_NOFILE`（Windows）。
     Unsupported,
+    /// 抬额度失败（读/写 rlimit 出错）。`install` 会为它打 WARN；
+    /// 它**不代表启动失败**——见模块注释"失败只告警、不致命"。
+    Failed,
 }
 
 /// 把 soft 抬到 `min(hard, TARGET_SOFT_LIMIT)`（尽力而为，返回值描述实际发生了什么）。
@@ -104,9 +107,38 @@ pub fn raise_to_target() -> std::io::Result<NoFileOutcome> {
 ///
 /// 失败只告警——见模块注释"失败只告警、不致命"。告警文案要带上**可执行的下一步**
 /// （改 unit 的 `LimitNOFILE`），否则运维看到 "could not raise" 也不知道该做什么。
-pub fn install() {
-    match raise_to_target() {
-        Ok(NoFileOutcome::Raised { from, to, hard }) => {
+/// 启动时抬额度的**凭证**：只有 [`install`] 能产出它，而 [`crate::Gateway`] 的结构体字段要求
+/// 持有它——所以"忘了调用 install"会变成**编译错误**，不会静默退回 1024。
+///
+/// 为什么需要这道保险：`install()` 是 `pub fn`，删掉调用**不会**触发任何 `dead_code` 警告，
+/// 单测与 clippy 也全绿，只有高并发时才会冒 `Too many open files` —— 属于"静默失败"。
+pub struct Raised(NoFileOutcome);
+
+impl Raised {
+    /// 本次启动实际做了什么（日志里那一行就是它；测试也用它断言）。
+    pub fn outcome(&self) -> NoFileOutcome {
+        self.0
+    }
+}
+
+/// 启动时调用一次：抬额度、写日志，并把凭证交给调用方（见 [`Raised`]）。
+///
+/// 失败只告警——见模块注释"失败只告警、不致命"。告警文案要带上**可执行的下一步**，
+/// 否则运维看到 "could not raise" 也不知道该做什么。
+pub fn install() -> Raised {
+    let outcome = match raise_to_target() {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "could not raise the NOFILE soft limit; if you see 'Too many open files', \
+                 set LimitNOFILE in the service unit (it sets the ceiling this code can raise to)"
+            );
+            NoFileOutcome::Failed
+        }
+    };
+    match outcome {
+        NoFileOutcome::Raised { from, to, hard } => {
             // limited_by_hard=true 表示"环境的天花板比目标值还低"（unit/容器收紧过），
             // 那才真的到不了目标值；否则是**我们主动停**在 TARGET_SOFT_LIMIT。
             // 两者必须能区分，否则运维会把"设计如此"读成"被系统压住了"。
@@ -119,7 +151,7 @@ pub fn install() {
                 "raised NOFILE soft limit"
             )
         }
-        Ok(NoFileOutcome::Unchanged { soft, hard }) => {
+        NoFileOutcome::Unchanged { soft, hard } => {
             tracing::debug!(
                 soft,
                 hard,
@@ -127,20 +159,71 @@ pub fn install() {
                 "NOFILE soft limit already at or above the target"
             )
         }
-        Ok(NoFileOutcome::Unsupported) => {
+        NoFileOutcome::Unsupported => {
             tracing::debug!("RLIMIT_NOFILE is not adjustable on this platform")
         }
-        Err(e) => tracing::warn!(
-            error = %e,
-            "could not raise the NOFILE soft limit; if you see 'Too many open files', \
-             set LimitNOFILE in the service unit (it sets the ceiling this code can raise to)"
-        ),
+        NoFileOutcome::Failed => {}
     }
+    Raised(outcome)
+}
+
+/// 解析 `/proc/<pid>/limits` 里的 `Max open files` 一行，返回 `(soft, hard)`。
+///
+/// 存在的意义：让"启动后进程里实际生效的额度"能被断言，而不是只信日志打印的数字
+/// （日志是我们自己写的，写错也照样通过）。`unlimited` 按 `u64::MAX` 处理——内核在
+/// 上限为 RLIM_INFINITY 时就是这么打印的。
+pub fn parse_proc_limits(text: &str) -> Option<(u64, u64)> {
+    // 用 trim_start：真实 /proc/<pid>/limits 的该行不缩进（云端实测形态），
+    // 但不同内核版本的列对齐方式有差异，宽容一点不花成本。
+    let line = text
+        .lines()
+        .find(|l| l.trim_start().starts_with("Max open files"))?;
+    let mut nums = line.split_whitespace().filter_map(|tok| {
+        if tok == "unlimited" {
+            Some(u64::MAX)
+        } else {
+            tok.parse::<u64>().ok()
+        }
+    });
+    let soft = nums.next()?;
+    let hard = nums.next()?;
+    Some((soft, hard))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 解析 `/proc/<pid>/limits`：这是"启动后进程里**实际**生效的额度"的唯一外部证据，
+    /// 只信自家日志打印的数字等于自己证明自己。样例取自云端网关进程的真实输出。
+    #[test]
+    fn parses_the_max_open_files_line_from_proc_limits() {
+        // 真实形态：字段之间是空格对齐，末尾还有单位列（这里是 files）
+        let sample = "Limit                     Soft Limit           Hard Limit           Units     \n\
+                      Max open files            1024                 524288               files     \n\
+                      Max pending signals       63282                63282                signals   \n";
+        assert_eq!(parse_proc_limits(sample), Some((1024, 524288)));
+
+        // 抬完之后
+        let raised =
+            "Max open files            16384                524288               files     \n";
+        assert_eq!(parse_proc_limits(raised), Some((16384, 524288)));
+
+        // RLIM_INFINITY 在 /proc 里就是 unlimited（macOS 的 hard 常见）
+        let unlimited =
+            "Max open files            16384                unlimited            files     \n";
+        assert_eq!(parse_proc_limits(unlimited), Some((16384, u64::MAX)));
+
+        // 没有这一行时必须是 None，而不是默默返回 (0, 0) 让断言假通过
+        assert_eq!(parse_proc_limits("Max pending signals 1 2 signals\n"), None);
+        assert_eq!(parse_proc_limits(""), None);
+
+        // 前端有缩进的变体同样要能解析（对齐方式依内核版本而变）
+        assert_eq!(
+            parse_proc_limits("  Max open files 65535 65535 files\n"),
+            Some((65535, 65535))
+        );
+    }
 
     /// 规格：**systemd 给的 1024 必须被抬到目标值**，且只抬不降、重复调用幂等。
     ///
@@ -200,6 +283,7 @@ mod tests {
                     );
                 }
                 NoFileOutcome::Unsupported => panic!("unix 上不该是 Unsupported"),
+                NoFileOutcome::Failed => panic!("本机读/写 rlimit 不该失败（那会走 WARN 分支）"),
             }
 
             // 幂等：第二次必然无事可做，且不改变任何值

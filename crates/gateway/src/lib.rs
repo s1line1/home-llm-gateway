@@ -92,6 +92,13 @@ pub struct Gateway {
     /// 用量落库需要在关闭前强制 flush 一次（见 `Gateway::flush_usage_on_shutdown`）。
     key_store: KeyStore,
     tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// 「启动时抬过 NOFILE 额度」的凭证，见 [`nofile::Raised`] 与 [`nofile::install`]。
+    ///
+    /// **它没有任何运行时用途，唯一作用是编译期保险**：这个字段只能由
+    /// `nofile::install()` 的返回值填上，所以删掉那次调用就构造不出 `Gateway`
+    /// （`missing field` 编译错误），而不是静默地把 fd 额度留在 1024 上——
+    /// 那种失败只会在高并发时以 `Too many open files` 的形式冒出来，单测/clippy 全绿。
+    pub nofile: nofile::Raised,
 }
 
 impl Gateway {
@@ -100,10 +107,12 @@ impl Gateway {
         // workspace 同时链接了 ring 与 aws-lc-rs，不安装 rustls 会 panic）
         proto::install_ring_crypto_provider();
 
-        // 在**绑任何 socket 之前**把 NOFILE 的 soft 抬到 hard：systemd 给的默认 soft 是 1024，
-        // 生产水位（768 并发连接 → fd 峰值 785）下是贴脸的，撞上时表现为"新连接被拒但进程健康"
-        // （`accept error: Too many open files`）。失败只告警，不阻止启动——见 `nofile` 模块注释。
-        nofile::install();
+        // 在**绑任何 socket 之前**把 NOFILE 的 soft 抬到目标值（默认 16384）：systemd 给的默认
+        // soft 是 1024，生产水位（768 并发连接 → fd 峰值 785）下是贴脸的，撞上时表现为
+        // "新连接被拒但进程健康"（`accept error: Too many open files`）。
+        // 失败只告警，不阻止启动——见 `nofile` 模块注释；返回值存进结构体是**编译期保险**
+        // （删掉这行就构造不出 Gateway），不要为了"省一个字段"把它丢掉。
+        let nofile = nofile::install();
 
         let registry = Registry::default();
 
@@ -244,6 +253,7 @@ impl Gateway {
             registry,
             key_store,
             tasks,
+            nofile,
         })
     }
 
