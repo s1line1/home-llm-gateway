@@ -38,6 +38,8 @@ struct MetricsInner {
     /// **为什么**——尤其是 `registry-empty`（真没人注册）与 `all-candidates-stale`
     /// （有人注册但心跳全过期）必须分开：两者都表现为 503，处置方式却完全不同。
     agent_rejections: Mutex<HashMap<&'static str, u64>>,
+    /// "隧道建立失败后换 agent 重试"的次数，按结果分（ok = 重试成功，failed = 换过仍失败）。
+    tunnel_retries: Mutex<HashMap<&'static str, u64>>,
 }
 
 impl Metrics {
@@ -83,6 +85,17 @@ impl Metrics {
             .lock()
             .unwrap()
             .entry(reason)
+            .or_insert(0) += 1;
+    }
+
+    /// 记录一次"因隧道建立失败而换 agent 重试"及其结果。
+    pub fn record_tunnel_retry(&self, outcome: &'static str) {
+        *self
+            .inner
+            .tunnel_retries
+            .lock()
+            .unwrap()
+            .entry(outcome)
             .or_insert(0) += 1;
     }
 
@@ -168,6 +181,21 @@ impl Metrics {
         out.push_str("# HELP hlmg_agents_healthy Registered agents whose last heartbeat is within agent_stale_secs (routable candidates).\n");
         out.push_str("# TYPE hlmg_agents_healthy gauge\n");
         out.push_str(&format!("hlmg_agents_healthy {agents_healthy}\n"));
+        {
+            let retries = inner.tunnel_retries.lock().unwrap();
+            if !retries.is_empty() {
+                out.push_str("# HELP hlmg_tunnel_retries_total Requests retried on another agent after a tunnel setup failure, by outcome.\n");
+                out.push_str("# TYPE hlmg_tunnel_retries_total counter\n");
+                let mut outcomes: Vec<&&str> = retries.keys().collect();
+                outcomes.sort_unstable();
+                for o in outcomes {
+                    out.push_str(&format!(
+                        "hlmg_tunnel_retries_total{{outcome=\"{o}\"}} {}\n",
+                        retries[*o]
+                    ));
+                }
+            }
+        }
         {
             let rej = inner.agent_rejections.lock().unwrap();
             if !rej.is_empty() {

@@ -253,10 +253,23 @@ impl Registry {
         stale_after: Duration,
         model: &str,
     ) -> Result<(Entry, SlotGuard), AcquireError> {
+        self.try_acquire_excluding(stale_after, model, &[])
+    }
+
+    /// 同 [`Self::try_acquire`]，但**跳过 `exclude` 里列出的连接**（按 `stable_id`）。
+    ///
+    /// 用于"换一个 agent 重试"：刚失败的那条连接不该再被选中（否则重试没有意义）。
+    pub fn try_acquire_excluding(
+        &self,
+        stale_after: Duration,
+        model: &str,
+        exclude: &[usize],
+    ) -> Result<(Entry, SlotGuard), AcquireError> {
         let inner = self.inner.read().unwrap();
         let mut candidates: Vec<&Entry> = inner
             .values()
             .filter(|e| e.last_seen.elapsed() < stale_after)
+            .filter(|e| !exclude.contains(&e.stable_id))
             .collect();
         if candidates.is_empty() {
             return Err(AcquireError::NoAgent);
@@ -434,6 +447,37 @@ mod tests {
         assert_eq!(reg.len(), 0);
         // 对不存在的 agent 移除 → 无害
         reg.remove_if_same("ghost", id2);
+    }
+
+    /// 契约：**换 agent 重试时必须排除刚失败的那条连接**。
+    ///
+    /// 否则"重试"会再次选中同一条坏连接，等于没重试——这在生产表现为"重试了但还是
+    /// 502"，而日志里看不出原因。
+    #[tokio::test]
+    async fn try_acquire_excluding_skips_the_failed_connection() {
+        let reg = Registry::default();
+        let c1 = test_connection().await;
+        let c2 = test_connection().await;
+        let id1 = reg.register("a".into(), vec!["*".into()], 4, c1.clone());
+        let id2 = reg.register("b".into(), vec!["*".into()], 4, c2.clone());
+        let stale = Duration::from_secs(10);
+
+        // 不排除任何连接：两次选取都会命中某个候选（不关心是哪个）
+        assert!(reg.try_acquire(stale, "m").is_ok());
+
+        // 排除 a → 只能选到 b
+        let (e, _g) = reg.try_acquire_excluding(stale, "m", &[id1]).unwrap();
+        assert_eq!(e.stable_id, id2, "排除 a 后应选中 b");
+
+        // 排除 b → 只能选到 a
+        let (e, _g) = reg.try_acquire_excluding(stale, "m", &[id2]).unwrap();
+        assert_eq!(e.stable_id, id1, "排除 b 后应选中 a");
+
+        // 两条都排除 → 没有候选（这正是"没有别的 agent 可重试"那条分支）
+        assert!(matches!(
+            reg.try_acquire_excluding(stale, "m", &[id1, id2]),
+            Err(AcquireError::NoAgent)
+        ));
     }
 
     /// 契约：**单次隧道操作超时不得摘除条目**（高并发下那是排队假象），
