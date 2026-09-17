@@ -330,6 +330,14 @@
 - **`/metrics` 的坑**：`verified_cache_max: 0` 时 `hlmg_key_verify_{hits,misses}_total` 恒为 0（旧路径不加计数），
   已在《可观测性》写明，避免运维误判为"没有校验"。
 
+- [x] **已实施：用量落库批量化（本轮）**。原来每个请求都 `spawn_blocking` 一次
+      `INSERT ... ON CONFLICT`，实测把 2 vCPU 的上限摁在约 190 QPS（云端 515 个线程里 514 个
+      卡在 futex 等同一把 `db` 锁）。现改为：热路径只做内存累加 → 后台每 1s 一个事务批量写
+      **绝对累计值**（幂等、重启不重复累加）→ **SIGTERM/SIGINT 时强制再落库一次**，日志
+      `usage flushed before shutdown keys=N`，正常关闭不丢数据（仅 SIGKILL/断电会丢最后一个
+      flush 周期 ≤1s 的用量）。顺带开 `journal_mode=WAL` + `synchronous=NORMAL`。
+      实测（本机同机同负载 256 并发 × 20s）：934 → **15 744 QPS**，CPU/请求 11.2ms → 3.40ms，
+      线程数 521 → 151。**仍未实测：云端 2 vCPU 修好后的上限**（需把新二进制部署上去跑同一阶梯）。
 - [ ] **待评估：agent 侧事件批处理**。实测 agent 的开销由 SSE 事件**次数**决定（与字节无关，
       1 字节 → 101 字节的 payload 不改变 CPU/事件），而 `write_frame` 目前每事件一次 `write_all`
       且每次分配两个 `Vec`。可考虑攒批合并写，但需要两个端点同时改帧协议 → 属协议变更，先不动。

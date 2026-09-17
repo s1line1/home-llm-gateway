@@ -432,9 +432,12 @@ impl UsageCollector {
     ///
     /// **不得在这里等落库**：SQLite 写可能因锁重试阻塞数秒（rusqlite 默认 busy timeout 5s），
     /// 而本函数在响应流关闭**之前**执行——等它就会变成客户端的尾延迟（实测：DB 被独占锁
-    /// 卡住 3s，客户端就要多等 3s 才拿到 body 结束）。所以：
-    /// 内存累加立即做（`/admin/usage` 读的正是这份内存计数，读一致性不受影响），
-    /// 落库丢给阻塞线程池且不等结果。
+    /// 卡住 3s，客户端就要多等 3s 才拿到 body 结束）。所以这里**只做内存累加**
+    /// （`/admin/usage` 读的正是这份内存计数，读一致性不受影响），落库交给后台周期任务
+    /// （`usage_flush::spawn` → `KeyStore::flush_usage_once`），并由关闭前的强制 flush 兜底。
+    ///
+    /// 这里曾经是"每请求 spawn 一个阻塞任务写一次库"：那条路径让云端 515 个线程里 514 个
+    /// 卡在 futex 等同一把 `db` 锁，把 2 vCPU 的吞吐摁在约 190 QPS。
     fn finish(mut self) {
         if self.recorded {
             return;
@@ -443,14 +446,6 @@ impl UsageCollector {
         let delta = self.resolve_delta();
         self.key_store
             .accumulate_usage(&self.key_id, &self.key_name, &delta);
-        let store = self.key_store.clone();
-        let key_id = self.key_id.clone();
-        let key_name = self.key_name.clone();
-        // 显式 drop 句柄（= detach）：阻塞任务一旦启动就不会因句柄被丢弃而取消，
-        // 落库会在阻塞线程池上跑完；这里既不等它，也不占 async worker。
-        drop(tokio::task::spawn_blocking(move || {
-            store.persist_usage(&key_id, &key_name, &delta)
-        }));
     }
 
     fn resolve_delta(&mut self) -> UsageDelta {
