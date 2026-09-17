@@ -313,9 +313,12 @@ async fn metrics_route(State(state): State<AppState>, headers: HeaderMap) -> Res
     }
     // 已验证身份缓存的命中/未命中：命中多说明 argon2 复用良好（内存/CPU 都省）
     let (verify_hits, verify_misses) = state.key_store.verified_counters();
+    // 注册条目数 与 真正可路由数必须分开暴露：前者含失联但连接未关的 agent，
+    // 排查"全部请求 503"时只有后者能说明问题（见 `hlmg_agents_healthy` 的 HELP）。
+    let healthy = state.registry.healthy_count(state.agent_stale_after);
     state
         .metrics
-        .render(state.registry.len(), verify_hits, verify_misses)
+        .render(state.registry.len(), healthy, verify_hits, verify_misses)
         .into_response()
 }
 

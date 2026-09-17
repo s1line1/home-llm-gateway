@@ -206,14 +206,40 @@ pub async fn proxy(
     };
     let (mut entry, slot) = match state.registry.try_acquire(state.agent_stale_after, &model) {
         Ok(x) => x,
-        Err(AcquireError::NoAgent) => {
-            return error_response(StatusCode::SERVICE_UNAVAILABLE, "no edge available");
-        }
-        Err(AcquireError::NoModel) => {
-            return error_response(StatusCode::NOT_FOUND, "model not found on any agent");
-        }
-        Err(AcquireError::AtCapacity) => {
-            return error_response(StatusCode::TOO_MANY_REQUESTS, "agent at capacity");
+        // 三种拒绝**必须分开记录**：它们的运维含义完全不同，而客户端看到的
+        // 503/404/429 不足以区分。尤其"NoAgent"有两种成因——注册表空，或注册表里
+        // 有人但全部心跳超时（stale）——只看状态码会把后者误判成"agent 掉了"。
+        Err(
+            reason @ (AcquireError::NoAgent | AcquireError::NoModel | AcquireError::AtCapacity),
+        ) => {
+            let st = state.registry.status(state.agent_stale_after);
+            let why = match reason {
+                AcquireError::NoAgent if st.registered == 0 => "registry-empty",
+                AcquireError::NoAgent => "all-candidates-stale",
+                AcquireError::NoModel => "no-agent-serves-model",
+                _ => "all-candidates-at-capacity",
+            };
+            state.metrics.record_agent_rejection(why);
+            warn!(
+                model = %model,
+                reason = why,
+                registered = st.registered,
+                healthy = st.healthy,
+                stale_after_secs = state.agent_stale_after.as_secs(),
+                oldest_last_seen_secs = st.oldest_last_seen_ago.map(|d| d.as_secs()),
+                "no agent to route to"
+            );
+            return match reason {
+                AcquireError::NoAgent => {
+                    error_response(StatusCode::SERVICE_UNAVAILABLE, "no edge available")
+                }
+                AcquireError::NoModel => {
+                    error_response(StatusCode::NOT_FOUND, "model not found on any agent")
+                }
+                AcquireError::AtCapacity => {
+                    error_response(StatusCode::TOO_MANY_REQUESTS, "agent at capacity")
+                }
+            };
         }
     };
 
