@@ -5,6 +5,7 @@ pub mod error;
 pub mod http;
 pub mod keystore;
 pub mod metrics;
+pub mod nofile;
 pub mod quic;
 pub mod ratelimit;
 pub mod registry;
@@ -98,6 +99,11 @@ impl Gateway {
         // 显式安装 ring 为进程默认 crypto provider（见 proto::install_ring_crypto_provider 的说明：
         // workspace 同时链接了 ring 与 aws-lc-rs，不安装 rustls 会 panic）
         proto::install_ring_crypto_provider();
+
+        // 在**绑任何 socket 之前**把 NOFILE 的 soft 抬到 hard：systemd 给的默认 soft 是 1024，
+        // 生产水位（768 并发连接 → fd 峰值 785）下是贴脸的，撞上时表现为"新连接被拒但进程健康"
+        // （`accept error: Too many open files`）。失败只告警，不阻止启动——见 `nofile` 模块注释。
+        nofile::install();
 
         let registry = Registry::default();
 

@@ -585,6 +585,35 @@ macOS 交叉编译到 Linux 的说明见脚本头部注释；推荐 musl 目标�
 
 systemd 单元：`deploy/gateway.service`（云服务器）、`deploy/agent.service`（LLM 机器），改好参数后 `systemctl enable --now` 即可开机自启。
 
+### 文件描述符上限（为什么网关要自己抬）
+
+**现象**：并发一高，客户端开始零星 `connection reset by peer`，而网关 `/healthz` 正常、
+CPU/内存都不高；网关日志里是 `accept error: Too many open files (os error 24)`。
+实测（2026-09-17，云端 2 vCPU）日志里这种错误有 296 次，全部落在压测窗口内。
+
+**成因**：进程的 `RLIMIT_NOFILE` 有 soft（运行时实际强制执行，用满即 `EMFILE`）与 hard
+（soft 允许抬到的天花板）两个值。`gateway.service` 没设 `LimitNOFILE`，于是吃 systemd 的
+全局默认 —— `/proc/<pid>/limits` 显示 `Max open files 1024 524288`。1024 不是内核限制
+（`fs.nr_open` 是 1048576，同机 `cron` 也是 1024，`sshd` 则自己抬到了 1048576），
+而实测 768 个并发客户端连接时网关 fd 峰值就有 **785**，默认值在生产水位上是贴脸的。
+
+**处理**：网关启动时（绑任何 socket 之前）自己把 soft 抬到 `min(hard, 16384)`
+（`gateway/src/nofile.rs`）。任何进程都能在 hard 以内抬自己的 soft，不需要特权；
+失败只记 WARN 不阻止启动。启动日志会留一行，便于事后核对：
+
+```
+INFO gateway::nofile: raised NOFILE soft limit from=1024 to=16384 hard=524288 target=16384 limited_by_hard=false
+```
+
+**为什么不抬到 hard（云端是 524288）**：上限给到几十万，等于把"fd 泄漏"的引爆点从**本进程的
+`EMFILE`**（止损范围一个进程、日志直接可见）推到**整机的 `fs.file-max`/内存**（拖垮同机其他
+服务、现场更难还原）。16384 已是实测水位的约 20 倍，够用且代价不外溢。
+
+**unit 里还要不要写 `LimitNOFILE`**：可选。两者分工是"unit 定 hard（真正天花板），代码抬 soft"。
+如果想让天花板更高（例如要跑 2000+ 并发连接），在 unit 里加 `LimitNOFILE=65536` 即可——
+**不写也不会再撞那个 1024**。反过来若 unit 把 hard 压到 1024 以下，代码也只能抬到 hard，
+日志里 `limited_by_hard=true` 就是在提示这件事。
+
 ## API Key 管理（Admin API）
 
 网关内置轻量管理接口，可**运行时签发 / 吊销 key，无需重启网关**：
