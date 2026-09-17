@@ -313,3 +313,23 @@
   `web/src/hooks/useMetricsHistory.ts`：`/admin/agents` 已实现（不再是"契约预留"），
   404 分支改为"旧版网关或未启用 `/admin/*`"的降级说明。
 - `Makefile` 的 `deny` 目标注释、`deploy/gateway.service` 的 `Description`（Home → Edge）。
+
+### 后续一轮文档更新（已验证缓存 + 每事件 CPU 实测）
+
+- `README.md`：`/metrics` 补 `hlmg_key_verify_hits_total` / `_misses_total` 的告警用法；
+  `verified_cache_max` 补生产实测（hits 22 426 / misses 3）；新增《agent 每事件的 CPU 成本》
+  （成本随事件数而非字节数、sys 占 73–78%、单 agent 上限 ≈6 000 事件/秒）；目录结构 `quinn` → `s2n-quic`。
+- `DESIGN.md`：§5.2 认证改为三步流程并补「已验证身份缓存」设计表；§3/§4.1/§5/§6 的 `quinn` → `s2n-quic`；
+  §11.4 的 key 校验一行标注"单实例已实施"。
+- `DEPLOY.md` §10：补 `cred_version` 列轻量迁移（只加列、旧 key 可用）与升级后的核对命令。
+- **《并发上限与内存》整节重写**：原文把"每在途请求 15–20MB"当常态，而那是**缓存关闭**时的 argon2 成本。
+  现改为两笔账（冷启动 19MiB/凭据 vs 转发缓冲 ~0.2MB/请求），并补同一台机器只改 `verified_cache_max`
+  的对照实测（8 并发：172.8MB vs 31.6MB；64 并发：1236.5MB vs 27.1MB；128 并发关闭时 +1416MB 且 45% 失败）。
+  同一旧公式还散落在 README 两处（压测小节、admission control 小节）与 `gateway_config.example.yml`，
+  一并改为"仅缓存关闭时适用"。
+- **`/metrics` 的坑**：`verified_cache_max: 0` 时 `hlmg_key_verify_{hits,misses}_total` 恒为 0（旧路径不加计数），
+  已在《可观测性》写明，避免运维误判为"没有校验"。
+
+- [ ] **待评估：agent 侧事件批处理**。实测 agent 的开销由 SSE 事件**次数**决定（与字节无关，
+      1 字节 → 101 字节的 payload 不改变 CPU/事件），而 `write_frame` 目前每事件一次 `write_all`
+      且每次分配两个 `Vec`。可考虑攒批合并写，但需要两个端点同时改帧协议 → 属协议变更，先不动。

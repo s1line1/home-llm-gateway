@@ -52,7 +52,7 @@
 | **连接迁移（Connection ID）** | 边缘端 agent 网络切换（WiFi ↔ 蜂窝、IP 变化）时连接不中断，无需重连 |
 | **0-RTT / 快速重连** | 断线重连开销小，心跳丢失后恢复快 |
 | **内建 TLS 1.3 + mTLS** | 隧道加密和双向认证开箱即用，无需自己拼 TLS-over-TCP 栈 |
-| **Rust 生态成熟** | `quinn` 是生产级实现（Tokio 官方维护），API 稳定 |
+| **Rust 生态成熟** | `s2n-quic` 是生产级实现（AWS 维护），API 稳定；本项目已从 `quinn` 迁移到它（原判据见 §10） |
 
 风险点：QUIC 走 **UDP**。极少数 edge 侧网络（家庭路由器/运营商）可能封锁出站 UDP，届时需要 fallback（见 §10）。
 
@@ -60,7 +60,7 @@
 
 ### 4.1 传输层
 
-- `quinn` 建立 QUIC 连接（UDP 443）。
+- `s2n-quic` 建立 QUIC 连接（UDP 4433）。
 - **双向认证（mTLS）**：云端自建 CA，为每个 edge-agent 签发客户端证书；云端只接受持有有效证书的连接。防止任何人伪装成"边缘端 agent"接走流量。
 - 一个 QUIC 连接承载 N 个双向 **stream**；每个隧道帧独占一个 stream 发送（stream 天然有序、流式，天然适配"一个请求一条流"）。
 
@@ -97,11 +97,11 @@
 
 ## 5. 云端（cloud-gateway）设计
 
-**技术栈**：`axum` + `hyper` + `tower` + `quinn` + `clap` + `tracing` + `serde`
+**技术栈**：`axum` + `hyper` + `tower` + `s2n-quic` + `clap` + `tracing` + `serde`
 
 职责：
 1. **公网 HTTP(S) 入口**：监听 443（TLS），暴露 OpenAI 兼容路径 `/v1/models`、`/v1/chat/completions`、`/v1/embeddings` 等，一律透传给隧道内的 agent。
-2. **认证**：Bearer API Key（`sha256(token)` 快速索引定位单条记录 + argon2 校验，见 §7 密钥行；恒定时间比较只用在 admin token 上）；可选 IP 白名单（未实现）。
+2. **认证**：Bearer API Key。鉴权分三步：`sha256(token)` 查已验证身份缓存 → 该记录 `enabled` 且 `cred_version` 与当前代次一致即放行（O(1)，**不跑 argon2**）；未命中才做 argon2 校验（全表遍历早已不存在）。恒定时间比较只用在 admin token 上。细节见下方「已验证身份缓存」。
 3. **限流**：token bucket 按 Key 限流；按 agent 并发上限 admission control（429）。
 4. **Agent 路由**：维护 agent 注册表（agent_id → 当前 QUIC 连接 + 健康状态）；按请求 `model` 过滤候选（精确声明优先、`models: ["*"]` 通配兜底），同组内取在途最少者（见 `MODEL_ROUTING.md`）；无健康 agent → 503，有健康 agent 但无人能服务该模型 → 404。
 5. **QUIC Server**：接受边缘端连接，校验 mTLS 证书，处理 Register/Heartbeat，更新注册表，踢掉同一 agent_id 的旧连接（防重复拨号）。
@@ -113,11 +113,25 @@
    | `timeout_secs` | 120s | 响应体**逐帧空闲**（SSE 靠"有帧就不超时"活着） | 发 `Cancel`，结束该流 |
 
    （总超时仍未实现——SSE 长流不能被整请求时限误杀。响应头等待**不**能沿用 `timeout_secs`：agent 卡死时每个请求都会把连接、并发槽位与缓冲区占满那么久，实测 40 并发钉住约 620MB、客户端早已断开却无人发现。）
+
+   **已验证身份缓存**（`gateway/src/keystore/verified.rs`，配置项 `verified_cache_max`，默认 1650）：
+
+   动因是 argon2 的内存硬特性——`Argon2::default()` 为 `m=19456 KiB`（19MiB），**每次校验都分配 19MiB 且随并发线性叠加**，所以"每请求校验一次"的网关内存等于 `在途请求数 × 19MiB`（实测 40 并发放大到约 760MB，云机上直接 OOM）。
+
+   | 设计点 | 取值与理由 |
+   |---|---|
+   | 键 | `sha256(token)`，**缓存里绝不存明文**；容量满时淘汰最旧条目 |
+   | 命中条件 | 记录 `enabled` 且 `cred_version == 当前代次`（O(1) 两次比较） |
+   | 吊销 | 凭据变更（改/删 key）时 `bump_cred_generation()` 或删除记录 → **立即失效**，不依赖 TTL |
+   | TTL | 只决定"何时**再付一次** argon2 验证"，不承担正确性 |
+   | 单飞 | 同一 token 的并发冷启动请求串行化，**只跑一次 argon2**（否则 N 并发 = N × 19MiB）；`verified_cache_max: 0` 关闭缓存回到旧行为 |
+
+   代价：缓存存活期内不再重新校验哈希——安全性由 `cred_version` 核对兜底，而不是靠定期重算。生产实测（单 key、21 516 个 200）命中 22 426 / miss 3，内存峰值 7.5MB；`hlmg_key_verify_hits_total` / `_misses_total` 暴露这两个计数（miss 增量即风险信号）。
 7. **可观测性**：`tracing` 结构化日志 + `metrics`（请求数、延迟、token 量、在线 agent 数）。
 
 ## 6. 边缘端（edge-agent）设计
 
-**技术栈**：`quinn` + `reqwest` + `tokio` + `clap` + `tracing` + `serde`
+**技术栈**：`s2n-quic` + `reqwest` + `tokio` + `clap` + `tracing` + `serde`
 
 职责：
 1. **拨号与保活**：启动即连接云端，指数退避重连（0.5s → 1s → … → **上限 30s**）；每 N 秒（`heartbeat_secs`，默认 5s）发 `Heartbeat`。
@@ -154,7 +168,7 @@
 ## 10. 风险与备选方案
 
 1. **UDP 被封锁**：极少数 edge 侧网络封出站 UDP。备选：隧道降级为 TCP+TLS 并复用同一套帧协议（帧层不变，只换传输层），或提示用户放行 UDP 443。
-2. **quinn API 学习成本**：备选直接上 HTTP/3（`h3` crate），用标准 HTTP 语义替代自定义帧，代价是少一点控制力、多一层依赖。
+2. **QUIC 库 API 学习成本**（迁移到 `s2n-quic` 时踩过 `Server: !Clone`、`Connection::split()` 等）：备选直接上 HTTP/3（`h3` crate），用标准 HTTP 语义替代自定义帧，代价是少一点控制力、多一层依赖。
 3. **帧协议 bug 排查成本**：协议保持最小集（上表 8 种帧），先做对再做优化；用 `postcard` 保证序列化简单可调试。
 4. **edge 断网/断电**：云端靠心跳超时把 agent **排除出路由候选**（`agent_stale_secs`，默认 15s），客户端得到 503/404 而非悬挂；agent 恢复后自动重连，无需人工干预。注意现状：注册表条目要等连接真正关闭才摘除，因此 `Registry::len()`、`/metrics hlmg_agents`、`/admin/agents` 会把失联连接一并算作"在线"（见 TODO 审查登记）。
 5. **云服务器被攻击面**：公网入口只暴露认证后的转发能力，不暴露任何管理接口；管理走 SSH。
@@ -200,7 +214,7 @@
 |---|---|
 | agent 注册表（在线/心跳） | Redis（agent 心跳写 Redis，多实例共享） |
 | 限流令牌桶 | Redis（Lua 脚本原子操作） |
-| key 校验 | 本地缓存 + 失效机制（pub/sub 或短 TTL） |
+| key 校验 | ✅ 单实例已实施：`sha256(token)` → 已验证身份缓存 + `cred_version` 吊销核对（见 §5）——**天然无状态友好**，多实例下只需共享"代次"（Redis INCR/通知），不必共享缓存本身 |
 | 持久化 | SQLite → PostgreSQL（多写者、并发事务） |
 
 - 多实例 + LB：HTTP 入口挂 SLB/nginx；QUIC 侧 agent 支持配置多个网关地址（发现/故障转移）或随机拨入集群
@@ -240,8 +254,8 @@ home-llm-gateway/
 ├── Cargo.toml            # workspace
 ├── DESIGN.md             # 本文档
 ├── crates/
-│   ├── gateway/          # cloud-gateway 二进制（axum + quinn server）
-│   ├── agent/            # edge-agent 二进制（quinn client + reqwest）
+│   ├── gateway/          # cloud-gateway 二进制（axum + s2n-quic server）
+│   ├── agent/            # edge-agent 二进制（s2n-quic client + reqwest）
 │   └── proto/            # 共享 crate：帧类型、序列化、错误码
 │       └── tests/        # 帧编解码 roundtrip 测试
 └── certs/                # 自建 CA 与签发脚本（脚本而非仓库内私钥）
