@@ -40,6 +40,12 @@ struct MetricsInner {
     agent_rejections: Mutex<HashMap<&'static str, u64>>,
     /// "隧道建立失败后换 agent 重试"的次数，按结果分（ok = 重试成功，failed = 换过仍失败）。
     tunnel_retries: Mutex<HashMap<&'static str, u64>>,
+    /// 客户端停滞而主动放弃的次数，按方向分（`request-body` = 请求体读不动、
+    /// `response-body` = 客户端不消费响应体）。
+    ///
+    /// 这个计数是"准入槽位泄漏"的直接告警：修好之前，这类停滞不会留下任何痕迹，
+    /// 只表现为 `hlmg_active_requests` 只增不减（实测云端沉淀 8 个，只能重启恢复）。
+    client_stalls: Mutex<HashMap<&'static str, u64>>,
     /// 开流超时的次数，按判定分：`busy` = 在途已顶到承载上限（背压，不摘除）、
     /// `dead` = 未到上限却开不出流（坏连接，摘除）。
     ///
@@ -102,6 +108,17 @@ impl Metrics {
             .lock()
             .unwrap()
             .entry(outcome)
+            .or_insert(0) += 1;
+    }
+
+    /// 记录一次"客户端停滞 → 放弃"（`phase`：`request-body` / `response-body`）。
+    pub fn record_client_stall(&self, phase: &'static str) {
+        *self
+            .inner
+            .client_stalls
+            .lock()
+            .unwrap()
+            .entry(phase)
             .or_insert(0) += 1;
     }
 
@@ -224,6 +241,21 @@ impl Metrics {
                     out.push_str(&format!(
                         "hlmg_agent_rejections_total{{reason=\"{r}\"}} {}\n",
                         rej[*r]
+                    ));
+                }
+            }
+        }
+        {
+            let cs = inner.client_stalls.lock().unwrap();
+            if !cs.is_empty() {
+                out.push_str("# HELP hlmg_client_stalls_total Requests abandoned because the client stopped making progress, by direction. Kept slots do not leak: each one is released when the request ends.\n");
+                out.push_str("# TYPE hlmg_client_stalls_total counter\n");
+                let mut phases: Vec<&&str> = cs.keys().collect();
+                phases.sort_unstable();
+                for p in phases {
+                    out.push_str(&format!(
+                        "hlmg_client_stalls_total{{phase=\"{p}\"}} {}\n",
+                        cs[*p]
                     ));
                 }
             }

@@ -304,9 +304,20 @@
       与 `/admin/agents`（`admin.rs:173`）；只有 `try_acquire`（`registry.rs:145`）过滤了
       `agent_stale_secs`。活跃但沉默的连接会一直多报。修法：`len()`/`snapshot()` 接 `stale_after`，
       或另给一个 `healthy_len()` 供指标使用。
-- [ ] **慢客户端无限占并发槽**：`http_proxy.rs:419` 的 `tx.send(...).await` 无超时，也没有响应写超时
-      → 停止读取的客户端会无限期持有 `SlotGuard`（连带占住该 agent 的并发额度与 QUIC 流）。
-      DESIGN §11.2 已列"SSE 流式转发增加内存缓冲上限"，与本项合并做。
+- [x] **慢客户端无限占并发槽（2026-09-18 已修，三处都设了上限）**：以前有三处客户端侧等待
+      没有超时，任一处都能让在途请求永久占住准入票据（实测云端沉淀 8 个僵尸槽位：
+      `hlmg_active_requests` 恒为 8、`hlmg_request_count − Σ状态码 = 8`，只能重启恢复）：
+        ① 读请求体（`Bytes` 提取器）→ 改为逐块读 + 停滞超时 → 408；
+        ② 写响应体通道（`tx.send().await`）→ 停滞即取消上游并结束响应体；
+        ③ **hyper 往 socket 写**（应用层修不到的那一半，数据已在缓冲里）→ IO 层
+           `io_stall::WriteStall`，连续 `client_stall_secs` 写不进一字节就断开连接。
+      语义统一为"**停滞**"而非"总时长"（有字节流动就续期），所以慢客户端不会被误伤；
+      三处共用 `client_stall_secs`（默认 60s）。回归测试 `tests/e2e/stalls.rs`（判据：
+      `max_concurrent_requests: 1` 下后续请求不得 429）+ `io_stall` 单测，均已红检。
+      **仍未做**：响应体**内存缓冲上限**（DESIGN §11.2 与本项原本合并做的那半）——
+      现在通道是 32 块的有界队列，但 hyper 侧仍会缓冲到 socket 缓冲被写满为止。
+- [ ] **Cancel→上游缺上游侧断言**（原与本项相邻，仍缺）：`mock-llm` 没有"请求被取消"的
+      可观测信号（新加的 `/v1/flood` 提供了持续产出的上游，但还没暴露"被中途丢弃"的计数）。
 - [ ] **公网入口 accept 出错即永久停服**：`gateway/src/lib.rs:175` 的 `listener.accept().await?`
       用 `?` 结束整个循环，外层只有一句 `warn!("https server stopped")`。对比 QUIC 侧专门做了
       `hlmg_quic_accepting` + `error!` 告警（`quic.rs:29-36`），HTTP 入口（唯一公网入口）反而没有

@@ -10,3 +10,4 @@ mod common;
 mod https;
 mod metrics;
 mod nofile;
+mod stalls;
