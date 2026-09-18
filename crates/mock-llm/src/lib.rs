@@ -6,6 +6,7 @@ use std::{convert::Infallible, sync::Arc, time::Duration};
 use async_stream::stream;
 use axum::{
     body::{Body, Bytes},
+    extract::Query,
     extract::State,
     http::{
         header::{CACHE_CONTROL, CONTENT_TYPE},
@@ -15,6 +16,31 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+
+/// 持续产出 `chunks` 块、每块 `kb` KB（块间 `delay_ms` 毫秒，默认 0）。
+/// 上游会一直产到被取消为止——这正是"客户端不读时会不会永久占住槽位"要考的场景。
+async fn flood(Query(p): Query<std::collections::HashMap<String, String>>) -> Response {
+    let num = |k: &str, d: u64| p.get(k).and_then(|v| v.parse().ok()).unwrap_or(d);
+    let chunks = num("chunks", 100_000) as usize;
+    let kb = (num("kb", 64) as usize).clamp(1, 1024);
+    let delay = Duration::from_millis(num("delay_ms", 0));
+    let payload = Bytes::from(vec![b'F'; kb * 1024]);
+    let s = stream! {
+        for _ in 0..chunks {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            yield Ok::<_, Infallible>(payload.clone());
+        }
+    };
+    Response::builder()
+        .header(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/octet-stream"),
+        )
+        .body(Body::from_stream(s))
+        .unwrap()
+}
 
 #[derive(Clone)]
 struct AppState {
@@ -30,6 +56,10 @@ pub fn router(name: &str) -> Router {
         // 立刻回响应头、但正文迟迟不出：用来测**响应体空闲超时**（/v1/slow 卡的是响应头，
         // 属于另一条超时——网关的 head_timeout；两者语义不同，必须分开测）。
         .route("/v1/slow_body", post(slow_body))
+        // 连续快速产出：用来测**背压与取消**——客户端停止消费时，网关必须放弃该请求
+        // 并释放准入槽位（`?chunks=&kb=&delay_ms=`）。用一次性的固定大小响应测不出这件事：
+        // 数据可以先塞进 socket 缓冲与通道，通道并不会一直满着。
+        .route("/v1/flood", post(flood))
         .with_state(AppState {
             name: Arc::from(name),
         })

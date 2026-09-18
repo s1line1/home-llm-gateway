@@ -341,6 +341,28 @@ s2n-quic 的 `initial_max_streams_bidi` 默认只有 **100**（`InitialMaxStream
 回归测试：`e2e_more_concurrent_tunnels_than_the_default_quic_stream_ceiling`
 （120 条并发慢流；把额度改回 100 时正好 20/120 失败，且失败的是 503——正是上面那条放大链）。
 
+**客户端停滞：为什么必须三个方向都设上限**（`client_stall_secs`，默认 60s）
+
+准入票据（`max_concurrent_requests` 那道闸）的释放挂在 Drop 上，但**释放的前提是相关任务/连接
+能结束**。以前有三处客户端侧等待**没有任何超时**，任一处都能让在途请求永久占住槽位：
+
+| 位置 | 谁能触发 | 修法 |
+|---|---|---|
+| 读请求体（曾是 `Bytes` 提取器） | 只发 headers、声明大 `Content-Length` 却不发 body 的客户端 | 改为逐块读 + **停滞**超时（有字节就续期）→ `408` |
+| 写响应体通道（`tx.send().await`） | 读完响应头就不再读 socket 的客户端 | 通道满且 `stall` 内无人取 → 记指标 + 取消上游（`Cancel`，别白烧 token）+ 结束响应体 |
+| hyper 往 socket 写响应 | 同上（这一半**应用层修不到**：数据已在 hyper/socket 缓冲里） | IO 层包 `io_stall::WriteStall`：连续 `stall` 写不进一个字节 → 断开连接，body 随连接任务 drop，票据归还 |
+
+实测（2026-09-18 云端）：这类泄漏沉淀过 **8 个永不复位的槽位**——`hlmg_active_requests` 恒定 8，
+而 `hlmg_request_count − Σ状态码 = 8` 精确对上（= "被准入但永不结束"）。它只增不减：
+当前 `max_concurrent_requests: 5000` 时无害，但按本文件的内存口径生产该是 ~32 量级，
+8 个就是 25%，且**只能重启恢复**。
+
+判定的是**停滞**而不是**总时长**：该方向只要还有字节在动就持续续期，所以慢而持续的大 body
+上传、弱网下逐块到达的 SSE 都不会被误杀。三个方向共用同一个 `client_stall_secs`。
+回归测试：`tests/e2e/stalls.rs`（请求体停滞、响应体停滞各一条；判据是 `max_concurrent_requests: 1`
+下**后续请求不得 429**——槽位一泄漏就必然 429）与 `io_stall` 的单测（写不动必须 `TimedOut`、
+持续有进展绝不断开）。三条都做过红检。
+
 **隧道坏掉时的典型症状**（都踩过）：`/healthz` 正常但**所有 API 请求挂住不返回**、日志停在最后一行的 `agent registered`、内存只涨不落 —— 因为请求卡在"等响应头"上，占着连接、并发槽位与缓冲区，客户端早已断开也发现不了。监控可关注：
 
 - 日志出现 `upstream head timeout; evicting agent` / `tunnel write timed out; evicting agent`；
@@ -584,6 +606,9 @@ if !store.usage_has_pending() { continue; }                // 无变化 → 整�
     `no-agent-serves-model` / `all-candidates-at-capacity`。**503 的成因看这个，不要靠状态码猜**
   - `hlmg_tunnel_retries_total{outcome=...}`：因隧道建立失败而换 agent 重试的次数——
     `ok`（重试成功的**自愈**次数）/ `failed`（换了仍失败）/ `no-alternative`（没有别的 agent 可换）
+  - `hlmg_client_stalls_total{phase="request-body"|"response-body"}`：因客户端**停滞**而主动放弃的
+    请求数（读不动请求体 / 不消费响应体）。**它是准入槽位泄漏的直接告警**：修好之前这类停滞
+    不留任何痕迹，只表现为 `hlmg_active_requests` 只增不减
   - `hlmg_tunnel_open_timeouts_total{class=...}`：开流超过 `tunnel_op_secs` 的次数，按判定分——
     `busy`（在途已顶到承载上限，**背压**，不摘除，改换 agent 或 429）/ `dead`（没到上限却开不出流，
     坏连接，摘除）。**`busy` 陡增 = 该扩容或调 agent 的 `max_concurrency`；`dead` 陡增才是隧道/网络故障**

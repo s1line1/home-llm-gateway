@@ -35,6 +35,9 @@ pub struct AppState {
     pub tunnel_op_timeout: Duration,
     /// 等待上游响应头（首字节）的超时。见 [`crate::GatewayConfig`] 的说明。
     pub head_timeout: Duration,
+    /// 客户端停滞阈值：请求体/响应体两个方向"完全没动静"多久就放弃。
+    /// 见 [`crate::GatewayConfig::client_stall`]——没有它，在途请求会永久占住准入槽位。
+    pub client_stall: Duration,
     pub rate_limiter: Option<RateLimiter>,
     /// HTTP 全局在途请求上限（0 = 不限；per-key 限流之外的总闸门）。
     pub max_concurrent_requests: u32,
@@ -99,7 +102,9 @@ pub fn app(state: AppState) -> Router {
         }
     }
     router
-        .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
+        // 上限常量与 `http_proxy` 手动读 body 时用的**是同一个**（那边要自己判，因为
+        // 改成手动逐块读之后提取器层的限制不再生效）。
+        .layer(DefaultBodyLimit::max(crate::http_proxy::MAX_REQUEST_BODY))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             metrics_middleware,
@@ -454,6 +459,7 @@ mod tests {
             agent_stale_after: Duration::from_secs(10),
             tunnel_op_timeout: Duration::from_secs(2),
             head_timeout: Duration::from_secs(5),
+            client_stall: Duration::from_secs(60),
             rate_limiter: RateLimiter::new(0),
             max_concurrent_requests: 0,
             max_open_tunnel_streams: 1024,

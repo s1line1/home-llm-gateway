@@ -248,6 +248,7 @@ pub async fn start_stack_full(
         verified_cache_max,
         tunnel_op_timeout,
         head_timeout: Duration::from_secs(5),
+        client_stall: Duration::from_secs(60),
         agent_stale_after: Duration::from_secs(10),
         rate_limit_per_min,
         max_concurrent_requests: 0,
@@ -276,4 +277,78 @@ pub async fn start_stack_full(
     wait_for_agents(&gw, 1, Duration::from_secs(10)).await;
     let base = format!("http://{}", gw.http_addr);
     (gw, agent, base, test_key)
+}
+
+/// 与 [`start_stack_full`] 相同，但可以指定 **HTTP 全局在途上限** 与 **客户端停滞阈值**。
+///
+/// 专用于"停滞的客户端会不会永久占住准入槽位"这类测试：把 `max_concurrent_requests`
+/// 设成 1 之后判据变得极其锐利——槽位一旦泄漏，**后续任何请求都会 429**，
+/// 不需要去猜指标读数的含义。
+pub async fn start_stack_with_admission(
+    request_timeout: Duration,
+    tunnel_op_timeout: Duration,
+    client_stall: Duration,
+    max_concurrent_requests: u32,
+) -> (Gateway, Agent, String, String) {
+    let (ca, server_cert, server_key, client_cert, client_key) = gen_certs();
+    let mock_addr = start_mock_llm("mock-llm").await;
+    let (keys_path, test_key) = seed_keys_db();
+
+    let gw = Gateway::start(GatewayConfig {
+        http_bind: "127.0.0.1:0".parse().unwrap(),
+        quic_bind: "127.0.0.1:0".parse().unwrap(),
+        ca_cert: vec![ca.clone()],
+        server_cert: vec![server_cert.clone()],
+        server_key,
+        admin_token: None,
+        keys_file: Some(keys_path),
+        request_timeout,
+        verified_cache_max: gateway::keystore::DEFAULT_VERIFIED_MAX,
+        tunnel_op_timeout,
+        head_timeout: Duration::from_secs(5),
+        client_stall,
+        agent_stale_after: Duration::from_secs(10),
+        rate_limit_per_min: 0,
+        max_concurrent_requests,
+        max_open_tunnel_streams: 1024,
+        tls: None,
+        ui_dir: None,
+    })
+    .await
+    .unwrap();
+
+    let agent = Agent::start(AgentConfig {
+        cloud_addr: gw.quic_addr,
+        server_name: "localhost".into(),
+        ca_cert: vec![ca.clone()],
+        client_cert: vec![client_cert.clone()],
+        client_key,
+        agent_id: "stall-agent".into(),
+        models: vec!["mock-llm".into()],
+        max_concurrency: 4,
+        upstream_base: format!("http://{mock_addr}"),
+        heartbeat_interval: Duration::from_millis(200),
+        request_log: false,
+    })
+    .unwrap();
+
+    wait_for_agents(&gw, 1, Duration::from_secs(10)).await;
+    let base = format!("http://{}", gw.http_addr);
+    (gw, agent, base, test_key)
+}
+
+/// 读 `/metrics` 里的某个 gauge 值（测试用它断言"槽位是否归还"）。
+pub async fn metric_gauge(base: &str, name: &str) -> u64 {
+    let text = reqwest::get(format!("{base}/metrics"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    text.lines()
+        .find_map(|l| {
+            let (k, v) = l.split_once(' ')?;
+            (k == name).then(|| v.trim().parse().ok())?
+        })
+        .unwrap_or_else(|| panic!("指标 {name} 不在 /metrics 输出里"))
 }
