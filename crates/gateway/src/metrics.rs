@@ -46,6 +46,12 @@ struct MetricsInner {
     /// 这个计数是"准入槽位泄漏"的直接告警：修好之前，这类停滞不会留下任何痕迹，
     /// 只表现为 `hlmg_active_requests` 只增不减（实测云端沉淀 8 个，只能重启恢复）。
     client_stalls: Mutex<HashMap<&'static str, u64>>,
+    /// **响应头**超时的次数，按判定分：`slow` = 最近还在正常回响应头（被堵住的慢，不摘除）、
+    /// `silent` = 窗口内一次都没回过（判死，计入连续超时）。
+    ///
+    /// 与 `tunnel_open_timeouts` 分开是刻意的：那条问"还有额度吗"，这条问"最近还干活吗"，
+    /// 两者混在一起就没法判断"该扩容还是该查网络"。
+    head_timeouts: Mutex<HashMap<&'static str, u64>>,
     /// 开流超时的次数，按判定分：`busy` = 在途已顶到承载上限（背压，不摘除）、
     /// `dead` = 未到上限却开不出流（坏连接，摘除）。
     ///
@@ -108,6 +114,17 @@ impl Metrics {
             .lock()
             .unwrap()
             .entry(outcome)
+            .or_insert(0) += 1;
+    }
+
+    /// 记录一次响应头超时（`kind`：`slow` = 还在回响应头，`silent` = 窗口内没有任何响应头）。
+    pub fn record_head_timeout(&self, kind: &'static str) {
+        *self
+            .inner
+            .head_timeouts
+            .lock()
+            .unwrap()
+            .entry(kind)
             .or_insert(0) += 1;
     }
 
@@ -256,6 +273,21 @@ impl Metrics {
                     out.push_str(&format!(
                         "hlmg_client_stalls_total{{phase=\"{p}\"}} {}\n",
                         cs[*p]
+                    ));
+                }
+            }
+        }
+        {
+            let ht = inner.head_timeouts.lock().unwrap();
+            if !ht.is_empty() {
+                out.push_str("# HELP hlmg_upstream_head_timeouts_total Response heads that exceeded head_timeout_secs; class=slow means the agent had answered recently and is merely blocked (504, not evicted), class=silent means nothing came back within the window (counts toward eviction).\n");
+                out.push_str("# TYPE hlmg_upstream_head_timeouts_total counter\n");
+                let mut kinds: Vec<&&str> = ht.keys().collect();
+                kinds.sort_unstable();
+                for k in kinds {
+                    out.push_str(&format!(
+                        "hlmg_upstream_head_timeouts_total{{class=\"{k}\"}} {}\n",
+                        ht[*k]
                     ));
                 }
             }

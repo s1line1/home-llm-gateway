@@ -190,6 +190,7 @@ mod tests {
             agent_stale_after: Duration::from_secs(10),
             tunnel_op_timeout: Duration::from_secs(2),
             head_timeout: Duration::from_secs(5),
+            head_alive_window: Duration::from_secs(20),
             client_stall: Duration::from_secs(60),
             rate_limiter: None,
             max_concurrent_requests: 0,

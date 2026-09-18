@@ -219,6 +219,8 @@ impl Gateway {
             agent_stale_after: cfg.agent_stale_after,
             tunnel_op_timeout: cfg.tunnel_op_timeout,
             head_timeout: cfg.head_timeout,
+            // 4 倍 head_timeout：连续四个窗口一次响应头都没回来，才算"不是慢，是死"。
+            head_alive_window: cfg.head_timeout * 4,
             client_stall: cfg.client_stall,
             rate_limiter: RateLimiter::new(cfg.rate_limit_per_min),
             max_concurrent_requests: cfg.max_concurrent_requests,

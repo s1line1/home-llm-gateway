@@ -3,7 +3,7 @@
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicU32, AtomicUsize, Ordering},
+        atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
         Arc, RwLock,
     },
     time::{Duration, Instant},
@@ -56,6 +56,34 @@ pub struct Entry {
     /// 单次超时在高并发下是排队造成的假象（开流/写帧要过连接级流管理器）。
     /// 任何一次成功都会把它清零（见 `note_tunnel_op_ok`）。
     pub tunnel_op_timeouts: Arc<AtomicU32>,
+    /// **最近一次真的收到响应头**的时刻（自 [`epoch`] 起的毫秒数）。
+    ///
+    /// 初值是 [`NEVER`]（从未收到过）。**注册不算"活着"**：注册只证明连接建起来了，
+    /// 而这条判据问的是响应头有没有在流动。
+    ///
+    /// 为什么要单独记它：`tunnel_op_timeouts` 这一套只回答"连续失败了几次"，回答不了
+    /// "这条隧道最近还干不干活"。链路被堵住时是"一个响应头都收不到"，于是计数必然爬到阈值，
+    /// 把**健康但被堵住**的 agent 摘掉（实测：出口 0.4 MB/s 饱和时 1 026 次
+    /// `upstream head timeout; evicting agent`，随后全量 503）。有了这个时间戳，
+    /// 响应头超时就能像开流超时那样区分"忙/慢"与"死"（见 [`Entry::head_timeout_is_fatal`]）。
+    pub last_head_ok: Arc<AtomicU64>,
+}
+
+/// "从未收到过响应头"的哨兵值。
+///
+/// 不能用 0 当"从未"：时间基准是**首次使用时才创建**的，进程刚起来那一瞬间
+/// `now_millis()` 就是 0，会和"从未"撞在一起。`u64::MAX` 不可能被真实时间戳取到。
+const NEVER: u64 = u64::MAX;
+
+/// 时间基准：进程内单调时钟的原点（`Instant` 不能放进原子变量，所以存相对毫秒）。
+fn epoch() -> std::time::Instant {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    *EPOCH.get_or_init(std::time::Instant::now)
+}
+
+/// 自 [`epoch`] 起的毫秒数（用于 `last_head_ok` 这类无锁时间戳）。
+pub fn now_millis() -> u64 {
+    epoch().elapsed().as_millis() as u64
 }
 
 impl Entry {
@@ -74,6 +102,29 @@ impl Entry {
     /// （`min(声明的 max_concurrency, 端点流额度)`；`max_concurrency == 0` = 不限，
     /// 此时上限就是端点流额度）。达到 → 忙，不摘除；未达到 → 说明并不是没额度，
     /// 那就是真死了。
+    /// 一次「响应头超时」是否足以判定这条连接**已死**（该摘除）。
+    ///
+    /// 与 [`Entry::open_timeout_is_fatal`] 同一套思路，但问的是另一个问题：开流超时问
+    /// "还有额度吗"，响应头超时问 **"这条隧道最近还在干活吗"**——因为响应头超时的两种成因
+    /// 在现象上完全一样（15s 内没等到头），区别只在于"是被堵住的慢"还是"真的没有了"。
+    ///
+    /// 判据：`window` 内**有过**成功响应头 → 只是在慢（返回 `false`，调用方只回 504、不计 strike、
+    /// 不摘除）；从未有过、或窗口内一次都没有 → 死（走原来的连续 3 次摘除）。
+    ///
+    /// "从未有过"直接判死是有意的：没有成功响应头就**没有"只是慢"的证据**。否则一条注册后
+    /// 从不回包的坏隧道会被宽限一个窗口，坏连接的检出被推迟（既有 e2e 就钉着这一点）。
+    ///
+    /// 代价与兜底：真死但"最近刚成功过"的 agent 会晚 `window` 才被摘除。这不影响路由——
+    /// 真死的 agent 心跳会停，`agent_stale_after` 会先把它从候选里剔掉；而进程直接消失时，
+    /// QUIC 连接关闭会走 `remove_if_same` 正常摘除，根本不经过这里。
+    pub fn head_timeout_is_fatal(&self, window: Duration) -> bool {
+        let last = self.last_head_ok.load(Ordering::Relaxed);
+        if last == NEVER {
+            return true;
+        }
+        now_millis().saturating_sub(last) > window.as_millis() as u64
+    }
+
     pub fn open_timeout_is_fatal(&self, stream_ceiling: u32) -> bool {
         let ceiling = stream_ceiling.max(1);
         let effective = if self.max_concurrency == 0 {
@@ -116,6 +167,11 @@ impl Registry {
                 max_concurrency,
                 inflight: Arc::new(AtomicU32::new(0)),
                 tunnel_op_timeouts: Arc::new(AtomicU32::new(0)),
+                // 注册不是"活着"的证据：注册只说明连接建起来了，而这条判据问的是
+                // "**响应头**最近有没有流动"。所以从 NEVER 开始——一条注册后从不回响应头的
+                // 坏隧道必须能被原来的连续 3 次规则摘掉，不能因为"刚注册"而获得宽限
+                // （这条正是既有 e2e `e2e_dead_tunnel_fails_fast_instead_of_hanging` 钉住的）。
+                last_head_ok: Arc::new(AtomicU64::new(NEVER)),
                 last_seen: Instant::now(),
             },
         );
@@ -152,6 +208,8 @@ impl Registry {
         let inner = self.inner.read().unwrap();
         if let Some(e) = inner.values().find(|e| e.stable_id == stable_id) {
             e.tunnel_op_timeouts.store(0, Ordering::Relaxed);
+            // 顺手记下"这条隧道最近真的回过响应头"——响应头超时的"忙/死"判据靠它。
+            e.last_head_ok.store(now_millis(), Ordering::Relaxed);
         }
     }
 
@@ -938,6 +996,54 @@ mod tests {
         assert!(
             !entry3.open_timeout_is_fatal(100),
             "额度先于容量耗尽时，超时同样是背压（这正是要告警的配置不一致）"
+        );
+    }
+    /// 规格：**响应头超时要能区分"最近还在干活"与"真的没有了"**。
+    ///
+    /// 这条判据是"链路被堵住 → 健康 agent 被摘除 → 全量 503"的唯一出口：窗口内有过成功响应头
+    /// 就只是慢（不摘除），窗口内一次都没有才算死。窗口本身由 `4 × head_timeout` 派生（见 `http.rs`）。
+    ///
+    /// ⚠️ 时间基准 `epoch()` 是**首次使用时才创建**的，所以测试进程刚起来时 `now_millis()`
+    /// 接近 0——不能用"把时间戳减去 10 秒"来伪造沉默（会被 saturating 压到 0）。这里改为
+    /// 真实小睡几毫秒、再把窗口压到 1ms 来跨过边界，避免依赖时间基准的起点。
+    #[tokio::test]
+    async fn head_timeout_is_fatal_only_after_a_window_of_total_silence() {
+        let reg = Registry::default();
+        let conn = test_connection().await;
+        reg.register("alive".into(), vec!["*".into()], 4, conn);
+        let (entry, _guard) = reg.try_acquire(Duration::from_secs(10), "qwen2.5").unwrap();
+
+        // ① 刚注册但**从未回过响应头** → 没有"只是慢"的证据 → 判死
+        //    （否则注册后从不回包的坏隧道会被宽限一个窗口才摘除）
+        assert!(
+            entry.head_timeout_is_fatal(Duration::from_secs(60)),
+            "从未收到过响应头时不该被当成「只是慢」"
+        );
+
+        // ② 收到过响应头 → 仍在窗口内 → 只是慢（这条是判据最该避免的误判）
+        reg.note_tunnel_op_ok(entry.stable_id);
+        assert!(
+            !entry.head_timeout_is_fatal(Duration::from_secs(60)),
+            "刚刚回过响应头的隧道被判定为死"
+        );
+
+        // ③ 沉默 50ms 之后：窗口 1ms → 判死；窗口 60s → 仍只是慢。
+        //    同一次沉默、只改窗口就翻转结论，说明判据确实由"沉默时长 vs 窗口"决定。
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            entry.head_timeout_is_fatal(Duration::from_millis(1)),
+            "沉默 50ms > 窗口 1ms → 必须判死（否则坏连接永远摘不掉）"
+        );
+        assert!(
+            !entry.head_timeout_is_fatal(Duration::from_secs(60)),
+            "沉默 50ms < 窗口 60s → 只是慢，不能判死"
+        );
+
+        // ④ 期间只要再成功收到一次响应头，窗口重新开始计时
+        reg.note_tunnel_op_ok(entry.stable_id);
+        assert!(
+            !entry.head_timeout_is_fatal(Duration::from_millis(1)),
+            "刚回过响应头就该立刻回到「只是慢」，否则连续计数的语义不成立"
         );
     }
 }

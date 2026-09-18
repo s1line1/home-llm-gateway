@@ -519,15 +519,39 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
             return error_response(StatusCode::BAD_GATEWAY, format!("tunnel read failed: {e}"));
         }
         Err(_) => {
-            // 响应头超时：请求已经发出去了、对端却什么都没回 → 这条隧道已坏。
-            // 必须摘掉条目，否则后续每个请求都要再白等一次超时（"agent 注册着但卡住"
-            // 这个状态在对端进程消失时会一直保持，accept 循环不会返回、条目不会自己消失）。
-            warn!(
-                request_id,
-                agent = %entry.agent_id,
-                "upstream head timeout; evicting agent"
-            );
-            state.registry.evict(entry.stable_id);
+            // 响应头超时：请求已经发出去了、对端却什么都没回。**两种情况必须分开**：
+            //
+            //   慢：这条隧道最近还在正常回响应头（`head_alive_window` 内），说明它只是被链路/
+            //       上游堵住了 → 只回 504、**不计连续超时、不摘除**。把"慢"当"死"的代价实测过：
+            //       出口带宽饱和时一个响应头都收不到，连续计数必然爬到阈值 → 摘除健康 agent →
+            //       重连期间注册表为空 → **全量 503**（一次压测 1 026 次 head timeout、
+            //       `registry-empty` +3 753）。局部超载不该变成全站不可用。
+            //   死：窗口内一次都没回过 → 没有任何"只是慢"的理由，走原来的连续 3 次摘除。
+            let fatal = entry.head_timeout_is_fatal(state.head_alive_window);
+            let last_head_ago_secs = (crate::registry::now_millis().saturating_sub(
+                entry
+                    .last_head_ok
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )) / 1000;
+            if fatal {
+                state.metrics.record_head_timeout("silent");
+                warn!(
+                    request_id,
+                    agent = %entry.agent_id,
+                    last_head_ago_secs,
+                    window_secs = state.head_alive_window.as_secs(),
+                    "upstream head timeout and the agent has been silent; evicting agent"
+                );
+                state.registry.evict(entry.stable_id);
+            } else {
+                state.metrics.record_head_timeout("slow");
+                warn!(
+                    request_id,
+                    agent = %entry.agent_id,
+                    last_head_ago_secs,
+                    "upstream head timeout while the agent is still answering; not evicting"
+                );
+            }
             tunnel_cancel(&mut send, request_id, state.tunnel_op_timeout).await;
             let _ = send.finish();
             return error_response(StatusCode::GATEWAY_TIMEOUT, "upstream timed out");

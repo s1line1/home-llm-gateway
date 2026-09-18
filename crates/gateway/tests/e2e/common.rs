@@ -352,3 +352,59 @@ pub async fn metric_gauge(base: &str, name: &str) -> u64 {
         })
         .unwrap_or_else(|| panic!("指标 {name} 不在 /metrics 输出里"))
 }
+
+/// 与 [`start_stack_with_admission`] 相同，但可以指定 **`head_timeout`**。
+///
+/// 测"响应头超时该不该摘除"必须把 `head_timeout` 压到比上游延迟更短，否则测试要等十几秒。
+pub async fn start_stack_with_head_timeout(
+    head_timeout: Duration,
+    tunnel_op_timeout: Duration,
+    client_stall: Duration,
+    max_concurrent_requests: u32,
+) -> (Gateway, Agent, String, String) {
+    let (ca, server_cert, server_key, client_cert, client_key) = gen_certs();
+    let mock_addr = start_mock_llm("mock-llm").await;
+    let (keys_path, test_key) = seed_keys_db();
+
+    let gw = Gateway::start(GatewayConfig {
+        http_bind: "127.0.0.1:0".parse().unwrap(),
+        quic_bind: "127.0.0.1:0".parse().unwrap(),
+        ca_cert: vec![ca.clone()],
+        server_cert: vec![server_cert.clone()],
+        server_key,
+        admin_token: None,
+        keys_file: Some(keys_path),
+        request_timeout: Duration::from_secs(30),
+        verified_cache_max: gateway::keystore::DEFAULT_VERIFIED_MAX,
+        tunnel_op_timeout,
+        head_timeout,
+        client_stall,
+        agent_stale_after: Duration::from_secs(10),
+        rate_limit_per_min: 0,
+        max_concurrent_requests,
+        max_open_tunnel_streams: 1024,
+        tls: None,
+        ui_dir: None,
+    })
+    .await
+    .unwrap();
+
+    let agent = Agent::start(AgentConfig {
+        cloud_addr: gw.quic_addr,
+        server_name: "localhost".into(),
+        ca_cert: vec![ca.clone()],
+        client_cert: vec![client_cert.clone()],
+        client_key,
+        agent_id: "head-timeout-agent".into(),
+        models: vec!["mock-llm".into()],
+        max_concurrency: 4,
+        upstream_base: format!("http://{mock_addr}"),
+        heartbeat_interval: Duration::from_millis(200),
+        request_log: false,
+    })
+    .unwrap();
+
+    wait_for_agents(&gw, 1, Duration::from_secs(10)).await;
+    let base = format!("http://{}", gw.http_addr);
+    (gw, agent, base, test_key)
+}
