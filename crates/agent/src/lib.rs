@@ -127,8 +127,11 @@ async fn connect_once(
         .connect(Connect::new(cfg.cloud_addr).with_server_name(cfg.server_name.clone()))
         .await?;
 
-    // 保活：周期 = (协商后的空闲超时 × 3/4) 与 max_keep_alive_period（默认 30s）取小
-    // —— 这里是 min(10s × 3/4, 30s) = 7.5s，小于 10s 的空闲超时，网关才不会把连接判空闲关掉。
+    // 保活：s2n-quic 的周期 = min(本端 max_idle_timeout × 3/4, max_keep_alive_period)
+    // —— 这里是 min(20s × 3/4, 30s) = 15s。它小于协商出的空闲超时
+    //    （min(本端 20s, 网关 30s) = 20s），网关才不会把连接判空闲关掉。
+    //    公式见 s2n-quic-transport 的 `KeepAlive::new`（用的是本端 limits，不是协商值）；
+    //    `max_keep_alive_period` 默认 30s。
     conn.keep_alive(true)?;
 
     // ① 先拆：Handle 用来"开流"（Register/Heartbeat），acceptor 用来"收流"（代理请求）
