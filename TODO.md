@@ -69,6 +69,29 @@
       `/proc/self/limits` 核对生效值（不以自家日志为准），并断言 hard 未被改动
       （同样已验证过红）。**仍可选的加强**：unit 里写 `LimitNOFILE=65536` 抬高天花板——
       不写也不会再撞那个 1024，但日志里 `limited_by_hard=true` 表示天花板比目标值低。
+- [ ] **链路饱和会被 `head_timeout` 放大成"agent 摘除"（2026-09-18 实测定位；机制已清楚，未改行为）**：
+      云 ECS 的**下行带宽被限在 ≈0.40 MB/s（3.2 Mbps）**（HTTP/SSH-TCP/QUIC 三种测法一致；
+      对照：清华镜像→同一台 Mac 是 10.1 MB/s，排除家庭带宽）。当 `QPS × (请求字节+响应字节)`
+      超过这个上限时，响应头 15s 内到不了 → `head_timeout` 判定"隧道已坏" → 摘除 agent →
+      连接被关 → agent 重连（退避最长 30s）→ 期间注册表为空 → **全量 503**。
+      实测同一施加速率下，请求体 1 KB → 失败 **0.00%**；换成 8 KB（响应 ~11 KB）→ 失败 **48%**，
+      一个窗口内 `upstream head timeout; evicting agent` 1 026 次、`registry-empty` +3 753。
+      ⚠️ 期间 `hlmg_tunnel_open_timeouts_total` 恒为 **0** —— 也就是说开流路径完全正常，
+      失败与摘除全部走"响应头超时"这条路径；两者必须分开看，否则会把链路问题误判成网关缺陷。
+      **数据完整性不受影响**：所有档位（含严重超载）`mismatch` 全为 0，到达的字节逐字节正确。
+      候选改法（都未实施，需先定取舍）：
+        1. **运维**：把 ECS 带宽调上去（固定带宽上调或改按流量）——最直接，先做这个再谈验收；
+        2. **判据**：`head_timeout` 摘除前增加"agent 是否仍在回心跳/是否仍有别的请求成功"的
+           旁证，避免把"上游慢"当成"隧道死"（本仓库已有 `Entry::open_timeout_is_fatal`
+           这一套"忙≠死"的思路，可以推广到 head 超时）；
+        3. **验收规范**：任何云端压测都要先声明字节预算（`QPS × 字节 ≤ 链路`），
+           否则测的是链路不是网关。本地栈（RTT≈0、无带宽瓶颈）对照很有用：
+           同样 64 KB body，本地 13.7ms vs 云端 1.64s；同样 256KB 响应，本地 18ms vs 云端 616ms。
+      **已试过且无效（别再重复）**：把 agent 侧 `with_bidirectional_remote_data_window(1 MiB)` +
+      `with_data_window(16 MiB)` 调大 —— 8 KB 请求体延迟 240ms → 229ms，基本没变。
+      说明瓶颈不在对端授予的流控窗口，而在**链路本身**（这点从"TCP 直下也只有 0.40 MB/s"
+      就能反证）。同理，`initial_congestion_window`（`cubic::Builder::with_initial_congestion_window`
+      是公开 API）当时没来得及试，但在 3.2 Mbps 的链路上下调它不会突破上限。
 - [ ] **监听 backlog 被硬编码成 128**：`tokio::net::TcpListener::bind` 走 mio，而 mio 为对齐 std
       写死 `listen(.., 128)`（`mio-1.2.2/src/net/tcp/listener.rs`），云端 `net.core.somaxconn=4096`
       完全用不上。实测 `ss -lnt` 的 Send-Q 就是 128；dmesg 里 10 次
