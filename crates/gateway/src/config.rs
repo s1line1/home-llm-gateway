@@ -94,6 +94,22 @@ pub struct ConfigFile {
     /// 网关会打 WARN（否则同样的排队超时会以更难查的形式复现）。0 = 用默认值。
     #[serde(default = "default_max_open_tunnel_streams")]
     max_open_tunnel_streams: u32,
+    /// 客户端"完全停滞"多久就放弃（秒）：请求体读不动、或响应体客户端不消费。
+    ///
+    /// 为什么必须有：准入票据（`max_concurrent_requests` 那道闸）的释放挂在 Drop 上，
+    /// 但**释放的前提是那个任务/连接能结束**。以前有三处客户端侧等待**没有超时**，
+    /// 任一处都能让在途请求永久占住槽位：读请求体、写响应体通道、hyper 往 socket 写响应。
+    ///
+    /// 实测（2026-09-18 云端）这类泄漏沉淀过 8 个僵尸槽位：`hlmg_active_requests` 恒定 8
+    /// 不再下降，而 `hlmg_request_count − Σ状态码 = 8` 精确对上——即"被准入但永不结束"。
+    /// 槽位只增不减，配置闸门时会被慢慢吃光（生产口径约 32，8 个就是 25%），只能重启恢复。
+    ///
+    /// 语义是**停滞**而不是**总时长**：只要该方向还有字节在流动就不断续期，所以慢而持续的
+    /// 大 body 上传、弱网下逐块到达的 SSE 都不会被误杀；真正停住（一个字节都没有）才放弃。
+    /// 默认 60s 与隧道侧逐帧空闲超时（`timeout_secs`，120s）同量级且更短，避免"上游还在
+    /// 产出、客户端已僵住"时白烧 token。
+    #[serde(default = "default_client_stall_secs")]
+    client_stall_secs: u64,
     /// 公网入口 HTTPS 证书 PEM（提供后启用 TLS，与 tls_key 成对）
     #[serde(default)]
     tls_cert: Option<PathBuf>,
@@ -138,6 +154,11 @@ fn default_tunnel_op_secs() -> u64 {
 }
 fn default_head_timeout_secs() -> u64 {
     15
+}
+/// 客户端停滞阈值默认值（秒）。见字段注释：语义是"该方向不再有字节流动"，
+/// 所以对慢而持续的传输无影响；60s 足以覆盖人类可感知的正常停顿。
+fn default_client_stall_secs() -> u64 {
+    60
 }
 /// 每连接隧道流额度默认值。
 ///
@@ -201,6 +222,7 @@ pub fn from_file(cfg: ConfigFile) -> anyhow::Result<GatewayConfig> {
         agent_stale_after: Duration::from_secs(cfg.agent_stale_secs),
         tunnel_op_timeout: Duration::from_secs(cfg.tunnel_op_secs),
         head_timeout: Duration::from_secs(cfg.head_timeout_secs),
+        client_stall: Duration::from_secs(cfg.client_stall_secs),
         rate_limit_per_min: cfg.rate_limit_per_min,
         max_concurrent_requests: cfg.max_concurrent_requests,
         max_open_tunnel_streams: if cfg.max_open_tunnel_streams == 0 {
@@ -380,6 +402,7 @@ rate_limit_per_min: 60
             "tunnel_op_secs",
             "head_timeout_secs",
             "max_open_tunnel_streams",
+            "client_stall_secs",
         ] {
             assert!(
                 text.contains(key),
@@ -392,6 +415,7 @@ rate_limit_per_min: 60
             cfg.max_open_tunnel_streams,
             default_max_open_tunnel_streams()
         );
+        assert_eq!(cfg.client_stall_secs, default_client_stall_secs());
     }
 
     /// 规格：**流额度不能是 0**。

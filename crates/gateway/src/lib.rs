@@ -3,6 +3,7 @@
 pub mod admin;
 pub mod error;
 pub mod http;
+pub mod io_stall;
 pub mod keystore;
 pub mod metrics;
 pub mod nofile;
@@ -66,6 +67,11 @@ pub struct GatewayConfig {
     pub head_timeout: Duration,
     /// 超过该时长未心跳的 agent 视为失联。
     pub agent_stale_after: Duration,
+    /// 客户端"完全停滞"多久就放弃：请求体读不动 / 响应体客户端不消费。
+    ///
+    /// 这两处的 await 以前没有超时，会让在途请求永久占住准入槽位（实测云端沉淀了 8 个
+    /// 僵尸槽位，`hlmg_active_requests` 只增不减）。见 `GatewayConfig` 对应配置项注释。
+    pub client_stall: Duration,
     /// 每个 API Key 每分钟请求上限（0 = 不限流）。
     pub rate_limit_per_min: u32,
     /// HTTP 全局在途请求上限（0 = 不限）。
@@ -209,6 +215,7 @@ impl Gateway {
             agent_stale_after: cfg.agent_stale_after,
             tunnel_op_timeout: cfg.tunnel_op_timeout,
             head_timeout: cfg.head_timeout,
+            client_stall: cfg.client_stall,
             rate_limiter: RateLimiter::new(cfg.rate_limit_per_min),
             max_concurrent_requests: cfg.max_concurrent_requests,
             max_open_tunnel_streams: cfg.max_open_tunnel_streams,
@@ -222,16 +229,18 @@ impl Gateway {
         match https {
             Some(https) => {
                 info!(addr = %cfg.http_bind, "https public entry enabled");
+                let client_stall = cfg.client_stall;
                 tasks.push(tokio::spawn(async move {
-                    if let Err(e) = serve_https(listener, app, https).await {
+                    if let Err(e) = serve_https(listener, app, https, client_stall).await {
                         warn!("https server stopped: {e}");
                     }
                 }));
             }
             None => {
                 info!(addr = %cfg.http_bind, "http public entry enabled");
+                let client_stall = cfg.client_stall;
                 tasks.push(tokio::spawn(async move {
-                    if let Err(e) = axum::serve(listener, app).await {
+                    if let Err(e) = serve_plain(listener, app, client_stall).await {
                         warn!("http server stopped: {e}");
                     }
                 }));
@@ -283,10 +292,32 @@ impl Gateway {
 ///
 /// rustls 配置由调用方（`Gateway::start`）预先构建好传入，这样证书材料有问题会在
 /// **启动时**就失败，而不是在这里默默结束、留下一个"看起来启动了"的空壳进程。
+/// 服务一条客户端连接（TLS 与明文共用）。
+///
+/// **写方向必须包 [`io_stall::WriteStall`]**：hyper 自己**没有写超时**，客户端读完响应头
+/// 就不再读时，hyper 会永久阻塞在 `poll_write`，而准入票据绑在 response body 上——
+/// body 不被丢弃，槽位就永不归还（实测云端沉淀 8 个僵尸槽位，只能重启）。
+/// 应用层的响应体停滞超时修不掉这一半，因为数据已经在 hyper/socket 的缓冲里。
+async fn serve_conn<I>(io: I, app: Router, peer: std::net::SocketAddr, client_stall: Duration)
+where
+    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let io = TokioIo::new(io_stall::WriteStall::new(io, client_stall));
+    // 桥接 hyper(0.4 Service) 与 axum(tower 0.5 Service)
+    let service = service_fn(move |req: hyper::Request<Incoming>| {
+        let mut app = app.clone();
+        async move { app.call(req).await }
+    });
+    if let Err(e) = http1::Builder::new().serve_connection(io, service).await {
+        warn!("http connection {peer} error: {e}");
+    }
+}
+
 async fn serve_https(
     listener: tokio::net::TcpListener,
     app: Router,
     server_config: Arc<rustls::ServerConfig>,
+    client_stall: Duration,
 ) -> anyhow::Result<()> {
     let acceptor = TlsAcceptor::from(server_config);
     loop {
@@ -295,20 +326,24 @@ async fn serve_https(
         let app = app.clone();
         tokio::spawn(async move {
             match acceptor.accept(stream).await {
-                Ok(tls_stream) => {
-                    let io = TokioIo::new(tls_stream);
-                    // 桥接 hyper(0.4 Service) 与 axum(tower 0.5 Service)
-                    let service = service_fn(move |req: hyper::Request<Incoming>| {
-                        let mut app = app.clone();
-                        async move { app.call(req).await }
-                    });
-                    if let Err(e) = http1::Builder::new().serve_connection(io, service).await {
-                        warn!("https connection {peer} error: {e}");
-                    }
-                }
+                Ok(tls_stream) => serve_conn(tls_stream, app, peer, client_stall).await,
                 Err(e) => warn!("tls handshake from {peer} failed: {e}"),
             }
         });
+    }
+}
+
+/// 明文入口：与 [`serve_https`] 同一套服务实现（含写停滞超时）。
+/// 以前这里直接用 `axum::serve`，它没有写超时，客户端不读响应体就会卡住一条连接并占住票据。
+async fn serve_plain(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    client_stall: Duration,
+) -> anyhow::Result<()> {
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        let app = app.clone();
+        tokio::spawn(async move { serve_conn(stream, app, peer, client_stall).await });
     }
 }
 pub mod config;
