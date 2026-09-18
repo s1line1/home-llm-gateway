@@ -164,9 +164,16 @@ async fn embeddings(
     }))
 }
 
-/// 慢端点：先睡 800ms 再响应，用于测试网关超时/并发控制。
-async fn slow(State(st): State<AppState>) -> Json<serde_json::Value> {
-    tokio::time::sleep(Duration::from_millis(800)).await;
+/// 慢端点：先睡一会儿再响应（默认 800ms），用于测试网关超时/并发控制。
+///
+/// `?ms=N` 可调延迟——测"响应头超时但 agent 仍在正常回其它请求"这类场景需要把延迟
+/// 推到 `head_timeout` 之上（见 `tests/e2e/stalls.rs`）。
+async fn slow(
+    State(st): State<AppState>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let ms = q.get("ms").and_then(|v| v.parse().ok()).unwrap_or(800);
+    tokio::time::sleep(Duration::from_millis(ms)).await;
     Json(serde_json::json!({ "ok": true, "slow": true, "server": st.name.as_ref() }))
 }
 

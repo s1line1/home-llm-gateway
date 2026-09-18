@@ -38,6 +38,11 @@ pub struct AppState {
     /// 客户端停滞阈值：请求体/响应体两个方向"完全没动静"多久就放弃。
     /// 见 [`crate::GatewayConfig::client_stall`]——没有它，在途请求会永久占住准入槽位。
     pub client_stall: Duration,
+    /// 响应头超时的"忙/死"判据窗口：这么久内有过成功响应头，就只是"慢"。
+    ///
+    /// 由 `head_timeout` 派生（4 倍），不单独设配置项：它表达的是"连续 4 个响应头超时窗口
+    /// 一次都没回过"——到这个程度就不再是"排队慢"了（见 `registry::Entry::head_timeout_is_fatal`）。
+    pub head_alive_window: Duration,
     pub rate_limiter: Option<RateLimiter>,
     /// HTTP 全局在途请求上限（0 = 不限；per-key 限流之外的总闸门）。
     pub max_concurrent_requests: u32,
@@ -459,6 +464,7 @@ mod tests {
             agent_stale_after: Duration::from_secs(10),
             tunnel_op_timeout: Duration::from_secs(2),
             head_timeout: Duration::from_secs(5),
+            head_alive_window: Duration::from_secs(20),
             client_stall: Duration::from_secs(60),
             rate_limiter: RateLimiter::new(0),
             max_concurrent_requests: 0,

@@ -7,6 +7,7 @@ mod admin;
 mod agents;
 mod chain;
 mod common;
+mod head_timeout;
 mod https;
 mod metrics;
 mod nofile;

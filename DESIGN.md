@@ -139,7 +139,13 @@
    若还有别的在途请求（它们已送达 agent、模型正在生成，不属于可重试范围），
    等在途归零或超过 5s 宽限期再关，避免为了修一条坏流而打断正常请求。
 
-   **"忙"与"死"必须分开**（`registry::Entry::open_timeout_is_fatal`）：
+   **"忙"与"死"必须分开，两类超时都要分**（`Entry::open_timeout_is_fatal` 与
+   `Entry::head_timeout_is_fatal`）：响应头超时问的是"这条隧道最近还干活吗"——窗口
+   （`4 × head_timeout`）内有过成功响应头就只回 504、不计连续超时；从未有过或窗口内一次都没回来
+   才算死（注册不算"活着"：要的是响应头在流动）。
+   没有这条，链路饱和（"一个响应头都收不到"）会把健康 agent 摘掉、放大成全量 503。
+
+   开流超时（`registry::Entry::open_timeout_is_fatal`）：
    `open_bidirectional_stream()` 在连接级流额度排满时是**排队**而非报错（见 §4.4），
    所以超时可能只是背压。判据 = 在途数是否已达 `min(agent 声明的 max_concurrency, 流额度)`。
    一律按"死"处理的代价在云端实测过：摘除健康 agent → 连接被关 → agent 重连（退避最长 30s）
