@@ -463,3 +463,40 @@
 - [ ] **待评估：agent 侧事件批处理**。实测 agent 的开销由 SSE 事件**次数**决定（与字节无关，
       1 字节 → 101 字节的 payload 不改变 CPU/事件），而 `write_frame` 目前每事件一次 `write_all`
       且每次分配两个 `Vec`。可考虑攒批合并写，但需要两个端点同时改帧协议 → 属协议变更，先不动。
+
+## 重建蓝图 §6 未修项
+
+> 来源：`REBUILD.md` §6 的 12 条验收断言。它那列"反面案例"钉在 `745e8e8`，其中一部分
+> 此后已经修掉；**本节只登记仍未修的**，避免同一件事在两处各维护一份。行号对应 `6609a8c`。
+
+- [ ] **R1 帧头固定自描述 + golden bytes 契约测试**：线格式仍是 `[u32 BE 长度][postcard 枚举]`，
+      帧类型 tag 就是**变体声明序号**（`crates/proto/src/io.rs:29-33`、`crates/proto/src/frame.rs:7-43`）
+      ——增删变体即破坏线格式，且没有 golden bytes 断言兜住。
+- [ ] **R2 按帧类型分设长度上限**：`MAX_FRAME = 64 MiB` 硬编码，且按声明长度直接
+      `vec![0u8; len]`（`crates/proto/src/io.rs:11,54-62`）——敌意前缀声明 64 MiB 就真分配 64 MiB。
+      目标：上限按帧类型分设，分配量对声明值不敏感（计数型分配器断言）。
+- [ ] **R3 读路径合一（取消安全）**：现在有两条读路径——`read_frame`
+      （`crates/proto/src/io.rs:43`，`read_exact` 包装、不可取消）与 `FrameReader`
+      （`io.rs:100`，走 `DribbleReader`，`io.rs:287`，可取消）。`read_frame` 仍用在控制面
+      `crates/gateway/src/quic.rs:87`。目标：只留可取消的那条。
+- [ ] **R4 EOF 四格分明**：`read_frame` 读 4 字节前缀时**任何 `UnexpectedEof` 都返回 `Ok(None)`**
+      （`crates/proto/src/io.rs:47-53`）——1–3 字节的头部截断被当成干净关闭。`FrameReader`
+      那侧已经分清了（`io.rs:108-115`，测试 `frame_reader_truncated_frame_errors`），差的只是老路径。
+- [ ] **R6 "流即会话"可断言**：首帧必须是 `ProxyRequest`、后续帧 `request_id` 必须一致
+      ——现在既无断言也无日志，不一致只会表现成"上游好像没在收流"。
+- [ ] **R8 原子占位改 CAS**：`Admission::try_enter` 仍是 `fetch_add` 后回滚
+      （`crates/gateway/src/metrics.rs:83-92`），并发下存在"双双误拒"窗口。
+- [ ] **R9 背压按字节有界**：回写客户端的通道仍是 `mpsc::channel(32)`，**按条数**有界
+      （`crates/gateway/src/http_proxy.rs:566`）——大帧场景下"32 条"不等于"字节有界"。
+      相关的"响应体内存缓冲上限"见上文 P1。
+- [ ] **R10 总时长上限**：`timeout_secs`（120s）是响应体**逐帧空闲**超时，没有整请求总时限
+      （`DESIGN.md` §5 自认）。SSE 长流不能被总时限误杀，动之前要先把语义想清楚。
+- [ ] **R11 延迟分位数**：`hlmg_request_duration_ms` 只有 sum，没有直方图
+      （`crates/gateway/src/metrics.rs:316`）——"p99 变差"从求和值里看不出来。
+- [ ] **R12 healthz 豁免闸门 + 深度检查**：`/healthz` 恒返 `"ok"`
+      （`crates/gateway/src/http.rs:287-289`），且只有 `/metrics` 豁免准入（`http.rs:357-359`）
+      ——闸门打满时健康检查会 429，把"慢"放大成"全挂"。
+
+**已修、不要再照 §6 做一遍的**：R7 票据绑响应 body（钉点时即正确）、R10 的
+`open_bi`/写帧/agent 侧握手三项超时、R11 的 `agent_id` 进日志与 agent 拒绝按 `reason` 分源、
+§5.1 的 `hlmg_agents` 语义（已拆出 `hlmg_agents_healthy`）。

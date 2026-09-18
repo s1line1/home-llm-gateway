@@ -1,14 +1,19 @@
 # Edge LLM 网关 — 重建蓝图
 
 > **用途**：从零重建同类项目（edge LLM 网关）的实施规格。
-> 以现有 `home-llm-gateway`（HEAD `745e8e8`，82 commits）为参考实现，把"哪些必须照做、
+> 以现有 `home-llm-gateway`（HEAD `6609a8c`，216 commits）为参考实现，把"哪些必须照做、
 > 哪些必须改、怎么验收"写成可执行的约束。
 >
 > **与 DESIGN.md 的分工**：`DESIGN.md` 回答"这个系统是什么"；本文回答
 > **"重写时哪些决策不能重新论证、哪些坑必须在第一天就绕开、每条约束怎么验收"**。
 >
 > **依据**：`DESIGN.md` / `TODO.md` / `OPTIMIZATION.md`，加两轮全量代码审查
-> （帧层含计数型分配器实测、网关层含锁与热路径审查）。文中所有引用位置对应 `745e8e8`。
+> （帧层含计数型分配器实测、网关层含锁与热路径审查）。
+>
+> **基线**：文中"现有实现"的代码位置与缺陷对应 `745e8e8`（2026-09-11，初稿钉点，
+> 累计 82 commits）。此后已有 134 个提交落地，一部分批评已被修掉、一部分仍成立——
+> 逐条现状见 `TODO.md`《重建蓝图 §6 未修项》。**§4.4/§4.5 的传输参数已按 `s2n-quic`
+> 重写**（初稿写的是 quinn，2026-09 已迁移，参数名与默认值都不同）。
 >
 > **状态**：蓝图。面向新代码库，不讨论如何修改现有仓库。
 
@@ -22,7 +27,7 @@
 |---|---|---|
 | 1 | §1 不可逆决策清单 | M0 的一页纸，先钉死不变量再写代码 |
 | 2 | §6 硬性要求（12 条验收断言） | 直接当 checklist，每条都有验收方式 |
-| 3 | §4.7 传输参数表 | 复制进代码注释，解释每一个值为什么是这个 |
+| 3 | §4.5 传输参数表 | 复制进代码注释，解释每一个值为什么是这个 |
 
 **读法**：§3/§4/§5 是规格正文，§6 是它们的可验收投影，§7 是排期，§8 是验证体系，
 §10 是"事故 → 约束"的反向索引（想知道某条要求为什么存在，查这里）。
@@ -62,7 +67,7 @@
 
 | 决策 | 说明 |
 |---|---|
-| `quinn` vs `h3` | 自定义帧更简单可控；想省维护量可换 `h3`，代价是少一点控制力 |
+| `s2n-quic` vs `h3` | 自定义帧更简单可控；想省维护量可换 `h3`（用标准 HTTP 语义替代自定义帧），代价是少一点控制力、多一层依赖。选型与迁移的坑见 `DESIGN.md` §10 |
 | `postcard` vs `protobuf` | **只有动机是"跨语言互操作/生态标准化"才值得做**。postcard 在性能和简单性上更优。若仅为协议演进，postcard 加字段本身就够（但注意 §3.6 的单向兼容陷阱） |
 | `axum` vs 裸 `hyper` | 无实质差异 |
 | 自研前端 vs 不提供 | 管理面板是独立工程，可后补 |
@@ -323,7 +328,7 @@ if limit > 0 && prev >= limit as u64 { active.fetch_sub(1, Relaxed); None } else
   → mpsc(cap N) 填满
   → forward_body 的 tx.send().await 挂起
   → 不再 read_frame(recv)
-  → quinn 单流接收窗耗尽
+  → s2n-quic 单流接收窗耗尽
   → agent 的 write_frame 挂起
   → agent 不再 poll 上游 body stream
   → reqwest 停止读 TCP → 上游 LLM 写阻塞
@@ -332,28 +337,43 @@ if limit > 0 && prev >= limit as u64 { active.fetch_sub(1, Relaxed); None } else
 **这条链的存在完全依赖于每一跳都有界。** 任何一跳无界（`unbounded_channel`、
 按条数而非字节、连接级接收窗无上界）→ 慢客户端 + 快上游 = 内存打满。
 
-参考上界（quinn 默认，现有仓库**未覆盖窗口参数**）：
+参考上界（`s2n-quic` 默认；现有仓库**只设了流额度，没设数据窗口**）：
 
-| 参数 | 默认值 | 含义 |
+| 参数（s2n-quic 名） | 默认值 | 作用域 |
 |---|---|---|
-| `stream_receive_window` | 1 250 000 B | **每流**接收窗 —— 这才是写侧挂起的真正阈值 |
-| `send_window` | 10 000 000 B | **每连接**发送缓冲，跨流共享 |
-| `receive_window` | `VarInt::MAX` | **连接级接收信用实际不设限** |
+| `with_data_window` | `InitialMaxData::RECOMMENDED` = 3 750 000 B | **连接级**接收信用 |
+| 三个 `*_data_window`（bidi-local / bidi-remote / uni） | 同上，均 = 3 750 000 B | **每流**接收窗 —— 这才是写侧挂起的真正阈值 |
+
+> 与 quinn 的关键差别：s2n-quic 的默认值由 `compute_data_window(150 Mbps, 100 ms RTT, 2)`
+> 算出，是个**有限值** 3.75 MB；而 quinn 的连接级 `receive_window` 默认是 `VarInt::MAX`
+> （无界）。所以"默认等于无约束"这句对 quinn 成立、**对现在的传输栈不成立**。
 
 ### 4.5 传输参数表（复制进代码注释）
 
-quinn 官方注释：*"Worst-case memory use is directly proportional to
-`max_concurrent_bidi_streams * stream_receive_window`, with an upper bound proportional to
-`receive_window`."*
+传输栈是 `s2n-quic`（`Cargo.toml: s2n-quic = "1.88"`）。**参数名与 quinn 完全不同，别把
+quinn 的名字抄进来**：s2n-quic 全在 `Limits` 上用 `with_*` setter，窗口类一律叫
+`*_data_window`，且校验上限 `u32::MAX`（4 GB）。
 
-| 参数 | 建议起点 | 为什么 |
-|---|---|---|
-| `max_concurrent_bidi_streams` | 与你的并发目标一致（现有项目取 1000） | **默认 100**，高并发压测会撞墙（延迟爆炸、连接被重置） |
-| `stream_receive_window` | **必须与上一项成对设置** | 1000 × 1.25 MB ≈ **1.25 GB** 最坏接收缓冲。现有项目把流上限调到 1000 却没收紧窗口，在 2C4G 部署上是明确的 OOM 面。"ceiling 不是预分配、空闲不耗成本"**只在空闲时成立** |
-| `receive_window` | **设成有上界** | 默认 `VarInt::MAX` 等于无约束 |
-| `send_window` | 按需 | 连接级共享，1000 条长 SSE 流会在此争用（`send_fairness` 缓解不消除） |
-| `max_idle_timeout` | 20 s 量级 | 挂死兜底 |
-| `keep_alive_interval`（agent 侧） | 5 s 量级 | 配合失联判定（N 次丢失） |
+| 参数（s2n-quic 名） | 建议起点 | 现有实现 | 为什么 |
+|---|---|---|---|
+| `with_max_open_local_bidirectional_streams` | ≥ 并发目标 | 已设，默认 1024（`max_open_tunnel_streams`） | **默认只有 100**（`InitialMaxStreamsBidi::RECOMMENDED`），高并发会撞墙；**排满时不报错而是排队**（见注 ①） |
+| `with_max_open_remote_bidirectional_streams` | 同上 | agent 已设 1000 | 可用额度 = `min(本地额度, 对端额度)`，**两端都要够** |
+| `with_data_window` | 目标吞吐 × RTT | **两端都没设**，吃默认 3.75 MB | 连接级信用。默认值对 0.4 MB/s 的出口是过度宽松，但**有界** |
+| 三个 `*_data_window` | **与流上限成对设置** | 都没设 | 每流接收窗，`N × 窗口` 才是最坏接收缓冲（见注 ②） |
+| `with_max_idle_timeout` | 20 s 量级 | agent 已设 20 s | 不设时默认 `MaxIdleTimeout::RECOMMENDED` = 30 s；挂死兜底 |
+| `with_max_handshake_duration` | 30 s | agent 已设 30 s | 默认 `MAX_HANDSHAKE_DURATION_DEFAULT` = 10 s，高并发下握手超时（见注 ③） |
+| keep-alive（`keep_alive(true)`） | 开启 | agent 已开 | 周期 = `min(协商空闲超时 × 3/4, max_keep_alive_period)`；不保活会被对端按空闲超时关掉 |
+
+**注 ①（流额度排满是排队，不是报错）**：`open_bidirectional_stream()` 在额度用尽时
+**不返回错误，而是等待额度回收**。上游一慢，第 `额度+1` 条请求就排过 `tunnel_op_secs`，
+被误判成"隧道已死" → 摘除健康 agent → 重连期间注册表为空 → **全量 503**。
+所以 `流额度 ≥ 并发目标`，且摘除判据必须区分"忙"与"死"。
+
+**注 ②（窗口与流上限成对）**：`流上限 × 每流窗口` 才是最坏接收缓冲——**流上限调高时
+必须同步收紧窗口**。"ceiling 不是预分配、空闲不耗成本"这句话**只在空闲时成立**。
+
+**注 ③（握手超时会连锁）**：高并发时新连接握不上手 → 心跳超时 → 断开重连 → 握手又超时，
+形成重连风暴；真正的退避要交给重连的指数退避，而不是靠缩短握手超时。
 
 > ⚠️ **两端都要声明，只改一端不生效**（QUIC 传输参数是双方协商的）。
 > 这是本项目最贵的一次教训——它只在高并发压测里才暴露，所以重构时
@@ -449,10 +469,9 @@ quinn 官方注释：*"Worst-case memory use is directly proportional to
 
 **要求**：请求路径上的日志必须携带 `request_id` + **`agent_id`** + `model` + 状态码 + 耗时。
 
-> ⚠️ **现有实现最大的诊断缺口**：整个请求路径**没有任何一条日志包含 `agent_id`**，
-> 而且注册条目的结构体**根本没有 `agent_id` 字段**（id 只作为 HashMap 的 key 存在）。
-> 所以网关**在日志层面无法回答"这次请求被路由到了哪个 edge"**，
-> 只能靠 agent 侧日志 + `request_id` 反查。出事故时这是致命的。
+> ✅ **这一条现有实现已经补上**（`745e8e8` 时它确实是最大的诊断缺口）：注册条目的结构体现在
+> 带 `agent_id` 字段，请求路径上的日志也带上了它。重建时**照搬，别退回去**——
+> "网关答不出这次请求去了哪台 edge"是最贵的排查成本。
 
 **日志分级**：正常流量按 DEBUG 门控（避免刷屏），4xx/5xx 提升到 INFO/ERROR。
 配一个开关让压测时能关掉逐请求日志。
@@ -470,6 +489,11 @@ quinn 官方注释：*"Worst-case memory use is directly proportional to
 
 > 这 12 条是 §3/§4/§5 的可验收投影。每条都有"反面案例"（现有代码位置）
 > 和"验收方式"，可直接当 checklist 用。
+>
+> ⚠️ **"反面案例"列钉在 `745e8e8`，是当时的状态、不是现状。** 此后已补齐的：
+> R7 的票据绑响应 body（钉点时即做对）、R10 的 `open_bi`/写帧/agent 握手三项超时、
+> R11 的 `agent_id` 进日志与按 `reason` 分源的 agent 拒绝计数、§5.1 的 `hlmg_agents`
+> 语义（已拆出 `hlmg_agents_healthy`）。**仍未修的项已搬到 `TODO.md`**，别在这里维护第二份。
 
 | # | 要求 | 反面案例（`745e8e8`） | 验收方式 |
 |---|---|---|---|
@@ -550,9 +574,9 @@ M5  模型路由：按 model 过滤候选、精确优先、`*` 兜底、同组�
 | 配置格式 | CLI flags → YAML（`10f90de`） | 第一天 YAML |
 | 持久化 | JSON → SQLite（`3b0665e`），中间误提交 `keys.db`（`653decd`） | 第一天 SQLite + 立刻 gitignore |
 | `request_id` 贯通 | 后期才补（`b2e3a5d`），要改所有路径 | M1 就贯穿 HTTP/帧/日志 |
-| `agent_id` 进日志/指标 | 至今没有 | M1 就带上（同时解决 R11 和 R12 的一半） |
+| `agent_id` 进日志/指标 | 后期才补（`745e8e8` 时结构体还没有该字段） | M1 就带上（同时解决 R11 和 R12 的一半） |
 | 日志落盘 | 后期才配 systemd 文件（`e558f53`） | 部署文档 M4 就带 |
-| 传输默认值 | 压测撞墙才发现（`114ac8f`） | M2.5 提前显式化 |
+| 传输默认值 | 压测撞墙才发现（`114ac8f`，quinn 时代；换栈后又以"排队"形式重现一次） | M2.5 提前显式化——**窗口参数也要设，不只是流额度** |
 | 帧的 version 校验 | 至今只写不读 | M0 就定，M1 就校验 |
 | 单流错误隔离 | 至今毒化整条连接 | M1 就做对 |
 
@@ -568,12 +592,12 @@ M5  模型路由：按 model 过滤候选、精确优先、`*` 兜底、同组�
 | 2 | 客户端中断 → 请求 future 被 hyper drop → 槽位永久泄漏 → 此后全部 429 直到重启（`f7d4032`） | `/healthz` 也 429，看起来像"网关死了" | §4.2, §6-R7 |
 | 3 | 两台 edge 用同一 `agent_id` → 网关"同名接管"关旧连接 → agent 把被踢当干净断开、退避重置 → **每 ~500 ms 互踢、永不收敛** → 长于踢连接周期的请求全部 502 | 两侧进程健康、管理页恒显示"1 个 agent 在线"、日志只有反复的 reconnect。**唯一信号是 `hlmg_agent_connections_total` 在飞涨——而它是 counter，不看 rate 注意不到** | §6-R12, §5.1 |
 | 4 | 并发请求各自读到对方自增后的计数 → 双双被误拒（`b000b3b`） | 串行单测永远发现不了 | §4.3, §6-R8 |
-| 5 | quinn `max_concurrent_bidi_streams` 默认 100 → 高并发延迟爆炸、连接被重置（`114ac8f`） | 只在压测暴露 | §4.5, §6-R7（M2.5 门禁） |
+| 5 | quinn 时代 `max_concurrent_bidi_streams` 默认 100 → 高并发延迟爆炸、连接被重置（`114ac8f`）。**换 `s2n-quic` 后同一根源又以"额度排满只是排队"重现**（§4.5 注 ①） | 第一次只在压测暴露；第二次更隐蔽：进程、日志、systemd 全正常，只有 503 与重连数在涨 | §4.4, §4.5, §6-R7 |
 | 6 | 每请求 inline 跑 argon2（10–30 ms / 19 MiB）→ 占住 async worker → 连正在流式的 SSE 一起拖慢（`8050af3`） | 表现为"莫名卡顿"，非错误 | §7 热路径；重建时再加**认证缓存** |
 | 7 | 同一份请求体被全量 JSON 解析 3 次 | 无错误，纯成本 | §4.8 附注（单位成本） |
 | 8 | QUIC 隧道入口静默死亡：进程、HTTP、systemd 全显示健康、日志一行都没有 | **无任何信号**，只能靠专门造的 gauge | §5.1（Drop 守卫型 gauge） |
 | 9 | 误提交 `keys.db`（`653decd`） | — | §9（第一天 gitignore） |
-| 10 | 文档漂移：`DESIGN.md` 写的帧格式 `[frame_type: u8][request_id: u64][payload]` 与实现（长度前缀 + postcard 枚举）不符 | 新人按文档理解协议会全错 | §3.1（golden bytes 而非手写文档） |
+| 10 | 文档漂移：`DESIGN.md` 写的帧格式 `[frame_type: u8][request_id: u64][payload]` 与实现（长度前缀 + postcard 枚举）不符 | 新人按文档理解协议会全错 | §3.1（golden bytes 而非手写文档）；**该漂移已修正**，但"用契约测试而不是手写文档来固化线格式"这条要求不变 |
 | 11 | 测试注释声称 `read_frame` 与 `FrameReader`"语义完全相同"，实测不成立且无测试覆盖 | 差异会被误判为"上游正常收流" | §3.4, §6-R4 |
 | 12 | 同项目两个同名 `NEXT_REQUEST_ID` 静态计数器 → 兜底路径可撞号，破坏"三方对账一致"的承诺 | 只损害日志可读性 | §5.2, §6-R11 |
 
