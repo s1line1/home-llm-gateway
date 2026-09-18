@@ -28,7 +28,13 @@ heartbeat_secs: 5
 models:
   - qwen2.5
 
-# 声明的最大并发请求数（网关据此做 admission control）
+# 声明的最大并发请求数（网关据此做 admission control）。
+# 两个约束：
+#   ① 这是**声明**——agent 端没有信号量，不会自己拦；超了由网关按这个数字拒绝
+#      （返回 429 "agent at capacity"），所以它是"告诉网关我能吃多少"。
+#   ② 必须 ≤ 网关的 `max_open_tunnel_streams`（默认 1024）。声明超过网关的每连接流额度时，
+#      多出来的请求会排在 **QUIC 流额度**上而不是容量上，表现为"隧道随机超时"→ 被摘除 →
+#      重连期间全量 503；网关会在 agent 注册时打 WARN 提示（见 README《失败处理》）。
 max_concurrency: 2
 
 # 每请求转发日志开关（received/responded/done/cancelled）。
