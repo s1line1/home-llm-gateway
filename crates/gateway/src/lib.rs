@@ -1,8 +1,10 @@
 //! cloud-gateway：公网 OpenAI 兼容入口（可选 HTTPS）+ QUIC 隧道服务端。
 
 pub mod admin;
+pub mod config;
 pub mod error;
 pub mod http;
+pub mod http_proxy;
 pub mod io_stall;
 pub mod keystore;
 pub mod metrics;
@@ -11,6 +13,8 @@ pub mod quic;
 pub mod ratelimit;
 pub mod registry;
 pub mod tls;
+pub mod usage;
+pub mod usage_flush;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
@@ -346,7 +350,3 @@ async fn serve_plain(
         tokio::spawn(async move { serve_conn(stream, app, peer, client_stall).await });
     }
 }
-pub mod config;
-pub mod http_proxy;
-pub mod usage;
-pub mod usage_flush;
