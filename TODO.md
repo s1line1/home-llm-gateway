@@ -112,6 +112,13 @@
            顺带刷新 `Entry.last_head_ok`。回归测试：`tests/e2e/head_timeout.rs` 两条（都做过红检：
            强制判死时"三次慢请求"立刻变 `silent` 且日志出现 3 次 `evicting agent`）
            + `registry::tests::head_timeout_is_fatal_only_after_a_window_of_total_silence`。
+           **云端验证（2026-09-18 21:39，部署 `c7f298e`）**：同一档（8 KB body、RATE=50、30s、
+           4 agent）复测——失败率 48.97% → **41.55%（全部是 504）**；`{class="slow"}` **+924**、
+           `class="silent"` **0**；`hlmg_agent_connections_total` **+0**、`registry-empty` **+0**、
+           502/503/429 **全 0**、4 个 agent 重连 **全 0**、`mismatch` 0；日志窗口内
+           `not evicting` 924 / `silent; evicting` 0 / `agent evicted` 0。对照（16 B body、同参数）
+           3 000 请求 0.00% 失败、中位 60.6ms。**即：同样超载，从"整队下线 → 全量 503"变成
+           "924 个请求各自 504"。**
            **效果边界**：这只是把"局部超载"与"全站不可用"分开——链路饱和时 504 依旧存在，
            **不减字节就不提吞吐**；真死但"最近刚成功过"的 agent 会晚一个窗口才被摘除
            （不影响路由：心跳停掉后 `agent_stale_after` 先把它剔出候选）；
