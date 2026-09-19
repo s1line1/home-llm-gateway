@@ -287,6 +287,23 @@ impl Gateway {
         n
     }
 
+    /// 停网关。**目前只是 abort 监听任务，没有 drain。**
+    ///
+    /// 现状（`systemctl restart` → SIGTERM → `main.rs::shutdown_signal` → 这里）：在途请求被直接
+    /// 切断——SSE 长流在客户端看来是"流被截断"而不是正常结束；到 agent 的隧道连接随进程一起
+    /// 消失，靠 agent 侧指数退避（≤30s）重连。也就是说"干净退出"目前只覆盖**内存用量不丢**
+    /// （见 [`Self::flush_usage_on_shutdown`]），**不覆盖"对用户无感"**。
+    ///
+    /// TODO（要求见 `REBUILD.md` §6-R12；登记见 `TODO.md`《重建蓝图 §6 未修项》R12）：
+    /// 做成 drain 式关闭——① 先停 accept（不再接新请求）② 给在途请求一个宽限期
+    /// ③ 到期前让在途流收到明确的结束/错误事件，使客户端能区分"被截断"与"正常结束"
+    /// ④ 到点再 abort。
+    ///
+    /// 配套：`deploy/gateway.service` 的 `TimeoutStopSec`（当前未设 = systemd 默认 90s）必须
+    /// **大于**宽限期，否则宽限期还没走完就被 SIGKILL。
+    ///
+    /// ⚠️ `registry.rs::close_when_drained` 是"摘除单个 agent 时等它在途请求收尾"，
+    /// **不是进程退出路径**，别直接复用到这里。
     pub async fn shutdown(self) {
         for t in self.tasks {
             t.abort();
