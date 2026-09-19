@@ -150,8 +150,22 @@ curl -N -H "Authorization: Bearer dev-key" \
 ### 6. 测试
 
 ```bash
-cargo test    # proto roundtrip + 端到端集成测试（内存生成证书，无需任何外部服务）
+cargo test             # proto roundtrip + 端到端集成测试（内存生成证书，无需任何外部服务）
+cargo nextest run -w   # 同上，但用 nextest（CI 用的就是它，见下）
 ```
+
+> **CI 用 `cargo nextest`**（`cargo test` 仍然可用，两者都要能过）。换它的原因：nextest
+> **每条测试一个进程**，各测试二进制之间可以并行，而且不会像 libtest 那样把 `#[serial]`
+> 的**等锁时间**算进"这条测试跑了多久"——CI 上原来那几条 `has been running for over 60
+> seconds` 多数只是排在队里等锁。
+>
+> ⚠️ 但这也意味着 **nextest 下 `#[serial]` 会失效**（`serial_test` 的锁是**进程内**的，
+> 进程隔离后各锁各的）。e2e 每条都要起独立 runtime + QUIC + mTLS 栈、且含时序敏感断言，
+> 所以它的串行改由 `.config/nextest.toml` 的 **test-group**（`max-threads = 1`）保证；
+> `#[serial]` 标记**保留不删**，因为 `cargo test` 仍然依赖它们。
+>
+> `make test` = `cargo test`，`make nextest` = nextest（未安装时先 `cargo install cargo-nextest --locked`）。
+> 另外 nextest **不跑 doctest**：本仓库当前没有 doctest，将来若加了要补 `cargo test --doc`。
 
 ### 7. 基准测试（Criterion）
 
