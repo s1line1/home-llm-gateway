@@ -34,13 +34,14 @@ Local LLM (Ollama / vLLM / llama.cpp / mock-llm)
 ```
 crates/
 ├── proto/      tunnel frame protocol (Register/Heartbeat/ProxyRequest/Response*/Cancel/Error)
-├── gateway/    cloud-gateway binary (axum + quinn server)
-├── agent/      edge-agent binary (quinn client + reqwest)
+├── gateway/    cloud-gateway binary (axum + s2n-quic server)
+├── agent/      edge-agent binary (s2n-quic client + reqwest)
 └── mock-llm/   fake OpenAI-compatible LLM (to bring up the full chain without a real model)
 certs/          dev certificate script
 deploy/         systemd units (gateway.service / agent.service)
 scripts/        multi-platform release packaging script + git pre-commit hook (cargo deny + fmt)
 Dockerfile      multi-stage container build (gateway / agent / mock-llm binaries; see the header comment)
+docker-compose.yml  container deployment example (gateway; agent template at the end of the file)
 deny.toml       cargo-deny policy (dependency licenses / advisories; run by CI and the pre-commit hook)
 ```
 
