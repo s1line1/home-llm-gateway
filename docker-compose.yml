@@ -1,0 +1,56 @@
+# home-llm-gateway 容器部署示例（网关；agent 模板在文件末尾，默认注释掉）
+#
+# 为什么要这样写，四条都踩过或验过（详见 DEPLOY.md §11）：
+#   ① 镜像的 ENTRYPOINT 是 gateway 二进制 → command 里**不要**再写一个 "gateway"，
+#      那是未声明的位置参数，clap 会以退出码 2 让容器立刻退出；
+#   ② 配置里的路径**按容器内 CWD 解析**（不按配置文件所在目录），而镜像的 WORKDIR 是
+#      /etc/home-llm-gateway → 这里做**同路径挂载**，`gateway_config.example.yml` 里的
+#      绝对路径 /etc/home-llm-gateway/... 可以原样使用，不必改配置；
+#   ③ `keys.db` 是 SQLite **WAL** 模式，会额外生成 `keys.db-wal` / `keys.db-shm`
+#      → 必须挂**目录**（不能只挂那个文件），并且**目录**要可写；
+#   ④ QUIC 隧道走 **UDP**：写成 TCP 时 agent 连不上；云安全组也要放行 UDP 4433。
+
+services:
+  gateway:
+    build: .
+    image: home-llm-gateway
+    container_name: gateway
+    restart: unless-stopped
+    # 不带位置参数；ENTRYPOINT 已是 gateway，这里只喂 --config
+    command: ["--config", "/etc/home-llm-gateway/gateway-config.yml"]
+    # 与镜像 WORKDIR 一致；配置里的相对路径（ui_dir 等）以此为基准
+    working_dir: /etc/home-llm-gateway
+    ports:
+      - "8443:8443" # HTTP/HTTPS 入口，对应配置里的 listen_addr
+      - "4433:4433/udp" # QUIC 隧道入口，对应 quic_addr。**必须是 /udp**
+    volumes:
+      # 单挂载、同路径：配置 + 证书 + keys.db 都在这一个目录里（最省事，配置零改动）
+      - /etc/home-llm-gateway:/etc/home-llm-gateway
+
+      # 想做到"证书只读 + 数据可写"就换成下面两行（此时配置里要同步改成
+      # cert/key/ca → /config/...，keys_file → /data/keys.db）：
+      # - /etc/home-llm-gateway:/config:ro
+      # - /var/lib/home-llm-gateway:/data
+
+    # 说明：
+    #  · 配置**不支持环境变量展开**（`config.rs` 里没有 env 取值），所以 admin_token 只能
+    #    写在 gateway-config.yml 里 → 该文件是密钥，建议 chmod 600，不要打进镜像。
+    #  · 日志走 stdout（没有日志文件配置项），用 `docker compose logs -f gateway` 看即可；
+    #    日志时间戳由程序固定为东八区，`TZ=` 不会改变它。
+    #  · 镜像里**不含 web/dist**，容器内访问 `/` 会看到"UI 未构建"的提示页；
+    #    要用面板就把 `web/dist` 挂进来，并把配置的 ui_dir 指向它。
+
+# agent 通常跑在 LLM 所在的机器（edge 节点），不在网关这台云服务器上。
+# 真要在这台机器上跑，取消下面注释——注意 **entrypoint 必须切换**，否则跑起来的是网关：
+#
+#  agent:
+#    image: home-llm-gateway
+#    container_name: agent
+#    restart: always
+#    entrypoint: ["/usr/local/bin/agent"]
+#    command: ["--config", "/etc/home-llm-gateway/agent-config.yml"]
+#    working_dir: /etc/home-llm-gateway
+#    # host 网络：agent 要连本机 LLM（如 http://127.0.0.1:8000），且出站 UDP 4433 不受限
+#    network_mode: host
+#    volumes:
+#      - /etc/home-llm-gateway:/etc/home-llm-gateway

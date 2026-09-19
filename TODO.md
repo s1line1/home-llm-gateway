@@ -260,10 +260,10 @@
       （admin_token 配置文件明文）；考虑"首次启动自动建默认 key"或引导提示
 - [ ] **usage 数据保留策略（B 档，可选）**：`key_usage` 无限累积（reset 是待定项）——
       长时间运行表会涨；建议与 reset 一并设计保留窗口/归档
-- [ ] **Dockerfile / docker-compose（C 档，可选）**：~~当前部署是 systemd + 手动传文件~~
-      **更正（2026-09 审查）**：`Dockerfile` 已存在（多阶段，产出 gateway/agent/mock-llm 三个二进制），
-      并已在 README 目录结构中登记；剩余缺口是 **docker-compose**，以及镜像不含 `web/dist`
-      （容器内 `/` 会是构建提示页）——容器化需多阶段构建把前端一并打进去
+- [ ] **镜像不含 `web/dist`（C 档，可选）**：`Dockerfile` 与 `docker-compose.yml` 均已就绪
+      （容器化的路径映射、ENTRYPOINT 与 UDP 端口三个坑见 `DEPLOY.md` §11），**仅剩**容器内没有
+      管理面板：访问 `/` 只得到"UI 未构建"的提示页。要做就在多阶段构建里加一个 pnpm 阶段把
+      `web/dist` 打进去，或在 compose 里挂载 `web/dist` 并把 `ui_dir` 指过去。
 - [ ] **结构化访问日志 JSONL（C 档，可选）**：tracing 文本日志给人看；如需审计
       "谁何时调了什么"可加 JSON 行落盘
 - [ ] **keys.db 迁移规模化**：当前自动迁移（`keystore.rs::migrate_legacy_keys`）同步执行、
