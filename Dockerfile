@@ -31,7 +31,14 @@
 # 镜像内含 gateway / agent / mock-llm 三个二进制。
 # 也可以直接用仓库根的 `docker-compose.yml`（网关 + 可选 agent）。
 
-FROM rust:1.95 AS builder
+# 构建基底**必须与运行阶段的发行版对齐**：`rust:1.95` 现在是 Debian 13（trixie，glibc 2.41），
+# 而运行阶段是 `debian:bookworm-slim`（Debian 12，glibc 2.36）。在 trixie 上链接出来的
+# gateway / agent 在 bookworm 里根本起不来：
+#   /usr/local/bin/gateway: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.38' not found
+# 症状很隐蔽：**镜像能构建成功**，`mock-llm --version` 也正常（它依赖少），只有 gateway/agent
+# 一启动就死。用 `-bookworm` 变体把两边对齐，顺带让产物二进制也能直接在 Debian 12 宿主机上跑。
+# （另一条路是把运行阶段换成 `debian:trixie-slim`，但那样产物就要求 glibc ≥ 2.38。）
+FROM rust:1.95-bookworm AS builder
 
 # 工具链：**必须显式指定**，否则构建会挂死在这里。
 # 仓库的 `rust-toolchain.toml` 写的是 `channel = "stable"`，而本镜像里装的是
