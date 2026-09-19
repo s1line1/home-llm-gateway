@@ -18,6 +18,11 @@ struct Args {
     config: PathBuf,
 }
 
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    run(Args::parse()).await
+}
+
 /// 启动网关主循环（独立函数，便于单元测试覆盖启动路径）。
 async fn run(args: Args) -> anyhow::Result<()> {
     // 日志时间戳固定东八区（UTC+8）：China Standard Time，无夏令时。
@@ -63,11 +68,6 @@ async fn shutdown_signal() {
         _ = ctrl_c => tracing::info!("received SIGINT"),
         _ = terminate => tracing::info!("received SIGTERM"),
     }
-}
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    run(Args::parse()).await
 }
 
 #[cfg(test)]
