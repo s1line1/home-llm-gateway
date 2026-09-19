@@ -552,6 +552,14 @@
 - [ ] **R12 healthz 豁免闸门 + 深度检查**：`/healthz` 恒返 `"ok"`
       （`crates/gateway/src/http.rs:287-289`），且只有 `/metrics` 豁免准入（`http.rs:357-359`）
       ——闸门打满时健康检查会 429，把"慢"放大成"全挂"。
+- [ ] **R12 drain 式关闭**：`Gateway::shutdown`（`crates/gateway/src/lib.rs:290`）目前只是
+      `abort()` 掉四个任务（两个 HTTP 监听、QUIC accept、用量 flusher），**没有排空**——
+      `systemctl restart`（SIGTERM）会把在途 SSE 流切断，客户端看到的是"流被截断"而非正常结束；
+      agent 的隧道连接随进程消失、靠自身退避（≤30s）重连。做法：先停 accept → 宽限期 →
+      到期前给在途流一个明确的结束/错误事件 → 再 abort。配套 `TimeoutStopSec`
+      （`deploy/gateway.service` 未设 = systemd 默认 90s）必须 > 宽限期，且 `flush_usage_on_shutdown`
+      是阻塞式 SQLite 写、无超时，卡住就只能等那 90s 后的 SIGKILL。
+      注：`registry.rs::close_when_drained` 是"摘除单个 agent"用的，不是进程退出路径。
 
 **已修、不要再照 §6 做一遍的**：R7 票据绑响应 body（钉点时即正确）、R10 的
 `open_bi`/写帧/agent 侧握手三项超时、R11 的 `agent_id` 进日志与 agent 拒绝按 `reason` 分源、

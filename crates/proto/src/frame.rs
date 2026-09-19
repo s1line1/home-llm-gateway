@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// 隧道帧。所有帧经 postcard 序列化，由 [`io::write_frame`] 加上长度前缀。
+/// 隧道帧。所有帧经 postcard 序列化，由 [`crate::io::write_frame`] 加上长度前缀。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Frame {
     /// agent → cloud：注册，声明身份与能力。

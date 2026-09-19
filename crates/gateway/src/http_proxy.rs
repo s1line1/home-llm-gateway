@@ -198,7 +198,7 @@ async fn tunnel_cancel(
 }
 
 /// 请求体上限。**只此一处定义**：`http.rs` 的 `DefaultBodyLimit` 层的值取自这里，
-/// 而手动逐块读 body 时（见 [`read_body_with_stall`]）也用它——两处若各写一个数字，
+/// 而手动逐块读 body 时（见 `read_body_with_stall`）也用它——两处若各写一个数字，
 /// 早晚会漂移成一个"提取器放行、这里拒绝（或反过来）"的鬼故事。
 pub const MAX_REQUEST_BODY: usize = 16 * 1024 * 1024;
 
@@ -771,7 +771,7 @@ enum SendOutcome {
 
 /// 带停滞超时地往客户端送一块。
 ///
-/// 语义与请求体侧一致（见 [`read_body_with_stall`]）：**有进展就不超时**。客户端只要还在
+/// 语义与请求体侧一致（见 `read_body_with_stall`）：**有进展就不超时**。客户端只要还在
 /// 消费，通道就不会满，超时永远不会触发；只有"连着但一个字节都不取"才判定僵住。
 async fn send_to_client(
     tx: &mpsc::Sender<Result<Bytes, String>>,
