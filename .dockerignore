@@ -2,6 +2,9 @@ target
 .cargo-home
 dist
 .git
+# 前端依赖：装完后 web/node_modules 有 100MB+，占仓库体积九成。镜像不用它，
+# 但每次构建都会把它当上下文传给 builder，还容易让清单层/源码层的缓存失效。
+**/node_modules
 keys.db
 keys.db-wal
 keys.db-shm
