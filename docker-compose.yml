@@ -9,6 +9,9 @@
 #   ③ `keys.db` 是 SQLite **WAL** 模式，会额外生成 `keys.db-wal` / `keys.db-shm`
 #      → 必须挂**目录**（不能只挂那个文件），并且**目录**要可写；
 #   ④ QUIC 隧道走 **UDP**：写成 TCP 时 agent 连不上；云安全组也要放行 UDP 4433。
+#   ⑤ 日志默认进 docker 的 json-file（宿主机 `/var/lib/docker/containers/<id>/…-json.log`：
+#      **删容器即删日志**，且默认不轮转）。本文件把它重定向到**固定路径**
+#      `/var/log/home-llm-gateway/gateway.log`，代价是 `docker logs` 变空——取舍见 DEPLOY.md §11。
 
 services:
   gateway:
@@ -16,8 +19,18 @@ services:
     image: home-llm-gateway
     container_name: gateway
     restart: unless-stopped
-    # 不带位置参数；ENTRYPOINT 已是 gateway，这里只喂 --config
-    command: ["--config", "/etc/home-llm-gateway/gateway-config.yml"]
+    # 日志重定向到固定路径。三条注意：
+    #   ① ENTRYPOINT 已是 gateway，所以必须同时换 entrypoint，否则 `sh -c` 会被当成
+    #      gateway 的参数喂进去（就是上面第 ① 条坑的另一种形式）；
+    #   ② **`exec` 不能省**：不加 exec 时 PID 1 是 sh，`docker stop` 的 SIGTERM 传不到网关，
+    #      优雅退出与"退出前用量落库"都不会执行（两条写法都实测对比过）；
+    #   ③ 不要写 `... | tee 文件`：有管道就没法 exec，信号必然丢。
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "exec /usr/local/bin/gateway --config /etc/home-llm-gateway/gateway-config.yml >> /var/log/home-llm-gateway/gateway.log 2>&1"
+    # 日志文件里不要 ANSI 颜色码（实测：不加时该文件每一行都带 ^[[2m / ^[[32m）
+    environment:
+      NO_COLOR: "1"
     # 与镜像 WORKDIR 一致；配置里的相对路径（ui_dir 等）以此为基准
     working_dir: /etc/home-llm-gateway
     ports:
@@ -32,11 +45,22 @@ services:
       # - /etc/home-llm-gateway:/config:ro
       # - /var/lib/home-llm-gateway:/data
 
+      # 日志目录。宿主上先 `mkdir -p /var/log/home-llm-gateway`（容器以 root 运行，可写）。
+      # 轮转要靠宿主 logrotate（见 deploy/logrotate.example）——不配会无限增长。
+      - /var/log/home-llm-gateway:/var/log/home-llm-gateway
+
     # 说明：
     #  · 配置**不支持环境变量展开**（`config.rs` 里没有 env 取值），所以 admin_token 只能
     #    写在 gateway-config.yml 里 → 该文件是密钥，建议 chmod 600，不要打进镜像。
-    #  · 日志走 stdout（没有日志文件配置项），用 `docker compose logs -f gateway` 看即可；
-    #    日志时间戳由程序固定为东八区，`TZ=` 不会改变它。
+    #  · 日志三条路（本文件用的是第一条）：
+    #      ① 固定文件路径 = 上面的 entrypoint/command 重定向 → /var/log/home-llm-gateway/gateway.log
+    #         （`>>` 追加，重启不丢；代价：`docker logs` 为空，轮转靠宿主 logrotate）
+    #      ② 保留 `docker logs`：注释掉 entrypoint/command/environment 三处、去掉日志卷，改用
+    #             logging: { driver: json-file, options: { max-size: "50m", max-file: "5" } }
+    #         （日志仍在 /var/lib/docker/containers/<id>/ 下，**删容器即删日志**）
+    #      ③ `logging: { driver: journald }` → 进宿主机 journald，`journalctl -t gateway` 可查，
+    #         删容器不丢；同样 `docker logs` 为空。
+    #  · 日志时间戳由程序固定为东八区，`TZ=` 不会改变它。
     #  · 镜像里**不含 web/dist**，容器内访问 `/` 会看到"UI 未构建"的提示页；
     #    要用面板就把 `web/dist` 挂进来，并把配置的 ui_dir 指向它。
 
