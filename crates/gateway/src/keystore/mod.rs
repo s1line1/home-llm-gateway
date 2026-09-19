@@ -148,7 +148,7 @@ pub const DEFAULT_VERIFIED_MAX: usize = 1650;
 /// 它只决定"多久之后重新付一次 argon2 的钱"。
 pub const DEFAULT_VERIFIED_TTL: Duration = Duration::from_secs(30 * 60);
 
-const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS api_keys (
+const API_KEY_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS api_keys (
     id TEXT PRIMARY KEY,
     lookup TEXT NOT NULL UNIQUE,
     key_hash TEXT NOT NULL,
@@ -192,9 +192,9 @@ impl KeyStore {
                         tracing::warn!("sqlite: set synchronous=NORMAL failed (non-fatal): {e}");
                     }
                     let init = (|| {
-                        conn.execute_batch(SCHEMA)?;
+                        conn.execute_batch(API_KEY_SCHEMA)?;
                         conn.execute_batch(USAGE_SCHEMA)?;
-                        // 老库（无 cred_version 列）→ 补列；新库上 SCHEMA 已建好，这里跳过。
+                        // 老库（无 cred_version 列）→ 补列；新库上 API_KEY_SCHEMA 已建好，这里跳过。
                         if !table_has_column(&conn, "api_keys", "cred_version")? {
                             conn.execute_batch(
                                 "ALTER TABLE api_keys ADD COLUMN cred_version INTEGER NOT NULL DEFAULT 1",
@@ -732,7 +732,7 @@ fn migrate_legacy_keys(conn: &mut Connection) -> rusqlite::Result<usize> {
 
     let tx = conn.transaction()?;
     tx.execute("ALTER TABLE api_keys RENAME TO api_keys_legacy", [])?;
-    tx.execute_batch(SCHEMA)?;
+    tx.execute_batch(API_KEY_SCHEMA)?;
     {
         let mut ins = tx.prepare(
             "INSERT INTO api_keys (id, lookup, key_hash, name, created_at, enabled)
