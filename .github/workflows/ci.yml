@@ -31,8 +31,18 @@ jobs:
       - name: License check (cargo-deny)
         uses: EmbarkStudios/cargo-deny-action@v2
 
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+
+      # 用 nextest 而不是 cargo test：每条测试一个进程，各二进制之间能并行，
+      # 而且不会把 `#[serial]` 的**等锁时间**算成测试运行时间（原来 CI 里那几条
+      # "has been running for over 60 seconds" 多数只是排在队里等锁）。
+      # e2e 的串行由 `.config/nextest.toml` 的 test-group 保证——nextest 下
+      # `#[serial]` 的进程内锁会失效，这一条不能漏。
+      # 注意：nextest **不跑 doctest**。当前仓库没有 doctest（src 里没有代码块），
+      # 将来若加了，需要补一步 `cargo test --doc --workspace`。
       - name: Test
-        run: cargo test --workspace
+        run: cargo nextest run --workspace
 
   web:
     name: Web (build)

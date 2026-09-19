@@ -59,10 +59,13 @@ clippy: ## clippy 检查（-D warnings，与 CI 同等门槛）
 deny: ##（cargo deny check 完整检查 advisories/bans/sources 由 pre-commit hook 与 CI 执行）
 	cargo deny check
 
-check: fmt clippy test web-build ## 一键全量验证（格式 + clippy + 测试 + 前端构建，同 CI）
+check: fmt clippy nextest web-build ## 一键全量验证（格式 + clippy + 测试 + 前端构建，同 CI）
 
-test: ## 运行全部 Rust 测试（含 e2e）
+test: ## 运行全部 Rust 测试（cargo 原生 runner，含 e2e；串行靠测试里的 #[serial]）
 	cargo test
+
+nextest: ## 同上，但用 nextest（CI 用的就是它；e2e 的串行由 .config/nextest.toml 的 test-group 保证）
+	cargo nextest run --workspace
 
 bench: ## 基准测试（Criterion）：make bench BENCH="-p proto -p gateway"
 	cargo bench $(BENCH)

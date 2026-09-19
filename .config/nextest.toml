@@ -1,0 +1,30 @@
+# nextest 配置（CI 与本地都读这份：`cargo nextest run --workspace`）
+#
+# ① 为什么需要 test-group（**换 nextest 必须处理的一件事**）
+#    nextest 默认**每条测试一个进程**，而 `serial_test` 的 `#[serial]` 用的是**进程内**全局锁——
+#    进程一隔离就变成"各锁各的"，等于失效。而 e2e 每条测试都要起独立的运行时 + QUIC + mTLS
+#    栈，并且含时序敏感断言（`tests/e2e/main.rs` 里写明了串行的理由：并行会互相抢 CPU），
+#    所以在 nextest 下必须用**它自己的 test-group** 把它限成"一次只跑一条"。
+#    语义与原来的 `#[serial]` 等价；`#[serial]` 标记**保留不删**，因为 `cargo test` 仍然需要它们。
+#
+#    为什么只给 e2e 配 test-group：`src/` 里另有一批 `#[serial]`（keystore 单测），
+#    它们的理由是"这些测试要读**进程级**的 argon2 调用计数器、会互相污染"——nextest
+#    每条测试一个进程，这个污染源天然消失（它们用 tempdir()，也不争抢固定路径/端口），
+#    所以不需要额外分组；并行反而更快。
+#
+# ② 顺带修掉一个观测问题：`#[serial]` 的等锁时间会被 libtest 算进"这条测试跑了多久"，
+#    于是 CI 上会看到好几条 "has been running for over 60 seconds"，其实是在排队。
+#    nextest 把"等待"和"运行"分开统计，所以下面的超时阈值报出来的就是真的卡住。
+
+[test-groups]
+e2e-serial = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'binary(e2e)'
+test-group = 'e2e-serial'
+
+[profile.default]
+# 与 `cargo test` 的行为保持一致：跑完所有测试再汇总，不因第一个失败就停
+fail-fast = false
+# 单条超过 60s 记为慢、超过 180s 判定卡死并终止（period × terminate-after）
+slow-timeout = { period = "60s", terminate-after = 3 }
