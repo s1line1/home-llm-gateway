@@ -33,6 +33,18 @@
 
 FROM rust:1.95 AS builder
 
+# 工具链：**必须显式指定**，否则构建会挂死在这里。
+# 仓库的 `rust-toolchain.toml` 写的是 `channel = "stable"`，而本镜像里装的是
+# `1.95.0-x86_64-unknown-linux-gnu`。rustup 找不到 "stable" 就去 static.rust-lang.org 下整套
+# 工具链（rustc/rust-std/cargo/clippy/rustfmt，约 130 MB）——实测这一步在网络层面**挂住不返回**
+# （日志停在 `downloading 5 components`：7 分钟零字节、CPU 0.1%、磁盘零增长）。这才是"镜像构建
+# 跑不完"的根本原因，跟 2 核编译快慢无关。
+# `RUSTUP_TOOLCHAIN` 优先级高于 rust-toolchain.toml，指到镜像里已有的工具链后构建不碰网络。
+# 想改用当前 stable（与 CI 一致）：--build-arg RUST_TOOLCHAIN=stable
+# —— 那时需要能访问 rustup 源，或另外配 RUSTUP_DIST_SERVER 国内镜像。
+ARG RUST_TOOLCHAIN=1.95.0
+ENV RUSTUP_TOOLCHAIN=$RUST_TOOLCHAIN
+
 # crates 镜像源。**关键是这个镜像要自己提供包体**：
 # 索引（sparse index）决定“有哪些 crate”，包体地址写在索引 config.json 的 `dl` 字段里，
 # 而 `replace-with` 是整源替换 —— 所以 `dl` 指向哪，包体就从哪下。
