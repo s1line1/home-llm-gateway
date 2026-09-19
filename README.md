@@ -44,6 +44,7 @@ agent_config.example.yml    edge-agent 配置模板（所有参数，YAML）
 deploy/         systemd 单元（gateway.service / agent.service）
 scripts/        多平台 release 打包脚本 + git pre-commit hook（cargo deny + fmt）
 Dockerfile      多阶段容器构建（gateway / agent / mock-llm 三个二进制，用法见文件头注释）
+docker-compose.yml  容器部署示例（网关；agent 模板在文件末尾，路径映射见 DEPLOY.md §11）
 deny.toml       cargo-deny 策略（依赖许可证 / 公告；CI 与 pre-commit hook 执行）
 ```
 

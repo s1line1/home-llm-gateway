@@ -282,3 +282,68 @@ sqlite3 /etc/home-llm-gateway/keys.db "PRAGMA table_info(api_keys);"   # 应含 
 curl -s localhost:8080/metrics | grep -E 'hlmg_key_verify_(hits|misses)_total'
 # 稳态下 hits 快速累积、misses 几乎不动（每个不同 token 只付一次 argon2）
 ```
+
+## 11. Docker 部署（可选）
+
+§4–§6 的 systemd 路径是默认方案；本节只讲**容器化时路径与端口怎么映射**，以及三个会让人卡住的坑。
+仓库里已有 `Dockerfile`（多阶段，产出 gateway / agent / mock-llm 三个二进制）和
+`docker-compose.yml`（网关；agent 的模板注释在文件末尾）。
+
+### 11.1 一条硬规则：配置里的路径按「进程 CWD」解析
+
+`gateway/src/config.rs` 的 `from_path` 只把 YAML 读进来交给 `from_file`，**不会**把里面的路径
+重写成"相对配置文件所在目录"。所以 `cert` / `key` / `ca` / `keys_file` / `ui_dir` 全部由操作系统
+按**进程的工作目录**解析。
+
+- systemd 那份之所以能用相对路径（`ui_dir: web/dist`、`keys_file: keys.db`），靠的是单元里的
+  `WorkingDirectory=/etc/home-llm-gateway`；
+- 镜像里已补 `WORKDIR /etc/home-llm-gateway`，语义与之一致。
+
+### 11.2 挂载点必须与配置里的路径对齐（二选一）
+
+`gateway_config.example.yml` 和 `agent_config.example.yml` 用的都是绝对路径
+`/etc/home-llm-gateway/...`，所以：
+
+| 方案 | 挂载 | 配置文件 |
+|---|---|---|
+| **A. 同路径挂载**（推荐） | `-v /etc/home-llm-gateway:/etc/home-llm-gateway` | **零改动**，示例配置原样可用 |
+| **B. 挂到 `/config`** | `-v /etc/home-llm-gateway:/config` | 必须把 cert/key/ca 改成 `/config/...`、`keys_file` 改成 `/config/keys.db` |
+
+⚠️ 两者混用是最常见的启动失败：容器内会报读不到证书/密钥（`cert/key/ca paths are required`
+之后是文件读取失败）。**挂载点了，配置里的路径就得跟着走**，反之亦然。
+
+### 11.3 三个必须知道的坑
+
+1. **命令行里不要再写 `gateway` / `agent`**：镜像的 ENTRYPOINT 已经是 gateway 二进制，而 CLI
+   只接受 `--config`（没有子命令、没有位置参数）。多写那一个词会被 clap 判成
+   `unexpected argument 'gateway' found` 并以**退出码 2** 立刻退出，配 `restart` 就是崩溃重启循环。
+2. **同一个镜像跑 agent 必须切 entrypoint**：加 `--entrypoint /usr/local/bin/agent`
+   （mock-llm 同理），否则跑起来的仍然是网关。
+3. **`keys.db` 是 SQLite WAL 模式**：会额外生成 `keys.db-wal` / `keys.db-shm`，所以必须挂
+   **目录**（不能只挂那个文件），而且**目录**要可写；SELinux 主机上可能还要加 `:z` / `:Z`。
+
+### 11.4 端口与安全组
+
+| 端口 | 协议 | 用途 |
+|---|---|---|
+| 8443 | TCP | HTTP/HTTPS 入口（`listen_addr`），客户端与 Web UI 走这里 |
+| 4433 | **UDP** | QUIC 隧道（`quic_addr`），agent 拨号走这里 |
+
+- 写成 `-p 4433:4433`（漏掉 `/udp`）会映射成 TCP，**agent 永远连不上**；
+- 云安全组要放行 **UDP 4433**（只放 TCP 是常见错误），见 §2；
+- 网关不需要 `--network host`，发布端口即可；agent 那一侧常配 host 网络（它要连本机 LLM）。
+
+### 11.5 容器化的两个能力缺口
+
+- **配置不支持环境变量展开**（`config.rs` 里没有任何 env 取值），所以 `admin_token` 只能写在
+  `gateway-config.yml` 里。该文件因此属于密钥：`chmod 600`、不要 `COPY` 进镜像、用只读挂载。
+- **镜像里没有 `web/dist`**：容器内访问 `/` 只会看到"UI 未构建"的提示页。要用管理面板，就在构建
+  镜像时把前端一并打进去，或在 compose 里把 `web/dist` 挂进去并调整 `ui_dir`。已登记在 `TODO.md`。
+
+### 11.6 用 docker compose
+
+```bash
+docker compose config -q          # 只校验配置，不起容器
+docker compose up -d gateway
+docker compose logs -f gateway    # 日志走 stdout（没有日志文件配置项）
+```
