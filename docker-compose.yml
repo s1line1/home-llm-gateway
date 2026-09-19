@@ -47,7 +47,17 @@ services:
 
       # 日志目录。宿主上先 `mkdir -p /var/log/home-llm-gateway`（容器以 root 运行，可写）。
       # 轮转要靠宿主 logrotate（见 deploy/logrotate.example）——不配会无限增长。
+      # 装规则
+      # sudo cp /root/home-llm-gateway/deploy/logrotate.example /etc/logrotate.d/home-llm-gateway
+      # sudo chown root:root /etc/logrotate.d/home-llm-gateway
+      # sudo chmod 644 /etc/logrotate.d/home-llm-gateway
       - /var/log/home-llm-gateway:/var/log/home-llm-gateway
+
+      # 演练：只打印它打算做什么，不动任何文件（最安全，先跑这个）
+      # sudo logrotate -d /etc/logrotate.d/home-llm-gateway
+
+      # 立即强制轮转一次（每天只自动轮一次，这条是马上生效）
+      # sudo logrotate -f /etc/logrotate.d/home-llm-gateway
 
     # 说明：
     #  · 配置**不支持环境变量展开**（`config.rs` 里没有 env 取值），所以 admin_token 只能
