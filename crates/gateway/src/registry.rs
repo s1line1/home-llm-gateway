@@ -56,9 +56,9 @@ pub struct Entry {
     /// 单次超时在高并发下是排队造成的假象（开流/写帧要过连接级流管理器）。
     /// 任何一次成功都会把它清零（见 `note_tunnel_op_ok`）。
     pub tunnel_op_timeouts: Arc<AtomicU32>,
-    /// **最近一次真的收到响应头**的时刻（自 [`epoch`] 起的毫秒数）。
+    /// **最近一次真的收到响应头**的时刻（自 `epoch` 起的毫秒数）。
     ///
-    /// 初值是 [`NEVER`]（从未收到过）。**注册不算"活着"**：注册只证明连接建起来了，
+    /// 初值是 `NEVER`（从未收到过）。**注册不算"活着"**：注册只证明连接建起来了，
     /// 而这条判据问的是响应头有没有在流动。
     ///
     /// 为什么要单独记它：`tunnel_op_timeouts` 这一套只回答"连续失败了几次"，回答不了
@@ -81,7 +81,7 @@ fn epoch() -> std::time::Instant {
     *EPOCH.get_or_init(std::time::Instant::now)
 }
 
-/// 自 [`epoch`] 起的毫秒数（用于 `last_head_ok` 这类无锁时间戳）。
+/// 自 `epoch` 起的毫秒数（用于 `last_head_ok` 这类无锁时间戳）。
 pub fn now_millis() -> u64 {
     epoch().elapsed().as_millis() as u64
 }

@@ -51,6 +51,11 @@ struct Verified {
 /// 未命中时用于串行化同一 token 的并发校验。
 type FlightSlot = std::sync::Arc<Mutex<()>>;
 
+/// 已验证身份缓存：命中即跳过 argon2 校验，未命中时按 token 串行化（单飞）。
+///
+/// 只缓存**校验结论**，凭据版本（`cred_version`）不一致或记录消失时立即失效，所以吊销
+/// 依然即时生效、不依赖 TTL。峰值内存由 argon2 的并发校验决定（每次 19 MiB），
+/// 见 `TODO.md` 的《argon2 使用方式重构》。
 #[derive(Default)]
 pub(crate) struct VerifiedCache {
     entries: Mutex<HashMap<String, Verified>>,
