@@ -17,10 +17,9 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, warn};
 
-use crate::auth::authenticate;
 use crate::body::{read_body_with_stall, BodyRead, MAX_REQUEST_BODY};
 use crate::openai::error_response;
-use crate::state::AppState;
+use crate::{auth::authenticate, state::AppState};
 use forward::forward_body;
 use tunnel::tunnel_cancel;
 
