@@ -30,7 +30,7 @@
       Claude Code（`ANTHROPIC_BASE_URL` 或 router）的配置示例与模型名约定
 - [x] **OpenAI 兼容错误语义标准化（2026-09 实施）**：对照 OpenAI 协议修补三处，
       SDK/工具按 error.type 与 Retry-After 决定重试行为：
-      1. **error.type 按状态码映射**（`proxy::error_response`）：400→
+      1. **error.type 按状态码映射**（`openai::error_response`，唯一构造器）：400→
          `invalid_request_error`、401→`authentication_error`、403→`permission_error`、
          404→`not_found_error`、409→`conflict_error`、429→`rate_limit_error`、
          5xx→`server_error`、其余→`api_error`
@@ -423,10 +423,15 @@
 
 ### P2 — 契约 / 一致性
 
-- [ ] **`error.type` 分叉**：`proxy::error_response` 自我声明是 OpenAI 错误格式的唯一来源
-      （`proxy/mod.rs:27-29`），但 `admin.rs:34/110/121/156/166` 与 `http.rs:117` 手搓了 5 种
-      不一致的 type（`auth_error` / `invalid_request` / `gateway_error` / `not_found`）。
-      修法：admin 与 UI fallback 也走同一个构造器/映射表。
+- [x] **`error.type` 分叉（已修）**：`openai::error_response` 自我声明是 OpenAI 错误格式的
+      唯一来源，但 `admin.rs` 的 5 处（401 `auth_error` / 400 `invalid_request` /
+      500×2 `gateway_error` / 404 `not_found`）与 `http/ui.rs` 的 SPA 404（`not_found`）
+      手搓了 4 种只有本文件认识的名字。现在这 6 处全部走同一个构造器：
+      401→`authentication_error`、400→`invalid_request_error`、404→`not_found_error`、
+      5xx→`server_error`（**响应体的 type 值变了**，这是本条的目的）。
+      测试：`admin::tests::{admin_errors_use_the_openai_error_shape, create_key_rejects_overlong_name}`
+      （先红后绿）+ `http::ui::tests::ui_fallback_serves_spa_to_browser_but_404_to_api` 的 type 断言。
+      仅剩的"自有名字"是 `web/` 前端自己的展示文案，与协议面无关。
 - [x] **`x-request-id` 只在 `req-<u64>` 形状下才等于隧道 `request_id`（已修）**：
       拆分前 `metrics_middleware` 与 `proxy` 各持一个从 1 开始的静态计数器，UUID 客户端
       （Codex/DSH 的真实形态）让两个数列独立递增 → 撞号；e2e 在旧代码上实测同一 agent

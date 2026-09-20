@@ -10,9 +10,7 @@ use axum::{
     extract::State,
     http::{HeaderMap, StatusCode, Uri},
     response::{Html, IntoResponse, Response},
-    Json,
 };
-use serde_json::json;
 use tower::ServiceExt;
 use tower_http::services::{ServeDir, ServeFile};
 
@@ -42,11 +40,9 @@ pub(super) async fn ui_fallback(
         .map(|seg| seg.contains('.'))
         .unwrap_or(false);
     if !wants_html && !has_extension {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": { "message": "not found", "type": "not_found" } })),
-        )
-            .into_response();
+        // 统一错误格式：以前这里手搓的是 `type: "not_found"`，与 proxy 的
+        // `not_found_error` 不是同一个语义名（同一个网关两种 404）
+        return crate::openai::error_response(StatusCode::NOT_FOUND, "not found");
     }
     let req = axum::extract::Request::builder()
         .uri(uri)
@@ -163,10 +159,12 @@ mod tests {
         // API 类未注册路径（Accept: */*、无扩展名）→ 404，绝不能返回 index.html
         let resp = call_ui_fallback(state.clone(), "/admin/agents", Some("*/*")).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-        assert!(
-            !body_str(resp).await.contains("id=\"root\""),
-            "API paths must not get SPA"
-        );
+        // 错误体走 openai::error_response：type 是 `not_found_error`
+        // （以前这里手搓 `not_found`，与 proxy 的 404 不是同一个语义名）
+        let body = body_str(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body).expect("404 body is JSON");
+        assert_eq!(v["error"]["type"], "not_found_error");
+        assert!(!body.contains("id=\"root\""), "API paths must not get SPA");
     }
 
     /// 大资源：body 现在是**流式**转发（不再 collect 成 Bytes），本用例锁住"改流式没把

@@ -29,11 +29,9 @@ pub async fn admin_auth(
     if ok {
         return next.run(req).await;
     }
-    (
-        StatusCode::UNAUTHORIZED,
-        Json(json!({ "error": { "message": "invalid admin token", "type": "auth_error" } })),
-    )
-        .into_response()
+    // 统一走 openai::error_response：`type` 按状态码映射（401 → authentication_error），
+    // 与 proxy / 中间件产生的错误同一个语义表——自造 type 会让 SDK 无从判断重试行为。
+    crate::openai::error_response(StatusCode::UNAUTHORIZED, "invalid admin token")
 }
 
 /// 列出所有动态 key（不暴露明文；明文不落盘后无法显示真实前缀，用固定掩码）。
@@ -105,22 +103,17 @@ pub async fn create_key(
         .unwrap_or("unnamed")
         .to_string();
     if name.chars().count() > 64 {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": { "message": "name too long", "type": "invalid_request" } })),
-        )
-            .into_response();
+        return crate::openai::error_response(StatusCode::BAD_REQUEST, "name too long");
     }
     // argon2 哈希 + SQLite 写穿较重，移到阻塞线程池，避免卡 async worker
     let store = state.key_store.clone();
     let created = match tokio::task::spawn_blocking(move || store.create(name)).await {
         Ok(c) => c,
         Err(e) => {
-            return (
+            return crate::openai::error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": { "message": format!("key creation failed: {e}"), "type": "gateway_error" } })),
-            )
-                .into_response();
+                format!("key creation failed: {e}"),
+            );
         }
     };
     (
@@ -151,21 +144,16 @@ pub async fn delete_key(State(state): State<AppState>, Path(id): Path<String>) -
     let removed = match tokio::task::spawn_blocking(move || store.delete(&id)).await {
         Ok(r) => r,
         Err(e) => {
-            return (
+            return crate::openai::error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": { "message": format!("key deletion failed: {e}"), "type": "gateway_error" } })),
-            )
-                .into_response();
+                format!("key deletion failed: {e}"),
+            );
         }
     };
     if removed {
         StatusCode::NO_CONTENT.into_response()
     } else {
-        (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": { "message": "key not found", "type": "not_found" } })),
-        )
-            .into_response()
+        crate::openai::error_response(StatusCode::NOT_FOUND, "key not found")
     }
 }
 
@@ -213,6 +201,39 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        // `type` 必须来自 openai::error_response 的映射表（400 → invalid_request_error），
+        // 不能是本文件自造的 `invalid_request`（SDK 按 type 决定重试语义）
+        assert_eq!(
+            body_json(resp).await["error"]["type"],
+            "invalid_request_error"
+        );
+    }
+
+    /// `/admin/*` 的错误体必须与网关别处**同一个**格式：`error.type` 按状态码映射。
+    ///
+    /// 拆分前这里是自造的名字（`auth_error`），而 `proxy::error_response` 用的是
+    /// `authentication_error`——同一个网关两种错误语义，SDK 只能按其中一种判断。
+    #[tokio::test]
+    async fn admin_errors_use_the_openai_error_shape() {
+        use tower::ServiceExt;
+
+        let state = test_state(); // admin_token = Some("admin-token")
+        let resp = crate::http::app(state)
+            .oneshot(
+                axum::extract::Request::builder()
+                    .uri("/admin/keys")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body = body_json(resp).await;
+        assert_eq!(
+            body["error"]["type"], "authentication_error",
+            "admin 401 的 type 与 proxy 的 401 必须一致"
+        );
+        assert_eq!(body["error"]["message"], "invalid admin token");
     }
 
     #[tokio::test]
