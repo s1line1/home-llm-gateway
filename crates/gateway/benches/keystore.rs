@@ -5,7 +5,7 @@
 use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, Criterion};
-use gateway::keystore::KeyStore;
+use gateway::storage::KeyStore;
 
 fn bench_keystore(c: &mut Criterion) {
     let store = KeyStore::new(None);

@@ -24,10 +24,10 @@ use tracing::{debug, error, info, warn};
 
 use crate::gateway::Options;
 use crate::io_stall;
-use crate::keystore::KeyStore;
 use crate::metrics::Metrics;
 use crate::ratelimit::RateLimiter;
 use crate::registry::Registry;
+use crate::storage::KeyStore;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -608,7 +608,7 @@ mod tests {
     use super::*;
     use axum::http::{HeaderMap, HeaderValue};
 
-    use crate::{keystore::KeyStore, metrics::Metrics, registry::Registry};
+    use crate::{metrics::Metrics, registry::Registry, storage::KeyStore};
 
     fn test_state(ui: Option<PathBuf>) -> AppState {
         // 测试档位：只改这个文件真正关心的旋钮，其余取库默认（`Options::default()`）。

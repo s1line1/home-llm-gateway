@@ -7,7 +7,7 @@
 //!   `contains("usage")` 预过滤，命中才做行级 JSON 解析（99% chunk 零开销）。
 //! - 上游无 usage（如 mock 的 SSE、超时/断流被 Cancel）→ 估算并标记来源。
 //!
-//! 本模块只含**纯函数**（提取/估算，便于单测）；存储与累加在 keystore。
+//! 本模块只含**纯函数**（提取/估算，便于单测）；存储与累加在 storage。
 
 /// 从上游响应提取到的用量（精确来源，非估算）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

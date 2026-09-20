@@ -266,7 +266,7 @@
       `web/dist` 打进去，或在 compose 里挂载 `web/dist` 并把 `ui_dir` 指过去。
 - [ ] **结构化访问日志 JSONL（C 档，可选）**：tracing 文本日志给人看；如需审计
       "谁何时调了什么"可加 JSON 行落盘
-- [ ] **keys.db 迁移规模化**：当前自动迁移（`keystore.rs::migrate_legacy_keys`）同步执行、
+- [ ] **keys.db 迁移规模化**：当前自动迁移（`storage/mod.rs::migrate_legacy_keys`）同步执行、
       全量读入内存 + 单一大事务——仅适合小数据量 / 个人 / 小团队（适用边界见 DEPLOY.md §10）。
       改进：① **分批流式**：cursor 每批 ~500 条、小事务提交、内存有界（低成本，建议先做）；
       ② **独立离线迁移命令** `gateway migrate-keys`：维护窗口运行，运行时零负担，天然支持分批；
@@ -282,11 +282,11 @@
 
 | 环节 | 位置 | 事实 |
 |---|---|---|
-| 发号 | `keystore/hash.rs:116` | key 恒为 `sk-` + 24 随机字节（**192 位熵**）；`/admin/keys` 只收 `name`，**不存在"运维自己填 key"的入口**（`admin.rs:98`） |
-| 存储 | `keystore/mod.rs:374` | 同时存 `lookup = sha256(明文)`（O(1) 索引）与 `key_hash = argon2id(明文)`（PHC 串，`m=19456 KiB / t=2 / p=1`） |
-| 校验 | `keystore/mod.rs:350` → `hash.rs:94` | 按 sha256 索引命中记录后，**再跑一次 19 MiB 的 argon2id 校验**（在 `spawn_blocking` 里，`http_proxy.rs:81`） |
-| 缓存 | `keystore/verified.rs:55` | `(lookup, cred_version)` 命中即跳过校验；有 TTL 与上限（`verified_cache_max: 1650`） |
-| 单飞 | `keystore/verified.rs:57` | `inflight: HashMap<lookup, FlightSlot>`——**只对同一个 token 串行；不同 token 完全并行且无上界** |
+| 发号 | `storage/hash.rs:116` | key 恒为 `sk-` + 24 随机字节（**192 位熵**）；`/admin/keys` 只收 `name`，**不存在"运维自己填 key"的入口**（`admin.rs:98`） |
+| 存储 | `storage/mod.rs:374` | 同时存 `lookup = sha256(明文)`（O(1) 索引）与 `key_hash = argon2id(明文)`（PHC 串，`m=19456 KiB / t=2 / p=1`） |
+| 校验 | `storage/mod.rs:350` → `hash.rs:94` | 按 sha256 索引命中记录后，**再跑一次 19 MiB 的 argon2id 校验**（在 `spawn_blocking` 里，`http_proxy.rs:81`） |
+| 缓存 | `storage/verified.rs:55` | `(lookup, cred_version)` 命中即跳过校验；有 TTL 与上限（`verified_cache_max: 1650`） |
+| 单飞 | `storage/verified.rs:57` | `inflight: HashMap<lookup, FlightSlot>`——**只对同一个 token 串行；不同 token 完全并行且无上界** |
 
 ### 问题
 
@@ -387,7 +387,7 @@
 
 ### P1 — 正确性 / 健壮性
 
-- [ ] **usage 内存累加竞态（少报用量）**：`gateway/src/keystore/mod.rs:318-335` 在 map 无 cell 时
+- [ ] **usage 内存累加竞态（少报用量）**：`gateway/src/storage/mod.rs:318-335` 在 map 无 cell 时
       新建 `c` 再 `or_insert_with(|| c.clone())`，然后**返回本地 `c`**——若并发请求先插入成功，
       `or_insert_with` 保留的是别人的 cell，本次增量就记进了不在 map 里的孤儿 cell。
       后果：SQLite 的 `key_usage` 正确，但 `/admin/usage`、`/admin/keys` 的内存视图少报，
@@ -466,7 +466,7 @@
       （`ApiError.status` 就在手边）；`Agents.tsx:28` 硬编码 `agent_stale_secs` 的默认值 `15`；
       `registry.rs:124,151,158` 三处裸比较 `"*"`；`extract_model -> Result<String, ()>` 丢掉失败原因；
       `HeadOutcome::Error(u16, String)` 用裸状态码。
-- [ ] **死代码 / 死常量**：`KeyStore::authorize_id`（`keystore/mod.rs:210`）、`Metrics::request_count`
+- [ ] **死代码 / 死常量**：`KeyStore::authorize_id`（`storage/mod.rs:210`）、`Metrics::request_count`
       （`metrics.rs:98`）、`HISTORY_LEN` 被导出但 `useMetricsHistory.ts:41` 硬编码 `60`。
 
 ### 本次一并修掉的文档漂移（无需再动代码）

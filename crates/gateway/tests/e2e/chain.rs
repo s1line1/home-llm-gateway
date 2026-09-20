@@ -353,7 +353,7 @@ async fn e2e_upstream_never_receives_client_credentials() {
 async fn e2e_verified_cache_reuses_argon2_across_requests() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     let (gw, agent, base, key) = start_stack(4, |o| {
-        o.verified_cache_max = gateway::keystore::DEFAULT_VERIFIED_MAX;
+        o.verified_cache_max = gateway::storage::DEFAULT_VERIFIED_MAX;
     })
     .await;
     let client = reqwest::Client::new();
@@ -410,7 +410,7 @@ async fn e2e_verified_cache_reuses_argon2_across_requests() {
 async fn e2e_concurrent_cold_requests_hash_once() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     let (gw, agent, base, key) = start_stack(8, |o| {
-        o.verified_cache_max = gateway::keystore::DEFAULT_VERIFIED_MAX;
+        o.verified_cache_max = gateway::storage::DEFAULT_VERIFIED_MAX;
     })
     .await;
     let client = reqwest::Client::new();

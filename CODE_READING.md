@@ -75,7 +75,7 @@ crates/proto/src/headers.rs  逐跳头过滤（gateway/agent 共享）
 
 ```
 gateway/src/registry.rs    agent 注册表 + 模型过滤/精确优先排序 + SlotGuard 并发占位（admission control）
-gateway/src/keystore/       SQLite 存储 + argon2 哈希 + sha256 lookup 快速索引（+ hash.rs 哈希原语）
+gateway/src/storage/       SQLite 存储 + argon2 哈希 + sha256 lookup 快速索引（+ hash.rs 哈希原语）
 gateway/src/admin.rs        Admin API（key 管理 + agents 列表 + usage 查询）
 gateway/src/usage_meter.rs        per-key token 用量提取 / 无 usage 时估算（纯函数，由 http_proxy 调用）
 gateway/src/ratelimit.rs    令牌桶

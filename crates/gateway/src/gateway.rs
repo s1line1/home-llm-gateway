@@ -14,12 +14,11 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 use crate::{
     error::GatewayError,
-    http,
-    keystore::KeyStore,
-    listen,
+    http, listen,
     metrics::Metrics,
     nofile, quic,
     registry::Registry,
+    storage::KeyStore,
     tls::{self, TlsPem},
     usage_flush,
 };
@@ -99,7 +98,7 @@ pub struct Options {
     // ── 旋钮 ──
     /// 已验证身份缓存容量（0 = 关闭，每请求都跑 argon2 校验）。
     ///
-    /// 见 `keystore::verified` 的说明：argon2 每次占 19MiB 工作内存，缓存 + 单飞
+    /// 见 `storage::verified` 的说明：argon2 每次占 19MiB 工作内存，缓存 + 单飞
     /// 把它的成本从"每请求"降到"每(凭据版本)"，且不影响吊销即时性。
     pub verified_cache_max: usize,
     /// 单次请求转发空闲超时（逐帧）。语义是**逐帧空闲**而不是总时长，所以 SSE 长流

@@ -27,7 +27,7 @@
 //!   `runtime` 表消失 → 直接 miss → 401，与版本号无关。
 //! - 唯一的语义变化：**同一凭据在被缓存的这段时间内不再重算 argon2**。若将来新增
 //!   "改 key 但不 bump 版本"的写路径，缓存会静默失效——所以 `KeyStore` 里每次
-//!   凭据变更都必须走 [`crate::keystore::KeyStore`] 的版本自增（见 `bump`）。测试
+//!   凭据变更都必须走 [`crate::storage::KeyStore`] 的版本自增（见 `bump`）。测试
 //!   `credential_change_invalidates_for_immediately` 守住这条。
 
 use std::{

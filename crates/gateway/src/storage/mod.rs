@@ -37,7 +37,7 @@ use serde::Serialize;
 pub mod hash;
 pub mod verified;
 
-use crate::keystore::hash::{generate_id_key, hash_argon2, lookup_of, now_secs, verify_argon2};
+use crate::storage::hash::{generate_id_key, hash_argon2, lookup_of, now_secs, verify_argon2};
 
 #[derive(Clone)]
 pub struct KeyStore {
@@ -1091,7 +1091,7 @@ mod tests {
         let path = dir.path().join("keys.db");
         let hash = {
             // 用同一套 argon2 参数造一条"升级前"的记录（表里没有 cred_version 列）
-            let h = crate::keystore::hash::hash_argon2("sk-upgrade-secret");
+            let h = crate::storage::hash::hash_argon2("sk-upgrade-secret");
             let conn = Connection::open(&path).unwrap();
             conn.execute_batch(
                 "CREATE TABLE api_keys (
@@ -1109,7 +1109,7 @@ mod tests {
                  VALUES (?1, ?2, ?3, ?4, ?5, 1)",
                 rusqlite::params![
                     "old-id",
-                    crate::keystore::hash::lookup_of("sk-upgrade-secret"),
+                    crate::storage::hash::lookup_of("sk-upgrade-secret"),
                     h,
                     "old",
                     1700000000i64
@@ -1243,7 +1243,7 @@ mod tests {
 #[cfg(test)]
 mod verified_tests {
     use super::*;
-    use crate::keystore::hash::CheapArgon2;
+    use crate::storage::hash::CheapArgon2;
     use serial_test::serial;
     use std::sync::{Arc, Barrier};
 

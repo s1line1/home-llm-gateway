@@ -126,7 +126,7 @@ pub async fn wait_for_agents(gw: &Gateway, count: usize, timeout: Duration) {
 pub fn seed_keys_db() -> (PathBuf, String) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("keys.db");
-    let store = gateway::keystore::KeyStore::new(Some(path.clone()));
+    let store = gateway::storage::KeyStore::new(Some(path.clone()));
     let created = store.create("e2e".into());
     std::mem::forget(dir);
     (path, created.plaintext)

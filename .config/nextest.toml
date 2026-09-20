@@ -7,7 +7,7 @@
 #    所以在 nextest 下必须用**它自己的 test-group** 把它限成"一次只跑一条"。
 #    语义与原来的 `#[serial]` 等价；`#[serial]` 标记**保留不删**，因为 `cargo test` 仍然需要它们。
 #
-#    为什么只给 e2e 配 test-group：`src/` 里另有一批 `#[serial]`（keystore 单测），
+#    为什么只给 e2e 配 test-group：`src/` 里另有一批 `#[serial]`（storage 单测），
 #    它们的理由是"这些测试要读**进程级**的 argon2 调用计数器、会互相污染"——nextest
 #    每条测试一个进程，这个污染源天然消失（它们用 tempdir()，也不争抢固定路径/端口），
 #    所以不需要额外分组；并行反而更快。
