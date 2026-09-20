@@ -158,7 +158,7 @@
    `tunnel open timed out` 累计 9345 次）。分类计数暴露为
    `hlmg_tunnel_open_timeouts_total{class="busy"|"dead"}`。
 
-   **已验证身份缓存**（`gateway/src/keystore/verified.rs`，配置项 `verified_cache_max`，默认 1650）：
+   **已验证身份缓存**（`gateway/src/storage/verified.rs`，配置项 `verified_cache_max`，默认 1650）：
 
    动因是 argon2 的内存硬特性——`Argon2::default()` 为 `m=19456 KiB`（19MiB），**每次校验都分配 19MiB 且随并发线性叠加**，所以"每请求校验一次"的网关内存等于 `在途请求数 × 19MiB`（实测 40 并发放大到约 760MB，云机上直接 OOM）。
 
@@ -245,7 +245,7 @@
 
 ### 11.2 阶段 1：单实例优化（小团队，几十并发）
 
-- key 校验改为"先哈希定位、再恒定时间比较"，避免全表遍历 ✅ 已实施（`sha256(token)` lookup 索引 + argon2 校验，见 `gateway/src/keystore/`；恒定时间比较落在 admin token 上）
+- key 校验改为"先哈希定位、再恒定时间比较"，避免全表遍历 ✅ 已实施（`sha256(token)` lookup 索引 + argon2 校验，见 `gateway/src/storage/`；恒定时间比较落在 admin token 上）
 - SQLite 写操作（create/revoke）挪到 `spawn_blocking`，不阻塞 async runtime ✅ 已实施（OPTIMIZATION.md C2；keystore argon2/落库走阻塞线程池）
 - QUIC 流上限调优：`max_concurrent_bidi_streams` 默认 100，高并发流场景上调 ✅ 已实施（网关侧调到 1000，见 `gateway/src/tls.rs`）
 - 慢上游排队：agent 满时先排队（带超时）而非直接 429

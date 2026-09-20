@@ -20,8 +20,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, warn};
 
 use crate::http::AppState;
-use crate::keystore::UsageDelta;
 use crate::registry::AcquireError;
+use crate::storage::UsageDelta;
 
 static NEXT_REQUEST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
@@ -649,7 +649,7 @@ async fn read_head(recv: &mut s2n_quic::stream::ReceiveStream) -> anyhow::Result
 /// 请求级 usage 收集：SSE 流式逐块预过滤提取；非流式缓冲到 End 后整包解析；
 /// 均拿不到 usage（上游未提供 / 取消 / 断流）→ 估算并标记。
 struct UsageCollector {
-    key_store: crate::keystore::KeyStore,
+    key_store: crate::storage::KeyStore,
     key_id: String,
     key_name: String,
     /// 请求 body 的 prompt 估算（无 usage 时的 prompt 降级）。
@@ -668,7 +668,7 @@ struct UsageCollector {
 
 impl UsageCollector {
     fn new(
-        key_store: crate::keystore::KeyStore,
+        key_store: crate::storage::KeyStore,
         key_id: String,
         key_name: String,
         prompt_est: u64,
@@ -799,7 +799,7 @@ async fn forward_body(
     op_timeout: Duration,
     _slot: crate::registry::SlotGuard,
     metrics: crate::metrics::Metrics,
-    key_store: crate::keystore::KeyStore,
+    key_store: crate::storage::KeyStore,
     key_id: String,
     key_name: String,
     prompt_est: u64,

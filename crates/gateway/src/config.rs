@@ -5,7 +5,7 @@ use std::{net::SocketAddr, path::PathBuf, time::Duration};
 use anyhow::Context;
 use serde::Deserialize;
 
-use crate::{keystore::KeyStore, GatewayConfig, Options, TlsPem, TunnelTls};
+use crate::{storage::KeyStore, GatewayConfig, Options, TlsPem, TunnelTls};
 
 /// YAML 配置文件结构。所有字段均有默认值；`cert`/`key`/`ca` 必须显式提供。
 #[derive(Debug, Deserialize)]

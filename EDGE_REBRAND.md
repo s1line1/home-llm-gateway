@@ -33,7 +33,7 @@
 | `crates/gateway/src/registry.rs:1` | "家端 agent 注册表" → "edge-agent 注册表" |
 | `crates/gateway/src/quic.rs:1` | "接受家端 agent 连接" → "接受 edge-agent 连接" |
 | `crates/gateway/src/tls.rs:15` | "校验家端 agent 的客户端证书" → "校验 edge-agent" |
-| `crates/gateway/src/keystore/mod.rs:14` | "家庭网关低 QPS 下" → "edge 网关低 QPS 下" |
+| `crates/gateway/src/storage/mod.rs:14` | "家庭网关低 QPS 下" → "edge 网关低 QPS 下" |
 | `crates/agent/src/config.rs:52` | `default_agent_id()` 返回 `home-agent-1` → `edge-1`（**仅默认值**；已有配置不受影响） |
 
 ### 第三层：Web UI 文案（需重建 web/dist）
