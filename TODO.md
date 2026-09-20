@@ -459,9 +459,11 @@
       认证 + 限流。现在两条路径（`/v1/{*rest}` 与 `/v1/models`）都走 `auth::authenticate`，
       401/429 的文案与顺序只存在一处：`auth.rs`。另一半未修：`Accept: text/html` 探测
       仍复制两份（`http.rs:103-107` 与 `:197-201`）。
-- [ ] **`UsageCollector` 位置与自我声明矛盾**：110 行、有状态的它住在 `proxy/mod.rs:292-395`，
-      而 `usage_meter.rs:10` 自称"只含纯函数"，OPTIMIZATION S1 又把 proxy 限定为"代理转发"——
-      二选一：搬去 `usage_meter.rs`，或改掉那句注释。
+- [x] **`UsageCollector` 位置与自我声明矛盾（2026-09 已修）**：它原先是"有状态的状态机住在
+      `proxy/mod.rs`"，与 `usage_meter.rs` 自称"只含纯函数"、OPTIMIZATION S1 把 proxy 限定为
+      "代理转发"三方矛盾。**两个选项都没选**：它没有搬进 `usage_meter.rs`（那会让"纯函数"
+      那一格也不再成立），而是独立成 `proxy/usage.rs`——策略（何时提取/估算/结算）自己一格，
+      纯函数在 `usage_meter`，落库在 `storage`，`proxy/mod.rs` 只剩转发编排。
 - [ ] **前端四份独立 `/metrics` 轮询**：`Layout.tsx:24`、`Overview.tsx:9`、`MetricsPage.tsx:10`、
       `Agents.tsx:61` 各实例化一个 `useMetricsHistory()`（各自 5s 轮询、各自一份历史）。抽 context 共享。
 - [ ] **小体积/常量类**：`Agents.tsx:72` 用 `error.message.includes("404")` 嗅探状态码
