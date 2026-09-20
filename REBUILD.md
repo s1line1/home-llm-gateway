@@ -158,12 +158,12 @@ pub struct FrameReader<R> {
 2. **唯一的 await 必须是可取消安全的 `AsyncReadExt::read`**（tokio 保证落败 = 未读到任何数据）；
 3. 解析逻辑（`take_frame`）**全程不 await**；
 4. **不对外暴露基于 `read_exact` 的读帧函数**。现有项目保留了 `read_frame`（`proto/io.rs:32-55`）
-   并在注释里写"不可安全取消"，但仍在网关三处配合 `timeout` 使用（`http_proxy.rs:194/262/416`）——
+   并在注释里写"不可安全取消"，但仍在网关三处配合 `timeout` 使用（`proxy/mod.rs:194/262/416`）——
    那是**脆弱的巧合**：超时后立刻放弃整条请求才没出事，谁加一次重试就复现原 bug。新代码应让
    这类 API 不存在，而不是靠注释警告。
 5. **流即会话可断言**：每条请求流的首帧必须是 `ProxyRequest`，其后所有帧的 `request_id`
    必须等于该流的值。不符即错（可日志、可告警、可测）。现有项目把 `request_id` 在读响应时
-   全用 `..` 丢弃（`http_proxy.rs:418/431/444`），这个不变量完全没有护栏。
+   全用 `..` 丢弃（`proxy/mod.rs:418/431/444`），这个不变量完全没有护栏。
 
 ### 3.3 取消安全（规格 + 测试范式）
 
@@ -230,7 +230,7 @@ pub struct FrameReader<R> {
 
 - 帧的 body/chunk 字段**从第一天就用 `Bytes`**，不用 `Vec<u8>`；
 - 解出载荷后用 `buf.split_to(n)` 切分，而不是 `to_vec()` 再让反序列化分配一次；
-- 现有项目 `Bytes::from(chunk.clone())`（`http_proxy.rs:419`）是**纯浪费**——
+- 现有项目 `Bytes::from(chunk.clone())`（`proxy/mod.rs:419`）是**纯浪费**——
   `chunk` 已是解构出的所有权值，直接 `Bytes::from(chunk)` 即可
   （注意别破坏后面 `usage.observe(&chunk)` 的顺序）；
 - agent 侧 `bytes.to_vec()`（从 reqwest 的 `Bytes` 拷进 `Vec`）同样可免。
@@ -409,7 +409,7 @@ quinn 的名字抄进来**：s2n-quic 全在 `Limits` 上用 `with_*` setter，�
 | 进程 SIGTERM | 先停 accept → 排空窗口 → 再退（§6-R12） |
 
 > ⚠️ **现有实现的反面案例（真实并发正确性缺口）**：
-> `forward_body` **只在 `tx.send()` 失败时**才发现客户端断开（`http_proxy.rs:419`）。
+> `forward_body` **只在 `tx.send()` 失败时**才发现客户端断开（`proxy/mod.rs:419`）。
 > 若客户端断开后上游恰好**不再产出任何 chunk**（LLM 正在"思考"、首 token 之前的静默期），
 > 任务阻塞在 `read_frame(recv)` 上，`tx.send` 永不被调用 →
 > **该请求的 agent 槽位要等到 `idle_timeout`（默认 120 s）超时才释放，`Cancel` 帧也不会发出**。
@@ -499,14 +499,14 @@ quinn 的名字抄进来**：s2n-quic 全在 `Limits` 上用 `with_*` setter，�
 |---|---|---|---|
 | **R1** | 帧头固定且自描述：`[len][version][kind][request_id][payload]`，`kind` 用**显式 discriminant** | 类型 tag 藏在 postcard 载荷里，变体序号即线格式（`frame.rs:6-43`） | 每种帧的 **golden bytes** 断言；加一个"打乱变体声明顺序"仍能通过编码测试 |
 | **R2** | 读前校验长度再分配；上限按帧类型分设、可协商 | `MAX_FRAME=64 MiB` 硬编码；声明 64 MiB 前缀即申请 67 MB（`io.rs:11,50`） | 计数型分配器断言：敌意前缀下分配量为 O(1) 字节 |
-| **R3** | 唯一读路径可取消安全；不存在 `read_exact` 包装的公开读帧 API | `read_frame` 不可取消却仍在 `timeout` 中使用（`io.rs:32`, `http_proxy.rs:194/262/416`） | `DribbleReader` + `select!{biased}` 范式（`io.rs:331-355`）；API 层面审查 |
+| **R3** | 唯一读路径可取消安全；不存在 `read_exact` 包装的公开读帧 API | `read_frame` 不可取消却仍在 `timeout` 中使用（`io.rs:32`, `proxy/mod.rs:194/262/416`） | `DribbleReader` + `select!{biased}` 范式（`io.rs:331-355`）；API 层面审查 |
 | **R4** | EOF 四格分明：帧边界 / 载荷中途 / **头部中途** / 超上限 | 头部 1–3 字节截断被误判为正常关闭（`io.rs:37-41`），且注释谎称与 `FrameReader` 一致 | 四格各一条断言 |
 | **R5** | 解码/方向/`request_id` 错误 → **只 reset 该流**，不摘连接 | 控制面 `?` 直接退出循环 → 整台 edge 被摘除（`quic.rs:63` + `46-48`），且被 e2e 固化为期望 | e2e：发坏帧后该 agent 仍在册、其他请求正常 |
-| **R6** | "流即会话"可断言：首帧必须 `ProxyRequest`，后续帧 `request_id` 一致 | `request_id` 被 `..` 丢弃（`http_proxy.rs:418/431/444`），无断言无日志 | 不一致时错误可观测 + 该流被 reset |
+| **R6** | "流即会话"可断言：首帧必须 `ProxyRequest`，后续帧 `request_id` 一致 | `request_id` 被 `..` 丢弃（`proxy/mod.rs:418/431/444`），无断言无日志 | 不一致时错误可观测 + 该流被 reset |
 | **R7** | 计数一律 RAII 释放，且票据绑到**响应 body** 生命周期 | ✅ 已做对（`metrics.rs:203`, `registry.rs:196`, `http.rs:312`）——**照搬** | e2e：客户端中断 + **上游静默**场景下，槽位须在秒级归零（现有实现会拖到 120 s，见 §4.7） |
 | **R8** | 原子占位用 CAS，无 check-then-act | ✅ 已做对（`registry.rs:170`, `metrics.rs:57`）——**照搬**；HTTP 侧有良性误拒窗口 | 并发 N 请求恰好 limit 通过、零误拒 |
-| **R9** | 背压端到端有界，且**按字节**而非按条数 | 通道 `mpsc(32)` 条数有界、字节无界（`http_proxy.rs:221`） | 慢客户端压测下进程 RSS 有上界 |
-| **R10** | 超时矩阵完整，区分"空闲"与"总时长"；取消**即时**传播 | 无总时长上限；无 TLS 握手/`open_bi`/写帧/控制流超时；取消可延迟 120 s（`http_proxy.rs:419`） | 静默上游的取消在秒级释放槽位，而非等 `idle_timeout` |
+| **R9** | 背压端到端有界，且**按字节**而非按条数 | 通道 `mpsc(32)` 条数有界、字节无界（`proxy/mod.rs:221`） | 慢客户端压测下进程 RSS 有上界 |
+| **R10** | 超时矩阵完整，区分"空闲"与"总时长"；取消**即时**传播 | 无总时长上限；无 TLS 握手/`open_bi`/写帧/控制流超时；取消可延迟 120 s（`proxy/mod.rs:419`） | 静默上游的取消在秒级释放槽位，而非等 `idle_timeout` |
 | **R11** | 可归因性：日志/指标带 `request_id` + **`agent_id`** + `model`；429 分源；延迟有分位数 | 无 `agent_id`（结构体无此字段）；429 三源合一；只有求和值；`hlmg_agents` 语义错误 | 从 `/metrics` 能区分三种 429；从日志能回答"路由到哪个 edge" |
 | **R12** | 生命周期与运维：drain 式关闭；healthz 豁免闸门；`agent_id` 全局唯一 | SIGTERM 只 abort 2 个监听任务（`lib.rs:157-161`）；healthz 过闸门；默认 `agent_id` 会撞车 | SIGTERM 下在途流收到明确错误事件而非硬切；两进程读同一份配置能共存 |
 

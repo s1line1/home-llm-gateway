@@ -141,11 +141,11 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/models", get(models_route))
         .route(
             "/v1/{*rest}",
-            get(crate::http_proxy::proxy)
-                .post(crate::http_proxy::proxy)
-                .put(crate::http_proxy::proxy)
-                .delete(crate::http_proxy::proxy)
-                .patch(crate::http_proxy::proxy),
+            get(crate::proxy::proxy)
+                .post(crate::proxy::proxy)
+                .put(crate::proxy::proxy)
+                .delete(crate::proxy::proxy)
+                .patch(crate::proxy::proxy),
         );
     if state.admin_token.is_some() {
         let admin = Router::new()
@@ -179,9 +179,9 @@ pub fn app(state: AppState) -> Router {
         }
     }
     router
-        // 上限常量与 `http_proxy` 手动读 body 时用的**是同一个**（那边要自己判，因为
+        // 上限常量与 `proxy` 手动读 body 时用的**是同一个**（那边要自己判，因为
         // 改成手动逐块读之后提取器层的限制不再生效）。
-        .layer(DefaultBodyLimit::max(crate::http_proxy::MAX_REQUEST_BODY))
+        .layer(DefaultBodyLimit::max(crate::proxy::MAX_REQUEST_BODY))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             metrics_middleware,
@@ -364,7 +364,7 @@ async fn healthz() -> &'static str {
 /// （`["*"]` 全匹配的 agent 不贡献条目——它接受任意请求，但具体能跑什么
 /// 只有上游知道，列出会误导客户端）。与代理入口同级的认证 + 限流。
 async fn models_route(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Some(rejection) = crate::http_proxy::auth_and_rate_limit(&state, &headers).await {
+    if let Some(rejection) = crate::proxy::auth_and_rate_limit(&state, &headers).await {
         return rejection;
     }
     let data: Vec<_> = state
@@ -450,7 +450,7 @@ async fn metrics_middleware(
     let limit = state.max_concurrent_requests;
     let Some(admission) = state.metrics.try_enter(limit) else {
         state.metrics.record_rejected(429);
-        let mut resp = crate::http_proxy::error_response(
+        let mut resp = crate::proxy::error_response(
             axum::http::StatusCode::TOO_MANY_REQUESTS,
             "too many concurrent requests, retry later",
         );

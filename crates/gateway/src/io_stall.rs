@@ -7,7 +7,7 @@
 //! 恒定 8、`hlmg_request_count − Σ状态码 = 8`，配了 `max_concurrent_requests` 的网关被
 //! 只增不减地吃掉闸门，只能重启恢复。
 //!
-//! 应用层的"响应体停滞超时"（`http_proxy::send_to_client`）**修不掉这一半**：它只能让
+//! 应用层的"响应体停滞超时"（`proxy::send_to_client`）**修不掉这一半**：它只能让
 //! *我们自己的任务* 不再 park；数据已经在 hyper 的缓冲与 socket 缓冲里，hyper 不解开写阻塞，
 //! body 就不会被 drop。所以必须在 IO 层给写方向设上限。
 //!
@@ -27,7 +27,7 @@ use std::{
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// 写方向停滞超时包装器。读方向**不**包装：请求头读取由 hyper 的 `header_read_timeout`
-/// 负责，请求体读取由 `http_proxy::read_body_with_stall` 负责。
+/// 负责，请求体读取由 `proxy::read_body_with_stall` 负责。
 pub struct WriteStall<S> {
     inner: S,
     stall: Duration,

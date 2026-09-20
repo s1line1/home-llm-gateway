@@ -58,7 +58,7 @@ crates/proto/src/headers.rs  逐跳头过滤（gateway/agent 共享）
    配置加载（config.rs）→ Gateway::start 组装（HTTP + QUIC + keystore + registry + 优雅关闭）
 ② gateway/src/http.rs
    路由、中间件、SPA fallback（/v1/* 怎么进到 proxy）
-③ gateway/src/http_proxy.rs            ★ 最重要
+③ gateway/src/proxy/mod.rs            ★ 最重要
    认证 → 限流 → 最少负载选 agent → open_bi 开流 → 发 ProxyRequest → 流式回写
 ④ gateway/src/quic.rs
    服务端：accept_loop、Register / Heartbeat 控制流
@@ -77,7 +77,7 @@ crates/proto/src/headers.rs  逐跳头过滤（gateway/agent 共享）
 gateway/src/registry.rs    agent 注册表 + 模型过滤/精确优先排序 + SlotGuard 并发占位（admission control）
 gateway/src/storage/       SQLite 存储 + argon2 哈希 + sha256 lookup 快速索引（+ hash.rs 哈希原语）
 gateway/src/admin.rs        Admin API（key 管理 + agents 列表 + usage 查询）
-gateway/src/usage_meter.rs        per-key token 用量提取 / 无 usage 时估算（纯函数，由 http_proxy 调用）
+gateway/src/usage_meter.rs        per-key token 用量提取 / 无 usage 时估算（纯函数，由 proxy 调用）
 gateway/src/ratelimit.rs    令牌桶
 gateway/src/metrics.rs      Prometheus 指标（HTTP 层 + 隧道层）
 gateway/src/error.rs        GatewayError（thiserror；anyhow 只留 main.rs）
@@ -119,7 +119,7 @@ web/src/components/   ← 布局/图表/UI（无依赖 SVG 图表）
 
 | 文件 | 为什么先读它 |
 |---|---|
-| `crates/gateway/src/http_proxy.rs` | 全链路的心脏（认证 → 路由 → 隧道） |
+| `crates/gateway/src/proxy/mod.rs` | 全链路的心脏（认证 → 路由 → 隧道） |
 | `crates/gateway/src/registry.rs` 的 `try_acquire` | 并发控制精髓（SlotGuard RAII 自动归还） |
 | `crates/agent/src/lib.rs` 的 `handle_stream` | 转发 + Cancel 的 `select!` 竞速 |
 | `crates/proto/src/frame.rs` | 两端通信的契约 |

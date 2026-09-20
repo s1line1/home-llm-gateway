@@ -274,7 +274,7 @@ impl Gateway {
         ));
 
         // ⑤ 起任务。入列顺序有意义：用量 flusher 必须在 serve 任务之前就位（它按周期
-        //    批量写库，见 `http_proxy::UsageCollector::finish`；关闭时由 `shutdown` 补最后一刀）。
+        //    批量写库，见 `proxy::UsageCollector::finish`；关闭时由 `shutdown` 补最后一刀）。
         let tasks = vec![
             usage_flush::spawn(key_store.clone()),
             http::spawn_entry(sockets.http, app, https, opts.client_stall),

@@ -95,7 +95,7 @@ impl Metrics {
     }
 
     /// 记录被 admission 拒绝的请求（不计 active/耗时，但计入请求数与状态码分布）。
-    /// 记录一次"无可路由 agent"的拒绝及其原因（原因常量见 `http_proxy` 的调用点）。
+    /// 记录一次"无可路由 agent"的拒绝及其原因（原因常量见 `proxy` 的调用点）。
     pub fn record_agent_rejection(&self, reason: &'static str) {
         *self
             .inner

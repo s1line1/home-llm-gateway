@@ -30,7 +30,7 @@
       Claude Code（`ANTHROPIC_BASE_URL` 或 router）的配置示例与模型名约定
 - [x] **OpenAI 兼容错误语义标准化（2026-09 实施）**：对照 OpenAI 协议修补三处，
       SDK/工具按 error.type 与 Retry-After 决定重试行为：
-      1. **error.type 按状态码映射**（`http_proxy::error_response`）：400→
+      1. **error.type 按状态码映射**（`proxy::error_response`）：400→
          `invalid_request_error`、401→`authentication_error`、403→`permission_error`、
          404→`not_found_error`、409→`conflict_error`、429→`rate_limit_error`、
          5xx→`server_error`、其余→`api_error`
@@ -93,10 +93,10 @@
       **原因分两层（写清楚，避免以后两半混着读）**：
         · **链路层（代码解决不了）**：出口 ≈0.40 MB/s，超出的字节必然来不及时 → 只能调带宽
           或减少字节（别整包回吐、压缩、把大请求拆小）。
-        · **网关行为层（代码能解决）**：响应头超时**被当成"隧道已死"**——`http_proxy.rs:530`
+        · **网关行为层（代码能解决）**：响应头超时**被当成"隧道已死"**——`proxy/mod.rs:530`
           的 head 超时分支**无条件**调 `registry.evict()`；而摘除计数与开流超时**共用**
           （`registry.rs:148` 的 `TUNNEL_TIMEOUTS_BEFORE_EVICT = 3`），且**只在收到响应头时清零**
-          （`registry.rs:151` 的 `note_tunnel_op_ok`，唯一调用点 `http_proxy.rs:507` 的
+          （`registry.rs:151` 的 `note_tunnel_op_ok`，唯一调用点 `proxy/mod.rs:507` 的
           `HeadOutcome::Head` 分支）。链路饱和时"一个响应头都收不到" → 计数必然涨到 3 →
           摘除 + 关连接 → 重连期间注册表为空 → **全量 503**。**这条放大是行为问题，不是链路的
           必然结果。**
@@ -284,7 +284,7 @@
 |---|---|---|
 | 发号 | `storage/hash.rs:116` | key 恒为 `sk-` + 24 随机字节（**192 位熵**）；`/admin/keys` 只收 `name`，**不存在"运维自己填 key"的入口**（`admin.rs:98`） |
 | 存储 | `storage/mod.rs:374` | 同时存 `lookup = sha256(明文)`（O(1) 索引）与 `key_hash = argon2id(明文)`（PHC 串，`m=19456 KiB / t=2 / p=1`） |
-| 校验 | `storage/mod.rs:350` → `hash.rs:94` | 按 sha256 索引命中记录后，**再跑一次 19 MiB 的 argon2id 校验**（在 `spawn_blocking` 里，`http_proxy.rs:81`） |
+| 校验 | `storage/mod.rs:350` → `hash.rs:94` | 按 sha256 索引命中记录后，**再跑一次 19 MiB 的 argon2id 校验**（在 `spawn_blocking` 里，`proxy/mod.rs:81`） |
 | 缓存 | `storage/verified.rs:55` | `(lookup, cred_version)` 命中即跳过校验；有 TTL 与上限（`verified_cache_max: 1650`） |
 | 单飞 | `storage/verified.rs:57` | `inflight: HashMap<lookup, FlightSlot>`——**只对同一个 token 串行；不同 token 完全并行且无上界** |
 
@@ -422,16 +422,16 @@
 
 ### P2 — 契约 / 一致性
 
-- [ ] **`error.type` 分叉**：`http_proxy::error_response` 自我声明是 OpenAI 错误格式的唯一来源
-      （`http_proxy.rs:27-29`），但 `admin.rs:34/110/121/156/166` 与 `http.rs:117` 手搓了 5 种
+- [ ] **`error.type` 分叉**：`proxy::error_response` 自我声明是 OpenAI 错误格式的唯一来源
+      （`proxy/mod.rs:27-29`），但 `admin.rs:34/110/121/156/166` 与 `http.rs:117` 手搓了 5 种
       不一致的 type（`auth_error` / `invalid_request` / `gateway_error` / `not_found`）。
       修法：admin 与 UI fallback 也走同一个构造器/映射表。
-- [ ] **`x-request-id` 只在 `req-<u64>` 形状下才等于隧道 `request_id`**：`http_proxy.rs:168-173`
+- [ ] **`x-request-id` 只在 `req-<u64>` 形状下才等于隧道 `request_id`**：`proxy/mod.rs:168-173`
       只认 `strip_prefix("req-")`，其他形状（Codex/DSH 发的是 UUID 形态）回落到**第二个**静态计数器
-      （`http_proxy.rs:25`，与 `http.rs:320` 的计数器都从 1 开始）→ 数值撞车；P0 宣称的
+      （`proxy/mod.rs:25`，与 `http.rs:320` 的计数器都从 1 开始）→ 数值撞车；P0 宣称的
       "HTTP 层 / 隧道帧 / 日志三方对账一致"在真实客户端上并不成立。修法：统一 id 生成器，
       客户端 id 原样进隧道（改名叫 trace id）或帧内改用字符串。
-- [ ] **`extract_model` 卡住非 chat 的 `/v1/*`**：`http_proxy.rs:142-147` 对 `http.rs:46-53`
+- [ ] **`extract_model` 卡住非 chat 的 `/v1/*`**：`proxy/mod.rs:142-147` 对 `http.rs:46-53`
       catch-all 注册的**所有方法与路径**都要求 body 是带 `model` 的 JSON → `GET /v1/files`、
       `DELETE /v1/files/{id}`、multipart（`/v1/audio/transcriptions`）现在一律 400，
       与 DESIGN §5.1"一律透传"冲突。修法：按路径/方法白名单要求 model（chat/completions、
@@ -455,10 +455,10 @@
       23 处 `CertificateParams::default()` 的 PKI 脚手架（`agent/src/lib.rs:326-366`、
       `gateway/src/tls.rs:75-109`、`gateway/src/main.rs:76-100`、`agent/src/main.rs:75-99`、
       `registry.rs:212-255`、`quic.rs:103-125`）。抽一个共享 fixture。
-- [ ] **重复逻辑**：`proxy` 内联了 `auth_and_rate_limit` 已封装的认证 + 限流（`http_proxy.rs:133-140`）；
+- [ ] **重复逻辑**：`proxy` 内联了 `auth_and_rate_limit` 已封装的认证 + 限流（`proxy/mod.rs:133-140`）；
       `Accept: text/html` 探测复制两份（`http.rs:103-107` 与 `:197-201`）。
-- [ ] **`UsageCollector` 位置与自我声明矛盾**：110 行、有状态的它住在 `http_proxy.rs:292-395`，
-      而 `usage_meter.rs:10` 自称"只含纯函数"，OPTIMIZATION S1 又把 http_proxy 限定为"代理转发"——
+- [ ] **`UsageCollector` 位置与自我声明矛盾**：110 行、有状态的它住在 `proxy/mod.rs:292-395`，
+      而 `usage_meter.rs:10` 自称"只含纯函数"，OPTIMIZATION S1 又把 proxy 限定为"代理转发"——
       二选一：搬去 `usage_meter.rs`，或改掉那句注释。
 - [ ] **前端四份独立 `/metrics` 轮询**：`Layout.tsx:24`、`Overview.tsx:9`、`MetricsPage.tsx:10`、
       `Agents.tsx:61` 各实例化一个 `useMetricsHistory()`（各自 5s 轮询、各自一份历史）。抽 context 共享。
@@ -543,7 +543,7 @@
 - [ ] **R8 原子占位改 CAS**：`Admission::try_enter` 仍是 `fetch_add` 后回滚
       （`crates/gateway/src/metrics.rs:83-92`），并发下存在"双双误拒"窗口。
 - [ ] **R9 背压按字节有界**：回写客户端的通道仍是 `mpsc::channel(32)`，**按条数**有界
-      （`crates/gateway/src/http_proxy.rs:566`）——大帧场景下"32 条"不等于"字节有界"。
+      （`crates/gateway/src/proxy/mod.rs:566`）——大帧场景下"32 条"不等于"字节有界"。
       相关的"响应体内存缓冲上限"见上文 P1。
 - [ ] **R10 总时长上限**：`timeout_secs`（120s）是响应体**逐帧空闲**超时，没有整请求总时限
       （`DESIGN.md` §5 自认）。SSE 长流不能被总时限误杀，动之前要先把语义想清楚。
