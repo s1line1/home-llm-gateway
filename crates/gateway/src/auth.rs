@@ -13,8 +13,8 @@ use axum::{
     response::Response,
 };
 
-use crate::http::AppState;
 use crate::openai::error_response;
+use crate::state::AppState;
 use tracing::warn;
 
 /// 已通过认证的调用方身份。

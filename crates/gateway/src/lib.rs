@@ -18,6 +18,7 @@ pub mod proxy;
 pub mod quic;
 pub mod ratelimit;
 pub mod registry;
+pub mod state;
 pub mod storage;
 pub mod tls;
 pub mod ui;

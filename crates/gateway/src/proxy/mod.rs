@@ -18,9 +18,9 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, warn};
 
 use crate::auth::authenticate;
-use crate::http::AppState;
 use crate::openai::error_response;
 use crate::registry::AcquireError;
+use crate::state::AppState;
 use crate::storage::UsageDelta;
 
 static NEXT_REQUEST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
