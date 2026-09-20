@@ -68,9 +68,9 @@ pub fn app(state: AppState) -> Router {
         }
     }
     router
-        // 上限常量与 `proxy` 手动读 body 时用的**是同一个**（那边要自己判，因为
+        // 上限常量与 `body::read_body_with_stall` 手动读 body 时用的**是同一个**（那边要自己判，因为
         // 改成手动逐块读之后提取器层的限制不再生效）。
-        .layer(DefaultBodyLimit::max(crate::proxy::MAX_REQUEST_BODY))
+        .layer(DefaultBodyLimit::max(crate::body::MAX_REQUEST_BODY))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             metrics_middleware,
