@@ -29,7 +29,7 @@ async fn e2e_startup_raises_the_nofile_soft_limit_in_the_real_process() {
     let lowered = target > 1024 && rlimit::setrlimit(rlimit::Resource::NOFILE, 1024, hard).is_ok();
     let soft_before = rlimit::getrlimit(rlimit::Resource::NOFILE).unwrap().0;
 
-    let (gw, agent, _base, _key) = start_stack(Duration::from_secs(10), 0, 4, None).await;
+    let (gw, agent, _base, _key) = start_stack(4, |_| {}).await;
 
     // ① 网关自己报告的结论（必须与启动日志一致）
     let outcome = gw.nofile.outcome();
@@ -69,4 +69,58 @@ async fn e2e_startup_raises_the_nofile_soft_limit_in_the_real_process() {
 
     // 收尾：还原进来时的 soft，避免影响同一二进制里的其他用例
     let _ = rlimit::setrlimit(rlimit::Resource::NOFILE, original_soft, hard);
+}
+
+/// 规格：**启动失败不许改动进程级状态**。
+///
+/// `Gateway::start` 的顺序是"先构建 TLS 材料（纯校验，注定失败时在碰任何资源之前就返回），
+/// 再 `nofile::install()`"。所以一次失败的启动不该抬 NOFILE。
+///
+/// 为什么值得一条测试：这条顺序**只能**靠测试钉住——把 `start` 里那两行对调，编译、
+/// clippy 与其余用例全都照样通过（`Gateway.nofile` 字段只保证 `install()` 被调用过，
+/// 不保证它发生在校验之后）。而副作用是有后果的：`deploy/gateway.service` 是
+/// `Restart=always`，配置写错时会反复重试，每次都去改一遍进程的 fd 额度。
+///
+/// 断言口径与上一条相同：直接读**进程自己**的限额，不信自家日志或返回值。
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_failed_start_leaves_the_process_nofile_limit_untouched() {
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+
+    let (original_soft, hard) = rlimit::getrlimit(rlimit::Resource::NOFILE).unwrap();
+    // 把 soft 压到 1024（复现 systemd 未设 LimitNOFILE 时的默认），这样"有没有被抬过"
+    // 才是可观测的；环境不允许改限额时**跳过**而不是假通过。
+    if hard < 1024 || rlimit::setrlimit(rlimit::Resource::NOFILE, 1024, hard).is_err() {
+        eprintln!("skipped: 本环境不允许把 NOFILE soft 压到 1024");
+        return;
+    }
+    let soft_before = rlimit::getrlimit(rlimit::Resource::NOFILE).unwrap().0;
+
+    // 隧道材料合法、只有 HTTPS 材料是垃圾 → 失败点必然在 TLS 构建阶段，早于 install()
+    let (ca, server_cert, server_key, _client_cert, _client_key) = gen_certs();
+    let result = Gateway::start(GatewayConfig {
+        tunnel: TunnelTls {
+            ca_cert: vec![ca],
+            server_cert: vec![server_cert],
+            server_key,
+        },
+        opts: Options {
+            https: Some(TlsPem {
+                cert: b"not a pem".to_vec(),
+                key: b"not a key".to_vec(),
+            }),
+            ..Options::default()
+        },
+    })
+    .await;
+
+    let soft_after = rlimit::getrlimit(rlimit::Resource::NOFILE).unwrap().0;
+    let _ = rlimit::setrlimit(rlimit::Resource::NOFILE, original_soft, hard);
+
+    assert!(result.is_err(), "垃圾 HTTPS 材料必须让启动失败");
+    assert_eq!(
+        soft_after, soft_before,
+        "启动失败不该改动进程的 NOFILE —— 这正是把纯校验排在副作用之前的目的"
+    );
 }

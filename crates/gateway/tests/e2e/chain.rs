@@ -6,7 +6,7 @@ use super::common::*;
 #[serial]
 async fn e2e_chain_with_mock_llm() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
-    let (gw, agent, base, key) = start_stack(Duration::from_secs(10), 0, 4, None).await;
+    let (gw, agent, base, key) = start_stack(4, |_| {}).await;
     let client = reqwest::Client::new();
 
     // 无认证 → 401
@@ -88,7 +88,7 @@ async fn e2e_chain_with_mock_llm() {
 #[serial]
 async fn e2e_sse_streaming_passthrough() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
-    let (gw, agent, base, key) = start_stack(Duration::from_secs(10), 0, 4, None).await;
+    let (gw, agent, base, key) = start_stack(4, |_| {}).await;
     let client = reqwest::Client::new();
 
     let resp = client
@@ -149,7 +149,8 @@ async fn e2e_gateway_timeout_cancels_upstream() {
     //
     // 契约：响应头已经发出去了，状态码不可能再变，所以**不能**断言 504；正确契约是
     // 正文在超时点被截断（收不到 [DONE]，流以错误结束），而不是让客户端一直挂着。
-    let (gw, agent, base, key) = start_stack(Duration::from_millis(300), 0, 4, None).await;
+    let (gw, agent, base, key) =
+        start_stack(4, |o| o.request_timeout = Duration::from_millis(300)).await;
     let client = reqwest::Client::new();
 
     let t0 = std::time::Instant::now();
@@ -213,7 +214,7 @@ async fn e2e_client_disconnect_cancels_upstream() {
     use futures_util::StreamExt;
 
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
-    let (gw, agent, base, key) = start_stack(Duration::from_secs(10), 0, 4, None).await;
+    let (gw, agent, base, key) = start_stack(4, |_| {}).await;
     let client = reqwest::Client::new();
 
     // 发起 SSE 流式请求，读到一个 chunk 后直接丢弃响应（模拟客户端断开）
@@ -305,24 +306,19 @@ async fn e2e_upstream_never_receives_client_credentials() {
     });
 
     let gw = Gateway::start(GatewayConfig {
-        http_bind: "127.0.0.1:0".parse().unwrap(),
-        quic_bind: "127.0.0.1:0".parse().unwrap(),
-        ca_cert: vec![ca.clone()],
-        server_cert: vec![server_cert.clone()],
-        server_key,
-        admin_token: None,
-        keys_file: Some(keys_path),
-        verified_cache_max: gateway::keystore::DEFAULT_VERIFIED_MAX,
-        request_timeout: Duration::from_secs(10),
-        tunnel_op_timeout: Duration::from_secs(2),
-        head_timeout: Duration::from_secs(5),
-        client_stall: Duration::from_secs(60),
-        agent_stale_after: Duration::from_secs(10),
-        rate_limit_per_min: 0,
-        max_concurrent_requests: 0,
-        max_open_tunnel_streams: 1024,
-        tls: None,
-        ui_dir: None,
+        tunnel: TunnelTls {
+            ca_cert: vec![ca.clone()],
+            server_cert: vec![server_cert.clone()],
+            server_key,
+        },
+        opts: Options {
+            keys_file: Some(keys_path),
+            request_timeout: Duration::from_secs(10),
+            tunnel_op_timeout: Duration::from_secs(2),
+            head_timeout: Duration::from_secs(5),
+            agent_stale_after: Duration::from_secs(10),
+            ..Options::default()
+        },
     })
     .await
     .unwrap();
@@ -387,13 +383,9 @@ async fn e2e_upstream_never_receives_client_credentials() {
 #[serial]
 async fn e2e_verified_cache_reuses_argon2_across_requests() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
-    let (gw, agent, base, key) = start_stack_with_verify_cache(
-        Duration::from_secs(10),
-        gateway::keystore::DEFAULT_VERIFIED_MAX,
-        0,
-        4,
-        None,
-    )
+    let (gw, agent, base, key) = start_stack(4, |o| {
+        o.verified_cache_max = gateway::keystore::DEFAULT_VERIFIED_MAX;
+    })
     .await;
     let client = reqwest::Client::new();
     let req = || {
@@ -448,13 +440,9 @@ async fn e2e_verified_cache_reuses_argon2_across_requests() {
 #[serial]
 async fn e2e_concurrent_cold_requests_hash_once() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
-    let (gw, agent, base, key) = start_stack_with_verify_cache(
-        Duration::from_secs(10),
-        gateway::keystore::DEFAULT_VERIFIED_MAX,
-        0,
-        8,
-        None,
-    )
+    let (gw, agent, base, key) = start_stack(8, |o| {
+        o.verified_cache_max = gateway::keystore::DEFAULT_VERIFIED_MAX;
+    })
     .await;
     let client = reqwest::Client::new();
 

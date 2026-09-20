@@ -5,7 +5,7 @@ use std::{net::SocketAddr, path::PathBuf, time::Duration};
 use anyhow::Context;
 use serde::Deserialize;
 
-use crate::{GatewayConfig, TlsPem};
+use crate::{keystore::KeyStore, GatewayConfig, Options, TlsPem, TunnelTls};
 
 /// YAML 配置文件结构。所有字段均有默认值；`cert`/`key`/`ca` 必须显式提供。
 #[derive(Debug, Deserialize)]
@@ -134,31 +134,33 @@ fn default_ui_dir() -> Option<PathBuf> {
     Some(PathBuf::from("web/dist"))
 }
 fn default_timeout_secs() -> u64 {
-    120
+    Options::DEFAULT_REQUEST_TIMEOUT.as_secs()
 }
 fn default_agent_stale_secs() -> u64 {
-    15
+    Options::DEFAULT_AGENT_STALE_AFTER.as_secs()
 }
 fn default_verified_cache_max() -> usize {
-    crate::keystore::DEFAULT_VERIFIED_MAX
+    KeyStore::default_verified_max()
 }
+/// 隧道控制操作超时默认值（秒）。
+///
+/// 高并发下开流/写帧要排队过连接级流管理器，超时值直接决定"多少请求被误判"。
+///
+/// 实测（2026-09-17，云端 2 vCPU，768 并发）：
+///   2s → 单次超时即摘除，注册表变空、503 占 92.6%（僵尸态，已由 registry::evict 修掉）
+///   5s + 连续 3 次才摘除 → 4 个 agent 时零 503，但仍有 5–7% 请求是 502（隧道操作超 5s）
+/// 故再放宽到 10s：坏连接仍有"连续 3 次超时"兜底（最坏 30s 判死），
+/// 而健康但繁忙的连接不再因 5s 这个人为门槛被计一次失败。
 fn default_tunnel_op_secs() -> u64 {
-    // 高并发下开流/写帧要排队过连接级流管理器，超时值直接决定"多少请求被误判"。
-    //
-    // 实测（2026-09-17，云端 2 vCPU，768 并发）：
-    //   2s → 单次超时即摘除，注册表变空、503 占 92.6%（僵尸态，已由 registry::evict 修掉）
-    //   5s + 连续 3 次才摘除 → 4 个 agent 时零 503，但仍有 5–7% 请求是 502（隧道操作超 5s）
-    // 故再放宽到 10s：坏连接仍有"连续 3 次超时"兜底（最坏 30s 判死），
-    // 而健康但繁忙的连接不再因 5s 这个人为门槛被计一次失败。
-    10
+    Options::DEFAULT_TUNNEL_OP_TIMEOUT.as_secs()
 }
 fn default_head_timeout_secs() -> u64 {
-    15
+    Options::DEFAULT_HEAD_TIMEOUT.as_secs()
 }
 /// 客户端停滞阈值默认值（秒）。见字段注释：语义是"该方向不再有字节流动"，
 /// 所以对慢而持续的传输无影响；60s 足以覆盖人类可感知的正常停顿。
 fn default_client_stall_secs() -> u64 {
-    60
+    Options::DEFAULT_CLIENT_STALL.as_secs()
 }
 /// 每连接隧道流额度默认值。
 ///
@@ -169,7 +171,7 @@ fn default_client_stall_secs() -> u64 {
 /// `max_concurrency`**，而不是靠把这里调小去当限流闸——调小只会让开流排队超时，
 /// 表现为"隧道随机超时"（见字段注释）。
 fn default_max_open_tunnel_streams() -> u32 {
-    1024
+    Options::DEFAULT_MAX_OPEN_TUNNEL_STREAMS
 }
 
 /// 从 YAML 文件加载并映射为网关配置。
@@ -182,6 +184,9 @@ pub fn from_path(path: &PathBuf) -> anyhow::Result<GatewayConfig> {
 }
 
 /// 把 YAML 配置映射为网关配置（独立函数，便于单元测试）。
+///
+/// 这里是**唯一**的 YAML 字段名 → 类型化旋钮映射点：`Options` 的每个字段都显式写出来，
+/// 这是映射的职责；测试与库调用方则用 `..Options::default()` 只写自己要改的那些。
 pub fn from_file(cfg: ConfigFile) -> anyhow::Result<GatewayConfig> {
     if cfg.cert.as_os_str().is_empty()
         || cfg.key.as_os_str().is_empty()
@@ -189,49 +194,43 @@ pub fn from_file(cfg: ConfigFile) -> anyhow::Result<GatewayConfig> {
     {
         anyhow::bail!("config: cert/key/ca paths are required");
     }
-    let tls = match (&cfg.tls_cert, &cfg.tls_key) {
-        (Some(c), Some(k)) => Some(TlsPem {
-            cert: std::fs::read(c)
-                .with_context(|| format!("config: cannot read tls_cert {}", c.display()))?,
-            key: std::fs::read(k)
-                .with_context(|| format!("config: cannot read tls_key {}", k.display()))?,
-        }),
+    let tunnel = TunnelTls::from_pem_files(&cfg.ca, &cfg.cert, &cfg.key)
+        .context("config: cannot load the tunnel cert/key/ca")?;
+    let https = match (&cfg.tls_cert, &cfg.tls_key) {
+        (Some(c), Some(k)) => Some(
+            TlsPem::from_pem_files(c, k)
+                .with_context(|| format!("config: cannot read {}", c.display()))?,
+        ),
         (None, None) => None,
         _ => anyhow::bail!("config: tls_cert and tls_key must be provided together"),
     };
 
     Ok(GatewayConfig {
-        http_bind: cfg
-            .listen_addr
-            .parse::<SocketAddr>()
-            .with_context(|| format!("config: invalid listen_addr {:?}", cfg.listen_addr))?,
-        quic_bind: cfg
-            .quic_addr
-            .parse::<SocketAddr>()
-            .with_context(|| format!("config: invalid quic_addr {:?}", cfg.quic_addr))?,
-        ca_cert: proto::pem::load_certs(&cfg.ca)
-            .with_context(|| format!("config: cannot load ca cert {}", cfg.ca.display()))?,
-        server_cert: proto::pem::load_certs(&cfg.cert)
-            .with_context(|| format!("config: cannot load cert {}", cfg.cert.display()))?,
-        server_key: proto::pem::load_key(&cfg.key)
-            .with_context(|| format!("config: cannot load key {}", cfg.key.display()))?,
-        admin_token: cfg.admin_token,
-        keys_file: cfg.keys_file,
-        verified_cache_max: cfg.verified_cache_max,
-        request_timeout: Duration::from_secs(cfg.timeout_secs),
-        agent_stale_after: Duration::from_secs(cfg.agent_stale_secs),
-        tunnel_op_timeout: Duration::from_secs(cfg.tunnel_op_secs),
-        head_timeout: Duration::from_secs(cfg.head_timeout_secs),
-        client_stall: Duration::from_secs(cfg.client_stall_secs),
-        rate_limit_per_min: cfg.rate_limit_per_min,
-        max_concurrent_requests: cfg.max_concurrent_requests,
-        max_open_tunnel_streams: if cfg.max_open_tunnel_streams == 0 {
-            default_max_open_tunnel_streams()
-        } else {
-            cfg.max_open_tunnel_streams
+        tunnel,
+        opts: Options {
+            http_bind: cfg
+                .listen_addr
+                .parse::<SocketAddr>()
+                .with_context(|| format!("config: invalid listen_addr {:?}", cfg.listen_addr))?,
+            quic_bind: cfg
+                .quic_addr
+                .parse::<SocketAddr>()
+                .with_context(|| format!("config: invalid quic_addr {:?}", cfg.quic_addr))?,
+            https,
+            admin_token: cfg.admin_token,
+            keys_file: cfg.keys_file,
+            ui_dir: cfg.ui_dir,
+            verified_cache_max: cfg.verified_cache_max,
+            request_timeout: Duration::from_secs(cfg.timeout_secs),
+            tunnel_op_timeout: Duration::from_secs(cfg.tunnel_op_secs),
+            head_timeout: Duration::from_secs(cfg.head_timeout_secs),
+            agent_stale_after: Duration::from_secs(cfg.agent_stale_secs),
+            client_stall: Duration::from_secs(cfg.client_stall_secs),
+            rate_limit_per_min: cfg.rate_limit_per_min,
+            max_concurrent_requests: cfg.max_concurrent_requests,
+            // 原样带过去：`0 → 默认值`的归一只有一处，在 `Options::stream_ceiling()`。
+            max_open_tunnel_streams: cfg.max_open_tunnel_streams,
         },
-        tls,
-        ui_dir: cfg.ui_dir,
     })
 }
 
@@ -294,14 +293,14 @@ rate_limit_per_min: 60
             dir.path().join("keys.db").to_str().unwrap(),
         );
         let cfg = from_file(parse_yaml(&yaml)).unwrap();
-        assert_eq!(cfg.http_bind.to_string(), "0.0.0.0:8443");
-        assert_eq!(cfg.quic_bind.to_string(), "0.0.0.0:4433");
-        assert_eq!(cfg.admin_token.as_deref(), Some("admin"));
-        assert_eq!(cfg.keys_file, Some(dir.path().join("keys.db")));
-        assert_eq!(cfg.request_timeout, Duration::from_secs(30));
-        assert_eq!(cfg.agent_stale_after, Duration::from_secs(20));
-        assert_eq!(cfg.rate_limit_per_min, 60);
-        assert!(cfg.tls.is_none());
+        assert_eq!(cfg.opts.http_bind.to_string(), "0.0.0.0:8443");
+        assert_eq!(cfg.opts.quic_bind.to_string(), "0.0.0.0:4433");
+        assert_eq!(cfg.opts.admin_token.as_deref(), Some("admin"));
+        assert_eq!(cfg.opts.keys_file, Some(dir.path().join("keys.db")));
+        assert_eq!(cfg.opts.request_timeout, Duration::from_secs(30));
+        assert_eq!(cfg.opts.agent_stale_after, Duration::from_secs(20));
+        assert_eq!(cfg.opts.rate_limit_per_min, 60);
+        assert!(cfg.opts.https.is_none());
     }
 
     #[test]
@@ -316,21 +315,21 @@ rate_limit_per_min: 60
         );
         let cfg = from_file(parse_yaml(&yaml)).unwrap();
         assert_eq!(
-            cfg.http_bind.to_string(),
+            cfg.opts.http_bind.to_string(),
             "0.0.0.0:8080",
             "default listen_addr"
         );
         assert_eq!(
-            cfg.quic_bind.to_string(),
+            cfg.opts.quic_bind.to_string(),
             "0.0.0.0:4433",
             "default quic_addr"
         );
-        assert_eq!(cfg.request_timeout, Duration::from_secs(120));
-        assert_eq!(cfg.agent_stale_after, Duration::from_secs(15));
-        assert_eq!(cfg.rate_limit_per_min, 0);
-        assert!(cfg.admin_token.is_none());
-        assert_eq!(cfg.keys_file, Some(PathBuf::from("keys.db")));
-        assert!(cfg.tls.is_none());
+        assert_eq!(cfg.opts.request_timeout, Duration::from_secs(120));
+        assert_eq!(cfg.opts.agent_stale_after, Duration::from_secs(15));
+        assert_eq!(cfg.opts.rate_limit_per_min, 0);
+        assert!(cfg.opts.admin_token.is_none());
+        assert_eq!(cfg.opts.keys_file, Some(PathBuf::from("keys.db")));
+        assert!(cfg.opts.https.is_none());
     }
 
     #[test]
@@ -355,7 +354,7 @@ rate_limit_per_min: 60
             key.to_str().unwrap(),
         );
         let cfg = from_file(parse_yaml(&yaml)).unwrap();
-        let tls = cfg.tls.expect("tls pair should be loaded");
+        let tls = cfg.opts.https.expect("tls pair should be loaded");
         assert!(!tls.cert.is_empty() && !tls.key.is_empty());
     }
 
@@ -439,9 +438,7 @@ rate_limit_per_min: 60
         );
         assert_eq!(parse_yaml(&yaml).max_open_tunnel_streams, 0);
         assert_eq!(
-            from_file(parse_yaml(&yaml))
-                .unwrap()
-                .max_open_tunnel_streams,
+            from_file(parse_yaml(&yaml)).unwrap().opts.stream_ceiling(),
             default_max_open_tunnel_streams()
         );
 
@@ -453,9 +450,7 @@ rate_limit_per_min: 60
             ca.to_str().unwrap(),
         );
         assert_eq!(
-            from_file(parse_yaml(&yaml))
-                .unwrap()
-                .max_open_tunnel_streams,
+            from_file(parse_yaml(&yaml)).unwrap().opts.stream_ceiling(),
             300
         );
 
@@ -467,9 +462,7 @@ rate_limit_per_min: 60
             ca.to_str().unwrap(),
         );
         assert_eq!(
-            from_file(parse_yaml(&yaml))
-                .unwrap()
-                .max_open_tunnel_streams,
+            from_file(parse_yaml(&yaml)).unwrap().opts.stream_ceiling(),
             default_max_open_tunnel_streams()
         );
     }
@@ -487,11 +480,58 @@ rate_limit_per_min: 60
         );
         std::fs::write(&config_path, &yaml).unwrap();
         let cfg = from_path(&config_path).unwrap();
-        assert_eq!(cfg.http_bind.to_string(), "127.0.0.1:8080");
+        assert_eq!(cfg.opts.http_bind.to_string(), "127.0.0.1:8080");
     }
 
     #[test]
     fn from_path_missing_file_errors() {
         assert!(from_path(&PathBuf::from("/nonexistent/config.yml")).is_err());
+    }
+
+    /// 规格：**数值旋钮的默认值只能有一个说法**。
+    ///
+    /// 默认值现在有两处落点：`Options::default()`（库 / 测试调用方）与这里的 serde
+    /// `default_*`（部署，YAML 省略该字段时）。端口与落盘位置**刻意不同**——库默认密闭
+    /// （临时端口、不碰任何文件），部署默认是 `0.0.0.0:8080` / `keys.db`——但所有
+    /// `Duration` / 数量旋钮必须一致：否则同一条 `timeout_secs` 的默认值会有两个说法，
+    /// "文档写的是哪一个"就变成靠记忆。这条测试把两者钉在一起。
+    #[test]
+    fn yaml_defaults_and_options_default_agree_on_the_tuning_knobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ca, cert, key) = gen_cert_files(dir.path());
+        let yaml = format!(
+            "cert: {}\nkey: {}\nca: {}\n",
+            cert.to_str().unwrap(),
+            key.to_str().unwrap(),
+            ca.to_str().unwrap(),
+        );
+        let opts = from_file(parse_yaml(&yaml)).unwrap().opts;
+        let d = Options::default();
+
+        assert_eq!(opts.request_timeout, d.request_timeout, "timeout_secs");
+        assert_eq!(
+            opts.tunnel_op_timeout, d.tunnel_op_timeout,
+            "tunnel_op_secs"
+        );
+        assert_eq!(opts.head_timeout, d.head_timeout, "head_timeout_secs");
+        assert_eq!(
+            opts.agent_stale_after, d.agent_stale_after,
+            "agent_stale_secs"
+        );
+        assert_eq!(opts.client_stall, d.client_stall, "client_stall_secs");
+        assert_eq!(opts.verified_cache_max, d.verified_cache_max);
+        assert_eq!(opts.rate_limit_per_min, d.rate_limit_per_min);
+        assert_eq!(opts.max_concurrent_requests, d.max_concurrent_requests);
+        assert_eq!(
+            opts.max_open_tunnel_streams, d.max_open_tunnel_streams,
+            "max_open_tunnel_streams"
+        );
+        assert_eq!(opts.stream_ceiling(), d.stream_ceiling());
+
+        // 刻意不同：库默认密闭（内核分配端口、不读不写任何文件），部署默认面向公网
+        assert_ne!(opts.http_bind, d.http_bind, "库默认不绑公网端口");
+        assert_ne!(opts.keys_file, d.keys_file, "库默认不碰 keys.db");
+        assert!(opts.ui_dir.is_some(), "部署默认托管 web/dist");
+        assert!(d.ui_dir.is_none(), "库默认不读 UI 目录");
     }
 }

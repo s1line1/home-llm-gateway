@@ -24,8 +24,11 @@ async fn e2e_stalled_request_body_releases_the_admission_slot() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     // 停滞阈值压到 1s：测试要快；语义与生产默认 60s 完全相同
     let stall = Duration::from_secs(1);
-    let (gw, agent, base, key) =
-        start_stack_with_admission(Duration::from_secs(10), Duration::from_secs(2), stall, 1).await;
+    let (gw, agent, base, key) = start_stack(4, |o| {
+        o.client_stall = stall;
+        o.max_concurrent_requests = 1;
+    })
+    .await;
 
     // ── 裸 TCP：发 headers（声明 100KB body）+ 10 字节，然后停住不再发 ──
     let mut sock = tokio::net::TcpStream::connect(gw.http_addr).await.unwrap();
@@ -108,8 +111,11 @@ async fn e2e_stalled_request_body_releases_the_admission_slot() {
 async fn e2e_client_that_stops_reading_the_body_releases_the_admission_slot() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     let stall = Duration::from_secs(1);
-    let (gw, agent, base, key) =
-        start_stack_with_admission(Duration::from_secs(10), Duration::from_secs(2), stall, 1).await;
+    let (gw, agent, base, key) = start_stack(4, |o| {
+        o.client_stall = stall;
+        o.max_concurrent_requests = 1;
+    })
+    .await;
 
     // 裸 TCP：打一个**持续产出**的上游端点（`/v1/flood`），读到响应头之后停止读取。
     //

@@ -7,7 +7,7 @@ use super::common::*;
 async fn e2e_admin_api_keys() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     let (gw, agent, base, key) =
-        start_stack(Duration::from_secs(10), 0, 4, Some("admin-token")).await;
+        start_stack(4, |o| o.admin_token = Some("admin-token".into())).await;
     let client = reqwest::Client::new();
 
     // 无 admin token → 401；普通 API key 也不行
@@ -118,7 +118,7 @@ async fn e2e_admin_api_keys() {
 async fn e2e_usage_metering() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     let (gw, agent, base, key) =
-        start_stack(Duration::from_secs(10), 0, 4, Some("admin-token")).await;
+        start_stack(4, |o| o.admin_token = Some("admin-token".into())).await;
     let client = reqwest::Client::new();
 
     // 非流式 chat ×2（mock 每次返回 usage prompt 1 / completion 1）
@@ -237,7 +237,7 @@ async fn e2e_usage_metering() {
 async fn e2e_openai_error_semantics() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     let (gw, agent, base, key) =
-        start_stack(Duration::from_secs(10), 0, 4, Some("admin-token")).await;
+        start_stack(4, |o| o.admin_token = Some("admin-token".into())).await;
     let client = reqwest::Client::new();
 
     // 401：无 key → authentication_error
@@ -280,7 +280,7 @@ async fn e2e_openai_error_semantics() {
     assert_eq!(body["error"]["type"], "not_found_error");
 
     // 429：限流（每 key 1 次/分钟）→ rate_limit_error + Retry-After
-    let (gw2, agent2, base2, key2) = start_stack(Duration::from_secs(10), 1, 4, None).await;
+    let (gw2, agent2, base2, key2) = start_stack(4, |o| o.rate_limit_per_min = 1).await;
     let client2 = reqwest::Client::new();
     let req = || {
         client2
@@ -302,24 +302,19 @@ async fn e2e_openai_error_semantics() {
     let (ca, server_cert, server_key, _client_cert, _client_key) = gen_certs();
     let (keys_path, lone_key) = seed_keys_db();
     let gw3 = Gateway::start(GatewayConfig {
-        http_bind: "127.0.0.1:0".parse().unwrap(),
-        quic_bind: "127.0.0.1:0".parse().unwrap(),
-        ca_cert: vec![ca],
-        server_cert: vec![server_cert],
-        server_key,
-        admin_token: None,
-        keys_file: Some(keys_path),
-        verified_cache_max: gateway::keystore::DEFAULT_VERIFIED_MAX,
-        request_timeout: Duration::from_secs(10),
-        tunnel_op_timeout: Duration::from_secs(2),
-        head_timeout: Duration::from_secs(5),
-        client_stall: Duration::from_secs(60),
-        agent_stale_after: Duration::from_secs(10),
-        rate_limit_per_min: 0,
-        max_concurrent_requests: 0,
-        max_open_tunnel_streams: 1024,
-        tls: None,
-        ui_dir: None,
+        tunnel: TunnelTls {
+            ca_cert: vec![ca],
+            server_cert: vec![server_cert],
+            server_key,
+        },
+        opts: Options {
+            keys_file: Some(keys_path),
+            request_timeout: Duration::from_secs(10),
+            tunnel_op_timeout: Duration::from_secs(2),
+            head_timeout: Duration::from_secs(5),
+            agent_stale_after: Duration::from_secs(10),
+            ..Options::default()
+        },
     })
     .await
     .unwrap();
@@ -355,24 +350,19 @@ async fn e2e_usage_write_does_not_stall_the_response() {
     let (keys_path, key) = seed_keys_db();
 
     let gw = Gateway::start(GatewayConfig {
-        http_bind: "127.0.0.1:0".parse().unwrap(),
-        quic_bind: "127.0.0.1:0".parse().unwrap(),
-        ca_cert: vec![ca.clone()],
-        server_cert: vec![server_cert.clone()],
-        server_key,
-        admin_token: None,
-        keys_file: Some(keys_path.clone()),
-        verified_cache_max: gateway::keystore::DEFAULT_VERIFIED_MAX,
-        request_timeout: Duration::from_secs(30),
-        tunnel_op_timeout: Duration::from_secs(2),
-        head_timeout: Duration::from_secs(5),
-        client_stall: Duration::from_secs(60),
-        agent_stale_after: Duration::from_secs(10),
-        rate_limit_per_min: 0,
-        max_concurrent_requests: 0,
-        max_open_tunnel_streams: 1024,
-        tls: None,
-        ui_dir: None,
+        tunnel: TunnelTls {
+            ca_cert: vec![ca.clone()],
+            server_cert: vec![server_cert.clone()],
+            server_key,
+        },
+        opts: Options {
+            keys_file: Some(keys_path.clone()),
+            request_timeout: Duration::from_secs(30),
+            tunnel_op_timeout: Duration::from_secs(2),
+            head_timeout: Duration::from_secs(5),
+            agent_stale_after: Duration::from_secs(10),
+            ..Options::default()
+        },
     })
     .await
     .unwrap();

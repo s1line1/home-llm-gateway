@@ -1,6 +1,6 @@
 //! TLS 配置构造与 PEM 加载。
 
-use std::{io::Cursor, sync::Arc};
+use std::{io::Cursor, path::Path, sync::Arc};
 
 use proto::ALPN;
 use rustls::{
@@ -11,12 +11,45 @@ use rustls::{
 
 use crate::error::GatewayError;
 
+/// HTTPS 证书 PEM 内容。
+#[derive(Debug)]
+pub struct TlsPem {
+    pub cert: Vec<u8>,
+    pub key: Vec<u8>,
+}
+
+impl TlsPem {
+    /// 从两个 PEM 文件装载（生产路径）。
+    pub fn from_pem_files(cert: &Path, key: &Path) -> Result<Self, GatewayError> {
+        Ok(Self {
+            cert: std::fs::read(cert)
+                .map_err(|e| GatewayError::Other(format!("cannot read {}: {e}", cert.display())))?,
+            key: std::fs::read(key)
+                .map_err(|e| GatewayError::Other(format!("cannot read {}: {e}", key.display())))?,
+        })
+    }
+
+    /// 构建公网 HTTPS 入口的 rustls 配置。
+    ///
+    /// 与隧道侧不同：这里**不要求**客户端证书（浏览器没有），所以 `with_no_client_auth`。
+    /// 错误消息保持原样——运维就是靠它定位"证书与私钥不匹配"。
+    pub(crate) fn server_config(&self) -> Result<Arc<rustls::ServerConfig>, GatewayError> {
+        https_server_config(&self.cert, &self.key)
+            .map(Arc::new)
+            .map_err(|e| {
+                GatewayError::Config(format!("tls_cert/tls_key 无法构建 HTTPS 服务端配置: {e}"))
+            })
+    }
+}
+
 /// 构造 HTTPS（公网 API 入口）的 rustls ServerConfig，由 PEM 字节构建。
 pub fn https_server_config(
     cert_pem: &[u8],
     key_pem: &[u8],
 ) -> anyhow::Result<rustls::ServerConfig> {
-    proto::install_ring_crypto_provider();
+    // workspace 同时链接 ring 与 aws-lc-rs，rustls 无法自动选 provider，
+    // 不装任何 `Config::builder()` 都会 panic（见 proto::crypto 的模块说明）。
+    proto::crypto::provider();
     let mut cert_reader = Cursor::new(cert_pem);
     let certs = rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
     let mut key_reader = Cursor::new(key_pem);
@@ -33,11 +66,11 @@ pub fn rustls_server_tls(
     cert: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
 ) -> Result<rustls::ServerConfig, GatewayError> {
-    // 双 provider（ring + aws-lc-rs）共存时必须显式安装，见 `proto::install_ring_crypto_provider`。
-    // 这里必须与 `https_server_config` 一样自己装：否则这个构造函数就**隐含依赖**"别的代码
-    // 先装过 provider"——`cargo test` 下同进程里总有别的测试先装（所以一直没暴露），
-    // 但 nextest 每条测试一个进程，`tls::tests::server_config_builds_mtls` 单独跑就崩。
-    proto::install_ring_crypto_provider();
+    // 自己确保 provider 已装（`proto::crypto::provider` 幂等，是**唯一**入口）：
+    // 否则这个构造函数就**隐含依赖**"别的代码先装过 provider"——`cargo test` 下同进程里
+    // 总有别的测试先装（所以一直没暴露），但 nextest 每条测试一个进程，
+    // `tls::tests::server_config_builds_mtls` 单独跑就崩。
+    proto::crypto::provider();
     let mut roots = RootCertStore::empty();
     for c in ca {
         roots.add(c.clone())?

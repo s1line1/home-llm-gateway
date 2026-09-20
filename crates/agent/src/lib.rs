@@ -44,8 +44,7 @@ pub struct Agent {
 
 impl Agent {
     pub fn start(cfg: AgentConfig) -> anyhow::Result<Self> {
-        // 双 provider（ring + aws-lc-rs）共存时必须显式安装，见 proto::install_ring_crypto_provider
-        proto::install_ring_crypto_provider();
+        // provider 由 `tls::rustls_client_tls` 自己确保（幂等），这里不再需要显式安装。
         let client_config = tls::rustls_client_tls(
             &cfg.ca_cert,
             cfg.client_cert.clone(),
@@ -348,7 +347,8 @@ mod tests {
     /// 建立一个本地的 s2n-quic 连接对（无 mTLS），返回客户端 [`Handle`]。
     /// 服务端只保活连接、不读流。
     async fn test_connection() -> Handle {
-        proto::install_ring_crypto_provider();
+        // 本测试直接构建 rustls 配置（绕过 tls 构造函数）→ 自己确保 provider 已装。
+        proto::crypto::provider();
 
         // 服务端：自签证书 + 无客户端认证
         let key = KeyPair::generate().unwrap();
@@ -414,7 +414,8 @@ mod tests {
         cert: CertificateDer<'static>,
         key: PrivateKeyDer<'static>,
     ) -> (SocketAddr, tokio::sync::mpsc::Receiver<Handle>) {
-        proto::install_ring_crypto_provider();
+        // 本测试直接构建 rustls 配置（绕过 tls 构造函数）→ 自己确保 provider 已装。
+        proto::crypto::provider();
 
         let mut roots = rustls::RootCertStore::empty();
         roots.add(ca.clone()).unwrap();
@@ -459,7 +460,8 @@ mod tests {
         cert: CertificateDer<'static>,
         key: PrivateKeyDer<'static>,
     ) -> (SocketAddr, tokio::sync::mpsc::Receiver<()>) {
-        proto::install_ring_crypto_provider();
+        // 本测试直接构建 rustls 配置（绕过 tls 构造函数）→ 自己确保 provider 已装。
+        proto::crypto::provider();
 
         let mut roots = rustls::RootCertStore::empty();
         roots.add(ca.clone()).unwrap();
@@ -516,7 +518,8 @@ mod tests {
         key: PrivateKeyDer<'static>,
         first_reply_delay: Duration,
     ) -> SocketAddr {
-        proto::install_ring_crypto_provider();
+        // 本测试直接构建 rustls 配置（绕过 tls 构造函数）→ 自己确保 provider 已装。
+        proto::crypto::provider();
 
         let mut roots = rustls::RootCertStore::empty();
         roots.add(ca.clone()).unwrap();
