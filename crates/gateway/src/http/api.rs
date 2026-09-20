@@ -53,9 +53,11 @@ pub(super) async fn metrics_route(State(state): State<AppState>, headers: Header
         .map(|a| a.contains("text/html"))
         .unwrap_or(false);
     if wants_html {
-        if let Some(dir) = &state.ui {
-            if let Ok(html) = std::fs::read_to_string(dir.join("index.html")) {
-                return Html(html).into_response();
+        // 走 `AppState` 里的缓存读（按 mtime 校验）：以前这里每次请求同步
+        // `std::fs::read_to_string`，是在 async 上下文里做阻塞 I/O。
+        if let Some(index) = &state.ui_index {
+            if let Some(html) = index.load().await {
+                return Html(html.to_string()).into_response();
             }
         }
     }

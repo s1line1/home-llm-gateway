@@ -22,7 +22,7 @@ use crate::metrics::Metrics;
 use crate::ratelimit::RateLimiter;
 use crate::registry::Registry;
 use crate::storage::KeyStore;
-use crate::ui::resolve_ui;
+use crate::ui::{resolve_ui, IndexHtml};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -56,6 +56,12 @@ pub struct AppState {
     pub metrics: Metrics,
     /// React UI 静态目录（None = `/` 显示构建提示页）。
     pub ui: Option<PathBuf>,
+    /// `ui/index.html` 的缓存读（按 mtime 校验），`ui` 为 None 时也是 None。
+    /// 从 `ui` 派生而不是各自 `dir.join("index.html")`：读盘只有这一条路径。
+    ///
+    /// `pub(crate)` 而非 `pub`：其余字段是"配置值"，外部（`config.rs`/`main.rs`）会读；
+    /// 这个字段只给 `http` 的 handler 用，没必要把 [`IndexHtml`] 带进公开 API。
+    pub(crate) ui_index: Option<IndexHtml>,
     /// `ui_dir` 不可用的具体原因（None = 没配 ui_dir，或配了且可用）。
     /// 由启动时 [`resolve_ui`] 判定后写入，占位页会把它显示出来——否则用户只看到白屏/通用文案。
     pub ui_problem: Option<String>,
@@ -72,6 +78,9 @@ impl AppState {
     /// 不通过就降级成占位页，并把原因交给页面自己显示。
     pub fn new(registry: Registry, key_store: KeyStore, metrics: Metrics, opts: &Options) -> Self {
         let (ui, ui_problem) = resolve_ui(opts.ui_dir.as_deref());
+        let ui_index = ui
+            .as_ref()
+            .map(|dir| IndexHtml::new(dir.join("index.html")));
         Self {
             registry,
             key_store,
@@ -87,6 +96,7 @@ impl AppState {
             max_open_tunnel_streams: opts.stream_ceiling(),
             metrics,
             ui,
+            ui_index,
             ui_problem,
         }
     }
