@@ -183,7 +183,7 @@ async fn healthz() -> &'static str {
 /// 只有上游知道，列出会误导客户端）。与代理入口同级的认证 + 限流。
 async fn models_route(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(rejection) = crate::auth::authenticate(&state, &headers).await {
-        return rejection;
+        return rejection.into_response();
     }
     let data: Vec<_> = state
         .registry

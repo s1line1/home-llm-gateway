@@ -26,26 +26,48 @@ pub struct AuthenticatedKey {
     pub key_name: String,
 }
 
-/// 认证 + 限流：通过返回身份，否则返回**现成的错误响应**（401 / 429）。
+/// 认证 / 限流被拒的原因。
 ///
-/// 把错误响应直接交出来（而不是返回 `Option`/`bool` 让调用点自己构造），是为了让
-/// "认证没过却继续往下走"写不出来：拿不到 [`AuthenticatedKey`]，唯一能做的就是把它还给客户端。
+/// **刻意做小**：`Response`（`hyper::Response<axum::body::Body>`）是 128+ 字节，把它塞进
+/// `Err` 会让 `Result` 连 Ok 路径都要搬这么大一块，clippy 的 `result_large_err` 会报
+/// （CI 用的 stable 比本机 1.97 新，是它先发现的）。所以这里只留原因，响应交给
+/// [`AuthRejection::into_response`] 生成——顺带把两条文案收在一处。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthRejection {
+    /// 缺少 / 无效的 Bearer key → 401。
+    InvalidKey,
+    /// 超过该 key 的每分钟配额 → 429（带 `Retry-After`）。
+    RateLimited,
+}
+
+impl AuthRejection {
+    /// 生成给客户端的响应。**状态码、`error.type` 与文案只在这里定义。**
+    pub fn into_response(self) -> Response {
+        match self {
+            AuthRejection::InvalidKey => {
+                error_response(StatusCode::UNAUTHORIZED, "invalid or missing API key")
+            }
+            AuthRejection::RateLimited => {
+                error_response(StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded")
+            }
+        }
+    }
+}
+
+/// 认证 + 限流：通过返回身份，否则返回拒绝原因。
+///
+/// 返回 `Result` 而不是 `Option`/`bool`，是为了让"认证没过却继续往下走"写不出来：
+/// 拿不到 [`AuthenticatedKey`]，唯一能做的就是处理那个 `Err`。
 pub async fn authenticate(
     state: &AppState,
     headers: &HeaderMap,
-) -> Result<AuthenticatedKey, Response> {
+) -> Result<AuthenticatedKey, AuthRejection> {
     let Some(key) = verify_api_key(state, headers).await else {
-        return Err(error_response(
-            StatusCode::UNAUTHORIZED,
-            "invalid or missing API key",
-        ));
+        return Err(AuthRejection::InvalidKey);
     };
     if let Some(rl) = &state.rate_limiter {
         if !rl.try_acquire(&key.token) {
-            return Err(error_response(
-                StatusCode::TOO_MANY_REQUESTS,
-                "rate limit exceeded",
-            ));
+            return Err(AuthRejection::RateLimited);
         }
     }
     Ok(key)
@@ -73,4 +95,40 @@ async fn verify_api_key(state: &AppState, headers: &HeaderMap) -> Option<Authent
         key_id: record.id,
         key_name: record.name,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 规格：两种拒绝的状态码 / `error.type` / `Retry-After` 必须与拆分前**逐字一致**。
+    ///
+    /// SDK 按 `error.type` 决定是否自动重试（429 重试、401 不重试），脚本按 `Retry-After`
+    /// 退避——这条把 `into_response` 这张映射表钉住，因为响应构造现在只在这一处。
+    #[tokio::test]
+    async fn rejection_maps_to_the_same_response_as_before() {
+        for (rejection, status, ty) in [
+            (
+                AuthRejection::InvalidKey,
+                StatusCode::UNAUTHORIZED,
+                "authentication_error",
+            ),
+            (
+                AuthRejection::RateLimited,
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_error",
+            ),
+        ] {
+            let resp = rejection.into_response();
+            assert_eq!(resp.status(), status);
+            assert_eq!(
+                resp.headers().contains_key(axum::http::header::RETRY_AFTER),
+                status == StatusCode::TOO_MANY_REQUESTS,
+                "只有 429 带 Retry-After"
+            );
+            let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(v["error"]["type"], ty);
+        }
+    }
 }

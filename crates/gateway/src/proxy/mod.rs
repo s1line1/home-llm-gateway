@@ -54,7 +54,7 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
     // 认证 + 限流（per-key 令牌桶）：拿不到身份的唯一出路就是把它还给客户端。
     let key = match authenticate(&state, &headers).await {
         Ok(key) => key,
-        Err(rejection) => return rejection,
+        Err(rejection) => return rejection.into_response(),
     };
 
     // 读请求体：停滞/超限/读失败各自有明确状态码，且**都会归还准入票据**（随本函数返回而
