@@ -11,6 +11,13 @@ use rustls::{
 
 use crate::error::GatewayError;
 
+/// HTTPS 证书 PEM 内容。
+#[derive(Debug)]
+pub struct TlsPem {
+    pub cert: Vec<u8>,
+    pub key: Vec<u8>,
+}
+
 /// 构造 HTTPS（公网 API 入口）的 rustls ServerConfig，由 PEM 字节构建。
 pub fn https_server_config(
     cert_pem: &[u8],

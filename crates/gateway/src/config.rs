@@ -5,7 +5,7 @@ use std::{net::SocketAddr, path::PathBuf, time::Duration};
 use anyhow::Context;
 use serde::Deserialize;
 
-use crate::{GatewayConfig, TlsPem};
+use crate::{keystore::KeyStore, GatewayConfig, TlsPem};
 
 /// YAML 配置文件结构。所有字段均有默认值；`cert`/`key`/`ca` 必须显式提供。
 #[derive(Debug, Deserialize)]
@@ -140,7 +140,7 @@ fn default_agent_stale_secs() -> u64 {
     15
 }
 fn default_verified_cache_max() -> usize {
-    crate::keystore::DEFAULT_VERIFIED_MAX
+    KeyStore::default_verified_max()
 }
 fn default_tunnel_op_secs() -> u64 {
     // 高并发下开流/写帧要排队过连接级流管理器，超时值直接决定"多少请求被误判"。

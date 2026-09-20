@@ -146,7 +146,7 @@ pub struct UsageDelta {
 pub const DEFAULT_VERIFIED_MAX: usize = 1650;
 /// 已验证身份的默认有效期。注意：**吊销不依赖它**（版本校验优先），
 /// 它只决定"多久之后重新付一次 argon2 的钱"。
-pub const DEFAULT_VERIFIED_TTL: Duration = Duration::from_secs(30 * 60);
+const DEFAULT_VERIFIED_TTL: Duration = Duration::from_secs(30 * 60);
 
 const API_KEY_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS api_keys (
     id TEXT PRIMARY KEY,
@@ -173,6 +173,14 @@ impl KeyStore {
     /// 吊销仍然是即时的——版本校验在缓存之前，不依赖 TTL）。
     pub fn new(file: Option<PathBuf>) -> Self {
         Self::with_verified(file, DEFAULT_VERIFIED_MAX, DEFAULT_VERIFIED_TTL)
+    }
+
+    pub fn default_verified_ttl() -> Duration {
+        DEFAULT_VERIFIED_TTL
+    }
+
+    pub fn default_verified_max() -> usize {
+        DEFAULT_VERIFIED_MAX
     }
 
     /// 指定已验证缓存容量与有效期；`max = 0` 关闭缓存（恢复"每请求都跑 argon2"的旧行为）。
