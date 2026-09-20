@@ -18,7 +18,8 @@ pub fn rustls_client_tls(
     cert: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
 ) -> Result<rustls::ClientConfig, AgentError> {
-    proto::install_ring_crypto_provider();
+    // 自己确保 provider 已装（proto::crypto::provider 幂等、唯一入口），否则 builder 会 panic。
+    proto::crypto::provider();
     let mut roots = RootCertStore::empty();
     for c in ca {
         roots.add(c.clone())?

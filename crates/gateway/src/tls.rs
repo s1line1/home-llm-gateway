@@ -23,7 +23,9 @@ pub fn https_server_config(
     cert_pem: &[u8],
     key_pem: &[u8],
 ) -> anyhow::Result<rustls::ServerConfig> {
-    proto::install_ring_crypto_provider();
+    // workspace 同时链接 ring 与 aws-lc-rs，rustls 无法自动选 provider，
+    // 不装任何 `Config::builder()` 都会 panic（见 proto::crypto 的模块说明）。
+    proto::crypto::provider();
     let mut cert_reader = Cursor::new(cert_pem);
     let certs = rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
     let mut key_reader = Cursor::new(key_pem);
@@ -40,11 +42,11 @@ pub fn rustls_server_tls(
     cert: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
 ) -> Result<rustls::ServerConfig, GatewayError> {
-    // 双 provider（ring + aws-lc-rs）共存时必须显式安装，见 `proto::install_ring_crypto_provider`。
-    // 这里必须与 `https_server_config` 一样自己装：否则这个构造函数就**隐含依赖**"别的代码
-    // 先装过 provider"——`cargo test` 下同进程里总有别的测试先装（所以一直没暴露），
-    // 但 nextest 每条测试一个进程，`tls::tests::server_config_builds_mtls` 单独跑就崩。
-    proto::install_ring_crypto_provider();
+    // 自己确保 provider 已装（`proto::crypto::provider` 幂等，是**唯一**入口）：
+    // 否则这个构造函数就**隐含依赖**"别的代码先装过 provider"——`cargo test` 下同进程里
+    // 总有别的测试先装（所以一直没暴露），但 nextest 每条测试一个进程，
+    // `tls::tests::server_config_builds_mtls` 单独跑就崩。
+    proto::crypto::provider();
     let mut roots = RootCertStore::empty();
     for c in ca {
         roots.add(c.clone())?

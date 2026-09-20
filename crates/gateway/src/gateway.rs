@@ -102,9 +102,8 @@ pub struct Gateway {
 
 impl Gateway {
     pub async fn start(cfg: GatewayConfig) -> Result<Self, crate::error::GatewayError> {
-        // 显式安装 ring 为进程默认 crypto provider（见 proto::install_ring_crypto_provider 的说明：
-        // workspace 同时链接了 ring 与 aws-lc-rs，不安装 rustls 会 panic）
-        proto::install_ring_crypto_provider();
+        // crypto provider 由下面的 tls 构造函数自己确保（`proto::crypto::provider` 幂等，
+        // 唯一入口）——启动路径不再需要"记得先装"这一步。
 
         // 在**绑任何 socket 之前**把 NOFILE 的 soft 抬到目标值（默认 16384）：systemd 给的默认
         // soft 是 1024，生产水位（768 并发连接 → fd 峰值 785）下是贴脸的，撞上时表现为

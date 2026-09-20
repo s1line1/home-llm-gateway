@@ -15,7 +15,8 @@ async fn main() -> anyhow::Result<()> {
     let path = PathBuf::from("gateway-config.yml");
     let cfg = config::from_path(&path)?;
 
-    proto::install_ring_crypto_provider();
+    // 示例直接构建 rustls 配置 → 自己确保 provider 已装。
+    proto::crypto::provider();
 
     let tls = rustls_server_config(&cfg.ca_cert, cfg.server_cert, cfg.server_key)?; // 上面那份，含 mTLS
     let mut server = s2n_quic::Server::builder()

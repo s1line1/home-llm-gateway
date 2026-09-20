@@ -150,7 +150,8 @@ mod tests {
         use rcgen::{CertificateParams, KeyPair};
         use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 
-        proto::install_ring_crypto_provider();
+        // 本测试直接构建 rustls 配置（绕过 tls 构造函数）→ 自己确保 provider 已装。
+        proto::crypto::provider();
 
         let key = KeyPair::generate().unwrap();
         let cert = CertificateParams::new(vec!["localhost".to_string()])
