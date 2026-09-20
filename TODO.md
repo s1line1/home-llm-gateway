@@ -208,7 +208,7 @@
       按 API key 统计 token 消耗（prompt/completion/total + 请求数 + 最后使用时间），
       Admin API 可查询、Keys 页展示；吊销 key 后用量记录仍保留（可审计）。
       **实现（与定稿设计的差异已标注）**：
-      1. 数据来源：`crates/gateway/src/usage.rs` 透传层提取——非流式整包缓冲后解析
+      1. 数据来源：`crates/gateway/src/usage_meter.rs` 透传层提取——非流式整包缓冲后解析
          JSON usage；流式逐块 `contains("usage")` 预过滤 + SSE data 行级解析（零开销快路径）；
          上游无 usage / 取消 / 断流 → 估算（prompt 按请求体 messages 字符 /4、
          completion 按已转发字节 /4），`estimated_requests` 计数标记
@@ -221,7 +221,7 @@
          `usage`；Keys 页加用量列（total + in/out，估算带 `~` 标记）；
          `POST /admin/usage/reset` 留后期
       4. 范围：只做**计量**（统计+查询+展示）；配额/超限拒绝排除，留多租户阶段
-      5. 测试：单测（usage.rs 提取/SSE 行/无 usage 估算 ×6、keystore 累加+持久化+
+      5. 测试：单测（usage_meter.rs 提取/SSE 行/无 usage 估算 ×6、keystore 累加+持久化+
          吊销保留 ×2）；e2e `e2e_usage_metering`（打 2 次请求 → /admin/usage 与
          mock 返回的 usage 一致、/admin/keys 内嵌一致、吊销后记录仍可查）
 - [ ] **计量与治理延伸（待定：暂未决定是否实施）**：usage 计量完成后的候选方向，
@@ -237,7 +237,7 @@
       5. **用量告警**（quota 80%/100% 打日志/UI 提示，纯读+日志）
       6. **prompt 缓存命中率统计**（vLLM Automatic Prefix Caching：响应 usage 里
          `prompt_tokens_details.cached_tokens` / DeepSeek `prompt_cache_hit_tokens`；
-         usage.rs 提取时顺手读 cached_tokens，算命中率 = cached/prompt）——
+         usage_meter.rs 提取时顺手读 cached_tokens，算命中率 = cached/prompt）——
          仅**代理计费 API**（DeepSeek/OpenAI cache hit 打折）时有省钱价值；
          当前网关连自家 vLLM（无金钱成本），价值有限，暂缓
       注：模型白名单/请求数配额/到期时间等非 token 维度与 token quota 二选一或组合，
@@ -458,8 +458,8 @@
 - [ ] **重复逻辑**：`proxy` 内联了 `auth_and_rate_limit` 已封装的认证 + 限流（`http_proxy.rs:133-140`）；
       `Accept: text/html` 探测复制两份（`http.rs:103-107` 与 `:197-201`）。
 - [ ] **`UsageCollector` 位置与自我声明矛盾**：110 行、有状态的它住在 `http_proxy.rs:292-395`，
-      而 `usage.rs:10` 自称"只含纯函数"，OPTIMIZATION S1 又把 http_proxy 限定为"代理转发"——
-      二选一：搬去 `usage.rs`，或改掉那句注释。
+      而 `usage_meter.rs:10` 自称"只含纯函数"，OPTIMIZATION S1 又把 http_proxy 限定为"代理转发"——
+      二选一：搬去 `usage_meter.rs`，或改掉那句注释。
 - [ ] **前端四份独立 `/metrics` 轮询**：`Layout.tsx:24`、`Overview.tsx:9`、`MetricsPage.tsx:10`、
       `Agents.tsx:61` 各实例化一个 `useMetricsHistory()`（各自 5s 轮询、各自一份历史）。抽 context 共享。
 - [ ] **小体积/常量类**：`Agents.tsx:72` 用 `error.message.includes("404")` 嗅探状态码
@@ -482,7 +482,7 @@
   已删除的 CLI 旗标（`--server-name` / `--agent-stale-secs` / `--admin-token`）改为配置项、
   新增 `agent_id` 唯一性警告与对应排障行、安全清单同步。
 - `CODE_READING.md` / `OPTIMIZATION.md` / `EDGE_REBRAND.md`：e2e 数量（13 → 23）、
-  测试总数（85 → 119）、模块地图补 `usage.rs` / `error.rs`、A3 与 C3 的状态标注更正。
+  测试总数（85 → 119）、模块地图补 `usage_meter.rs` / `error.rs`、A3 与 C3 的状态标注更正。
 - `web/README.md` + `web/src/api/{client,types}.ts`、`web/src/pages/Agents.tsx`、
   `web/src/hooks/useMetricsHistory.ts`：`/admin/agents` 已实现（不再是"契约预留"），
   404 分支改为"旧版网关或未启用 `/admin/*`"的降级说明。
