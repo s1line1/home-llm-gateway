@@ -179,26 +179,22 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    use crate::{http::AppState, keystore::KeyStore, metrics::Metrics, registry::Registry};
+    use crate::{
+        gateway::Options, http::AppState, keystore::KeyStore, metrics::Metrics, registry::Registry,
+    };
 
     fn test_state() -> AppState {
-        AppState {
-            registry: Registry::default(),
-            key_store: KeyStore::new(None),
+        let opts = Options {
             admin_token: Some("admin-token".into()),
-            timeout: Duration::from_secs(10),
-            agent_stale_after: Duration::from_secs(10),
-            tunnel_op_timeout: Duration::from_secs(2),
             head_timeout: Duration::from_secs(5),
-            head_alive_window: Duration::from_secs(20),
-            client_stall: Duration::from_secs(60),
-            rate_limiter: None,
-            max_concurrent_requests: 0,
-            max_open_tunnel_streams: 1024,
-            metrics: Metrics::default(),
-            ui: None,
-            ui_problem: None,
-        }
+            ..Options::default()
+        };
+        AppState::new(
+            Registry::default(),
+            KeyStore::new(None),
+            Metrics::default(),
+            &opts,
+        )
     }
 
     async fn body_json(resp: Response) -> serde_json::Value {

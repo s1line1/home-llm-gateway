@@ -18,10 +18,15 @@ async fn main() -> anyhow::Result<()> {
     // 示例直接构建 rustls 配置 → 自己确保 provider 已装。
     proto::crypto::provider();
 
-    let tls = rustls_server_config(&cfg.ca_cert, cfg.server_cert, cfg.server_key)?; // 上面那份，含 mTLS
+    // 身份材料在 `cfg.tunnel` 下（必填），可调旋钮在 `cfg.opts` 下。
+    let tls = rustls_server_config(
+        &cfg.tunnel.ca_cert,
+        cfg.tunnel.server_cert.clone(),
+        cfg.tunnel.server_key.clone_key(),
+    )?; // 上面那份，含 mTLS
     let mut server = s2n_quic::Server::builder()
         .with_tls(Server::from(Arc::new(tls)))? // ← From<Arc<rustls::ServerConfig>>（s2n-quic-rustls/src/server.rs:60）
-        .with_io(cfg.quic_bind)? // SocketAddr 可直接传（provider/io.rs:57 impl_socket_addrs!(SocketAddr)）
+        .with_io(cfg.opts.quic_bind)? // SocketAddr 可直接传（provider/io.rs:57 impl_socket_addrs!(SocketAddr)）
         .start()?;
 
     loop {

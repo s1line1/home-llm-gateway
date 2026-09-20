@@ -23,12 +23,10 @@ async fn e2e_slow_head_does_not_evict_an_agent_that_is_still_answering() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     // head_timeout 压到 400ms，上游 /v1/slow?ms=1500 必然超时；窗口是 4×head_timeout = 1.6s，
     // 所以期间"另一个正常请求成功"就足以证明它只是慢。
-    let (gw, agent, base, key) = start_stack_with_head_timeout(
-        Duration::from_millis(400),
-        Duration::from_secs(2),
-        Duration::from_secs(5),
-        0,
-    )
+    let (gw, agent, base, key) = start_stack(4, |o| {
+        o.head_timeout = Duration::from_millis(400);
+        o.client_stall = Duration::from_secs(5);
+    })
     .await;
     let client = reqwest::Client::new();
     let normal = || {
@@ -102,12 +100,10 @@ async fn e2e_slow_head_does_not_evict_an_agent_that_is_still_answering() {
 async fn e2e_silent_agent_is_still_evicted_after_the_window() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     // 窗口 = 4 × 100ms = 400ms：比 head_timeout 长，但足够短，测试里等得起。
-    let (gw, agent, base, key) = start_stack_with_head_timeout(
-        Duration::from_millis(100),
-        Duration::from_secs(2),
-        Duration::from_secs(5),
-        0,
-    )
+    let (gw, agent, base, key) = start_stack(4, |o| {
+        o.head_timeout = Duration::from_millis(100);
+        o.client_stall = Duration::from_secs(5);
+    })
     .await;
     let client = reqwest::Client::new();
 

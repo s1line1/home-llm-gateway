@@ -11,7 +11,7 @@
 //! *我们自己的任务* 不再 park；数据已经在 hyper 的缓冲与 socket 缓冲里，hyper 不解开写阻塞，
 //! body 就不会被 drop。所以必须在 IO 层给写方向设上限。
 //!
-//! 语义与其它停滞超时一致（见 `GatewayConfig::client_stall`）：**有进展就不超时**——
+//! 语义与其它停滞超时一致（见 `Options::client_stall`）：**有进展就不超时**——
 //! 每次 `poll_write` 只要被接受（哪怕只写进去 1 字节）就重新计时，只有连续 `stall` 时间
 //! 一个字节都写不进去才判定客户端僵住并返回 `TimedOut`，让 hyper 关掉这条连接
 //! （连接一结束，body 随连接任务一起被 drop，票据随之归还）。

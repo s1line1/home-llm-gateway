@@ -2,6 +2,7 @@
 
 use std::{
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
@@ -13,11 +14,16 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use hyper::{body::Incoming, server::conn::http1, service::service_fn};
+use hyper_util::rt::TokioIo;
 use serde_json::json;
-use tower::ServiceExt;
+use tokio_rustls::TlsAcceptor;
+use tower::{Service as TowerService, ServiceExt};
 use tower_http::services::{ServeDir, ServeFile};
 use tracing::{debug, error, info, warn};
 
+use crate::gateway::Options;
+use crate::io_stall;
 use crate::keystore::KeyStore;
 use crate::metrics::Metrics;
 use crate::ratelimit::RateLimiter;
@@ -31,12 +37,12 @@ pub struct AppState {
     pub admin_token: Option<String>,
     pub timeout: Duration,
     pub agent_stale_after: Duration,
-    /// 隧道控制操作超时（打开流 / 发送请求头 / 取消帧）。见 [`crate::GatewayConfig`] 的说明。
+    /// 隧道控制操作超时（打开流 / 发送请求头 / 取消帧）。见 [`crate::Options`] 的说明。
     pub tunnel_op_timeout: Duration,
-    /// 等待上游响应头（首字节）的超时。见 [`crate::GatewayConfig`] 的说明。
+    /// 等待上游响应头（首字节）的超时。见 [`crate::Options`] 的说明。
     pub head_timeout: Duration,
     /// 客户端停滞阈值：请求体/响应体两个方向"完全没动静"多久就放弃。
-    /// 见 [`crate::GatewayConfig::client_stall`]——没有它，在途请求会永久占住准入槽位。
+    /// 见 [`crate::Options::client_stall`]——没有它，在途请求会永久占住准入槽位。
     pub client_stall: Duration,
     /// 响应头超时的"忙/死"判据窗口：这么久内有过成功响应头，就只是"慢"。
     ///
@@ -56,8 +62,74 @@ pub struct AppState {
     /// React UI 静态目录（None = `/` 显示构建提示页）。
     pub ui: Option<PathBuf>,
     /// `ui_dir` 不可用的具体原因（None = 没配 ui_dir，或配了且可用）。
-    /// 由启动时 [`check_ui_dir`] 判定后写入，占位页会把它显示出来——否则用户只看到白屏/通用文案。
+    /// 由启动时 [`resolve_ui`] 判定后写入，占位页会把它显示出来——否则用户只看到白屏/通用文案。
     pub ui_problem: Option<String>,
+}
+
+impl AppState {
+    /// 从 [`Options`] 组装请求处理状态：配置 → `AppState` 的映射与**派生只在这一处发生**。
+    ///
+    /// 两个派生量都不单独设旋钮：
+    /// - `head_alive_window = head_timeout × 4`：连续四个窗口一次响应头都没回来，才算"不是慢，是死"；
+    /// - `max_open_tunnel_streams = opts.stream_ceiling()`：0 → 默认值，与绑 QUIC 端点同一口径。
+    ///
+    /// `ui_dir` 的可用性判定（[`resolve_ui`]）也在这里：它是**非致命**的启动自检，
+    /// 不通过就降级成占位页，并把原因交给页面自己显示。
+    pub fn new(registry: Registry, key_store: KeyStore, metrics: Metrics, opts: &Options) -> Self {
+        let (ui, ui_problem) = resolve_ui(opts.ui_dir.as_deref());
+        Self {
+            registry,
+            key_store,
+            admin_token: opts.admin_token.clone(),
+            timeout: opts.request_timeout,
+            agent_stale_after: opts.agent_stale_after,
+            tunnel_op_timeout: opts.tunnel_op_timeout,
+            head_timeout: opts.head_timeout,
+            head_alive_window: opts.head_timeout * 4,
+            client_stall: opts.client_stall,
+            rate_limiter: RateLimiter::new(opts.rate_limit_per_min),
+            max_concurrent_requests: opts.max_concurrent_requests,
+            max_open_tunnel_streams: opts.stream_ceiling(),
+            metrics,
+            ui,
+            ui_problem,
+        }
+    }
+}
+
+/// `ui_dir` 的启动期判定：返回（可托管的目录, 不可用的原因）。
+///
+/// 必须确认它是**一份能用的产物**，而不只是"有 index.html"——Vite 的源码目录同样有
+/// index.html，托管出去只会让浏览器白屏（见 [`check_ui_dir`]）。判定不通过就降级到
+/// 占位页，并把具体原因写进 `AppState`，让页面自己说清楚。
+///
+/// **非致命**：这里任何问题都不阻止网关启动（`ui_dir` 只是给人看的诊断面）。
+pub fn resolve_ui(configured: Option<&Path>) -> (Option<PathBuf>, Option<String>) {
+    let Some(p) = configured else {
+        return (None, None);
+    };
+    match check_ui_dir(p) {
+        UiDirCheck::Usable => (Some(p.to_path_buf()), None),
+        // 还没构建：占位页自带的通用文案（"构建前端后配置 ui_dir"）正好适用
+        UiDirCheck::NoIndex => {
+            warn!(path = %p.display(), "ui_dir 下没有 index.html；GET / 显示构建提示页");
+            (None, None)
+        }
+        UiDirCheck::SourceEntry => {
+            let msg = format!(
+                "ui_dir 指向的是前端**源码**目录，不是构建产物（默认 web/dist）：{}",
+                p.display()
+            );
+            error!(path = %p.display(), "{msg}；浏览器只会白屏，GET / 已改显示本提示页");
+            (None, Some(msg))
+        }
+        UiDirCheck::MissingAsset(asset) => {
+            let msg =
+                format!("index.html 引用的产物不存在：{asset}（构建过期，或 ui_dir 指向了别处）");
+            warn!(path = %p.display(), missing = %asset, "{msg}；GET / 显示构建提示页");
+            (None, Some(msg))
+        }
+    }
 }
 
 pub fn app(state: AppState) -> Router {
@@ -448,31 +520,109 @@ async fn metrics_middleware(
 
 static NEXT_REQUEST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// 起公网入口的 accept 循环（TLS 与明文共用一套服务实现），返回任务句柄。
+///
+/// rustls 配置由调用方（`Gateway::start`）**预先构建好**传入：证书材料有问题要在
+/// 启动时就失败，而不是在这里默默结束、留下一个"看起来启动了"的空壳进程。
+pub(crate) fn spawn_entry(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    https: Option<Arc<rustls::ServerConfig>>,
+    client_stall: Duration,
+) -> tokio::task::JoinHandle<()> {
+    // 日志记**真实**监听地址：配置写 `:0` 时只有 `local_addr()` 知道内核给了哪个端口。
+    match listener.local_addr() {
+        Ok(addr) if https.is_some() => info!(addr = %addr, "https public entry enabled"),
+        Ok(addr) => info!(addr = %addr, "http public entry enabled"),
+        Err(e) => warn!("cannot read the public entry's local_addr: {e}"),
+    }
+    tokio::spawn(async move {
+        let result = match https {
+            Some(cfg) => serve_https(listener, app, cfg, client_stall).await,
+            None => serve_plain(listener, app, client_stall).await,
+        };
+        if let Err(e) = result {
+            warn!("public entry stopped: {e}");
+        }
+    })
+}
+
+/// 服务一条客户端连接（TLS 与明文共用）。
+///
+/// **写方向必须包 [`io_stall::WriteStall`]**：hyper 自己**没有写超时**，客户端读完响应头
+/// 就不再读时，hyper 会永久阻塞在 `poll_write`，而准入票据绑在 response body 上——
+/// body 不被丢弃，槽位就永不归还（实测云端沉淀 8 个僵尸槽位，只能重启）。
+/// 应用层的响应体停滞超时修不掉这一半，因为数据已经在 hyper/socket 的缓冲里。
+async fn serve_conn<I>(io: I, app: Router, peer: std::net::SocketAddr, client_stall: Duration)
+where
+    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let io = TokioIo::new(io_stall::WriteStall::new(io, client_stall));
+    // 桥接 hyper(0.4 Service) 与 axum(tower 0.5 Service)
+    let service = service_fn(move |req: hyper::Request<Incoming>| {
+        let mut app = app.clone();
+        async move { app.call(req).await }
+    });
+    if let Err(e) = http1::Builder::new().serve_connection(io, service).await {
+        warn!("http connection {peer} error: {e}");
+    }
+}
+
+/// 基于 tokio-rustls 的 HTTPS accept 循环（每连接一个任务）。
+async fn serve_https(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    server_config: Arc<rustls::ServerConfig>,
+    client_stall: Duration,
+) -> anyhow::Result<()> {
+    let acceptor = TlsAcceptor::from(server_config);
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        let acceptor = acceptor.clone();
+        let app = app.clone();
+        tokio::spawn(async move {
+            match acceptor.accept(stream).await {
+                Ok(tls_stream) => serve_conn(tls_stream, app, peer, client_stall).await,
+                Err(e) => warn!("tls handshake from {peer} failed: {e}"),
+            }
+        });
+    }
+}
+
+/// 明文入口：与 [`serve_https`] 同一套服务实现（含写停滞超时）。
+/// 以前这里直接用 `axum::serve`，它没有写超时，客户端不读响应体就会卡住一条连接并占住票据。
+async fn serve_plain(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    client_stall: Duration,
+) -> anyhow::Result<()> {
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        let app = app.clone();
+        tokio::spawn(async move { serve_conn(stream, app, peer, client_stall).await });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::http::{HeaderMap, HeaderValue};
 
-    use crate::{keystore::KeyStore, metrics::Metrics, ratelimit::RateLimiter, registry::Registry};
+    use crate::{keystore::KeyStore, metrics::Metrics, registry::Registry};
 
     fn test_state(ui: Option<PathBuf>) -> AppState {
-        AppState {
-            registry: Registry::default(),
-            key_store: KeyStore::new(None),
-            admin_token: None,
-            timeout: Duration::from_secs(10),
-            agent_stale_after: Duration::from_secs(10),
-            tunnel_op_timeout: Duration::from_secs(2),
+        // 测试档位：只改这个文件真正关心的旋钮，其余取库默认（`Options::default()`）。
+        let opts = Options {
             head_timeout: Duration::from_secs(5),
-            head_alive_window: Duration::from_secs(20),
-            client_stall: Duration::from_secs(60),
-            rate_limiter: RateLimiter::new(0),
-            max_concurrent_requests: 0,
-            max_open_tunnel_streams: 1024,
-            metrics: Metrics::default(),
-            ui,
-            ui_problem: None,
-        }
+            ui_dir: ui,
+            ..Options::default()
+        };
+        AppState::new(
+            Registry::default(),
+            KeyStore::new(None),
+            Metrics::default(),
+            &opts,
+        )
     }
 
     fn headers_with_accept(accept: &str) -> HeaderMap {

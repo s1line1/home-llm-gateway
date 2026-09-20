@@ -7,7 +7,7 @@ use tracing::{debug, error, info, warn};
 use crate::metrics::Metrics;
 use crate::registry::Registry;
 
-/// `stream_ceiling` = 每条连接允许的在途隧道流数（见 `GatewayConfig::max_open_tunnel_streams`）。
+/// `stream_ceiling` = 每条连接允许的在途隧道流数（见 `Options::max_open_tunnel_streams`）。
 /// 它只用于**注册时的一致性告警**：agent 声明的 `max_concurrency` 超过这个额度时，网关侧
 /// 会先撞流额度而不是先撞容量闸——表现是"开流排队超时"，排查起来比容量不足隐蔽得多。
 pub async fn accept_loop(

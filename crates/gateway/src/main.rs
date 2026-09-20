@@ -41,9 +41,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
     tracing::info!(http = %gw.http_addr, quic = %gw.quic_addr, "Gateway ready");
     shutdown_signal().await;
     tracing::info!("graceful shutdown: stopping gateway");
-    // 先落库再停：用量在内存里按周期批量写库，退出前必须补最后这一刀，
-    // 否则最后一个 flush 周期内的用量会随进程一起消失。
-    gw.flush_usage_on_shutdown();
+    // 用量落库已并进 shutdown：先强制写一次（否则最后一个 flush 周期内的用量会随进程
+    // 一起消失），再 abort 任务。以前这里要记得先调 flush_usage_on_shutdown —— 现在忘不了。
     gw.shutdown().await;
     Ok(())
 }

@@ -14,27 +14,23 @@ async fn e2e_https_public_entry() {
     let (keys_path, key) = seed_keys_db();
 
     let gw = Gateway::start(GatewayConfig {
-        http_bind: "127.0.0.1:0".parse().unwrap(),
-        quic_bind: "127.0.0.1:0".parse().unwrap(),
-        ca_cert: parse_certs_pem(&ca_pem),
-        server_cert: parse_certs_pem(&srv_pem),
-        server_key: parse_key_pem(&srv_key_pem),
-        admin_token: None,
-        keys_file: Some(keys_path),
-        verified_cache_max: gateway::keystore::DEFAULT_VERIFIED_MAX,
-        request_timeout: Duration::from_secs(10),
-        tunnel_op_timeout: Duration::from_secs(2),
-        head_timeout: Duration::from_secs(5),
-        client_stall: Duration::from_secs(60),
-        agent_stale_after: Duration::from_secs(10),
-        rate_limit_per_min: 0,
-        max_concurrent_requests: 0,
-        max_open_tunnel_streams: 1024,
-        tls: Some(TlsPem {
-            cert: srv_pem.clone().into_bytes(),
-            key: srv_key_pem.clone().into_bytes(),
-        }),
-        ui_dir: None,
+        tunnel: TunnelTls {
+            ca_cert: parse_certs_pem(&ca_pem),
+            server_cert: parse_certs_pem(&srv_pem),
+            server_key: parse_key_pem(&srv_key_pem),
+        },
+        opts: Options {
+            keys_file: Some(keys_path),
+            request_timeout: Duration::from_secs(10),
+            tunnel_op_timeout: Duration::from_secs(2),
+            head_timeout: Duration::from_secs(5),
+            agent_stale_after: Duration::from_secs(10),
+            https: Some(TlsPem {
+                cert: srv_pem.clone().into_bytes(),
+                key: srv_key_pem.clone().into_bytes(),
+            }),
+            ..Options::default()
+        },
     })
     .await
     .unwrap();
@@ -126,24 +122,19 @@ async fn e2e_quic_control_stream_edge_frames() {
     let (ca, server_cert, server_key, client_cert, client_key) = gen_certs();
 
     let gw = Gateway::start(GatewayConfig {
-        http_bind: "127.0.0.1:0".parse().unwrap(),
-        quic_bind: "127.0.0.1:0".parse().unwrap(),
-        ca_cert: vec![ca.clone()],
-        server_cert: vec![server_cert.clone()],
-        server_key,
-        admin_token: None,
-        keys_file: None,
-        verified_cache_max: gateway::keystore::DEFAULT_VERIFIED_MAX,
-        request_timeout: Duration::from_secs(10),
-        tunnel_op_timeout: Duration::from_secs(2),
-        head_timeout: Duration::from_secs(5),
-        client_stall: Duration::from_secs(60),
-        agent_stale_after: Duration::from_secs(10),
-        rate_limit_per_min: 0,
-        max_concurrent_requests: 0,
-        max_open_tunnel_streams: 1024,
-        tls: None,
-        ui_dir: None,
+        tunnel: TunnelTls {
+            ca_cert: vec![ca.clone()],
+            server_cert: vec![server_cert.clone()],
+            server_key,
+        },
+        opts: Options {
+            keys_file: None,
+            request_timeout: Duration::from_secs(10),
+            tunnel_op_timeout: Duration::from_secs(2),
+            head_timeout: Duration::from_secs(5),
+            agent_stale_after: Duration::from_secs(10),
+            ..Options::default()
+        },
     })
     .await
     .unwrap();
@@ -305,24 +296,19 @@ async fn e2e_proxy_protocol_edge_cases() {
 
     // 短转发空闲超时（200ms），用于触发 body 空闲超时场景
     let gw = Gateway::start(GatewayConfig {
-        http_bind: "127.0.0.1:0".parse().unwrap(),
-        quic_bind: "127.0.0.1:0".parse().unwrap(),
-        ca_cert: vec![ca.clone()],
-        server_cert: vec![server_cert.clone()],
-        server_key,
-        admin_token: None,
-        keys_file: Some(keys_path),
-        verified_cache_max: gateway::keystore::DEFAULT_VERIFIED_MAX,
-        request_timeout: Duration::from_millis(200),
-        tunnel_op_timeout: Duration::from_secs(2),
-        head_timeout: Duration::from_secs(5),
-        client_stall: Duration::from_secs(60),
-        agent_stale_after: Duration::from_secs(10),
-        rate_limit_per_min: 0,
-        max_concurrent_requests: 0,
-        max_open_tunnel_streams: 1024,
-        tls: None,
-        ui_dir: None,
+        tunnel: TunnelTls {
+            ca_cert: vec![ca.clone()],
+            server_cert: vec![server_cert.clone()],
+            server_key,
+        },
+        opts: Options {
+            keys_file: Some(keys_path),
+            request_timeout: Duration::from_millis(200),
+            tunnel_op_timeout: Duration::from_secs(2),
+            head_timeout: Duration::from_secs(5),
+            agent_stale_after: Duration::from_secs(10),
+            ..Options::default()
+        },
     })
     .await
     .unwrap();
@@ -657,24 +643,20 @@ async fn gateway_start_fails_fast_on_unusable_tls() {
     async fn start_with_tls(tls: TlsPem) -> Result<Gateway, gateway::error::GatewayError> {
         let (ca, server_cert, server_key, _client_cert, _client_key) = gen_certs();
         Gateway::start(GatewayConfig {
-            http_bind: "127.0.0.1:0".parse().unwrap(),
-            quic_bind: "127.0.0.1:0".parse().unwrap(),
-            ca_cert: vec![ca],
-            server_cert: vec![server_cert],
-            server_key,
-            admin_token: None,
-            keys_file: None,
-            verified_cache_max: gateway::keystore::DEFAULT_VERIFIED_MAX,
-            request_timeout: Duration::from_secs(5),
-            tunnel_op_timeout: Duration::from_secs(2),
-            head_timeout: Duration::from_secs(5),
-            client_stall: Duration::from_secs(60),
-            agent_stale_after: Duration::from_secs(10),
-            rate_limit_per_min: 0,
-            max_concurrent_requests: 0,
-            max_open_tunnel_streams: 1024,
-            tls: Some(tls),
-            ui_dir: None,
+            tunnel: TunnelTls {
+                ca_cert: vec![ca],
+                server_cert: vec![server_cert],
+                server_key,
+            },
+            opts: Options {
+                keys_file: None,
+                request_timeout: Duration::from_secs(5),
+                tunnel_op_timeout: Duration::from_secs(2),
+                head_timeout: Duration::from_secs(5),
+                agent_stale_after: Duration::from_secs(10),
+                https: Some(tls),
+                ..Options::default()
+            },
         })
         .await
     }

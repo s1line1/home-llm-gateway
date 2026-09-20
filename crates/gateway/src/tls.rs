@@ -1,6 +1,6 @@
 //! TLS 配置构造与 PEM 加载。
 
-use std::{io::Cursor, sync::Arc};
+use std::{io::Cursor, path::Path, sync::Arc};
 
 use proto::ALPN;
 use rustls::{
@@ -16,6 +16,30 @@ use crate::error::GatewayError;
 pub struct TlsPem {
     pub cert: Vec<u8>,
     pub key: Vec<u8>,
+}
+
+impl TlsPem {
+    /// 从两个 PEM 文件装载（生产路径）。
+    pub fn from_pem_files(cert: &Path, key: &Path) -> Result<Self, GatewayError> {
+        Ok(Self {
+            cert: std::fs::read(cert)
+                .map_err(|e| GatewayError::Other(format!("cannot read {}: {e}", cert.display())))?,
+            key: std::fs::read(key)
+                .map_err(|e| GatewayError::Other(format!("cannot read {}: {e}", key.display())))?,
+        })
+    }
+
+    /// 构建公网 HTTPS 入口的 rustls 配置。
+    ///
+    /// 与隧道侧不同：这里**不要求**客户端证书（浏览器没有），所以 `with_no_client_auth`。
+    /// 错误消息保持原样——运维就是靠它定位"证书与私钥不匹配"。
+    pub(crate) fn server_config(&self) -> Result<Arc<rustls::ServerConfig>, GatewayError> {
+        https_server_config(&self.cert, &self.key)
+            .map(Arc::new)
+            .map_err(|e| {
+                GatewayError::Config(format!("tls_cert/tls_key 无法构建 HTTPS 服务端配置: {e}"))
+            })
+    }
 }
 
 /// 构造 HTTPS（公网 API 入口）的 rustls ServerConfig，由 PEM 字节构建。

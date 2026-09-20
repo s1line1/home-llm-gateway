@@ -29,7 +29,7 @@ async fn e2e_startup_raises_the_nofile_soft_limit_in_the_real_process() {
     let lowered = target > 1024 && rlimit::setrlimit(rlimit::Resource::NOFILE, 1024, hard).is_ok();
     let soft_before = rlimit::getrlimit(rlimit::Resource::NOFILE).unwrap().0;
 
-    let (gw, agent, _base, _key) = start_stack(Duration::from_secs(10), 0, 4, None).await;
+    let (gw, agent, _base, _key) = start_stack(4, |_| {}).await;
 
     // ① 网关自己报告的结论（必须与启动日志一致）
     let outcome = gw.nofile.outcome();

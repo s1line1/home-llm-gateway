@@ -11,6 +11,7 @@ pub mod http;
 pub mod http_proxy;
 pub mod io_stall;
 pub mod keystore;
+mod listen;
 pub mod metrics;
 pub mod nofile;
 pub mod quic;
@@ -22,5 +23,5 @@ pub mod usage_flush;
 
 // 再导出：保住 `gateway::{Gateway, GatewayConfig, TlsPem}` 这些既有导入路径
 // （src/config.rs、main.rs 与 tests/e2e/* 都按这些路径引用）。
-pub use gateway::{Gateway, GatewayConfig};
+pub use gateway::{Gateway, GatewayConfig, Options, TunnelTls};
 pub use tls::TlsPem;
