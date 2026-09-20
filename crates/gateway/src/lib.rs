@@ -12,6 +12,7 @@ pub mod io_stall;
 mod listen;
 pub mod metrics;
 pub mod nofile;
+pub mod openai;
 pub mod proxy;
 pub mod quic;
 pub mod ratelimit;

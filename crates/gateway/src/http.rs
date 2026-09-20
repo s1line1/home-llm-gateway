@@ -450,7 +450,7 @@ async fn metrics_middleware(
     let limit = state.max_concurrent_requests;
     let Some(admission) = state.metrics.try_enter(limit) else {
         state.metrics.record_rejected(429);
-        let mut resp = crate::proxy::error_response(
+        let mut resp = crate::openai::error_response(
             axum::http::StatusCode::TOO_MANY_REQUESTS,
             "too many concurrent requests, retry later",
         );
