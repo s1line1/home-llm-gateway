@@ -11,7 +11,7 @@ use crate::{error::GatewayError, gateway::Options, nofile};
 /// 已绑好的两个入口。两个地址都是**真实**地址（配置 `:0` 时是内核分配的临时端口）。
 pub(crate) struct Sockets {
     pub http: tokio::net::TcpListener,
-    pub quic: s2n_quic::Server,
+    pub server: s2n_quic::Server,
     pub http_addr: SocketAddr,
     pub quic_addr: SocketAddr,
 }
@@ -48,19 +48,19 @@ impl Sockets {
                 ))
             })?;
 
-        let quic = s2n_quic::Server::builder()
+        let quic_server = s2n_quic::Server::builder()
             .with_tls(s2n_quic::provider::tls::rustls::Server::from(quic_tls))?
             .with_io(opts.quic_bind)?
             .with_limits(limits)?
             .start()?;
-        let quic_addr = quic.local_addr()?;
+        let quic_addr = quic_server.local_addr()?;
 
         let http = tokio::net::TcpListener::bind(opts.http_bind).await?;
         let http_addr = http.local_addr()?;
 
         Ok(Self {
             http,
-            quic,
+            server: quic_server,
             http_addr,
             quic_addr,
         })
