@@ -4,6 +4,7 @@
 //! TLS 材料与 rustls 配置构造在 [`tls`]。
 
 pub mod admin;
+pub mod auth;
 pub mod config;
 pub mod error;
 pub mod gateway;

@@ -17,58 +17,13 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, warn};
 
+use crate::auth::authenticate;
 use crate::http::AppState;
 use crate::openai::error_response;
 use crate::registry::AcquireError;
 use crate::storage::UsageDelta;
 
 static NEXT_REQUEST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
-/// 校验 Bearer API Key（动态 key）；通过时返回 (token, key_id, key_name)。
-/// token 用作限流 key；key_id/key_name 用于用量计量。
-///
-/// argon2 校验单次 10-30ms（19MiB 内存）的 CPU 密集操作，**必须**放到阻塞线程池：
-/// 直接在请求路径上同步执行会占住 async worker（worker 数 = CPU 核数），
-/// 连带拖慢同一个 worker 上所有在途请求，包括正在流式回传的 SSE。
-async fn api_key(state: &AppState, headers: &HeaderMap) -> Option<(String, String, String)> {
-    let value = headers.get(axum::http::header::AUTHORIZATION)?;
-    let token = value.to_str().ok()?.strip_prefix("Bearer ")?.to_string();
-    let store = state.key_store.clone();
-    let token_for_verify = token.clone();
-    let record = match tokio::task::spawn_blocking(move || {
-        store.authorize_record(&token_for_verify)
-    })
-    .await
-    {
-        Ok(rec) => rec?,
-        Err(e) => {
-            // 校验任务 panic/被取消：按认证失败处理，不放行
-            warn!("key verification task failed: {e}");
-            return None;
-        }
-    };
-    Some((token, record.id, record.name))
-}
-
-/// 认证 + 限流（/v1/* 统一入口，含 /v1/models 聚合路由）。
-/// 认证失败 → Some(401)；限流失败 → Some(429)；通过 → None。
-pub async fn auth_and_rate_limit(state: &AppState, headers: &HeaderMap) -> Option<Response> {
-    let Some((token, _id, _name)) = api_key(state, headers).await else {
-        return Some(error_response(
-            StatusCode::UNAUTHORIZED,
-            "invalid or missing API key",
-        ));
-    };
-    if let Some(rl) = &state.rate_limiter {
-        if !rl.try_acquire(&token) {
-            return Some(error_response(
-                StatusCode::TOO_MANY_REQUESTS,
-                "rate limit exceeded",
-            ));
-        }
-    }
-    None
-}
 
 /// 从请求 body 提取路由所需模型：顶层 `model` 字段（OpenAI 兼容语义，必填）。
 /// 缺失 / 非字符串 / 空串 → Err（调用方返回 400）。
@@ -215,15 +170,11 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
         .and_then(|n| n.parse::<u64>().ok())
         .unwrap_or_else(|| NEXT_REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
 
-    // 认证：同时拿到 key_id/key_name（用量计量）与 token（限流）
-    let Some((token, key_id, key_name)) = api_key(&state, &headers).await else {
-        return error_response(StatusCode::UNAUTHORIZED, "invalid or missing API key");
+    // 认证 + 限流（per-key 令牌桶）：拿不到身份的唯一出路就是把它还给客户端。
+    let key = match authenticate(&state, &headers).await {
+        Ok(key) => key,
+        Err(rejection) => return rejection,
     };
-    if let Some(rl) = &state.rate_limiter {
-        if !rl.try_acquire(&token) {
-            return error_response(StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded");
-        }
-    }
 
     // 读请求体：停滞/超限/读失败各自有明确状态码，且**都会归还准入票据**（随本函数返回而
     // Drop）——这正是修掉"槽位永久泄漏"的地方。
@@ -544,8 +495,8 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
             slot,
             metrics,
             key_store,
-            key_id,
-            key_name,
+            key.key_id,
+            key.key_name,
             prompt_est,
             is_stream,
         )

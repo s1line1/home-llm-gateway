@@ -455,8 +455,10 @@
       23 处 `CertificateParams::default()` 的 PKI 脚手架（`agent/src/lib.rs:326-366`、
       `gateway/src/tls.rs:75-109`、`gateway/src/main.rs:76-100`、`agent/src/main.rs:75-99`、
       `registry.rs:212-255`、`quic.rs:103-125`）。抽一个共享 fixture。
-- [ ] **重复逻辑**：`proxy` 内联了 `auth_and_rate_limit` 已封装的认证 + 限流（`proxy/mod.rs:133-140`）；
-      `Accept: text/html` 探测复制两份（`http.rs:103-107` 与 `:197-201`）。
+- [x] **重复逻辑（认证+限流这一半已修，2026-09）**：`proxy` 曾内联复制一份已封装的
+      认证 + 限流。现在两条路径（`/v1/{*rest}` 与 `/v1/models`）都走 `auth::authenticate`，
+      401/429 的文案与顺序只存在一处：`auth.rs`。另一半未修：`Accept: text/html` 探测
+      仍复制两份（`http.rs:103-107` 与 `:197-201`）。
 - [ ] **`UsageCollector` 位置与自我声明矛盾**：110 行、有状态的它住在 `proxy/mod.rs:292-395`，
       而 `usage_meter.rs:10` 自称"只含纯函数"，OPTIMIZATION S1 又把 proxy 限定为"代理转发"——
       二选一：搬去 `usage_meter.rs`，或改掉那句注释。

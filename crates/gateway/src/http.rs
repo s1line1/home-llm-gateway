@@ -364,7 +364,7 @@ async fn healthz() -> &'static str {
 /// （`["*"]` 全匹配的 agent 不贡献条目——它接受任意请求，但具体能跑什么
 /// 只有上游知道，列出会误导客户端）。与代理入口同级的认证 + 限流。
 async fn models_route(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Some(rejection) = crate::proxy::auth_and_rate_limit(&state, &headers).await {
+    if let Err(rejection) = crate::auth::authenticate(&state, &headers).await {
         return rejection;
     }
     let data: Vec<_> = state
