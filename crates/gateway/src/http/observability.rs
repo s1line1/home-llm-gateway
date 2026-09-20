@@ -2,11 +2,15 @@
 //!
 //! 三条策略在这里，但它们不是并列的——第 3 条是前两条能成立的前提：
 //!
-//! 1. **id**：客户端自带 `x-request-id` 则沿用（幂等重试可对账），否则分配 `req-{n}`；
-//!    同时写响应头与**入站 headers**，后者供 `proxy` 复用为隧道 `request_id`。
-//!    ⚠️ 已知缺口（TODO 登记）：`proxy` 只认 `req-<u64>` 形状，真实客户端（Codex/DSH）
-//!    发的是 UUID → 它会回落到 `proxy` 里**另一个**同名计数器，两边都从 1 开始 → 可能撞号。
-//! 2. **闸门**：`max_concurrent_requests` 是全局在途上限（`/metrics` 豁免），超限立即 429，
+//! 1. **id**：隧道 id 与 HTTP 层 id 同源——只有一个计数器（`crate::request_id`）。
+//!    入站 `req-<u64>` 沿用（幂等重试可对账），其他形状（UUID / 非法值）分配新号；
+//!    规范化的 `req-{n}` 写回**入站 headers**，供 `proxy` 原样用作隧道 `request_id`；
+//!    响应头回显客户端原值，两边不一致时访问日志同时记 `request_id` 与
+//!    `client_request_id`。
+//!    （历史缺口：拆分前 `metrics_middleware` 与 `proxy` 各有一个计数器都从 1 起，
+//!    UUID 客户端会让两个数列独立递增、周期性撞号——现已由该模块统一。）
+//! 2. **闸门**：`max_concurrent_requests` 是全局在途上限（`/metrics` 完全不记；`/healthz`
+//!    豁免——探针被 429 会让 LB 摘除实例，把"慢"放大成"全挂"），超限立即 429，
 //!    防多 key 总和压垮单实例。
 //! 3. **票据移交**：`Admission` 的释放**完全由 Drop 负责**，且分两段——移交 body 之前
 //!    （含客户端中断导致 future 被 drop）就地归还；移交之后随 body 结束/丢弃归还。
@@ -27,9 +31,9 @@ use tracing::{debug, error, info, warn};
 
 use crate::state::AppState;
 
-/// 记录请求状态码与耗时（/metrics 自身不计入），并为每个请求生成/透传
-/// `x-request-id`（响应头 + 写进入站 headers 供 proxy 复用为隧道 request_id，
-/// 使 HTTP 层、隧道层、日志三方对账一致）。
+/// 记录请求状态码与耗时（/metrics 自身不计入），并为每个请求确定 id：
+/// 隧道 `request_id` 取自 `crate::request_id`（与响应头、日志同一数字），
+/// 写进入站 headers 供 `proxy` 复用；响应头另有回显客户端原值的规则（见实现）。
 ///
 /// 访问日志分级（target `gateway::access`），避免每请求一条 info 淹没真正的
 /// warn/error 日志：
@@ -46,36 +50,52 @@ pub(super) async fn metrics_middleware(
     if req.uri().path() == "/metrics" {
         return next.run(req).await;
     }
-    // 客户端自带 x-request-id 则沿用（幂等重试对账），否则分配
-    let request_id = match req.headers().get("x-request-id") {
-        Some(v) => v.to_str().unwrap_or_default().to_string(),
-        None => {
-            let id = NEXT_REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let id = format!("req-{id}");
-            if let Ok(v) = axum::http::HeaderValue::from_str(&id) {
-                req.headers_mut().insert("x-request-id", v);
-            }
-            id
-        }
-    };
+    // 隧道 id 与 HTTP 层共用一个计数器（crate::request_id），并**规范化写回入站 headers**：
+    // proxy 直接沿用这个数字，于是 UUID 客户端也不会让两边各自计数、周期性撞号。
+    let client_request_id = req
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let request_id =
+        crate::request_id::format(crate::request_id::tunnel_id(client_request_id.as_deref()));
+    if let Some(v) = crate::request_id::header_value(&request_id) {
+        req.headers_mut().insert("x-request-id", v);
+    }
+    // 响应头回显客户端原值（客户端按自己的 id 对账，可能是 UUID）；没有则回显 req-{n}。
+    // 与隧道 id 不同时，靠访问日志里的 client_request_id 字段对账。
+    let echo_id = client_request_id
+        .as_deref()
+        .unwrap_or(&request_id)
+        .to_string();
+    let client_request_id = client_request_id.unwrap_or_else(|| "-".to_string());
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     // HTTP 全局在途上限（0 = 不限）：try_enter 原子占位（旧值判定，无竞态），
     // 超限返回 None → 立即 429，防多 key 总和压垮单实例。
     // 票据的释放完全由 Drop 负责，分两段：① 移交 body 之前（含客户端中断导致 future
     // 被 drop）→ 就地 Drop 归还；② 移交 body 之后 → 随 body 结束/丢弃归还。
-    let limit = state.max_concurrent_requests;
+    //
+    // /healthz **豁免**（REBUILD §5.3 / R12）：闸门打满时探针若被 429，LB 会摘除实例、
+    // systemd 会重启循环——把上游的"慢"放大成整机"全挂"。用 `0 = 不限` 表达豁免，
+    // 于是 id、访问日志、在途与耗时记账与其它路径完全一致，区别只有"能不能被拒"。
+    let limit = if path == "/healthz" {
+        0
+    } else {
+        state.max_concurrent_requests
+    };
     let Some(admission) = state.metrics.try_enter(limit) else {
         state.metrics.record_rejected(429);
         let mut resp = crate::openai::error_response(
             axum::http::StatusCode::TOO_MANY_REQUESTS,
             "too many concurrent requests, retry later",
         );
-        if let Ok(v) = axum::http::HeaderValue::from_str(&request_id) {
+        if let Ok(v) = axum::http::HeaderValue::from_str(&echo_id) {
             resp.headers_mut().insert("x-request-id", v);
         }
         warn!(
             request_id = %request_id,
+            client_request_id = %client_request_id,
             method = %method,
             path = %path,
             active = state.metrics.active_count(),
@@ -88,7 +108,7 @@ pub(super) async fn metrics_middleware(
     let mut resp = next.run(req).await;
     let status = resp.status().as_u16();
     state.metrics.record_status(status);
-    if let Ok(v) = axum::http::HeaderValue::from_str(&request_id) {
+    if let Ok(v) = axum::http::HeaderValue::from_str(&echo_id) {
         resp.headers_mut().insert("x-request-id", v);
     }
     // 访问日志记的是"到首字节"的延迟（TTFB）；完整请求耗时的记账在准入票据里，
@@ -98,6 +118,7 @@ pub(super) async fn metrics_middleware(
         400..=499 => info!(
             target: "gateway::access",
             request_id = %request_id,
+            client_request_id = %client_request_id,
             method = %method,
             path = %path,
             status,
@@ -107,6 +128,7 @@ pub(super) async fn metrics_middleware(
         s if s >= 500 => error!(
             target: "gateway::access",
             request_id = %request_id,
+            client_request_id = %client_request_id,
             method = %method,
             path = %path,
             status,
@@ -116,6 +138,7 @@ pub(super) async fn metrics_middleware(
         _ => debug!(
             target: "gateway::access",
             request_id = %request_id,
+            client_request_id = %client_request_id,
             method = %method,
             path = %path,
             status,
@@ -134,8 +157,6 @@ pub(super) async fn metrics_middleware(
     });
     Response::from_parts(parts, axum::body::Body::new(body))
 }
-
-static NEXT_REQUEST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 #[cfg(test)]
 mod tests {
@@ -195,6 +216,77 @@ mod tests {
         );
     }
 
+    /// 客户端自带 UUID（Codex/DSH 的真实形态）时：响应头回显原值，但**写回入站
+    /// headers 的是规范化的 `req-{n}`**——proxy 复用它作隧道 request_id，于是
+    /// HTTP 层与隧道层永远是同一个数字，不再各自计数、周期性撞号。
+    #[tokio::test]
+    async fn uuid_client_id_echoed_but_inbound_id_normalized_for_tunnel() {
+        use axum::body::Body;
+        use axum::extract::Request;
+        use axum::http::HeaderMap;
+        use axum::routing::get;
+
+        // 回显入站 x-request-id，以便断言中间件写回了什么（app() 的 handler 都不看该头）
+        let state = test_state(None);
+        let router = axum::Router::new()
+            .route(
+                "/echo",
+                get(|headers: HeaderMap| async move {
+                    headers
+                        .get("x-request-id")
+                        .map(|v| v.to_str().unwrap_or_default().to_string())
+                        .unwrap_or_default()
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                super::metrics_middleware,
+            ))
+            .with_state(state);
+
+        for (sent, inbound_same) in [
+            // UUID（真实客户端形态）不能当隧道 id → 入站被换成 req-{n}
+            ("0197f1c2-9f0b-7c31-8a44-1b2c3d4e5f60", false),
+            // 规范形状 → 原样沿用（幂等重试对账）
+            ("req-999", true),
+        ] {
+            let resp = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/echo")
+                        .header("x-request-id", sent)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.headers()
+                    .get("x-request-id")
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                sent,
+                "响应头回显客户端原值"
+            );
+            let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+            let inbound = String::from_utf8(body.to_vec()).unwrap();
+            if inbound_same {
+                assert_eq!(inbound, sent, "入站沿用规范形状");
+            } else {
+                // 只断言形状：具体数值取决于进程内计数器已被其他测试推进到哪
+                assert!(
+                    inbound
+                        .strip_prefix("req-")
+                        .and_then(|n| n.parse::<u64>().ok())
+                        .is_some(),
+                    "入站被规范化为 req-{{n}}: {inbound}"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn concurrent_request_limit_rejects_with_429() {
         // max_concurrent_requests=1：先人为占住 1 个在途 → 第二个请求 429
@@ -207,11 +299,12 @@ mod tests {
         let held = metrics
             .try_enter(0)
             .expect("limit=0 admits unconditionally");
+        // 用 /v1/models 而不是 /healthz：探针已豁免闸门（见下一条用例）
         let resp = router
             .clone()
             .oneshot(
                 axum::extract::Request::builder()
-                    .uri("/healthz")
+                    .uri("/v1/models")
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
@@ -229,8 +322,36 @@ mod tests {
         );
         drop(held); // 票据 Drop → 释放槽位
 
-        // 槽位释放后恢复
+        // 槽位释放后不再被闸门拒（无 key → 401，说明走到了 handler）
         let resp = router
+            .oneshot(
+                axum::extract::Request::builder()
+                    .uri("/v1/models")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// R12：`/healthz` 必须豁免准入闸门。
+    ///
+    /// 闸门打满时探针若被 429，LB 会摘除实例、systemd 会重启循环——把上游的"慢"放大成
+    /// 整个网关"全挂"，而探针本来是全实例最不该被自己的限流拒掉的请求。
+    #[tokio::test]
+    async fn healthz_is_exempt_from_the_admission_gate() {
+        let mut state = test_state(None);
+        state.max_concurrent_requests = 1;
+        let metrics = state.metrics.clone();
+        let router = app(state);
+
+        // 占满唯一的槽位：此刻任何走闸门的请求都 429
+        let held = metrics
+            .try_enter(0)
+            .expect("limit=0 admits unconditionally");
+        let resp = router
+            .clone()
             .oneshot(
                 axum::extract::Request::builder()
                     .uri("/healthz")
@@ -239,7 +360,23 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "闸门打满时 /healthz 仍须 200（否则 LB 摘除会把\"慢\"放大成\"全挂\"）"
+        );
+
+        // 豁免的只是"能不能被拒"：id 与访问日志照旧，响应仍带 x-request-id
+        assert!(
+            resp.headers().get("x-request-id").is_some(),
+            "探针响应仍应带 x-request-id"
+        );
+        assert_eq!(
+            metrics.active_count(),
+            1 + 1,
+            "探针自身仍被计入在途（豁免不等于不计账）"
+        );
+        drop(held);
     }
 
     #[tokio::test]

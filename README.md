@@ -444,7 +444,7 @@ s2n-quic 的 `initial_max_streams_bidi` 默认只有 **100**（`InitialMaxStream
 - **`verified_cache_max`（默认 1650）把校验成本从"每请求"降到"每凭据版本"**：已验证身份缓存 + **单飞**（同一 token 的并发请求串行化，只跑一次 argon2）+ **凭据版本核对**（吊销即时生效，不靠 TTL）。峰值随之变成 `同时首用的不同 token 数 × 19MiB`：64 并发从 **1 236.5MB 降到 27.1MB**（上面那张对照表）。设 0 可回到"每请求都校验"的旧行为。
 
   > 生产实测（云端 2 vCPU / 1.6GB，同一 key）：缓存生效后 **21 516 个 200 + 941 个 429** 的负载下，`hlmg_key_verify_hits_total` = 22 426、`misses` = 3（命中率 99.99%），CPU 峰值 15%。
-- **`max_concurrent_requests` 是并发总量闸门，与内存脱钩**。它管的是「所有路径的在途 HTTP 请求总数」（只有 `/metrics` 豁免，SSE 长流从开头占到最后一块 body 送完），超限返回 `429 + Retry-After`。缓存关闭时它必须收在 `MemoryMax / 19MiB` 之下，否则那道闸等于没有——**先撞的是 `MemoryMax`（网关被 OOM 杀掉、连接中断），而不是这里优雅地 429**；缓存开启后按业务量给即可：
+- **`max_concurrent_requests` 是并发总量闸门，与内存脱钩**。它管的是「所有路径的在途 HTTP 请求总数」（`/metrics` 与 `/healthz` 豁免——探针被 429 会让 LB 摘除实例、把"慢"放大成"全挂"；SSE 长流从开头占到最后一块 body 送完），超限返回 `429 + Retry-After`。缓存关闭时它必须收在 `MemoryMax / 19MiB` 之下，否则那道闸等于没有——**先撞的是 `MemoryMax`（网关被 OOM 杀掉、连接中断），而不是这里优雅地 429**；缓存开启后按业务量给即可：
 
   ```yaml
   max_concurrent_requests: 32    # 缓存关闭时 ≈ MemoryMax / 20MB；开启后按业务量给
@@ -752,7 +752,7 @@ QPS 压到一两个数量级以下。上面这些数字只在"把模型换快"�
     坏连接，摘除）。**`busy` 陡增 = 该扩容或调 agent 的 `max_concurrency`；`dead` 陡增才是隧道/网络故障**
   - `hlmg_key_verify_hits_total` / `hlmg_key_verify_misses_total`：key 校验命中已验证缓存 / **真正跑了 argon2**的次数。misses 的**增量**就是内存与 CPU 的风险信号（一次 miss 峰值 +19MiB，见《并发上限与内存》），稳态下应接近 0；突然上涨说明凭据被吊销/新增，或缓存容量 `verified_cache_max` 不够。⚠️ **`verified_cache_max: 0` 时这两个计数器恒为 0**（走的是不走缓存的旧路径，两个数都不加）——看到 0 要先确认缓存是否被关掉，别当成"没有校验"
 - **结构化日志**：`tracing`，每个请求带 `request_id` / 状态码 / 耗时（`tower-http` TraceLayer）
-- **`/healthz`**：存活探针
+- **`/healthz`**：存活探针（⚠️ 仍恒返 `ok`，不做深度检查；但**豁免并发闸门**——闸门打满时探针也 200，否则 LB 摘除会把"慢"放大成"全挂"。见 `REBUILD.md` §5.3）
 
 > 注意：`/metrics` 未加认证，公网部署建议在安全组中仅对监控网段放行。
 

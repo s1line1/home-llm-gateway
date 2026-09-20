@@ -30,14 +30,15 @@
       Claude Code（`ANTHROPIC_BASE_URL` 或 router）的配置示例与模型名约定
 - [x] **OpenAI 兼容错误语义标准化（2026-09 实施）**：对照 OpenAI 协议修补三处，
       SDK/工具按 error.type 与 Retry-After 决定重试行为：
-      1. **error.type 按状态码映射**（`proxy::error_response`）：400→
+      1. **error.type 按状态码映射**（`openai::error_response`，唯一构造器）：400→
          `invalid_request_error`、401→`authentication_error`、403→`permission_error`、
          404→`not_found_error`、409→`conflict_error`、429→`rate_limit_error`、
          5xx→`server_error`、其余→`api_error`
       2. **429 响应带 `Retry-After: 60`**（限流/配额拒绝，SDK/脚本退避依赖）
-      3. **`x-request-id` 响应头**：metrics_middleware 生成/透传（客户端自带则沿用），
-         并写入站 headers 供 proxy 复用为隧道 request_id——HTTP 层/隧道帧/日志
-         三方对账一致；proxy 无该头时自增兜底
+      3. **`x-request-id` 响应头**：metrics_middleware 确定隧道 id（`req-<u64>` 沿用、
+         其他形状分配新号，唯一分配器见 `gateway::request_id`），规范化的 `req-{n}`
+         写回入站 headers 供 proxy 复用为隧道 request_id——HTTP 层/隧道帧/日志
+         三方对账一致；响应头回显客户端原值，不一致时日志另记 `client_request_id`
       （测试：error.type 映射单测 + 429 Retry-After 单测 + x-request-id 中间件单测 +
        e2e `e2e_openai_error_semantics`：401/400/404/429/503 各状态码的 type 与头）
 
@@ -422,18 +423,29 @@
 
 ### P2 — 契约 / 一致性
 
-- [ ] **`error.type` 分叉**：`proxy::error_response` 自我声明是 OpenAI 错误格式的唯一来源
-      （`proxy/mod.rs:27-29`），但 `admin.rs:34/110/121/156/166` 与 `http.rs:117` 手搓了 5 种
-      不一致的 type（`auth_error` / `invalid_request` / `gateway_error` / `not_found`）。
-      修法：admin 与 UI fallback 也走同一个构造器/映射表。
-- [ ] **`x-request-id` 只在 `req-<u64>` 形状下才等于隧道 `request_id`**：`proxy/mod.rs:168-173`
-      只认 `strip_prefix("req-")`，其他形状（Codex/DSH 发的是 UUID 形态）回落到**第二个**静态计数器
-      （`proxy/mod.rs:25`，与 `http.rs:320` 的计数器都从 1 开始）→ 数值撞车；P0 宣称的
-      "HTTP 层 / 隧道帧 / 日志三方对账一致"在真实客户端上并不成立。修法：统一 id 生成器，
-      客户端 id 原样进隧道（改名叫 trace id）或帧内改用字符串。
-- [ ] **`extract_model` 卡住非 chat 的 `/v1/*`**：`proxy/mod.rs:142-147` 对 `http.rs:46-53`
-      catch-all 注册的**所有方法与路径**都要求 body 是带 `model` 的 JSON → `GET /v1/files`、
-      `DELETE /v1/files/{id}`、multipart（`/v1/audio/transcriptions`）现在一律 400，
+- [x] **`error.type` 分叉（已修）**：`openai::error_response` 自我声明是 OpenAI 错误格式的
+      唯一来源，但 `admin.rs` 的 5 处（401 `auth_error` / 400 `invalid_request` /
+      500×2 `gateway_error` / 404 `not_found`）与 `http/ui.rs` 的 SPA 404（`not_found`）
+      手搓了 4 种只有本文件认识的名字。现在这 6 处全部走同一个构造器：
+      401→`authentication_error`、400→`invalid_request_error`、404→`not_found_error`、
+      5xx→`server_error`（**响应体的 type 值变了**，这是本条的目的）。
+      测试：`admin::tests::{admin_errors_use_the_openai_error_shape, create_key_rejects_overlong_name}`
+      （先红后绿）+ `http::ui::tests::ui_fallback_serves_spa_to_browser_but_404_to_api` 的 type 断言。
+      仅剩的"自有名字"是 `web/` 前端自己的展示文案，与协议面无关。
+- [x] **`x-request-id` 只在 `req-<u64>` 形状下才等于隧道 `request_id`（已修）**：
+      拆分前 `metrics_middleware` 与 `proxy` 各持一个从 1 开始的静态计数器，UUID 客户端
+      （Codex/DSH 的真实形态）让两个数列独立递增 → 撞号；e2e 在旧代码上实测同一 agent
+      连续收到 `request_id = [1,1,2,2,3,3]`（先红后绿：
+      `chain.rs::e2e_tunnel_request_id_is_unique_across_x_request_id_shapes`）。
+      修法：`gateway::request_id` 作**唯一**分配器（`req-<u64>` 沿用、其他形状分配新号），
+      中间件把规范化的 `req-{n}` 写回入站 headers 供 `proxy` 原样使用；响应头仍回显客户端
+      原值，两者不一致时访问日志同时记 `request_id` 与 `client_request_id`。
+      **未**采用"帧内改用字符串"：动协议字段类型要改 proto/agent/mock-llm 三处，
+      收益只是省掉那条日志映射。
+- [ ] **`extract_model` 卡住非 chat 的 `/v1/*`**：`proxy/mod.rs:28-34` 的 `extract_model`
+      对 catch-all 路由（`http/mod.rs:27-34` 的 `/v1/{*rest}`，注册了 GET/POST/PUT/DELETE/PATCH）
+      **所有方法与路径**都要求 body 是带 `model` 的 JSON（调用点 `proxy/mod.rs:81-86` → 400）→
+      `GET /v1/files`、`DELETE /v1/files/{id}`、multipart（`/v1/audio/transcriptions`）现在一律 400，
       与 DESIGN §5.1"一律透传"冲突。修法：按路径/方法白名单要求 model（chat/completions、
       embeddings…），其余透传。
 - [ ] **A3 类型化错误收尾**（OPTIMIZATION.md 已改标 ⚠️ 部分）：`Agent::start`
@@ -442,6 +454,16 @@
 - [ ] **Makefile `deny` 目标 ≠ hook/CI**：目标只跑 `cargo deny check licenses`，而 pre-commit hook
       与 CI 跑完整 `cargo deny check`（广告语已改，行为未变）。二选一：把目标改成完整检查，
       或明确 `make check` 不含完整 cargo-deny。
+- [ ] **工具链没真的锁版本 → 本地与 CI 的 lint 会漂移**（`OPTIMIZATION.md` 的 E2 已从 ✅ 改标 ⚠️ 名义）：
+      `rust-toolchain.toml` 是 `channel = "stable"`（**浮动 channel，不是钉版本**），
+      `.github/workflows/ci.yml:18-21` 用 `dtolnay/rust-toolchain@stable`——**不读那个文件**，
+      装的是 CI 当刻的最新 stable（步骤名却叫 `Install Rust (rust-toolchain.toml)`），
+      `Cargo.toml` 也没有 `rust-version` 兜底。后果实测过：`clippy::result_large_err`
+      只在 CI 触发、本地（stable 1.97.1）无论加不加 `-D` 都不报，于是"本地全绿 → CI 红"。
+      修法：`channel` 钉到具体版本（与 CI 一致）+ CI 侧指向同一版本（别再用 `@stable` 隐式浮动）
+      + 在 `[workspace.package]` 补 `rust-version` 声明 MSRV；升级工具链变成一次显式提交。
+      根因不清掉，后面每轮 CI 都可能冒出新的 nightly/stable 新 lint（例如 `Atomic::fetch_update`
+      弃用就是靠本地 nightly 才提前发现的，见本文件「坏味道 / 清理」里那条）。
 - [ ] **Heartbeat 载荷空洞**：`Frame::Heartbeat { inflight }` 恒为 0（`agent/src/lib.rs:136-140`），
       网关只打 debug 日志（`quic.rs:76-84`）。它是"容量感知路由"的前置数据：要么实现上报，
       要么删掉该字段（现在是死载荷，容易误导）。
@@ -472,6 +494,12 @@
       `HeadOutcome::Error(u16, String)` 用裸状态码。
 - [ ] **死代码 / 死常量**：`KeyStore::authorize_id`（`storage/mod.rs:210`）、`Metrics::request_count`
       （`metrics.rs:98`）、`HISTORY_LEN` 被导出但 `useMetricsHistory.ts:41` 硬编码 `60`。
+- [ ] **`Atomic::fetch_update` 已弃用 → 改 `try_update`**：`registry.rs:406`（`try_acquire`
+      抢并发槽位那处）。nightly 1.100.0 的措辞是 `deprecated: renamed to try_update for
+      consistency`——**纯改名**，签名与返回值语义完全一致（本地实测对照：成功路径两边都
+      `Ok(prev)`、闭包返 `None` 时两边都 `Err(cur)`，原子终值也相同）。`try_update` 在
+      **stable 1.97.1 上就能编译**，所以不必等新 stable，一行即可消掉未来的 deprecation 警告；
+      注意它现在只在 nightly 报警，稳定版 CI 不会提示（这也是"工具链没锁版本"那条的连带损失）。
 
 ### 本次一并修掉的文档漂移（无需再动代码）
 
@@ -553,9 +581,10 @@
       （`DESIGN.md` §5 自认）。SSE 长流不能被总时限误杀，动之前要先把语义想清楚。
 - [ ] **R11 延迟分位数**：`hlmg_request_duration_ms` 只有 sum，没有直方图
       （`crates/gateway/src/metrics.rs:316`）——"p99 变差"从求和值里看不出来。
-- [ ] **R12 healthz 豁免闸门 + 深度检查**：`/healthz` 恒返 `"ok"`
-      （`crates/gateway/src/http.rs:287-289`），且只有 `/metrics` 豁免准入（`http.rs:357-359`）
-      ——闸门打满时健康检查会 429，把"慢"放大成"全挂"。
+- [ ] **R12 healthz 深度检查**：`/healthz` 恒返 `"ok"`（`crates/gateway/src/http/api.rs`），
+      探针答不出"隧道入口还活着吗 / 还有几个 agent 注册 / 持久化可写吗"。
+      （闸门豁免这一半已修：`/healthz` 用 `limit = 0` 绕过准入，单测
+      `observability::tests::healthz_is_exempt_from_the_admission_gate` 锁住。）
 - [ ] **R12 drain 式关闭**：`Gateway::shutdown`（`crates/gateway/src/lib.rs:290`）目前只是
       `abort()` 掉四个任务（两个 HTTP 监听、QUIC accept、用量 flusher），**没有排空**——
       `systemctl restart`（SIGTERM）会把在途 SSE 流切断，客户端看到的是"流被截断"而非正常结束；

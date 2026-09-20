@@ -542,3 +542,135 @@ async fn e2e_client_disconnect_while_upstream_is_silent_releases_the_slot() {
     agent.shutdown().await;
     gw.shutdown().await;
 }
+
+/// 隧道 `request_id` 必须与 HTTP 层 id **同源**：不带 `x-request-id` 的请求与带 UUID 的
+/// 请求，隧道 id 必须互不重复。
+///
+/// 回归的是拆分前的真实缺口：`metrics_middleware` 与 `proxy` 各持一个从 1 开始的静态
+/// 计数器——不带头的请求走前者（`req-{n}` 写回 headers，`proxy` 沿用），带 UUID 的请求
+/// `proxy` 解析失败、回落到**它自己那个**计数器 → 两个 1..N 数列互相撞号（A 的第 n 个
+/// 请求与 B 的第 n 个请求拿到同一个 id，送给同一个 agent）。
+///
+/// 隧道 id 不是纯日志字段：`Frame::Cancel { request_id }` 按它定位请求，agent 也按它
+/// 关联会话；撞号意味着可能取消到错误的请求。修法是两侧共用一个分配器
+/// （`gateway::request_id`），本用例锁住这条不变量。
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn e2e_tunnel_request_id_is_unique_across_x_request_id_shapes() {
+    use std::sync::Arc;
+
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    let TestGateway {
+        gw,
+        certs,
+        key,
+        base,
+        ..
+    } = start_gateway(|_| {}).await;
+
+    // 裸 s2n-quic 客户端：注册成唯一 agent，随后每收到一条代理流就把它的 request_id 报回来
+    let client = s2n_quic::Client::builder()
+        .with_tls(s2n_quic::provider::tls::rustls::Client::from(Arc::new(
+            agent::tls::rustls_client_tls(
+                &certs.ca,
+                certs.client_cert.clone(),
+                certs.client_key.clone_key(),
+            )
+            .unwrap(),
+        )))
+        .unwrap()
+        .with_io("0.0.0.0:0")
+        .unwrap()
+        .start()
+        .unwrap();
+    let mut conn = client
+        .connect(s2n_quic::client::Connect::new(gw.quic_addr).with_server_name("localhost"))
+        .await
+        .unwrap();
+    let stream = conn.open_bidirectional_stream().await.unwrap();
+    let (mut rr, mut rs) = stream.split();
+    write_frame(
+        &mut rs,
+        &Frame::Register {
+            agent_id: "raw-ids".into(),
+            models: vec!["raw".into()],
+            max_concurrency: 8,
+            version: "test".into(),
+        },
+    )
+    .await
+    .unwrap();
+    rs.finish().unwrap();
+    let _ = read_frame(&mut rr).await;
+    drop((rs, rr));
+    wait_for_agents(&gw, 1, Duration::from_secs(10)).await;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+    let responder = tokio::spawn(async move {
+        loop {
+            let stream = match conn.accept_bidirectional_stream().await {
+                Ok(Some(s)) => s,
+                _ => break,
+            };
+            let (mut recv, mut send) = stream.split();
+            let request_id = match read_frame(&mut recv).await {
+                Ok(Some(Frame::ProxyRequest { request_id, .. })) => request_id,
+                _ => continue,
+            };
+            let _ = tx.send(request_id);
+            // 空 200：head + end，不带 body
+            if write_frame(
+                &mut send,
+                &Frame::ProxyResponseHead {
+                    request_id,
+                    status: 200,
+                    headers: vec![],
+                },
+            )
+            .await
+            .is_err()
+            {
+                break;
+            }
+            let _ = write_frame(
+                &mut send,
+                &Frame::ProxyResponseEnd {
+                    request_id,
+                    ok: true,
+                },
+            )
+            .await;
+        }
+    });
+
+    let http = reqwest::Client::new();
+    let uuid = "0197f1c2-9f0b-7c31-8a44-1b2c3d4e5f60";
+    let payload = serde_json::json!({"model": "raw", "messages": []});
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        for inbound in [None, Some(uuid)] {
+            let mut req = http
+                .post(format!("{base}/v1/chat/completions"))
+                .header("Authorization", format!("Bearer {key}"))
+                .json(&payload);
+            if let Some(id) = inbound {
+                req = req.header("x-request-id", id);
+            }
+            let resp = req.send().await.unwrap();
+            assert_eq!(resp.status(), 200, "裸 agent 回的是空 200");
+            seen.push(rx.recv().await.expect("每个请求都应有一条代理流"));
+        }
+    }
+
+    let mut uniq = seen.clone();
+    uniq.sort_unstable();
+    uniq.dedup();
+    assert_eq!(
+        uniq.len(),
+        seen.len(),
+        "隧道 request_id 撞号：HTTP 层与隧道层必须共用同一个分配器，实得 {seen:?}"
+    );
+
+    responder.abort();
+    gw.shutdown().await;
+}

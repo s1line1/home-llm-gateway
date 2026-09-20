@@ -10,9 +10,7 @@ use axum::{
     extract::State,
     http::{HeaderMap, StatusCode, Uri},
     response::{Html, IntoResponse, Response},
-    Json,
 };
-use serde_json::json;
 use tower::ServiceExt;
 use tower_http::services::{ServeDir, ServeFile};
 
@@ -42,11 +40,9 @@ pub(super) async fn ui_fallback(
         .map(|seg| seg.contains('.'))
         .unwrap_or(false);
     if !wants_html && !has_extension {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": { "message": "not found", "type": "not_found" } })),
-        )
-            .into_response();
+        // 统一错误格式：以前这里手搓的是 `type: "not_found"`，与 proxy 的
+        // `not_found_error` 不是同一个语义名（同一个网关两种 404）
+        return crate::openai::error_response(StatusCode::NOT_FOUND, "not found");
     }
     let req = axum::extract::Request::builder()
         .uri(uri)
@@ -57,13 +53,18 @@ pub(super) async fn ui_fallback(
         .fallback(ServeFile::new(dir.join("index.html")));
     match service.oneshot(req).await {
         Ok(resp) => {
-            // ServeDir 的 body 是 UnsyncBoxBody，收集成 Bytes 后重包为 axum Body
+            // 直接流式转发，不再先 collect 成 Bytes。
+            //
+            // 以前那一步（`BodyExt::collect`）把**整份**资源读进内存后才回第一个字节：
+            // 并发加载资源时网关内存随"资源大小 × 并发数"增长，且没有任何上限——
+            // 与 R9"内存有上界"冲突。`ServeDir` 的 body 是 `UnsyncBoxBody`（Send 但不
+            // Sync），而 `axum::body::Body::new` 只要求 Send，所以本来就不需要那一步；
+            // 改成流式后回压由客户端读取速度决定（配合 `io_stall::WriteStall` 兜住
+            // "客户端不读"）。
+            // parts 原样保留，故 content-type / content-length / last-modified 等
+            // 由 tower-http 决定的头不变。
             let (parts, body) = resp.into_parts();
-            let bytes = http_body_util::BodyExt::collect(body)
-                .await
-                .map(|c| c.to_bytes())
-                .unwrap_or_default();
-            Response::from_parts(parts, axum::body::Body::from(bytes))
+            Response::from_parts(parts, axum::body::Body::new(body))
         }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
@@ -158,10 +159,40 @@ mod tests {
         // API 类未注册路径（Accept: */*、无扩展名）→ 404，绝不能返回 index.html
         let resp = call_ui_fallback(state.clone(), "/admin/agents", Some("*/*")).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-        assert!(
-            !body_str(resp).await.contains("id=\"root\""),
-            "API paths must not get SPA"
+        // 错误体走 openai::error_response：type 是 `not_found_error`
+        // （以前这里手搓 `not_found`，与 proxy 的 404 不是同一个语义名）
+        let body = body_str(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body).expect("404 body is JSON");
+        assert_eq!(v["error"]["type"], "not_found_error");
+        assert!(!body.contains("id=\"root\""), "API paths must not get SPA");
+    }
+
+    /// 大资源：body 现在是**流式**转发（不再 collect 成 Bytes），本用例锁住"改流式没把
+    /// 由 tower-http 决定的响应头弄丢"——`content-length` / `content-type` 都来自
+    /// `parts`，丢了客户端就会当成 chunked 或类型未知。
+    #[tokio::test]
+    async fn ui_fallback_streams_large_assets_with_headers_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+        let big = vec![b'x'; 3 * 1024 * 1024];
+        std::fs::write(dir.path().join("assets/big.js"), &big).unwrap();
+        // index.html 必须存在，否则 resolve_ui 判定目录不可用（ui_fallback 不会注册）
+        std::fs::write(dir.path().join("index.html"), "<div id=\"root\">ui</div>").unwrap();
+        let state = test_state(Some(dir.path().to_path_buf()));
+
+        let resp = call_ui_fallback(state, "/assets/big.js", Some("*/*")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok()),
+            Some("3145728"),
+            "流式转发必须保留 content-length（它来自 parts，不是 body）"
         );
+        let body = axum::body::to_bytes(resp.into_body(), 8 * 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(body.len(), big.len(), "整份内容仍要原样送达");
     }
 
     #[test]

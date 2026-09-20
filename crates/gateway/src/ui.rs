@@ -1,7 +1,8 @@
 //! `ui_dir` 的启动期判定策略：**这份目录能不能拿来托管 Dashboard**。
 //!
-//! 与 `http.rs` 的分工：这里回答"是不是一份能用的产物"（纯判定 + 日志），`http.rs`
-//! 回答"怎么把它服务出去"（`ServeDir`、SPA fallback、占位页）。
+//! 与 `http/` 的分工：这里回答"是不是一份能用的产物"（纯判定 + 日志）与"怎么把 index.html
+//! 读出来"（[`IndexHtml`] 的缓存读），`http/ui.rs` 回答"怎么把它服务出去"
+//! （`ServeDir`、SPA fallback、占位页）。
 //!
 //! 单独成模块是为了**断开依赖环**：`AppState::new` 需要这个判定，而 `AppState` 定义在
 //! `state.rs`；把它留在 `http.rs` 会让依赖变成 `state → http → state`。
@@ -11,8 +12,73 @@
 //! TSX 当 `application/octet-stream` 发出去，浏览器执行不了 → 页面全白且**一条错误都没有**。
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use tracing::{error, warn};
+
+/// `ui_dir` 里 `index.html` 的**缓存读**（服务期每个请求都要它）。
+///
+/// 放在本模块而不是 `http/` 的原因与判定一样：`AppState` 要持有它，而 `AppState` 定义在
+/// `state.rs`；留在 `http/` 会重新造出 `state → http → state`。
+///
+/// 为什么需要缓存：`/metrics` 的浏览器分支与 SPA fallback 都要这份文件，而原来是**每次请求**
+/// `std::fs::read_to_string` ——在 async 上下文里做阻塞 I/O，磁盘一慢就占住 tokio worker
+/// （同一个 worker 上的其它请求一起被拖住）。
+///
+/// 缓存策略是**按 mtime 校验**而不是"启动时读一次"：重建前端后不需要重启网关就能生效，
+/// 否则"我明明 rebuild 了，页面还是旧的"会变成一个很难查的坑。代价是每个请求一次
+/// `tokio::fs::metadata`（走阻塞池，不挡 worker），命中时省掉整文件读取。
+///
+/// 读失败（文件被删/权限）**不缓存失败结果**，下次请求照旧重试——与原来"读不到就降级"
+/// 的行为一致。
+#[derive(Clone)]
+pub(crate) struct IndexHtml {
+    path: PathBuf,
+    /// `None` = 还没成功读过。存 `Arc<str>` 让命中路径只做一次引用计数。
+    cached: Arc<Mutex<Option<Cached>>>,
+}
+
+#[derive(Clone)]
+struct Cached {
+    /// 读这份内容时文件的 mtime；`None` = 该文件系统给不出 mtime。
+    mtime: Option<SystemTime>,
+    html: Arc<str>,
+}
+
+impl IndexHtml {
+    pub(crate) fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            cached: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// 取 index.html：mtime 未变则用缓存。读不到返回 `None`（调用方降级）。
+    pub(crate) async fn load(&self) -> Option<Arc<str>> {
+        let mtime = tokio::fs::metadata(&self.path)
+            .await
+            .ok()
+            .and_then(|m| m.modified().ok());
+        // 只有"缓存里有 mtime 且与磁盘一致"才算命中。mtime 不可知（None）时一律重读：
+        // 宁可多读一次盘，也不要在这类文件系统上永久钉住旧内容。
+        {
+            let guard = self.cached.lock().expect("index cache mutex poisoned");
+            if let Some(c) = guard.as_ref() {
+                if mtime.is_some() && c.mtime == mtime {
+                    return Some(c.html.clone());
+                }
+            }
+        }
+        // 先在锁外读：这里是唯一可能的 await，持锁跨 await 会把并发请求串起来
+        let html: Arc<str> = tokio::fs::read_to_string(&self.path).await.ok()?.into();
+        *self.cached.lock().expect("index cache mutex poisoned") = Some(Cached {
+            mtime,
+            html: html.clone(),
+        });
+        Some(html)
+    }
+}
 
 /// `ui_dir` 是否真的能拿来托管。
 ///
@@ -123,6 +189,62 @@ pub fn resolve_ui(configured: Option<&Path>) -> (Option<PathBuf>, Option<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- index.html 的缓存读 ----
+
+    /// 用 `set_modified` 显式控制 mtime：只靠"写完再写"来触发变更会依赖文件系统时间戳
+    /// 精度，测试会变得不确定。
+    fn write_with_mtime(path: &Path, content: &str, mtime: SystemTime) {
+        std::fs::write(path, content).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn index_html_is_cached_until_mtime_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.html");
+        let t0 = SystemTime::now();
+        write_with_mtime(&path, "A", t0);
+        let cache = IndexHtml::new(path.clone());
+
+        assert_eq!(&*cache.load().await.unwrap(), "A");
+
+        // 内容变了但 mtime 没变（模拟两次写落在同一时间戳）→ 仍是缓存内容：
+        // 这正是"命中缓存、没有重读盘"的证据
+        write_with_mtime(&path, "BBBB", t0);
+        assert_eq!(
+            &*cache.load().await.unwrap(),
+            "A",
+            "mtime 未变时必须命中缓存（不再读盘）"
+        );
+
+        // mtime 变了（重建前端）→ 重读，无需重启网关
+        write_with_mtime(&path, "BBBB", t0 + std::time::Duration::from_secs(1));
+        assert_eq!(
+            &*cache.load().await.unwrap(),
+            "BBBB",
+            "mtime 变化后必须重新读盘（rebuild 后不重启也要生效）"
+        );
+    }
+
+    #[tokio::test]
+    async fn index_html_read_failure_is_not_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.html");
+        let cache = IndexHtml::new(path.clone());
+
+        // 文件还不存在 → None（调用方降级为 Prometheus 文本）
+        assert!(cache.load().await.is_none());
+
+        // 失败不缓存：随后出现即可读到（与原来"读不到就降级"的行为一致）
+        write_with_mtime(&path, "A", SystemTime::now());
+        assert_eq!(&*cache.load().await.unwrap(), "A");
+    }
 
     // ---- ui_dir 可用性判定 ----
     // 曾经的事故：ui_dir 配成前端**源码**目录，index.html 照样在，于是被当成"已构建"托管出去，
