@@ -1,9 +1,8 @@
 //! 代理转发：认证 → 限流 → 编码为隧道帧转发（从 http.rs 拆分，保持路由层精简）。
 
+mod forward;
 mod tunnel;
 mod usage;
-
-use std::time::Duration;
 
 use axum::{
     body::{Body, Bytes},
@@ -22,8 +21,8 @@ use crate::body::{read_body_with_stall, BodyRead, MAX_REQUEST_BODY};
 use crate::openai::error_response;
 use crate::registry::AcquireError;
 use crate::state::AppState;
+use forward::forward_body;
 use tunnel::{open_tunnel, tunnel_cancel, tunnel_write, OpenFailure};
-use usage::UsageCollector;
 
 static NEXT_REQUEST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
@@ -365,7 +364,7 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
         .iter()
         .any(|(k, v)| k.eq_ignore_ascii_case("content-type") && v.contains("text/event-stream"));
     tokio::spawn(async move {
-        forward_body(
+        let end = forward_body(
             &mut recv,
             &mut send,
             request_id,
@@ -382,6 +381,7 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
             is_stream,
         )
         .await;
+        debug!(request_id, end = ?end, "response forwarding finished");
     });
 
     let mut builder = Response::builder().status(status);
@@ -430,147 +430,6 @@ async fn read_head(recv: &mut s2n_quic::stream::ReceiveStream) -> anyhow::Result
                     502,
                     "upstream closed before responding".into(),
                 ));
-            }
-        }
-    }
-}
-
-/// 往客户端方向送一块的结果。三种情况处置完全不同，必须分开。
-enum SendOutcome {
-    /// 客户端取走了。
-    Delivered,
-    /// 接收端已被丢弃 = 客户端断开/连接结束 → 取消上游（现状语义）。
-    ClientGone,
-    /// 通道满且 `stall` 内一直没人取 = 客户端**还连着但不再消费**响应体。
-    ///
-    /// 这一档以前不存在（`tx.send().await` 没有超时），正是"在途请求永久占住准入槽位"
-    /// 的另一半原因：通道容量 32，客户端一停，发送端就在这里永久 park，
-    /// 而准入票据（`Admission`）随 response body 一起挂在同一个任务上。
-    Stalled,
-}
-
-/// 带停滞超时地往客户端送一块。
-///
-/// 语义与请求体侧一致（见 `read_body_with_stall`）：**有进展就不超时**。客户端只要还在
-/// 消费，通道就不会满，超时永远不会触发；只有"连着但一个字节都不取"才判定僵住。
-async fn send_to_client(
-    tx: &mpsc::Sender<Result<Bytes, String>>,
-    item: Result<Bytes, String>,
-    stall: Duration,
-) -> SendOutcome {
-    match tokio::time::timeout(stall, tx.send(item)).await {
-        Ok(Ok(())) => SendOutcome::Delivered,
-        Ok(Err(_)) => SendOutcome::ClientGone,
-        Err(_) => SendOutcome::Stalled,
-    }
-}
-
-/// 把响应体帧流转发到通道；任一端关闭时向对端发 Cancel。
-/// `slot` 持有期间占用 agent 并发槽位，随任务结束释放。
-///
-/// `idle_timeout` 是**逐帧空闲**超时（响应阶段，SSE 长流靠"有帧就不超时"活着）；
-/// `op_timeout` 只用于取消帧的写——隧道坏掉时连 Cancel 都可能写不出去，绝不能在这里
-/// 阻塞（这正是"客户端已断开却发现不了"的死角）。
-///
-/// 参数确实多（流的两半、通道、三个超时、票据、指标、用量记账、请求元信息），但它们都是
-/// 这个后台任务**必须独占持有**的资源；打包成 struct 只是把同一张清单换个地方写，不会让
-/// 这个函数更难懂。
-#[allow(clippy::too_many_arguments)]
-async fn forward_body(
-    recv: &mut s2n_quic::stream::ReceiveStream,
-    send: &mut s2n_quic::stream::SendStream,
-    request_id: u64,
-    tx: mpsc::Sender<Result<Bytes, String>>,
-    idle_timeout: Duration,
-    client_stall: Duration,
-    op_timeout: Duration,
-    _slot: crate::registry::SlotGuard,
-    metrics: crate::metrics::Metrics,
-    key_store: crate::storage::KeyStore,
-    key_id: String,
-    key_name: String,
-    prompt_est: u64,
-    is_stream: bool,
-) {
-    let mut usage = UsageCollector::new(key_store, key_id, key_name, prompt_est, is_stream);
-    loop {
-        let frame = tokio::time::timeout(idle_timeout, read_frame(recv)).await;
-        match frame {
-            Ok(Ok(Some(Frame::ProxyResponseBody { chunk, .. }))) => {
-                match send_to_client(&tx, Ok(Bytes::from(chunk.clone())), client_stall).await {
-                    SendOutcome::Delivered => {}
-                    SendOutcome::ClientGone => {
-                        // 客户端已断开 → 取消上游；仍结算已转发部分
-                        warn!(request_id, "client disconnected, cancelling upstream");
-                        usage.observe(&chunk);
-                        tunnel_cancel(send, request_id, op_timeout).await;
-                        let _ = send.finish();
-                        usage.finish();
-                        return;
-                    }
-                    SendOutcome::Stalled => {
-                        // 客户端还在连接上、但不再消费响应体：以前这里会永久 park，
-                        // 于是准入票据永不释放（实测云端沉淀 8 个僵尸槽位，只能重启）。
-                        // 现在主动放弃：取消上游（别让 agent 继续烧 token）、结束响应体
-                        // （丢掉 tx → 客户端看到流被截断/连接关闭，这是诚实的失败信号）。
-                        metrics.record_client_stall("response-body");
-                        warn!(
-                            request_id,
-                            stall_ms = client_stall.as_millis(),
-                            "client stopped consuming the response body; cancelling upstream and releasing the slot"
-                        );
-                        usage.observe(&chunk);
-                        tunnel_cancel(send, request_id, op_timeout).await;
-                        let _ = send.finish();
-                        usage.finish();
-                        return;
-                    }
-                }
-                usage.observe(&chunk);
-                metrics.add_bytes_out(chunk.len());
-            }
-            Ok(Ok(Some(Frame::ProxyResponseEnd { .. }))) => {
-                let _ = send.finish();
-                usage.finish();
-                return;
-            }
-            Ok(Ok(Some(Frame::Error { code, message, .. }))) => {
-                let _ = send_to_client(
-                    &tx,
-                    Err(format!("upstream error {code}: {message}")),
-                    client_stall,
-                )
-                .await;
-                let _ = send.finish();
-                usage.finish();
-                return;
-            }
-            Ok(Ok(Some(_))) => {}
-            Ok(Ok(None)) => {
-                let _ = send_to_client(
-                    &tx,
-                    Err("upstream closed the stream early".into()),
-                    client_stall,
-                )
-                .await;
-                usage.finish();
-                return;
-            }
-            Ok(Err(e)) => {
-                let _ = send_to_client(&tx, Err(format!("tunnel read failed: {e}")), client_stall)
-                    .await;
-                usage.finish();
-                return;
-            }
-            Err(_) => {
-                // 空闲超时 → 取消上游；结算已转发部分
-                warn!(request_id, "upstream idle timeout, cancelling");
-                let _ =
-                    send_to_client(&tx, Err("upstream idle timeout".into()), client_stall).await;
-                tunnel_cancel(send, request_id, op_timeout).await;
-                let _ = send.finish();
-                usage.finish();
-                return;
             }
         }
     }
