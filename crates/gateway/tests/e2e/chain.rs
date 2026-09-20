@@ -290,8 +290,6 @@ async fn e2e_upstream_never_receives_client_credentials() {
     }
 
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
-    let (ca, server_cert, server_key, client_cert, client_key) = gen_certs();
-    let (keys_path, key) = seed_keys_db();
 
     let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -305,38 +303,9 @@ async fn e2e_upstream_never_receives_client_credentials() {
         let _ = axum::serve(listener, app).await;
     });
 
-    let gw = Gateway::start(GatewayConfig {
-        tunnel: TunnelTls {
-            ca_cert: vec![ca.clone()],
-            server_cert: vec![server_cert.clone()],
-            server_key,
-        },
-        opts: Options {
-            keys_file: Some(keys_path),
-            request_timeout: Duration::from_secs(10),
-            tunnel_op_timeout: Duration::from_secs(2),
-            head_timeout: Duration::from_secs(5),
-            agent_stale_after: Duration::from_secs(10),
-            ..Options::default()
-        },
-    })
-    .await
-    .unwrap();
+    let TestGateway { gw, certs, key, .. } = start_gateway(|_| {}).await;
 
-    let agent = Agent::start(AgentConfig {
-        cloud_addr: gw.quic_addr,
-        server_name: "localhost".into(),
-        ca_cert: vec![ca.clone()],
-        client_cert: vec![client_cert.clone()],
-        client_key,
-        agent_id: "cred-agent".into(),
-        models: vec!["mock-llm".into()],
-        max_concurrency: 4,
-        upstream_base: format!("http://{upstream_addr}"),
-        heartbeat_interval: Duration::from_millis(200),
-        request_log: false,
-    })
-    .unwrap();
+    let agent = certs.agent(&gw, "cred-agent", &["mock-llm"], upstream_addr, 4, false);
     wait_for_agents(&gw, 1, Duration::from_secs(10)).await;
 
     let client = reqwest::Client::new();

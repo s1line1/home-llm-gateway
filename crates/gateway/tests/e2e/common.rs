@@ -148,14 +148,21 @@ pub async fn metric_gauge(base: &str, name: &str) -> u64 {
         .unwrap_or_else(|| panic!("指标 {name} 不在 /metrics 输出里"))
 }
 
-/// 一套测试用证书材料：CA + 一份 agent 客户端身份。
+/// 一套测试用证书材料：CA + 一份 agent 客户端身份 + 服务端身份的两种编码形态。
 ///
-/// 由 [`start_gateway`] 产出，多 agent 场景复用它给每个 agent 签身份
-/// （客户端私钥用 `clone_key()`，每个 agent 各拿一份）。
+/// 由 [`start_gateway`] 产出。多 agent 场景复用它给每个 agent 签身份（客户端私钥用
+/// `clone_key()`，每个 agent 各拿一份）。HTTPS 公网入口要的是 **PEM 字节**而隧道侧要 DER，
+/// 所以两种形态都在这里——省得各用例自己再跑一遍 `gen_certs_pem()` 并手工 parse。
 pub struct TestCerts {
     pub ca: Vec<CertificateDer<'static>>,
     pub client_cert: Vec<CertificateDer<'static>>,
     pub client_key: PrivateKeyDer<'static>,
+    /// 服务端身份（DER）：隧道侧 `TunnelTls` 用。
+    server_cert_der: Vec<CertificateDer<'static>>,
+    server_key_der: PrivateKeyDer<'static>,
+    /// 服务端身份（PEM 字节）：HTTPS 公网入口用。
+    server_cert_pem: Vec<u8>,
+    server_key_pem: Vec<u8>,
 }
 
 impl TestCerts {
@@ -184,16 +191,58 @@ impl TestCerts {
         })
         .unwrap()
     }
+
+    /// 公网入口的 HTTPS 材料（PEM 字节，见 [`gateway::TlsPem`]）。
+    ///
+    /// 放进 `Options::https` 即可让入口走 TLS——但材料要**生成之后**才知道，所以那种用例得用
+    /// [`start_gateway_with`]，它的 `tune` 能拿到 `&TestCerts`。
+    pub fn https_pem(&self) -> TlsPem {
+        TlsPem {
+            cert: self.server_cert_pem.clone(),
+            key: self.server_key_pem.clone(),
+        }
+    }
 }
 
-/// 测试档位的网关配置：`tune` 只改这个用例真正要动的旋钮，其余取下面的**测试基线**。
+/// 裸网关 + 它周围的材料：证书、已种好的 api key、keys.db 路径、http base。
 ///
-/// 基线刻意与库默认（生产数值）不同：超时压到秒级，否则一条注定失败的用例会静默多挂
-/// 十几秒（`request_timeout` 库默认 120s）。端口用库默认的 `127.0.0.1:0`（内核分配，
-/// 靠 `gw.http_addr` 回读），不碰任何文件。
-fn test_options(tune: impl FnOnce(&mut Options), keys_path: PathBuf) -> Options {
+/// 多 agent / 异构模型 / 裸 QUIC 客户端 / 自定义上游这类要自己控制"网关之外那一半"的场景
+/// 用它；只要一套标准栈（mock-llm + 一个 test-agent）就用 [`start_stack`]。
+pub struct TestGateway {
+    pub gw: Gateway,
+    pub certs: TestCerts,
+    pub key: String,
+    /// 已种好的 keys.db 路径（少数用例要自己对它拿独占锁）。
+    pub keys_path: PathBuf,
+    /// `http://<真实端口>`。
+    pub base: String,
+}
+
+/// 起一个**裸网关**（不接 agent）。`tune` 只改这个用例真正要动的旋钮。
+///
+/// 测试基线刻意与库默认（生产数值）不同：超时压到秒级——否则一条注定失败的用例会静默多挂
+/// 十几秒（`request_timeout` 库默认 120s）。端口用库默认的 `127.0.0.1:0`（内核分配，靠
+/// `gw.http_addr` 回读），UI 目录不配。
+pub async fn start_gateway(tune: impl FnOnce(&mut Options)) -> TestGateway {
+    start_gateway_with(move |o, _certs| tune(o)).await
+}
+
+/// 同 [`start_gateway`]，但 `tune` 还能拿到证书材料——HTTPS 入口的 PEM 只有生成之后才知道。
+pub async fn start_gateway_with(tune: impl FnOnce(&mut Options, &TestCerts)) -> TestGateway {
+    let (ca_pem, srv_pem, srv_key_pem, cli_pem, cli_key_pem) = gen_certs_pem();
+    let certs = TestCerts {
+        ca: parse_certs_pem(&ca_pem),
+        client_cert: parse_certs_pem(&cli_pem),
+        client_key: parse_key_pem(&cli_key_pem),
+        server_cert_der: parse_certs_pem(&srv_pem),
+        server_key_der: parse_key_pem(&srv_key_pem),
+        server_cert_pem: srv_pem.into_bytes(),
+        server_key_pem: srv_key_pem.into_bytes(),
+    };
+
+    let (keys_path, key) = seed_keys_db();
     let mut opts = Options {
-        keys_file: Some(keys_path),
+        keys_file: Some(keys_path.clone()),
         request_timeout: Duration::from_secs(10),
         tunnel_op_timeout: Duration::from_secs(2),
         head_timeout: Duration::from_secs(5),
@@ -201,40 +250,30 @@ fn test_options(tune: impl FnOnce(&mut Options), keys_path: PathBuf) -> Options 
         client_stall: Duration::from_secs(60),
         ..Options::default()
     };
-    tune(&mut opts);
-    opts
-}
-
-/// 起一个**裸网关**（不接 agent、不种 key 之外的任何东西），返回
-/// (网关, 可复用的证书材料, 已种好的 api key)。
-///
-/// 多 agent / 异构模型这类要自己控制 agent 的场景用它；只要一套标准栈就用
-/// [`start_stack`]。
-pub async fn start_gateway(tune: impl FnOnce(&mut Options)) -> (Gateway, TestCerts, String) {
-    let (ca, server_cert, server_key, client_cert, client_key) = gen_certs();
-    let (keys_path, key) = seed_keys_db();
-    let opts = test_options(tune, keys_path);
+    tune(&mut opts, &certs);
 
     let gw = Gateway::start(GatewayConfig {
         tunnel: TunnelTls {
-            ca_cert: vec![ca.clone()],
-            server_cert: vec![server_cert],
-            server_key,
+            ca_cert: certs.ca.clone(),
+            server_cert: certs.server_cert_der.clone(),
+            server_key: certs.server_key_der.clone_key(),
         },
         opts,
     })
     .await
     .unwrap();
 
-    let certs = TestCerts {
-        ca: vec![ca],
-        client_cert: vec![client_cert],
-        client_key,
-    };
-    (gw, certs, key)
+    let base = format!("http://{}", gw.http_addr);
+    TestGateway {
+        gw,
+        certs,
+        key,
+        keys_path,
+        base,
+    }
 }
 
-/// 拉起一整套栈（mock-llm + gateway + agent），返回 (gw, agent, http base, api key)。
+/// 拉起一整套栈（mock-llm + gateway + 一个 test-agent），返回 (gw, agent, http base, api key)。
 ///
 /// `max_concurrency` 是 **agent 侧**的并发上限（准入控制的依据）；网关旋钮一律通过
 /// `tune` 闭包表达。以前这里有 6 个近邻函数（`start_stack_with_verify_cache` /
@@ -244,17 +283,17 @@ pub async fn start_stack(
     max_concurrency: u32,
     tune: impl FnOnce(&mut Options),
 ) -> (Gateway, Agent, String, String) {
-    let (gw, certs, key) = start_gateway(tune).await;
+    let t = start_gateway(tune).await;
     let mock_addr = start_mock_llm("mock-llm").await;
-    let agent = certs.agent(
-        &gw,
+    let agent = t.certs.agent(
+        &t.gw,
         "test-agent",
         &["mock-llm"],
         mock_addr,
         max_concurrency,
         true,
     );
-    wait_for_agents(&gw, 1, Duration::from_secs(10)).await;
-    let base = format!("http://{}", gw.http_addr);
+    wait_for_agents(&t.gw, 1, Duration::from_secs(10)).await;
+    let TestGateway { gw, key, base, .. } = t;
     (gw, agent, base, key)
 }

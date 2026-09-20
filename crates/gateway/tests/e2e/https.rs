@@ -9,46 +9,13 @@ use tokio::io::AsyncWriteExt;
 #[serial]
 async fn e2e_https_public_entry() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
-    let (ca_pem, srv_pem, srv_key_pem, cli_pem, cli_key_pem) = gen_certs_pem();
     let mock_addr = start_mock_llm("mock-llm").await;
-    let (keys_path, key) = seed_keys_db();
-
-    let gw = Gateway::start(GatewayConfig {
-        tunnel: TunnelTls {
-            ca_cert: parse_certs_pem(&ca_pem),
-            server_cert: parse_certs_pem(&srv_pem),
-            server_key: parse_key_pem(&srv_key_pem),
-        },
-        opts: Options {
-            keys_file: Some(keys_path),
-            request_timeout: Duration::from_secs(10),
-            tunnel_op_timeout: Duration::from_secs(2),
-            head_timeout: Duration::from_secs(5),
-            agent_stale_after: Duration::from_secs(10),
-            https: Some(TlsPem {
-                cert: srv_pem.clone().into_bytes(),
-                key: srv_key_pem.clone().into_bytes(),
-            }),
-            ..Options::default()
-        },
+    let TestGateway { gw, certs, key, .. } = start_gateway_with(|o, c| {
+        o.https = Some(c.https_pem());
     })
-    .await
-    .unwrap();
+    .await;
 
-    let agent = Agent::start(AgentConfig {
-        cloud_addr: gw.quic_addr,
-        server_name: "localhost".into(),
-        ca_cert: parse_certs_pem(&ca_pem),
-        client_cert: parse_certs_pem(&cli_pem),
-        client_key: parse_key_pem(&cli_key_pem),
-        agent_id: "test-agent".into(),
-        models: vec!["mock-llm".into()],
-        max_concurrency: 4,
-        upstream_base: format!("http://{mock_addr}"),
-        heartbeat_interval: Duration::from_millis(200),
-        request_log: true,
-    })
-    .unwrap();
+    let agent = certs.agent(&gw, "test-agent", &["mock-llm"], mock_addr, 4, true);
     wait_for_agents(&gw, 1, Duration::from_secs(10)).await;
 
     let client = reqwest::Client::builder()
@@ -119,33 +86,16 @@ async fn e2e_https_public_entry() {
 #[serial]
 async fn e2e_quic_control_stream_edge_frames() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
-    let (ca, server_cert, server_key, client_cert, client_key) = gen_certs();
-
-    let gw = Gateway::start(GatewayConfig {
-        tunnel: TunnelTls {
-            ca_cert: vec![ca.clone()],
-            server_cert: vec![server_cert.clone()],
-            server_key,
-        },
-        opts: Options {
-            keys_file: None,
-            request_timeout: Duration::from_secs(10),
-            tunnel_op_timeout: Duration::from_secs(2),
-            head_timeout: Duration::from_secs(5),
-            agent_stale_after: Duration::from_secs(10),
-            ..Options::default()
-        },
-    })
-    .await
-    .unwrap();
+    // keys_file: None —— 本用例只走裸 QUIC 控制流，不碰 key store
+    let TestGateway { gw, certs, .. } = start_gateway(|o| o.keys_file = None).await;
 
     // 裸 s2n-quic 客户端（复用 agent 的 mTLS 配置），不走 agent crate 逻辑
     let client = s2n_quic::Client::builder()
         .with_tls(s2n_quic::provider::tls::rustls::Client::from(Arc::new(
             agent::tls::rustls_client_tls(
-                std::slice::from_ref(&ca),
-                vec![client_cert.clone()],
-                client_key.clone_key(),
+                &certs.ca,
+                certs.client_cert.clone(),
+                certs.client_key.clone_key(),
             )
             .unwrap(),
         )))
@@ -291,35 +241,19 @@ async fn e2e_quic_control_stream_edge_frames() {
 #[serial]
 async fn e2e_proxy_protocol_edge_cases() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
-    let (ca, server_cert, server_key, client_cert, client_key) = gen_certs();
-    let (keys_path, key) = seed_keys_db();
-
-    // 短转发空闲超时（200ms），用于触发 body 空闲超时场景
-    let gw = Gateway::start(GatewayConfig {
-        tunnel: TunnelTls {
-            ca_cert: vec![ca.clone()],
-            server_cert: vec![server_cert.clone()],
-            server_key,
-        },
-        opts: Options {
-            keys_file: Some(keys_path),
-            request_timeout: Duration::from_millis(200),
-            tunnel_op_timeout: Duration::from_secs(2),
-            head_timeout: Duration::from_secs(5),
-            agent_stale_after: Duration::from_secs(10),
-            ..Options::default()
-        },
+    let TestGateway { gw, certs, key, .. } = start_gateway(|o| {
+        // 短转发空闲超时（200ms），用于触发 body 空闲超时场景
+        o.request_timeout = Duration::from_millis(200);
     })
-    .await
-    .unwrap();
+    .await;
 
     // 裸 s2n-quic 客户端：注册后按场景应答网关的代理请求
     let client = s2n_quic::Client::builder()
         .with_tls(s2n_quic::provider::tls::rustls::Client::from(Arc::new(
             agent::tls::rustls_client_tls(
-                std::slice::from_ref(&ca),
-                vec![client_cert.clone()],
-                client_key.clone_key(),
+                &certs.ca,
+                certs.client_cert.clone(),
+                certs.client_key.clone_key(),
             )
             .unwrap(),
         )))
