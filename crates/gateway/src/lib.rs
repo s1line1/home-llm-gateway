@@ -20,6 +20,7 @@ pub mod ratelimit;
 pub mod registry;
 pub mod storage;
 pub mod tls;
+pub mod ui;
 pub mod usage_flush;
 pub mod usage_meter;
 
