@@ -280,7 +280,7 @@ impl Gateway {
             usage_flush::spawn(key_store.clone()),
             http::spawn_entry(sockets.http, app, https, opts.client_stall),
             tokio::spawn(quic::accept_loop(
-                sockets.quic,
+                sockets.server,
                 registry.clone(),
                 metrics,
                 opts.stream_ceiling(),

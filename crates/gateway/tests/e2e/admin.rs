@@ -299,25 +299,11 @@ async fn e2e_openai_error_semantics() {
     assert_eq!(body["error"]["type"], "rate_limit_error");
 
     // 5xx：裸起一个**无 agent** 的 gateway → 请求必然 NoAgent → 503 server_error
-    let (ca, server_cert, server_key, _client_cert, _client_key) = gen_certs();
-    let (keys_path, lone_key) = seed_keys_db();
-    let gw3 = Gateway::start(GatewayConfig {
-        tunnel: TunnelTls {
-            ca_cert: vec![ca],
-            server_cert: vec![server_cert],
-            server_key,
-        },
-        opts: Options {
-            keys_file: Some(keys_path),
-            request_timeout: Duration::from_secs(10),
-            tunnel_op_timeout: Duration::from_secs(2),
-            head_timeout: Duration::from_secs(5),
-            agent_stale_after: Duration::from_secs(10),
-            ..Options::default()
-        },
-    })
-    .await
-    .unwrap();
+    let TestGateway {
+        gw: gw3,
+        key: lone_key,
+        ..
+    } = start_gateway(|_| {}).await;
     let resp = client
         .post(format!("http://{}/v1/chat/completions", gw3.http_addr))
         .header("Authorization", format!("Bearer {lone_key}"))
@@ -345,42 +331,19 @@ async fn e2e_openai_error_semantics() {
 #[serial]
 async fn e2e_usage_write_does_not_stall_the_response() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
-    let (ca, server_cert, server_key, client_cert, client_key) = gen_certs();
     let mock_addr = start_mock_llm("mock-llm").await;
-    let (keys_path, key) = seed_keys_db();
-
-    let gw = Gateway::start(GatewayConfig {
-        tunnel: TunnelTls {
-            ca_cert: vec![ca.clone()],
-            server_cert: vec![server_cert.clone()],
-            server_key,
-        },
-        opts: Options {
-            keys_file: Some(keys_path.clone()),
-            request_timeout: Duration::from_secs(30),
-            tunnel_op_timeout: Duration::from_secs(2),
-            head_timeout: Duration::from_secs(5),
-            agent_stale_after: Duration::from_secs(10),
-            ..Options::default()
-        },
+    let TestGateway {
+        gw,
+        certs,
+        key,
+        keys_path,
+        ..
+    } = start_gateway(|o| {
+        o.request_timeout = Duration::from_secs(30);
     })
-    .await
-    .unwrap();
+    .await;
 
-    let agent = Agent::start(AgentConfig {
-        cloud_addr: gw.quic_addr,
-        server_name: "localhost".into(),
-        ca_cert: vec![ca.clone()],
-        client_cert: vec![client_cert.clone()],
-        client_key,
-        agent_id: "usage-lock-agent".into(),
-        models: vec!["mock-llm".into()],
-        max_concurrency: 4,
-        upstream_base: format!("http://{mock_addr}"),
-        heartbeat_interval: Duration::from_millis(200),
-        request_log: false,
-    })
-    .unwrap();
+    let agent = certs.agent(&gw, "usage-lock-agent", &["mock-llm"], mock_addr, 4, false);
     wait_for_agents(&gw, 1, Duration::from_secs(10)).await;
 
     // 后台线程取 keys.db 独占锁并保持 3s（BEGIN EXCLUSIVE 立即取锁）

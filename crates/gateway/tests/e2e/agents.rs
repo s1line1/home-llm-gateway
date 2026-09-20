@@ -50,47 +50,12 @@ async fn e2e_admission_control() {
 #[serial]
 async fn e2e_multi_agent_least_loaded() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
-    let (ca, server_cert, server_key, client_cert, client_key) = gen_certs();
     let mock_a = start_mock_llm("mock-a").await;
     let mock_b = start_mock_llm("mock-b").await;
-    let (keys_path, key) = seed_keys_db();
+    let TestGateway { gw, certs, key, .. } = start_gateway(|_| {}).await;
 
-    let gw = Gateway::start(GatewayConfig {
-        tunnel: TunnelTls {
-            ca_cert: vec![ca.clone()],
-            server_cert: vec![server_cert.clone()],
-            server_key,
-        },
-        opts: Options {
-            keys_file: Some(keys_path),
-            request_timeout: Duration::from_secs(10),
-            tunnel_op_timeout: Duration::from_secs(2),
-            head_timeout: Duration::from_secs(5),
-            agent_stale_after: Duration::from_secs(10),
-            ..Options::default()
-        },
-    })
-    .await
-    .unwrap();
-
-    let mk_agent = |agent_id: &str, upstream: SocketAddr| {
-        Agent::start(AgentConfig {
-            cloud_addr: gw.quic_addr,
-            server_name: "localhost".into(),
-            ca_cert: vec![ca.clone()],
-            client_cert: vec![client_cert.clone()],
-            client_key: client_key.clone_key(),
-            agent_id: agent_id.into(),
-            models: vec!["mock-llm".into()],
-            max_concurrency: 1,
-            upstream_base: format!("http://{upstream}"),
-            heartbeat_interval: Duration::from_millis(200),
-            request_log: true,
-        })
-        .unwrap()
-    };
-    let agent_a = mk_agent("agent-a", mock_a);
-    let agent_b = mk_agent("agent-b", mock_b);
+    let agent_a = certs.agent(&gw, "agent-a", &["mock-llm"], mock_a, 1, true);
+    let agent_b = certs.agent(&gw, "agent-b", &["mock-llm"], mock_b, 1, true);
     wait_for_agents(&gw, 2, Duration::from_secs(10)).await;
 
     let client = reqwest::Client::new();
@@ -170,47 +135,19 @@ async fn e2e_rate_limit_per_key() {
 #[serial]
 async fn e2e_model_routing_and_models_endpoint() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
-    let (ca, server_cert, server_key, client_cert, client_key) = gen_certs();
     let mock_qwen = start_mock_llm("mock-qwen").await;
     let mock_llama = start_mock_llm("mock-llama").await;
-    let (keys_path, key) = seed_keys_db();
+    let TestGateway { gw, certs, key, .. } = start_gateway(|_| {}).await;
 
-    let gw = Gateway::start(GatewayConfig {
-        tunnel: TunnelTls {
-            ca_cert: vec![ca.clone()],
-            server_cert: vec![server_cert.clone()],
-            server_key,
-        },
-        opts: Options {
-            keys_file: Some(keys_path),
-            request_timeout: Duration::from_secs(10),
-            tunnel_op_timeout: Duration::from_secs(2),
-            head_timeout: Duration::from_secs(5),
-            agent_stale_after: Duration::from_secs(10),
-            ..Options::default()
-        },
-    })
-    .await
-    .unwrap();
-
-    let mk_agent = |agent_id: &str, models: Vec<&str>, upstream: SocketAddr| {
-        Agent::start(AgentConfig {
-            cloud_addr: gw.quic_addr,
-            server_name: "localhost".into(),
-            ca_cert: vec![ca.clone()],
-            client_cert: vec![client_cert.clone()],
-            client_key: client_key.clone_key(),
-            agent_id: agent_id.into(),
-            models: models.into_iter().map(String::from).collect(),
-            max_concurrency: 1,
-            upstream_base: format!("http://{upstream}"),
-            heartbeat_interval: Duration::from_millis(200),
-            request_log: false,
-        })
-        .unwrap()
-    };
-    let agent_qwen = mk_agent("edge-qwen", vec!["qwen2.5-72b"], mock_qwen);
-    let agent_llama = mk_agent("edge-llama", vec!["llama3-70b", "*"], mock_llama);
+    let agent_qwen = certs.agent(&gw, "edge-qwen", &["qwen2.5-72b"], mock_qwen, 1, false);
+    let agent_llama = certs.agent(
+        &gw,
+        "edge-llama",
+        &["llama3-70b", "*"],
+        mock_llama,
+        1,
+        false,
+    );
     wait_for_agents(&gw, 2, Duration::from_secs(10)).await;
 
     let client = reqwest::Client::new();
@@ -333,46 +270,11 @@ async fn e2e_admin_agents_lists_registry() {
 #[serial]
 async fn e2e_client_cancel_does_not_leak_concurrency_slot() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
-    let (ca, server_cert, server_key, client_cert, client_key) = gen_certs();
-    let mock_addr = start_mock_llm("mock-llm").await;
-    let (keys_path, key) = seed_keys_db();
-
-    let gw = Gateway::start(GatewayConfig {
-        tunnel: TunnelTls {
-            ca_cert: vec![ca.clone()],
-            server_cert: vec![server_cert.clone()],
-            server_key,
-        },
-        opts: Options {
-            keys_file: Some(keys_path),
-            request_timeout: Duration::from_secs(30),
-            tunnel_op_timeout: Duration::from_secs(2),
-            head_timeout: Duration::from_secs(5),
-            agent_stale_after: Duration::from_secs(10),
-            max_concurrent_requests: 1,
-            ..Options::default()
-        },
+    let (gw, agent, base, key) = start_stack(4, |o| {
+        o.request_timeout = Duration::from_secs(30);
+        o.max_concurrent_requests = 1;
     })
-    .await
-    .unwrap();
-
-    let agent = Agent::start(AgentConfig {
-        cloud_addr: gw.quic_addr,
-        server_name: "localhost".into(),
-        ca_cert: vec![ca.clone()],
-        client_cert: vec![client_cert.clone()],
-        client_key,
-        agent_id: "cancel-agent".into(),
-        models: vec!["mock-llm".into()],
-        max_concurrency: 4,
-        upstream_base: format!("http://{mock_addr}"),
-        heartbeat_interval: Duration::from_millis(200),
-        request_log: false,
-    })
-    .unwrap();
-    wait_for_agents(&gw, 1, Duration::from_secs(10)).await;
-
-    let base = format!("http://{}", gw.http_addr);
+    .await;
     let client = reqwest::Client::new();
 
     // 发起请求后 150ms 放弃 → 网关此刻仍 parked 在 read_head（上游 800ms 才回头）
@@ -434,46 +336,11 @@ async fn e2e_client_cancel_does_not_leak_concurrency_slot() {
 #[serial]
 async fn e2e_streaming_holds_concurrency_slot_until_body_ends() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
-    let (ca, server_cert, server_key, client_cert, client_key) = gen_certs();
-    let mock_addr = start_mock_llm("mock-llm").await;
-    let (keys_path, key) = seed_keys_db();
-
-    let gw = Gateway::start(GatewayConfig {
-        tunnel: TunnelTls {
-            ca_cert: vec![ca.clone()],
-            server_cert: vec![server_cert.clone()],
-            server_key,
-        },
-        opts: Options {
-            keys_file: Some(keys_path),
-            request_timeout: Duration::from_secs(30),
-            tunnel_op_timeout: Duration::from_secs(2),
-            head_timeout: Duration::from_secs(5),
-            agent_stale_after: Duration::from_secs(10),
-            max_concurrent_requests: 1,
-            ..Options::default()
-        },
+    let (gw, agent, base, key) = start_stack(4, |o| {
+        o.request_timeout = Duration::from_secs(30);
+        o.max_concurrent_requests = 1;
     })
-    .await
-    .unwrap();
-
-    let agent = Agent::start(AgentConfig {
-        cloud_addr: gw.quic_addr,
-        server_name: "localhost".into(),
-        ca_cert: vec![ca.clone()],
-        client_cert: vec![client_cert.clone()],
-        client_key,
-        agent_id: "stream-agent".into(),
-        models: vec!["mock-llm".into()],
-        max_concurrency: 4,
-        upstream_base: format!("http://{mock_addr}"),
-        heartbeat_interval: Duration::from_millis(200),
-        request_log: false,
-    })
-    .unwrap();
-    wait_for_agents(&gw, 1, Duration::from_secs(10)).await;
-
-    let base = format!("http://{}", gw.http_addr);
+    .await;
     let client = reqwest::Client::new();
 
     // mock 的 SSE 逐字输出（10ms/字）：200 字 ≈ 2s 流，足够在流中做断言
@@ -543,46 +410,11 @@ async fn e2e_streaming_holds_concurrency_slot_until_body_ends() {
 #[serial]
 async fn e2e_mid_stream_cancel_releases_concurrency_slot() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
-    let (ca, server_cert, server_key, client_cert, client_key) = gen_certs();
-    let mock_addr = start_mock_llm("mock-llm").await;
-    let (keys_path, key) = seed_keys_db();
-
-    let gw = Gateway::start(GatewayConfig {
-        tunnel: TunnelTls {
-            ca_cert: vec![ca.clone()],
-            server_cert: vec![server_cert.clone()],
-            server_key,
-        },
-        opts: Options {
-            keys_file: Some(keys_path),
-            request_timeout: Duration::from_secs(30),
-            tunnel_op_timeout: Duration::from_secs(2),
-            head_timeout: Duration::from_secs(5),
-            agent_stale_after: Duration::from_secs(10),
-            max_concurrent_requests: 1,
-            ..Options::default()
-        },
+    let (gw, agent, base, key) = start_stack(4, |o| {
+        o.request_timeout = Duration::from_secs(30);
+        o.max_concurrent_requests = 1;
     })
-    .await
-    .unwrap();
-
-    let agent = Agent::start(AgentConfig {
-        cloud_addr: gw.quic_addr,
-        server_name: "localhost".into(),
-        ca_cert: vec![ca.clone()],
-        client_cert: vec![client_cert.clone()],
-        client_key,
-        agent_id: "midstream-agent".into(),
-        models: vec!["mock-llm".into()],
-        max_concurrency: 4,
-        upstream_base: format!("http://{mock_addr}"),
-        heartbeat_interval: Duration::from_millis(200),
-        request_log: false,
-    })
-    .unwrap();
-    wait_for_agents(&gw, 1, Duration::from_secs(10)).await;
-
-    let base = format!("http://{}", gw.http_addr);
+    .await;
     let client = reqwest::Client::new();
 
     // 拿到响应头即开始流式回传（200 字 ≈ 2s）
@@ -652,44 +484,7 @@ async fn fetch_active(client: &reqwest::Client, base: &str) -> u64 {
 #[serial]
 async fn e2e_http_concurrent_request_limit() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
-    let (ca, server_cert, server_key, client_cert, client_key) = gen_certs();
-    let mock_addr = start_mock_llm("mock-llm").await;
-    let (keys_path, key) = seed_keys_db();
-
-    let gw = Gateway::start(GatewayConfig {
-        tunnel: TunnelTls {
-            ca_cert: vec![ca.clone()],
-            server_cert: vec![server_cert.clone()],
-            server_key,
-        },
-        opts: Options {
-            keys_file: Some(keys_path),
-            request_timeout: Duration::from_secs(10),
-            tunnel_op_timeout: Duration::from_secs(2),
-            head_timeout: Duration::from_secs(5),
-            agent_stale_after: Duration::from_secs(10),
-            max_concurrent_requests: 1,
-            ..Options::default()
-        },
-    })
-    .await
-    .unwrap();
-
-    let agent = Agent::start(AgentConfig {
-        cloud_addr: gw.quic_addr,
-        server_name: "localhost".into(),
-        ca_cert: vec![ca.clone()],
-        client_cert: vec![client_cert.clone()],
-        client_key: client_key.clone_key(),
-        agent_id: "limit-agent".into(),
-        models: vec!["mock-llm".into()],
-        max_concurrency: 4,
-        upstream_base: format!("http://{mock_addr}"),
-        heartbeat_interval: Duration::from_millis(200),
-        request_log: false,
-    })
-    .unwrap();
-    wait_for_agents(&gw, 1, Duration::from_secs(10)).await;
+    let (gw, agent, _base, key) = start_stack(4, |o| o.max_concurrent_requests = 1).await;
 
     let client = reqwest::Client::new();
     let url = format!("http://{}/v1/slow", gw.http_addr); // mock 睡 800ms → 并发窗口大
@@ -732,37 +527,23 @@ async fn e2e_http_concurrent_request_limit() {
 #[serial]
 async fn e2e_dead_tunnel_fails_fast_instead_of_hanging() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
-    let (ca, server_cert, server_key, client_cert, client_key) = gen_certs();
-    let (keys_path, key) = seed_keys_db();
-
     // request_timeout 给 5s：如果失败来自"读到响应头才超时"（504）就会花 5s，
     // 而隧道**写**超时是 500ms —— 两者在时间上可区分，断言才不会失真。
-    let gw = Gateway::start(GatewayConfig {
-        tunnel: TunnelTls {
-            ca_cert: vec![ca.clone()],
-            server_cert: vec![server_cert.clone()],
-            server_key,
-        },
-        opts: Options {
-            keys_file: Some(keys_path),
-            request_timeout: Duration::from_secs(5),
-            tunnel_op_timeout: Duration::from_millis(500),
-            head_timeout: Duration::from_millis(400),
-            agent_stale_after: Duration::from_secs(10),
-            ..Options::default()
-        },
+    let TestGateway { gw, certs, key, .. } = start_gateway(|o| {
+        o.request_timeout = Duration::from_secs(5);
+        o.tunnel_op_timeout = Duration::from_millis(500);
+        o.head_timeout = Duration::from_millis(400);
     })
-    .await
-    .unwrap();
+    .await;
 
     // 裸 QUIC 客户端冒充 agent：注册成功后就**什么都不做**（不读流、不回帧、不出字）。
     let client = s2n_quic::Client::builder()
         .with_tls(s2n_quic::provider::tls::rustls::Client::from(
             std::sync::Arc::new(
                 agent::tls::rustls_client_tls(
-                    std::slice::from_ref(&ca),
-                    vec![client_cert.clone()],
-                    client_key.clone_key(),
+                    &certs.ca,
+                    certs.client_cert.clone(),
+                    certs.client_key.clone_key(),
                 )
                 .unwrap(),
             ),
