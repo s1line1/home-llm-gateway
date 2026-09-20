@@ -101,7 +101,30 @@ pub(super) async fn forward_body(
 ) -> ForwardEnd {
     let mut usage = UsageCollector::new(key_store, key_id, key_name, prompt_est, is_stream);
     loop {
-        let frame = tokio::time::timeout(idle_timeout, read_frame(recv)).await;
+        // 同时等"上游来帧"与"客户端走人"。
+        //
+        // 为什么必须 select：以前只在 `tx.send` 失败时才发现客户端断开——断开后上游若恰好
+        // 不产帧（LLM 正在思考、首 token 之前的静默期），任务就停在 `read_frame` 上，
+        // `tx.send` 永不被调用 → Cancel 不发、agent 槽位要等满 `idle_timeout`（默认 120s）
+        // 才释放。而"看到卡顿就取消"正是最常见的交互形态（登记见 REBUILD §4.7：
+        // 后果是"上游明明空闲、新请求却 429 at capacity"）。
+        //
+        // **取消安全性**：`read_frame` 不是可取消安全的（REBUILD §R3 登记过），但这条分支与
+        // 下面的空闲超时一样——取消后立刻 `finish()` 并彻底放弃这条流、不再读它，所以丢掉
+        // 半读的帧无害。
+        let frame = tokio::select! {
+            r = tokio::time::timeout(idle_timeout, read_frame(recv)) => r,
+            _ = tx.closed() => {
+                warn!(
+                    request_id,
+                    "client disconnected while the upstream was silent; cancelling upstream"
+                );
+                tunnel_cancel(send, request_id, op_timeout).await;
+                let _ = send.finish();
+                usage.finish();
+                return ForwardEnd::ClientGone;
+            }
+        };
         match frame {
             Ok(Ok(Some(Frame::ProxyResponseBody { chunk, .. }))) => {
                 match send_to_client(&tx, Ok(Bytes::from(chunk.clone())), client_stall).await {

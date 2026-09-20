@@ -408,17 +408,22 @@ quinn 的名字抄进来**：s2n-quic 全在 `Limits` 上用 `with_*` setter，�
 | 隧道死亡 | 对客户端给出明确错误码 + 摘除 agent |
 | 进程 SIGTERM | 先停 accept → 排空窗口 → 再退（§6-R12） |
 
-> ⚠️ **现有实现的反面案例（真实并发正确性缺口）**：
-> `forward_body` **只在 `tx.send()` 失败时**才发现客户端断开（`proxy/mod.rs:419`）。
+> ✅ **已修（2026-09，`proxy/forward.rs`）**——原先的反面案例：
+> `forward_body` **只在 `tx.send()` 失败时**才发现客户端断开。
 > 若客户端断开后上游恰好**不再产出任何 chunk**（LLM 正在"思考"、首 token 之前的静默期），
 > 任务阻塞在 `read_frame(recv)` 上，`tx.send` 永不被调用 →
 > **该请求的 agent 槽位要等到 `idle_timeout`（默认 120 s）超时才释放，`Cancel` 帧也不会发出**。
 >
-> 而这恰是**最常见的交互形态**：用户看到卡顿就取消。后果是"上游明明空闲、
+> 而这恰是最常见的交互形态：用户看到卡顿就取消。后果是"上游明明空闲、
 > 新请求却 429 `agent at capacity`"，且 HTTP 层闸门不受影响 —— 现象只出现在 per-edge 容量上，
 > 极难归因。
 >
-> **修法**：把 `tx.closed()` 与 `read_frame` 放进同一个 `select!`，取消即时传播、槽位即时释放。
+> **修法已落地**：`tx.closed()` 与 `read_frame` 现处在同一个 `tokio::select!` 里，断开即时
+> 传播取消、槽位即时释放。回归测试
+> `chain::e2e_client_disconnect_while_upstream_is_silent_releases_the_slot`
+> （上游静默 3 s、idle 给 30 s；断言槽位在 1.5 s 内归还——**已验证过红**）。
+> 注意该分支取消 `read_frame` 是安全的**仅因为**它随后 `finish()` 并彻底放弃这条流
+> （`read_frame` 本身不可取消安全，见 §6-R3）。
 
 **控制流队头阻塞**（现有项目同样存在）：控制流接受循环是**串行**的且读帧**无超时**
 （`quic.rs:57-63`）。一个卡住的 agent 只要开一条 bidi 流不发帧，后续
