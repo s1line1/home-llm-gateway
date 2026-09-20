@@ -102,7 +102,7 @@ scripts/bench-k6/           k6 宏观压测模板（SSE 长流 + QPS，含 429 �
 Makefile                 dev/stop/check 一键流程 + 证书检查（certs-required）
 DEPLOY.md                生产部署：证书签发、systemd、安全组（UDP 4433 易漏）
 deploy/*.service         优雅关闭怎么生效（systemctl stop → SIGTERM → shutdown）
-rust-toolchain.toml      工具链锁定（stable + rustfmt/clippy）
+rust-toolchain.toml      工具链声明（stable 浮动 channel，未钉版本；CI 另行装 stable → 见 TODO）
 ```
 
 ### 第 6 步：前端（可选，30 分钟）

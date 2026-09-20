@@ -442,9 +442,10 @@
       原值，两者不一致时访问日志同时记 `request_id` 与 `client_request_id`。
       **未**采用"帧内改用字符串"：动协议字段类型要改 proto/agent/mock-llm 三处，
       收益只是省掉那条日志映射。
-- [ ] **`extract_model` 卡住非 chat 的 `/v1/*`**：`proxy/mod.rs:142-147` 对 `http.rs:46-53`
-      catch-all 注册的**所有方法与路径**都要求 body 是带 `model` 的 JSON → `GET /v1/files`、
-      `DELETE /v1/files/{id}`、multipart（`/v1/audio/transcriptions`）现在一律 400，
+- [ ] **`extract_model` 卡住非 chat 的 `/v1/*`**：`proxy/mod.rs:28-34` 的 `extract_model`
+      对 catch-all 路由（`http/mod.rs:27-34` 的 `/v1/{*rest}`，注册了 GET/POST/PUT/DELETE/PATCH）
+      **所有方法与路径**都要求 body 是带 `model` 的 JSON（调用点 `proxy/mod.rs:81-86` → 400）→
+      `GET /v1/files`、`DELETE /v1/files/{id}`、multipart（`/v1/audio/transcriptions`）现在一律 400，
       与 DESIGN §5.1"一律透传"冲突。修法：按路径/方法白名单要求 model（chat/completions、
       embeddings…），其余透传。
 - [ ] **A3 类型化错误收尾**（OPTIMIZATION.md 已改标 ⚠️ 部分）：`Agent::start`
@@ -453,6 +454,16 @@
 - [ ] **Makefile `deny` 目标 ≠ hook/CI**：目标只跑 `cargo deny check licenses`，而 pre-commit hook
       与 CI 跑完整 `cargo deny check`（广告语已改，行为未变）。二选一：把目标改成完整检查，
       或明确 `make check` 不含完整 cargo-deny。
+- [ ] **工具链没真的锁版本 → 本地与 CI 的 lint 会漂移**（`OPTIMIZATION.md` 的 E2 已从 ✅ 改标 ⚠️ 名义）：
+      `rust-toolchain.toml` 是 `channel = "stable"`（**浮动 channel，不是钉版本**），
+      `.github/workflows/ci.yml:18-21` 用 `dtolnay/rust-toolchain@stable`——**不读那个文件**，
+      装的是 CI 当刻的最新 stable（步骤名却叫 `Install Rust (rust-toolchain.toml)`），
+      `Cargo.toml` 也没有 `rust-version` 兜底。后果实测过：`clippy::result_large_err`
+      只在 CI 触发、本地（stable 1.97.1）无论加不加 `-D` 都不报，于是"本地全绿 → CI 红"。
+      修法：`channel` 钉到具体版本（与 CI 一致）+ CI 侧指向同一版本（别再用 `@stable` 隐式浮动）
+      + 在 `[workspace.package]` 补 `rust-version` 声明 MSRV；升级工具链变成一次显式提交。
+      根因不清掉，后面每轮 CI 都可能冒出新的 nightly/stable 新 lint（例如 `Atomic::fetch_update`
+      弃用就是靠本地 nightly 才提前发现的，见本文件「坏味道 / 清理」里那条）。
 - [ ] **Heartbeat 载荷空洞**：`Frame::Heartbeat { inflight }` 恒为 0（`agent/src/lib.rs:136-140`），
       网关只打 debug 日志（`quic.rs:76-84`）。它是"容量感知路由"的前置数据：要么实现上报，
       要么删掉该字段（现在是死载荷，容易误导）。
@@ -483,6 +494,12 @@
       `HeadOutcome::Error(u16, String)` 用裸状态码。
 - [ ] **死代码 / 死常量**：`KeyStore::authorize_id`（`storage/mod.rs:210`）、`Metrics::request_count`
       （`metrics.rs:98`）、`HISTORY_LEN` 被导出但 `useMetricsHistory.ts:41` 硬编码 `60`。
+- [ ] **`Atomic::fetch_update` 已弃用 → 改 `try_update`**：`registry.rs:406`（`try_acquire`
+      抢并发槽位那处）。nightly 1.100.0 的措辞是 `deprecated: renamed to try_update for
+      consistency`——**纯改名**，签名与返回值语义完全一致（本地实测对照：成功路径两边都
+      `Ok(prev)`、闭包返 `None` 时两边都 `Err(cur)`，原子终值也相同）。`try_update` 在
+      **stable 1.97.1 上就能编译**，所以不必等新 stable，一行即可消掉未来的 deprecation 警告；
+      注意它现在只在 nightly 报警，稳定版 CI 不会提示（这也是"工具链没锁版本"那条的连带损失）。
 
 ### 本次一并修掉的文档漂移（无需再动代码）
 
