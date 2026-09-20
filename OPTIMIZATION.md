@@ -10,7 +10,7 @@
 
 | # | 优化项 | 现状 | 方案 | 优先级/工作量 |
 |---|---|---|---|---|
-| S1 ✅ | gateway crate 按职责拆模块 | ~~混合~~ → `http_proxy.rs`（代理转发独立）、`storage/hash.rs`（哈希原语独立）、`config.rs`（配置解析独立）；http.rs 只剩路由/中间件/fallback | 高 / 中 |
+| S1 ✅ | gateway crate 按职责拆模块 | ~~混合~~ → `proxy/mod.rs`（代理转发独立）、`storage/hash.rs`（哈希原语独立）、`config.rs`（配置解析独立）；http.rs 只剩路由/中间件/fallback | 高 / 中 |
 | S2 ✅ | e2e 测试拆文件 | ~~1379 行单文件~~ → `tests/e2e/` 目录（main.rs 入口 + common.rs 辅助 + chain/agents/admin/metrics/https 场景，23 测试），保持单二进制使 #[serial] 全局生效 | 中 / 中 |
 | S3 ✅ | 配置解析抽独立模块 | → gateway/agent 各建 `config.rs`（from_path/from_file + 14 个测试），main.rs 只留 CLI 入口与信号处理 | 中 / 低 |
 | S4 ✅ | 共享代码去重 | ~~两处重复~~ → `proto::pem`（load_certs/load_key）+ `proto::headers`（is_hop_by_hop），gateway/agent 引用统一，测试移入 proto | 高 / 低 |

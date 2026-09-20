@@ -1,7 +1,7 @@
 # 精确一次重试：协议级去重设计（提案）
 
 > 状态：**提案，未实现**。本文只描述设计、取舍与落地步骤，代码改动留待确认后再做。
-> 相关实现：`crates/gateway/src/http_proxy.rs`（重试循环）、`crates/agent/src/stream.rs`（帧处理）、
+> 相关实现：`crates/gateway/src/proxy/mod.rs`（重试循环）、`crates/agent/src/stream.rs`（帧处理）、
 > `crates/proto/src/io.rs`（帧读写）。
 
 ## 1. 为什么要做
@@ -39,8 +39,8 @@
 | 帧格式 `[u32 长度][postcard 载荷]`；agent 先读满整帧再动上游 | `proto/src/io.rs`、`agent/src/stream.rs` | **建立阶段失败必然"未送达"**——这是现有重试安全性的根据，也是本设计不必覆盖的区间 |
 | agent 每条流一个任务，读到 `ProxyRequest` 后才构造上游 HTTP 请求 | `agent/src/stream.rs` | 去重表的插入点就在"读到完整帧之后、调用上游之前" |
 | `Cancel` 帧通过 watch 通道触发上游取消 | `agent/src/stream.rs` | 去重命中"等待复用"时要与取消联动（见 §4.5） |
-| 请求体在网关侧已整包在手（`Bytes`） | `gateway/src/http_proxy.rs` | 重放不需要重新读客户端 |
-| `request_id` 现在是 `x-request-id` 的数字部分或网关进程内自增 | `gateway/src/http.rs`、`http_proxy.rs` | **只在单实例内唯一**，多实例/重启会撞号 → 必须换标识（§4.1） |
+| 请求体在网关侧已整包在手（`Bytes`） | `gateway/src/proxy/mod.rs` | 重放不需要重新读客户端 |
+| `request_id` 现在是 `x-request-id` 的数字部分或网关进程内自增 | `gateway/src/http.rs`、`proxy/mod.rs` | **只在单实例内唯一**，多实例/重启会撞号 → 必须换标识（§4.1） |
 
 ## 4. 设计
 

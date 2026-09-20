@@ -1,0 +1,93 @@
+//! 请求处理共享状态：[`AppState`] —— 路由、代理、管理接口与认证都用它。
+//!
+//! 为什么它不在 `http.rs` 里：它曾是"路由模块"的一部分，而真正的消费者跨越了每一层
+//! （`proxy`、`auth`、`admin`、metrics 中间件）。那样会让路由层成为所有人的上游，
+//! 并形成 `http <-> proxy` 的模块环。搬到这里之后那三个层只**读**它，环没有了：
+//! `state <- {http, proxy, auth, admin}`。
+//!
+//! **仍剩一条反向边**：本模块依赖 [`crate::gateway::Options`]（`new` 的入参），而
+//! `gateway.rs` 要用 `AppState` 装配，于是 `state <-> gateway`。它比被消掉的那个环弱得多——
+//! `Options` 是**纯数据**（无行为、无 I/O、无状态），这条边只指向一个类型定义。
+//! 要彻底消掉得把 `Options` 从 `gateway.rs` 挪进自己的模块，且 `lib.rs` 必须 re-export
+//! 以保住 `gateway::Options` 这个既有路径（`tests/e2e` 按它引用）。留待需要时再做。
+//!
+//! `new` 承担**全部派生**（`head_alive_window`、`RateLimiter`、`stream_ceiling`、UI 判定），
+//! 所以每个派生量在整仓库只存在一处；调用方只给一个 [`Options`]。
+
+use std::path::PathBuf;
+use std::time::Duration;
+
+use crate::gateway::Options;
+use crate::metrics::Metrics;
+use crate::ratelimit::RateLimiter;
+use crate::registry::Registry;
+use crate::storage::KeyStore;
+use crate::ui::resolve_ui;
+
+#[derive(Clone)]
+pub struct AppState {
+    pub registry: Registry,
+    pub key_store: KeyStore,
+    /// Admin token（None 表示不启用 /admin/*）。
+    pub admin_token: Option<String>,
+    pub timeout: Duration,
+    pub agent_stale_after: Duration,
+    /// 隧道控制操作超时（打开流 / 发送请求头 / 取消帧）。见 [`crate::Options`] 的说明。
+    pub tunnel_op_timeout: Duration,
+    /// 等待上游响应头（首字节）的超时。见 [`crate::Options`] 的说明。
+    pub head_timeout: Duration,
+    /// 客户端停滞阈值：请求体/响应体两个方向"完全没动静"多久就放弃。
+    /// 见 [`crate::Options::client_stall`]——没有它，在途请求会永久占住准入槽位。
+    pub client_stall: Duration,
+    /// 响应头超时的"忙/死"判据窗口：这么久内有过成功响应头，就只是"慢"。
+    ///
+    /// 由 `head_timeout` 派生（4 倍），不单独设配置项：它表达的是"连续 4 个响应头超时窗口
+    /// 一次都没回过"——到这个程度就不再是"排队慢"了（见 `registry::Entry::head_timeout_is_fatal`）。
+    pub head_alive_window: Duration,
+    pub rate_limiter: Option<RateLimiter>,
+    /// HTTP 全局在途请求上限（0 = 不限；per-key 限流之外的总闸门）。
+    pub max_concurrent_requests: u32,
+    /// 每条 agent 连接允许的同时在途隧道流数（QUIC 双向流额度）。
+    ///
+    /// 两个用途：① 建 QUIC 端点时作为双向流额度（见 `Gateway::start`）；
+    /// ② 开流超时时用来区分"忙"（额度排满，排队超时）与"死"（见
+    /// `registry::Entry::open_timeout_is_fatal`）。
+    pub max_open_tunnel_streams: u32,
+    pub metrics: Metrics,
+    /// React UI 静态目录（None = `/` 显示构建提示页）。
+    pub ui: Option<PathBuf>,
+    /// `ui_dir` 不可用的具体原因（None = 没配 ui_dir，或配了且可用）。
+    /// 由启动时 [`resolve_ui`] 判定后写入，占位页会把它显示出来——否则用户只看到白屏/通用文案。
+    pub ui_problem: Option<String>,
+}
+
+impl AppState {
+    /// 从 [`Options`] 组装请求处理状态：配置 → `AppState` 的映射与**派生只在这一处发生**。
+    ///
+    /// 两个派生量都不单独设旋钮：
+    /// - `head_alive_window = head_timeout × 4`：连续四个窗口一次响应头都没回来，才算"不是慢，是死"；
+    /// - `max_open_tunnel_streams = opts.stream_ceiling()`：0 → 默认值，与绑 QUIC 端点同一口径。
+    ///
+    /// `ui_dir` 的可用性判定（[`resolve_ui`]）也在这里：它是**非致命**的启动自检，
+    /// 不通过就降级成占位页，并把原因交给页面自己显示。
+    pub fn new(registry: Registry, key_store: KeyStore, metrics: Metrics, opts: &Options) -> Self {
+        let (ui, ui_problem) = resolve_ui(opts.ui_dir.as_deref());
+        Self {
+            registry,
+            key_store,
+            admin_token: opts.admin_token.clone(),
+            timeout: opts.request_timeout,
+            agent_stale_after: opts.agent_stale_after,
+            tunnel_op_timeout: opts.tunnel_op_timeout,
+            head_timeout: opts.head_timeout,
+            head_alive_window: opts.head_timeout * 4,
+            client_stall: opts.client_stall,
+            rate_limiter: RateLimiter::new(opts.rate_limit_per_min),
+            max_concurrent_requests: opts.max_concurrent_requests,
+            max_open_tunnel_streams: opts.stream_ceiling(),
+            metrics,
+            ui,
+            ui_problem,
+        }
+    }
+}

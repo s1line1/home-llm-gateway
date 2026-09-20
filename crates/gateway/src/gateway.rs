@@ -18,6 +18,7 @@ use crate::{
     metrics::Metrics,
     nofile, quic,
     registry::Registry,
+    state,
     storage::KeyStore,
     tls::{self, TlsPem},
     usage_flush,
@@ -116,7 +117,7 @@ pub struct Options {
     /// 用 2s 的隧道控制超时去卡会误杀正常请求；但也不该沿用 `request_timeout`（120s），
     /// 否则 agent 卡死时每个请求都把连接与缓冲占满两分钟（实测 40 并发钉住约 620MB）。
     ///
-    /// 它**同时**决定 [`crate::http::AppState::head_alive_window`]（4 倍），不单独设旋钮。
+    /// 它**同时**决定 [`crate::state::AppState::head_alive_window`]（4 倍），不单独设旋钮。
     pub head_timeout: Duration,
     /// 超过该时长未心跳的 agent 视为失联。
     pub agent_stale_after: Duration,
@@ -266,7 +267,7 @@ impl Gateway {
             opts.verified_cache_max,
             KeyStore::default_verified_ttl(),
         );
-        let app = http::app(http::AppState::new(
+        let app = http::app(state::AppState::new(
             registry.clone(),
             key_store.clone(),
             metrics.clone(),
@@ -274,7 +275,7 @@ impl Gateway {
         ));
 
         // ⑤ 起任务。入列顺序有意义：用量 flusher 必须在 serve 任务之前就位（它按周期
-        //    批量写库，见 `http_proxy::UsageCollector::finish`；关闭时由 `shutdown` 补最后一刀）。
+        //    批量写库，见 `proxy::UsageCollector::finish`；关闭时由 `shutdown` 补最后一刀）。
         let tasks = vec![
             usage_flush::spawn(key_store.clone()),
             http::spawn_entry(sockets.http, app, https, opts.client_stall),

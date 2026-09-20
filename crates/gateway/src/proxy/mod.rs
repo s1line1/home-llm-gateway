@@ -1,117 +1,31 @@
 //! 代理转发：认证 → 限流 → 编码为隧道帧转发（从 http.rs 拆分，保持路由层精简）。
 
+mod tunnel;
+mod usage;
+
 use std::time::Duration;
 
 use axum::{
     body::{Body, Bytes},
     extract::{Request, State},
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
-    response::{IntoResponse, Response},
-    Json,
+    response::Response,
 };
-use proto::{
-    io::{read_frame, write_frame},
-    Frame,
-};
+use proto::{io::read_frame, Frame};
 
-use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 
-use crate::http::AppState;
+use crate::auth::authenticate;
+use crate::body::{read_body_with_stall, BodyRead, MAX_REQUEST_BODY};
+use crate::openai::error_response;
 use crate::registry::AcquireError;
-use crate::storage::UsageDelta;
+use crate::state::AppState;
+use tunnel::{open_tunnel, tunnel_cancel, tunnel_write, OpenFailure};
+use usage::UsageCollector;
 
 static NEXT_REQUEST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
-/// OpenAI 兼容错误响应：`error.type` 按状态码映射（SDK 据此决定重试/报错语义），
-/// 429 自动带 `Retry-After`（秒）供退避。pub(crate)：metrics_middleware（HTTP 总并发
-/// admission 拒绝）也用它，保证错误格式全局一致。
-pub(crate) fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
-    let body = Json(json!({
-        "error": {
-            "message": message.into(),
-            "type": openai_error_type(status),
-        }
-    }));
-    let mut builder = Response::builder().status(status);
-    if status == StatusCode::TOO_MANY_REQUESTS {
-        builder = builder.header(axum::http::header::RETRY_AFTER, "60");
-    }
-    builder
-        .body(body.into_response().into_body())
-        .unwrap_or_else(|e| {
-            // builder 失败（理论不发生）：退回无头响应，保证错误仍能送达
-            Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(axum::body::Body::from(format!(
-                    "error building response: {e}"
-                )))
-                .unwrap()
-        })
-}
-
-/// OpenAI error.type 语义（https://platform.openai.com/docs/guides/error-codes）：
-/// SDK 对 429/5xx 自动重试，对 4xx（除 429）不重试——type 必须与状态码一致。
-fn openai_error_type(status: StatusCode) -> &'static str {
-    match status.as_u16() {
-        400 => "invalid_request_error",
-        401 => "authentication_error",
-        403 => "permission_error",
-        404 => "not_found_error",
-        409 => "conflict_error",
-        429 => "rate_limit_error",
-        500..=599 => "server_error",
-        _ => "api_error",
-    }
-}
-
-/// 校验 Bearer API Key（动态 key）；通过时返回 (token, key_id, key_name)。
-/// token 用作限流 key；key_id/key_name 用于用量计量。
-///
-/// argon2 校验单次 10-30ms（19MiB 内存）的 CPU 密集操作，**必须**放到阻塞线程池：
-/// 直接在请求路径上同步执行会占住 async worker（worker 数 = CPU 核数），
-/// 连带拖慢同一个 worker 上所有在途请求，包括正在流式回传的 SSE。
-async fn api_key(state: &AppState, headers: &HeaderMap) -> Option<(String, String, String)> {
-    let value = headers.get(axum::http::header::AUTHORIZATION)?;
-    let token = value.to_str().ok()?.strip_prefix("Bearer ")?.to_string();
-    let store = state.key_store.clone();
-    let token_for_verify = token.clone();
-    let record = match tokio::task::spawn_blocking(move || {
-        store.authorize_record(&token_for_verify)
-    })
-    .await
-    {
-        Ok(rec) => rec?,
-        Err(e) => {
-            // 校验任务 panic/被取消：按认证失败处理，不放行
-            warn!("key verification task failed: {e}");
-            return None;
-        }
-    };
-    Some((token, record.id, record.name))
-}
-
-/// 认证 + 限流（/v1/* 统一入口，含 /v1/models 聚合路由）。
-/// 认证失败 → Some(401)；限流失败 → Some(429)；通过 → None。
-pub async fn auth_and_rate_limit(state: &AppState, headers: &HeaderMap) -> Option<Response> {
-    let Some((token, _id, _name)) = api_key(state, headers).await else {
-        return Some(error_response(
-            StatusCode::UNAUTHORIZED,
-            "invalid or missing API key",
-        ));
-    };
-    if let Some(rl) = &state.rate_limiter {
-        if !rl.try_acquire(&token) {
-            return Some(error_response(
-                StatusCode::TOO_MANY_REQUESTS,
-                "rate limit exceeded",
-            ));
-        }
-    }
-    None
-}
 
 /// 从请求 body 提取路由所需模型：顶层 `model` 字段（OpenAI 兼容语义，必填）。
 /// 缺失 / 非字符串 / 空串 → Err（调用方返回 400）。
@@ -120,127 +34,6 @@ fn extract_model(body: &[u8]) -> Result<String, ()> {
     match value.get("model") {
         Some(serde_json::Value::String(s)) if !s.is_empty() => Ok(s.clone()),
         _ => Err(()),
-    }
-}
-
-/// 打开一条隧道流失败的两类原因。**必须分开**：它们的处置完全不同
-/// （超时可能是"忙"，错误一定是"坏"）。
-enum OpenFailure {
-    /// 在 `op_timeout` 内没能开出流。可能是对端死了，也可能只是**流额度排满在排队**
-    /// ——后者由调用方用 [`crate::registry::Entry::open_timeout_is_fatal`] 判定。
-    TimedOut,
-    /// 开流直接返回错误：连接确已不可用。
-    Failed(String),
-}
-
-impl OpenFailure {
-    fn message(&self) -> String {
-        match self {
-            OpenFailure::TimedOut => "tunnel open timed out".into(),
-            OpenFailure::Failed(e) => e.clone(),
-        }
-    }
-}
-
-/// 打开一条隧道流（带超时）。
-///
-/// **为什么必须有超时**：健康隧道这一步是毫秒级（本机实测端到端固定开销 F≈56ms），
-/// 但隧道坏掉时开流/写帧可能长时间不返回——请求就一直挂在那里，占着连接、并发槽位和
-/// 缓冲区，客户端早已断开也发现不了。超时即判定连接已死，交给调用方摘除条目。
-///
-/// 实测补充：真正长时间卡住的是**等响应头**（见 [`proxy`] 里的 `head_timeout`）；
-/// s2n-quic 在连接已被判定关闭后，写会较快返回错误。两个超时都保留——两者互为兜底，
-/// 且触发时都必须摘除坏连接，否则后续请求会继续选中它。
-async fn open_tunnel(
-    entry: &mut crate::registry::Entry,
-    op_timeout: Duration,
-) -> Result<s2n_quic::stream::BidirectionalStream, OpenFailure> {
-    match tokio::time::timeout(op_timeout, entry.conn.open_bidirectional_stream()).await {
-        Ok(Ok(s)) => Ok(s),
-        Ok(Err(e)) => Err(OpenFailure::Failed(format!("tunnel open failed: {e}"))),
-        Err(_) => Err(OpenFailure::TimedOut),
-    }
-}
-
-/// 往隧道写一个帧（带超时），并把超时记为 ERROR 级 —— 这是"隧道已死"的唯一可靠信号。
-///
-/// 同理：一个几 KB 的帧在健康隧道上是微秒级，`op_timeout` 内写不完就只能是连接坏了。
-async fn tunnel_write(
-    send: &mut s2n_quic::stream::SendStream,
-    frame: &Frame,
-    op_timeout: Duration,
-    request_id: u64,
-    agent_id: &str,
-) -> Result<(), String> {
-    match tokio::time::timeout(op_timeout, write_frame(send, frame)).await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(format!("tunnel write failed: {e}")),
-        Err(_) => {
-            error!(
-                request_id,
-                agent = %agent_id,
-                timeout_ms = op_timeout.as_millis(),
-                "tunnel write timed out; evicting agent"
-            );
-            Err("tunnel write timed out".into())
-        }
-    }
-}
-
-/// 尽力发一个取消帧：**失败就算了**，绝不在这里阻塞（它本身可能就是卡住的那条路）。
-async fn tunnel_cancel(
-    send: &mut s2n_quic::stream::SendStream,
-    request_id: u64,
-    op_timeout: Duration,
-) {
-    let cancel = Frame::Cancel { request_id };
-    let _ = tokio::time::timeout(op_timeout, write_frame(send, &cancel)).await;
-}
-
-/// 请求体上限。**只此一处定义**：`http.rs` 的 `DefaultBodyLimit` 层的值取自这里，
-/// 而手动逐块读 body 时（见 `read_body_with_stall`）也用它——两处若各写一个数字，
-/// 早晚会漂移成一个"提取器放行、这里拒绝（或反过来）"的鬼故事。
-pub const MAX_REQUEST_BODY: usize = 16 * 1024 * 1024;
-
-/// 读 body 的结果。`Stalled` 与 `TooLarge`/`Failed` 必须分开：它们对客户端的
-/// 语义（408 / 413 / 400）和运维含义都不同。
-enum BodyRead {
-    Body(Bytes),
-    Stalled,
-    TooLarge,
-    Failed(String),
-}
-
-/// 逐块读取请求体，**每块之间**用停滞超时兜底。
-///
-/// 为什么不能用 `Bytes` 提取器：它会一直等到 body 读完，**没有任何超时**。客户端只要发完
-/// headers（声明一个大 `Content-Length`）就不再发 body，这个请求就会永久占住准入票据
-/// （`Admission`）——实测云端沉淀了 8 个这样的僵尸槽位（`hlmg_active_requests` 恒为 8、
-/// `request_count − Σ状态码 = 8`），而且只增不减，配了 `max_concurrent_requests` 的网关
-/// 会被慢慢吃光闸门（生产口径约 32，8 个 = 25%），只能重启恢复。
-///
-/// 语义是**停滞**而不是**总时长**：每收到一块就重新计时，所以"慢但一直在传"的大 body
-/// 上传不会被误杀（移动网络下的 16MB 上传可以合法地超过一分钟），只有该方向真的没有
-/// 字节再流动才放弃。
-async fn read_body_with_stall(body: axum::body::Body, stall: Duration, limit: usize) -> BodyRead {
-    use http_body_util::BodyExt;
-    let mut stream = body.into_data_stream();
-    let mut buf: Vec<u8> = Vec::new();
-    loop {
-        match tokio::time::timeout(stall, stream.frame()).await {
-            Ok(Some(Ok(frame))) => {
-                if let Ok(data) = frame.into_data() {
-                    if buf.len() + data.len() > limit {
-                        return BodyRead::TooLarge;
-                    }
-                    buf.extend_from_slice(&data);
-                }
-                // 非数据帧（trailers）忽略：本网关只转发 body 字节
-            }
-            Ok(Some(Err(e))) => return BodyRead::Failed(e.to_string()),
-            Ok(None) => return BodyRead::Body(Bytes::from(buf)),
-            Err(_) => return BodyRead::Stalled,
-        }
     }
 }
 
@@ -258,15 +51,11 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
         .and_then(|n| n.parse::<u64>().ok())
         .unwrap_or_else(|| NEXT_REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
 
-    // 认证：同时拿到 key_id/key_name（用量计量）与 token（限流）
-    let Some((token, key_id, key_name)) = api_key(&state, &headers).await else {
-        return error_response(StatusCode::UNAUTHORIZED, "invalid or missing API key");
+    // 认证 + 限流（per-key 令牌桶）：拿不到身份的唯一出路就是把它还给客户端。
+    let key = match authenticate(&state, &headers).await {
+        Ok(key) => key,
+        Err(rejection) => return rejection.into_response(),
     };
-    if let Some(rl) = &state.rate_limiter {
-        if !rl.try_acquire(&token) {
-            return error_response(StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded");
-        }
-    }
 
     // 读请求体：停滞/超限/读失败各自有明确状态码，且**都会归还准入票据**（随本函数返回而
     // Drop）——这正是修掉"槽位永久泄漏"的地方。
@@ -587,8 +376,8 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
             slot,
             metrics,
             key_store,
-            key_id,
-            key_name,
+            key.key_id,
+            key.key_name,
             prompt_est,
             is_stream,
         )
@@ -646,115 +435,6 @@ async fn read_head(recv: &mut s2n_quic::stream::ReceiveStream) -> anyhow::Result
     }
 }
 
-/// 请求级 usage 收集：SSE 流式逐块预过滤提取；非流式缓冲到 End 后整包解析；
-/// 均拿不到 usage（上游未提供 / 取消 / 断流）→ 估算并标记。
-struct UsageCollector {
-    key_store: crate::storage::KeyStore,
-    key_id: String,
-    key_name: String,
-    /// 请求 body 的 prompt 估算（无 usage 时的 prompt 降级）。
-    prompt_est: u64,
-    /// SSE（content-type: text/event-stream）。
-    is_stream: bool,
-    /// 已提取的 usage（精确来源；流式多次出现取最后一次）。
-    extracted: Option<crate::usage_meter::ExtractedUsage>,
-    /// 非流式整包缓冲。
-    buf: Vec<u8>,
-    /// 已转发字节（估算 completion 用）。
-    bytes_forwarded: u64,
-    /// 是否已记录（防止提前返回路径重复记录）。
-    recorded: bool,
-}
-
-impl UsageCollector {
-    fn new(
-        key_store: crate::storage::KeyStore,
-        key_id: String,
-        key_name: String,
-        prompt_est: u64,
-        is_stream: bool,
-    ) -> Self {
-        Self {
-            key_store,
-            key_id,
-            key_name,
-            prompt_est,
-            is_stream,
-            extracted: None,
-            buf: Vec::new(),
-            bytes_forwarded: 0,
-            recorded: false,
-        }
-    }
-
-    /// 每块转发后调用：记录字节、尝试提取 usage。
-    fn observe(&mut self, chunk: &[u8]) {
-        self.bytes_forwarded += chunk.len() as u64;
-        if self.is_stream {
-            if let Some(d) = crate::usage_meter::extract_usage(chunk) {
-                self.extracted = Some(d);
-            }
-        } else if self.buf.len() < 32 * 1024 * 1024 {
-            // 非流式：整包缓冲（End 后统一解析），避免 JSON 跨块时 usage 被切开。
-            // 超 32MiB 停止缓冲（防御性；usage 通常尾随，丢失则估算降级）
-            self.buf.extend_from_slice(chunk);
-        }
-    }
-
-    /// 响应结束（End / 断流 / 超时 / 客户端断开）：结算用量并记录。
-    ///
-    /// **不得在这里等落库**：SQLite 写可能因锁重试阻塞数秒（rusqlite 默认 busy timeout 5s），
-    /// 而本函数在响应流关闭**之前**执行——等它就会变成客户端的尾延迟（实测：DB 被独占锁
-    /// 卡住 3s，客户端就要多等 3s 才拿到 body 结束）。所以这里**只做内存累加**
-    /// （`/admin/usage` 读的正是这份内存计数，读一致性不受影响），落库交给后台周期任务
-    /// （`usage_flush::spawn` → `KeyStore::flush_usage_once`），并由关闭前的强制 flush 兜底。
-    ///
-    /// 这里曾经是"每请求 spawn 一个阻塞任务写一次库"：那条路径让云端 515 个线程里 514 个
-    /// 卡在 futex 等同一把 `db` 锁，把 2 vCPU 的吞吐摁在约 190 QPS。
-    fn finish(mut self) {
-        if self.recorded {
-            return;
-        }
-        self.recorded = true;
-        let delta = self.resolve_delta();
-        self.key_store
-            .accumulate_usage(&self.key_id, &self.key_name, &delta);
-    }
-
-    fn resolve_delta(&mut self) -> UsageDelta {
-        // 非流式：整包缓冲，End 后统一解析（避免 JSON 跨块切到 usage 字段）
-        if !self.is_stream {
-            if let Some(d) = crate::usage_meter::extract_usage(&self.buf) {
-                self.extracted = Some(d);
-            }
-        }
-        match &self.extracted {
-            Some(d) => UsageDelta {
-                prompt_tokens: d.prompt_tokens,
-                completion_tokens: d.completion_tokens,
-                estimated: false,
-            },
-            None => {
-                // 估算降级（标记 estimated）：prompt 按请求体估算；
-                // completion 按已转发字节 / 4（取消/断流/无 usage 上游均适用）
-                let completion = self.bytes_forwarded.div_ceil(4);
-                UsageDelta {
-                    prompt_tokens: self.prompt_est,
-                    completion_tokens: completion.max(1),
-                    estimated: true,
-                }
-            }
-        }
-    }
-}
-
-/// 把响应体帧流转发到通道；任一端关闭时向对端发 Cancel。
-/// `slot` 持有期间占用 agent 并发槽位，随任务结束释放。
-///
-/// `idle_timeout` 是**逐帧空闲**超时（响应阶段，SSE 长流靠"有帧就不超时"活着）；
-/// `op_timeout` 只用于取消帧的写——隧道坏掉时连 Cancel 都可能写不出去，绝不能在这里
-/// 阻塞（这正是"客户端已断开却发现不了"的死角）。
-#[allow(clippy::too_many_arguments)]
 /// 往客户端方向送一块的结果。三种情况处置完全不同，必须分开。
 enum SendOutcome {
     /// 客户端取走了。
@@ -785,9 +465,16 @@ async fn send_to_client(
     }
 }
 
-// 参数确实多（流的两半、通道、三个超时、票据、指标、用量记账、请求元信息），但它们
-// 都是这个后台任务**必须独占持有**的资源；打包成 struct 只是把同一张清单换个地方写，
-// 不会让这个函数更难懂。真正的接口收窄留给"响应转发"整体重构时做。
+/// 把响应体帧流转发到通道；任一端关闭时向对端发 Cancel。
+/// `slot` 持有期间占用 agent 并发槽位，随任务结束释放。
+///
+/// `idle_timeout` 是**逐帧空闲**超时（响应阶段，SSE 长流靠"有帧就不超时"活着）；
+/// `op_timeout` 只用于取消帧的写——隧道坏掉时连 Cancel 都可能写不出去，绝不能在这里
+/// 阻塞（这正是"客户端已断开却发现不了"的死角）。
+///
+/// 参数确实多（流的两半、通道、三个超时、票据、指标、用量记账、请求元信息），但它们都是
+/// 这个后台任务**必须独占持有**的资源；打包成 struct 只是把同一张清单换个地方写，不会让
+/// 这个函数更难懂。
 #[allow(clippy::too_many_arguments)]
 async fn forward_body(
     recv: &mut s2n_quic::stream::ReceiveStream,
@@ -992,113 +679,5 @@ mod tests {
         assert!(extract_model(br#"{"model":""}"#).is_err());
         // 非法 JSON → Err
         assert!(extract_model(b"not json").is_err());
-    }
-
-    #[test]
-    fn error_type_maps_to_openai_semantics() {
-        // 各状态码 → OpenAI error.type（SDK 据此决定是否自动重试）
-        assert_eq!(
-            openai_error_type(StatusCode::BAD_REQUEST),
-            "invalid_request_error"
-        );
-        assert_eq!(
-            openai_error_type(StatusCode::UNAUTHORIZED),
-            "authentication_error"
-        );
-        assert_eq!(openai_error_type(StatusCode::FORBIDDEN), "permission_error");
-        assert_eq!(openai_error_type(StatusCode::NOT_FOUND), "not_found_error");
-        assert_eq!(openai_error_type(StatusCode::CONFLICT), "conflict_error");
-        assert_eq!(
-            openai_error_type(StatusCode::TOO_MANY_REQUESTS),
-            "rate_limit_error"
-        );
-        assert_eq!(openai_error_type(StatusCode::BAD_GATEWAY), "server_error");
-        assert_eq!(
-            openai_error_type(StatusCode::SERVICE_UNAVAILABLE),
-            "server_error"
-        );
-        assert_eq!(openai_error_type(StatusCode::OK), "api_error");
-    }
-
-    #[tokio::test]
-    async fn error_response_carries_type_and_retry_after_on_429() {
-        let resp = error_response(StatusCode::BAD_REQUEST, "bad");
-        let bytes = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(v["error"]["type"], "invalid_request_error");
-
-        // 429 必须带 Retry-After（SDK/脚本退避依赖）
-        let resp = error_response(StatusCode::TOO_MANY_REQUESTS, "slow down");
-        assert_eq!(
-            resp.headers().get(axum::http::header::RETRY_AFTER),
-            Some(&axum::http::HeaderValue::from_static("60"))
-        );
-        // 非 429 不带 Retry-After
-        let resp = error_response(StatusCode::BAD_REQUEST, "bad");
-        assert!(resp
-            .headers()
-            .get(axum::http::header::RETRY_AFTER)
-            .is_none());
-    }
-
-    /// 造一个"分块到来"的 body：每块之间 sleep `gap`，共 `chunks` 块。
-    fn delayed_body(chunks: usize, gap: Duration, size: usize) -> axum::body::Body {
-        use futures_util::stream;
-        let s = stream::unfold(0usize, move |i| async move {
-            if i >= chunks {
-                return None;
-            }
-            tokio::time::sleep(gap).await;
-            Some((
-                Ok::<_, std::io::Error>(Bytes::from(vec![b'x'; size])),
-                i + 1,
-            ))
-        });
-        axum::body::Body::from_stream(s)
-    }
-
-    /// 规格：判定的是**停滞**而不是**总时长**。
-    ///
-    /// 这是本次修复的核心语义：慢而持续的上传必须能读完（移动网络下 16MB 合法地要几十秒），
-    /// 只有该方向真的没有字节再流动才放弃。若实现改成"整个读取总时长超时"，慢客户端会被
-    /// 误杀——所以这条用"总时长 > stall、但每块间隔 < stall"把语义钉死。
-    #[tokio::test]
-    async fn body_read_survives_a_slow_but_steady_client_and_gives_up_on_a_stall() {
-        let stall = Duration::from_millis(100);
-        // 3 块 × 40ms = 120ms > stall(100ms)，但每块间隔 40ms < stall → 必须读完
-        let body = delayed_body(3, Duration::from_millis(40), 4);
-        match read_body_with_stall(body, stall, 1024).await {
-            BodyRead::Body(b) => assert_eq!(b.len(), 12, "三块各 4 字节，一块都不能少"),
-            BodyRead::Stalled => panic!("慢但一直在传的客户端不该被放弃（判成了总时长超时）"),
-            _ => panic!("不该是别的结果"),
-        }
-
-        // 一块之后彻底停住 → 必须在 stall 量级返回 Stalled，而不是无限等下去
-        let body = delayed_body(1, Duration::from_secs(30), 4);
-        let started = std::time::Instant::now();
-        let outcome = read_body_with_stall(body, stall, 1024).await;
-        assert!(
-            matches!(outcome, BodyRead::Stalled),
-            "停下来不发的客户端必须被判为 Stalled"
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "必须在 stall 量级就返回，而不是等客户端那 30s"
-        );
-    }
-
-    /// 上限由本进程判（改成手动读 body 之后，提取器层的 `DefaultBodyLimit` 不再生效），
-    /// 且必须与 `http.rs` 那一层用**同一个常量**。
-    #[tokio::test]
-    async fn body_read_enforces_the_size_limit() {
-        let body = delayed_body(3, Duration::from_millis(1), 1024);
-        assert!(
-            matches!(
-                read_body_with_stall(body, Duration::from_secs(5), 2048).await,
-                BodyRead::TooLarge
-            ),
-            "超过上限必须 TooLarge（→ 413），而不是默默截断"
-        );
-        assert_eq!(MAX_REQUEST_BODY, 16 * 1024 * 1024, "上限值是契约的一部分");
     }
 }

@@ -1,10 +1,6 @@
 //! 公网 HTTP 入口：认证 → 路由 → 编码为隧道帧转发。
 
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     extract::{DefaultBodyLimit, Request, State},
@@ -22,115 +18,8 @@ use tower::{Service as TowerService, ServiceExt};
 use tower_http::services::{ServeDir, ServeFile};
 use tracing::{debug, error, info, warn};
 
-use crate::gateway::Options;
 use crate::io_stall;
-use crate::metrics::Metrics;
-use crate::ratelimit::RateLimiter;
-use crate::registry::Registry;
-use crate::storage::KeyStore;
-
-#[derive(Clone)]
-pub struct AppState {
-    pub registry: Registry,
-    pub key_store: KeyStore,
-    /// Admin token（None 表示不启用 /admin/*）。
-    pub admin_token: Option<String>,
-    pub timeout: Duration,
-    pub agent_stale_after: Duration,
-    /// 隧道控制操作超时（打开流 / 发送请求头 / 取消帧）。见 [`crate::Options`] 的说明。
-    pub tunnel_op_timeout: Duration,
-    /// 等待上游响应头（首字节）的超时。见 [`crate::Options`] 的说明。
-    pub head_timeout: Duration,
-    /// 客户端停滞阈值：请求体/响应体两个方向"完全没动静"多久就放弃。
-    /// 见 [`crate::Options::client_stall`]——没有它，在途请求会永久占住准入槽位。
-    pub client_stall: Duration,
-    /// 响应头超时的"忙/死"判据窗口：这么久内有过成功响应头，就只是"慢"。
-    ///
-    /// 由 `head_timeout` 派生（4 倍），不单独设配置项：它表达的是"连续 4 个响应头超时窗口
-    /// 一次都没回过"——到这个程度就不再是"排队慢"了（见 `registry::Entry::head_timeout_is_fatal`）。
-    pub head_alive_window: Duration,
-    pub rate_limiter: Option<RateLimiter>,
-    /// HTTP 全局在途请求上限（0 = 不限；per-key 限流之外的总闸门）。
-    pub max_concurrent_requests: u32,
-    /// 每条 agent 连接允许的同时在途隧道流数（QUIC 双向流额度）。
-    ///
-    /// 两个用途：① 建 QUIC 端点时作为双向流额度（见 `Gateway::start`）；
-    /// ② 开流超时时用来区分"忙"（额度排满，排队超时）与"死"（见
-    /// `registry::Entry::open_timeout_is_fatal`）。
-    pub max_open_tunnel_streams: u32,
-    pub metrics: Metrics,
-    /// React UI 静态目录（None = `/` 显示构建提示页）。
-    pub ui: Option<PathBuf>,
-    /// `ui_dir` 不可用的具体原因（None = 没配 ui_dir，或配了且可用）。
-    /// 由启动时 [`resolve_ui`] 判定后写入，占位页会把它显示出来——否则用户只看到白屏/通用文案。
-    pub ui_problem: Option<String>,
-}
-
-impl AppState {
-    /// 从 [`Options`] 组装请求处理状态：配置 → `AppState` 的映射与**派生只在这一处发生**。
-    ///
-    /// 两个派生量都不单独设旋钮：
-    /// - `head_alive_window = head_timeout × 4`：连续四个窗口一次响应头都没回来，才算"不是慢，是死"；
-    /// - `max_open_tunnel_streams = opts.stream_ceiling()`：0 → 默认值，与绑 QUIC 端点同一口径。
-    ///
-    /// `ui_dir` 的可用性判定（[`resolve_ui`]）也在这里：它是**非致命**的启动自检，
-    /// 不通过就降级成占位页，并把原因交给页面自己显示。
-    pub fn new(registry: Registry, key_store: KeyStore, metrics: Metrics, opts: &Options) -> Self {
-        let (ui, ui_problem) = resolve_ui(opts.ui_dir.as_deref());
-        Self {
-            registry,
-            key_store,
-            admin_token: opts.admin_token.clone(),
-            timeout: opts.request_timeout,
-            agent_stale_after: opts.agent_stale_after,
-            tunnel_op_timeout: opts.tunnel_op_timeout,
-            head_timeout: opts.head_timeout,
-            head_alive_window: opts.head_timeout * 4,
-            client_stall: opts.client_stall,
-            rate_limiter: RateLimiter::new(opts.rate_limit_per_min),
-            max_concurrent_requests: opts.max_concurrent_requests,
-            max_open_tunnel_streams: opts.stream_ceiling(),
-            metrics,
-            ui,
-            ui_problem,
-        }
-    }
-}
-
-/// `ui_dir` 的启动期判定：返回（可托管的目录, 不可用的原因）。
-///
-/// 必须确认它是**一份能用的产物**，而不只是"有 index.html"——Vite 的源码目录同样有
-/// index.html，托管出去只会让浏览器白屏（见 [`check_ui_dir`]）。判定不通过就降级到
-/// 占位页，并把具体原因写进 `AppState`，让页面自己说清楚。
-///
-/// **非致命**：这里任何问题都不阻止网关启动（`ui_dir` 只是给人看的诊断面）。
-pub fn resolve_ui(configured: Option<&Path>) -> (Option<PathBuf>, Option<String>) {
-    let Some(p) = configured else {
-        return (None, None);
-    };
-    match check_ui_dir(p) {
-        UiDirCheck::Usable => (Some(p.to_path_buf()), None),
-        // 还没构建：占位页自带的通用文案（"构建前端后配置 ui_dir"）正好适用
-        UiDirCheck::NoIndex => {
-            warn!(path = %p.display(), "ui_dir 下没有 index.html；GET / 显示构建提示页");
-            (None, None)
-        }
-        UiDirCheck::SourceEntry => {
-            let msg = format!(
-                "ui_dir 指向的是前端**源码**目录，不是构建产物（默认 web/dist）：{}",
-                p.display()
-            );
-            error!(path = %p.display(), "{msg}；浏览器只会白屏，GET / 已改显示本提示页");
-            (None, Some(msg))
-        }
-        UiDirCheck::MissingAsset(asset) => {
-            let msg =
-                format!("index.html 引用的产物不存在：{asset}（构建过期，或 ui_dir 指向了别处）");
-            warn!(path = %p.display(), missing = %asset, "{msg}；GET / 显示构建提示页");
-            (None, Some(msg))
-        }
-    }
-}
+use crate::state::AppState;
 
 pub fn app(state: AppState) -> Router {
     let mut router = Router::new()
@@ -141,11 +30,11 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/models", get(models_route))
         .route(
             "/v1/{*rest}",
-            get(crate::http_proxy::proxy)
-                .post(crate::http_proxy::proxy)
-                .put(crate::http_proxy::proxy)
-                .delete(crate::http_proxy::proxy)
-                .patch(crate::http_proxy::proxy),
+            get(crate::proxy::proxy)
+                .post(crate::proxy::proxy)
+                .put(crate::proxy::proxy)
+                .delete(crate::proxy::proxy)
+                .patch(crate::proxy::proxy),
         );
     if state.admin_token.is_some() {
         let admin = Router::new()
@@ -179,9 +68,9 @@ pub fn app(state: AppState) -> Router {
         }
     }
     router
-        // 上限常量与 `http_proxy` 手动读 body 时用的**是同一个**（那边要自己判，因为
+        // 上限常量与 `body::read_body_with_stall` 手动读 body 时用的**是同一个**（那边要自己判，因为
         // 改成手动逐块读之后提取器层的限制不再生效）。
-        .layer(DefaultBodyLimit::max(crate::http_proxy::MAX_REQUEST_BODY))
+        .layer(DefaultBodyLimit::max(crate::body::MAX_REQUEST_BODY))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             metrics_middleware,
@@ -243,77 +132,6 @@ async fn ui_missing(State(state): State<AppState>) -> Html<String> {
     Html(render_ui_missing(state.ui_problem.as_deref()))
 }
 
-/// `ui_dir` 是否真的能拿来托管。
-///
-/// 原来的判断只问"目录里有 index.html 吗"，而前端**源码**目录同样有——Vite 的
-/// `web/index.html` 里是 `<script type="module" src="/src/main.tsx">`，网关会把 TSX 当
-/// `application/octet-stream` 发出去，浏览器执行不了 → 页面全白且**一条错误都没有**。
-/// 所以这里问的是"这是一份能用的产物吗"。
-#[derive(Debug, PartialEq, Eq)]
-pub enum UiDirCheck {
-    /// 可用：index.html 在，且它引用的本地资源都能在磁盘上找到。
-    Usable,
-    /// 目录里没有 index.html（还没构建）。
-    NoIndex,
-    /// index.html 是前端**源码**入口（引用 /src/*），浏览器必然白屏。
-    SourceEntry,
-    /// index.html 引用的产物文件不存在（构建过期或 ui_dir 指错）。附上是哪一个。
-    MissingAsset(String),
-}
-
-/// 判定 `ui_dir` 是否是一份可托管的产物。放在 http.rs：只有这个模块知道
-/// "一份前端产物长什么样、怎么被托管"，lib.rs 只负责在启动时按结果编排。
-pub fn check_ui_dir(dir: &Path) -> UiDirCheck {
-    let Ok(html) = std::fs::read_to_string(dir.join("index.html")) else {
-        return UiDirCheck::NoIndex;
-    };
-    // Vite 的源码入口特征；换框架要跟着改（CRA 是 /static/js/…、Next export 是 /_next/…），
-    // 真正框架无关的兜底是下面的产物存在性检查。
-    if html.contains("src=\"/src/") || html.contains("src='/src/") {
-        return UiDirCheck::SourceEntry;
-    }
-    for asset in local_asset_refs(&html) {
-        if !dir.join(asset.trim_start_matches('/')).is_file() {
-            return UiDirCheck::MissingAsset(asset);
-        }
-    }
-    UiDirCheck::Usable
-}
-
-/// 抓 index.html 里 `src="/…"` / `href="/…"` 这类**本地静态资源**路径（去重、去掉 query/fragment）。
-///
-/// 只收"末段带扩展名"的引用，这条判据与 [`ui_fallback`] 的 `has_extension` 一致：
-/// SPA 前端路由（`/keys`、`/metrics`）会 fallback 到 index.html，磁盘上本来就没有对应文件，
-/// 误判成"缺失"会把一个**能用**的 UI 关掉——宁可漏报也不能误报。
-/// 同样跳过 http(s)://、协议相对的 //cdn、data:：那些不归 ui_dir 管。
-///
-/// 手写扫描而非引 HTML parser：只为一次启动自检不值得加依赖（metrics.rs 同样是手写无依赖）。
-fn local_asset_refs(html: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for attr in ["src=\"", "href=\"", "src='", "href='"] {
-        let quote = attr.chars().last().expect("attr ends with a quote");
-        let mut rest = html;
-        while let Some(idx) = rest.find(attr) {
-            rest = &rest[idx + attr.len()..];
-            let Some(end) = rest.find(quote) else { break };
-            let value = &rest[..end];
-            rest = &rest[end + quote.len_utf8()..];
-            if !value.starts_with('/') || value.starts_with("//") {
-                continue;
-            }
-            let path = value.split(['?', '#']).next().unwrap_or(value);
-            let looks_like_file = path.rsplit('/').next().is_some_and(|seg| seg.contains('.'));
-            if !looks_like_file {
-                continue;
-            }
-            if !out.iter().any(|p| p == path) {
-                out.push(path.to_string());
-            }
-        }
-    }
-    out
-}
-
 /// 渲染占位页：`reason` 有值时插到最上面。
 /// 用 `replace` 而不是 `format!`，省得给 HTML 里那堆 CSS 花括号做转义。
 fn render_ui_missing(reason: Option<&str>) -> String {
@@ -364,8 +182,8 @@ async fn healthz() -> &'static str {
 /// （`["*"]` 全匹配的 agent 不贡献条目——它接受任意请求，但具体能跑什么
 /// 只有上游知道，列出会误导客户端）。与代理入口同级的认证 + 限流。
 async fn models_route(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Some(rejection) = crate::http_proxy::auth_and_rate_limit(&state, &headers).await {
-        return rejection;
+    if let Err(rejection) = crate::auth::authenticate(&state, &headers).await {
+        return rejection.into_response();
     }
     let data: Vec<_> = state
         .registry
@@ -450,7 +268,7 @@ async fn metrics_middleware(
     let limit = state.max_concurrent_requests;
     let Some(admission) = state.metrics.try_enter(limit) else {
         state.metrics.record_rejected(429);
-        let mut resp = crate::http_proxy::error_response(
+        let mut resp = crate::openai::error_response(
             axum::http::StatusCode::TOO_MANY_REQUESTS,
             "too many concurrent requests, retry later",
         );
@@ -608,7 +426,11 @@ mod tests {
     use super::*;
     use axum::http::{HeaderMap, HeaderValue};
 
+    // 这些随 `AppState` 一起住进了 `state.rs`：lib target 里本模块不再需要它们，
+    // 但测试要自己构造 `AppState`（`test_state`），所以导入落在测试模块内。
+    use crate::gateway::Options;
     use crate::{metrics::Metrics, registry::Registry, storage::KeyStore};
+    use std::path::PathBuf;
 
     fn test_state(ui: Option<PathBuf>) -> AppState {
         // 测试档位：只改这个文件真正关心的旋钮，其余取库默认（`Options::default()`）。
@@ -957,79 +779,6 @@ mod tests {
             StatusCode::OK,
             "aborted in-flight request leaked the concurrency slot"
         );
-    }
-
-    // ---- ui_dir 可用性判定 ----
-    // 曾经的事故：ui_dir 配成前端**源码**目录，index.html 照样在，于是被当成"已构建"托管出去，
-    // 浏览器拿到 application/octet-stream 的 TSX，页面全白且没有任何错误可查。
-
-    #[test]
-    fn check_ui_dir_reports_no_index() {
-        let dir = tempfile::tempdir().unwrap();
-        assert_eq!(check_ui_dir(dir.path()), UiDirCheck::NoIndex);
-    }
-
-    #[test]
-    fn check_ui_dir_detects_vite_source_entry() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("index.html"),
-            r#"<div id="root"></div><script type="module" src="/src/main.tsx"></script>"#,
-        )
-        .unwrap();
-        assert_eq!(check_ui_dir(dir.path()), UiDirCheck::SourceEntry);
-    }
-
-    #[test]
-    fn check_ui_dir_accepts_built_dist() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
-        std::fs::write(dir.path().join("assets/index-abc.js"), "//built").unwrap();
-        std::fs::write(dir.path().join("assets/index-abc.css"), "/*built*/").unwrap();
-        std::fs::write(
-            dir.path().join("index.html"),
-            r#"<script type="module" crossorigin src="/assets/index-abc.js"></script>
-<link rel="stylesheet" crossorigin href="/assets/index-abc.css">"#,
-        )
-        .unwrap();
-        assert_eq!(check_ui_dir(dir.path()), UiDirCheck::Usable);
-    }
-
-    #[test]
-    fn check_ui_dir_flags_missing_asset() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("index.html"),
-            r#"<script type="module" src="/assets/index-abc.js"></script>"#,
-        )
-        .unwrap();
-        // 构建过期 / 目录指错：产物文件不在
-        assert_eq!(
-            check_ui_dir(dir.path()),
-            UiDirCheck::MissingAsset("/assets/index-abc.js".into())
-        );
-    }
-
-    #[test]
-    fn check_ui_dir_ignores_non_asset_refs() {
-        // 外部资源（http://、//cdn、data:）和 SPA 前端路由（无扩展名）都不是"缺失的产物"，
-        // 误判会把一个能用的 UI 关掉。
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
-        std::fs::write(dir.path().join("assets/ok.css"), "/*x*/").unwrap();
-        std::fs::write(dir.path().join("favicon.ico"), "x").unwrap();
-        std::fs::write(
-            dir.path().join("index.html"),
-            r#"<link rel="stylesheet" href="/assets/ok.css">
-<link rel="preconnect" href="https://fonts.example.com">
-<link rel="icon" href="//cdn.example.com/favicon.ico">
-<link rel="icon" href="/favicon.ico">
-<img src="data:image/png;base64,AAAA">
-<a href="/keys">keys</a>
-<a href="/metrics">metrics</a>"#,
-        )
-        .unwrap();
-        assert_eq!(check_ui_dir(dir.path()), UiDirCheck::Usable);
     }
 
     #[test]
