@@ -54,7 +54,7 @@ impl TunnelTls {
     }
 
     /// 构建 QUIC 隧道用的 mTLS rustls 配置。调用方拿到 `Arc` 才能交给 s2n-quic。
-    pub(crate) fn server_config(&self) -> Result<Arc<rustls::ServerConfig>, GatewayError> {
+    pub fn server_config(&self) -> Result<Arc<rustls::ServerConfig>, GatewayError> {
         tls::rustls_server_tls(
             &self.ca_cert,
             self.server_cert.clone(),
