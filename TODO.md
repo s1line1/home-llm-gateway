@@ -559,9 +559,10 @@
       （`DESIGN.md` §5 自认）。SSE 长流不能被总时限误杀，动之前要先把语义想清楚。
 - [ ] **R11 延迟分位数**：`hlmg_request_duration_ms` 只有 sum，没有直方图
       （`crates/gateway/src/metrics.rs:316`）——"p99 变差"从求和值里看不出来。
-- [ ] **R12 healthz 豁免闸门 + 深度检查**：`/healthz` 恒返 `"ok"`
-      （`crates/gateway/src/http.rs:287-289`），且只有 `/metrics` 豁免准入（`http.rs:357-359`）
-      ——闸门打满时健康检查会 429，把"慢"放大成"全挂"。
+- [ ] **R12 healthz 深度检查**：`/healthz` 恒返 `"ok"`（`crates/gateway/src/http/api.rs`），
+      探针答不出"隧道入口还活着吗 / 还有几个 agent 注册 / 持久化可写吗"。
+      （闸门豁免这一半已修：`/healthz` 用 `limit = 0` 绕过准入，单测
+      `observability::tests::healthz_is_exempt_from_the_admission_gate` 锁住。）
 - [ ] **R12 drain 式关闭**：`Gateway::shutdown`（`crates/gateway/src/lib.rs:290`）目前只是
       `abort()` 掉四个任务（两个 HTTP 监听、QUIC accept、用量 flusher），**没有排空**——
       `systemctl restart`（SIGTERM）会把在途 SSE 流切断，客户端看到的是"流被截断"而非正常结束；

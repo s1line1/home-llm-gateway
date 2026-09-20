@@ -211,7 +211,7 @@ max_concurrency: 4
 - **`GET /metrics`**: Prometheus text format (per-status counters, in-flight requests, online agents, bytes forwarded, cumulative latency) — scrapable by Prometheus/Grafana
   - Opened directly in a browser (`Accept: text/html`) it serves the dashboard page instead of text; scrapers (`Accept: */*`) are unaffected
 - **Structured logs**: `tracing` with `request_id` / status / latency per request (`tower-http` TraceLayer)
-- **`/healthz`**: liveness probe
+- **`/healthz`**: liveness probe (still a constant `ok`, no deep checks; but it is **exempt from the concurrency gate** — a probe must not 429 under saturation, or the LB would turn "slow" into "down". See `REBUILD.md` §5.3)
 
 > Note: `/metrics` has no auth; on a public deployment, restrict it to your monitoring network via the security group.
 

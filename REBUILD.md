@@ -483,10 +483,12 @@ quinn 的名字抄进来**：s2n-quic 全在 `Limits` 上用 `with_*` setter，�
 
 ### 5.3 健康检查
 
-- **必须豁免准入闸门**。⚠️ 现有实现中 `/healthz` 走完整准入 ——
+- **必须豁免准入闸门**。✅ 已修（`http/observability.rs` 的 `metrics_middleware`：`/healthz`
+  用 `limit = 0` 走"不限"，故 id / 访问日志 / 在途记账照旧，只有"能不能被拒"不同；
+  单测 `healthz_is_exempt_from_the_admission_gate` 先红后绿）。此前是走完整准入 ——
   闸门打满时健康检查返 429 → LB 摘除 / systemd 重启循环 → **把"慢"放大成"全挂"**。
 - **必须有深度**：至少检查隧道入口存活、注册 agent 数、持久化可写。
-  现有实现恒返 `"ok"`。
+  现有实现恒返 `"ok"`（仍在 `TODO.md` 登记）。
 
 ---
 

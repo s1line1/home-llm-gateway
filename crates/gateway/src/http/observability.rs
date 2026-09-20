@@ -9,7 +9,8 @@
 //!    `client_request_id`。
 //!    （历史缺口：拆分前 `metrics_middleware` 与 `proxy` 各有一个计数器都从 1 起，
 //!    UUID 客户端会让两个数列独立递增、周期性撞号——现已由该模块统一。）
-//! 2. **闸门**：`max_concurrent_requests` 是全局在途上限（`/metrics` 豁免），超限立即 429，
+//! 2. **闸门**：`max_concurrent_requests` 是全局在途上限（`/metrics` 完全不记；`/healthz`
+//!    豁免——探针被 429 会让 LB 摘除实例，把"慢"放大成"全挂"），超限立即 429，
 //!    防多 key 总和压垮单实例。
 //! 3. **票据移交**：`Admission` 的释放**完全由 Drop 负责**，且分两段——移交 body 之前
 //!    （含客户端中断导致 future 被 drop）就地归还；移交之后随 body 结束/丢弃归还。
@@ -74,7 +75,15 @@ pub(super) async fn metrics_middleware(
     // 超限返回 None → 立即 429，防多 key 总和压垮单实例。
     // 票据的释放完全由 Drop 负责，分两段：① 移交 body 之前（含客户端中断导致 future
     // 被 drop）→ 就地 Drop 归还；② 移交 body 之后 → 随 body 结束/丢弃归还。
-    let limit = state.max_concurrent_requests;
+    //
+    // /healthz **豁免**（REBUILD §5.3 / R12）：闸门打满时探针若被 429，LB 会摘除实例、
+    // systemd 会重启循环——把上游的"慢"放大成整机"全挂"。用 `0 = 不限` 表达豁免，
+    // 于是 id、访问日志、在途与耗时记账与其它路径完全一致，区别只有"能不能被拒"。
+    let limit = if path == "/healthz" {
+        0
+    } else {
+        state.max_concurrent_requests
+    };
     let Some(admission) = state.metrics.try_enter(limit) else {
         state.metrics.record_rejected(429);
         let mut resp = crate::openai::error_response(
@@ -290,11 +299,12 @@ mod tests {
         let held = metrics
             .try_enter(0)
             .expect("limit=0 admits unconditionally");
+        // 用 /v1/models 而不是 /healthz：探针已豁免闸门（见下一条用例）
         let resp = router
             .clone()
             .oneshot(
                 axum::extract::Request::builder()
-                    .uri("/healthz")
+                    .uri("/v1/models")
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
@@ -312,8 +322,36 @@ mod tests {
         );
         drop(held); // 票据 Drop → 释放槽位
 
-        // 槽位释放后恢复
+        // 槽位释放后不再被闸门拒（无 key → 401，说明走到了 handler）
         let resp = router
+            .oneshot(
+                axum::extract::Request::builder()
+                    .uri("/v1/models")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// R12：`/healthz` 必须豁免准入闸门。
+    ///
+    /// 闸门打满时探针若被 429，LB 会摘除实例、systemd 会重启循环——把上游的"慢"放大成
+    /// 整个网关"全挂"，而探针本来是全实例最不该被自己的限流拒掉的请求。
+    #[tokio::test]
+    async fn healthz_is_exempt_from_the_admission_gate() {
+        let mut state = test_state(None);
+        state.max_concurrent_requests = 1;
+        let metrics = state.metrics.clone();
+        let router = app(state);
+
+        // 占满唯一的槽位：此刻任何走闸门的请求都 429
+        let held = metrics
+            .try_enter(0)
+            .expect("limit=0 admits unconditionally");
+        let resp = router
+            .clone()
             .oneshot(
                 axum::extract::Request::builder()
                     .uri("/healthz")
@@ -322,7 +360,23 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "闸门打满时 /healthz 仍须 200（否则 LB 摘除会把\"慢\"放大成\"全挂\"）"
+        );
+
+        // 豁免的只是"能不能被拒"：id 与访问日志照旧，响应仍带 x-request-id
+        assert!(
+            resp.headers().get("x-request-id").is_some(),
+            "探针响应仍应带 x-request-id"
+        );
+        assert_eq!(
+            metrics.active_count(),
+            1 + 1,
+            "探针自身仍被计入在途（豁免不等于不计账）"
+        );
+        drop(held);
     }
 
     #[tokio::test]
