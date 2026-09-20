@@ -1,9 +1,9 @@
 //! 代理转发：认证 → 限流 → 编码为隧道帧转发（从 http.rs 拆分，保持路由层精简）。
 
+mod forward;
+mod routing;
 mod tunnel;
 mod usage;
-
-use std::time::Duration;
 
 use axum::{
     body::{Body, Bytes},
@@ -20,10 +20,9 @@ use tracing::{debug, warn};
 use crate::auth::authenticate;
 use crate::body::{read_body_with_stall, BodyRead, MAX_REQUEST_BODY};
 use crate::openai::error_response;
-use crate::registry::AcquireError;
 use crate::state::AppState;
-use tunnel::{open_tunnel, tunnel_cancel, tunnel_write, OpenFailure};
-use usage::UsageCollector;
+use forward::forward_body;
+use tunnel::tunnel_cancel;
 
 static NEXT_REQUEST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
@@ -108,177 +107,11 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
         body: body.to_vec(),
     };
 
-    // 隧道建立阶段允许**换一个 agent 重试**。
-    //
-    // 只有"开流 / 写请求帧"失败才重试：那时**请求帧从未送达 agent**，换一条连接重放
-    // 是安全的（body 已整包在手，可重放）。**响应头超时（504）不在其中**——请求可能
-    // 已在模型侧执行，重试会重复计费、重复生成，所以那条仍然直接把错误返回客户端：
-    // 宁可报错，也不做不安全的重复。
-    //
-    // 实测（云端 2 vCPU、4 agent、768 并发）失败**全部**是 502（开流/写帧超时）、
-    // 504 为 0，所以这条重试正好覆盖实际发生的失败。
-    const MAX_TUNNEL_ATTEMPTS: usize = 2;
-    let mut tried: Vec<usize> = Vec::with_capacity(MAX_TUNNEL_ATTEMPTS);
-    let mut last_failure: Option<String> = None;
-
-    let (entry, slot, mut recv, mut send) = loop {
-        let acquired =
-            state
-                .registry
-                .try_acquire_excluding(state.agent_stale_after, &model, &tried);
-        let (mut entry, slot) = match acquired {
-            Ok(x) => x,
-            // 三种拒绝**必须分开记录**：它们的运维含义完全不同，而客户端看到的
-            // 503/404/429 不足以区分。尤其"NoAgent"有两种成因——注册表空，或注册表里
-            // 有人但全部心跳超时（stale）——只看状态码会把后者误判成"agent 掉了"。
-            Err(
-                reason @ (AcquireError::NoAgent | AcquireError::NoModel | AcquireError::AtCapacity),
-            ) => {
-                let st = state.registry.status(state.agent_stale_after);
-                let why = match reason {
-                    AcquireError::NoAgent if st.registered == 0 => "registry-empty",
-                    AcquireError::NoAgent => "all-candidates-stale",
-                    AcquireError::NoModel => "no-agent-serves-model",
-                    _ => "all-candidates-at-capacity",
-                };
-                state.metrics.record_agent_rejection(why);
-                warn!(
-                    model = %model,
-                    reason = why,
-                    registered = st.registered,
-                    healthy = st.healthy,
-                    stale_after_secs = state.agent_stale_after.as_secs(),
-                    oldest_last_seen_secs = st.oldest_last_seen_ago.map(|d| d.as_secs()),
-                    "no agent to route to"
-                );
-                // 已经试过连接却挑不出下一条 → 把**真正的失败原因**（隧道错误）报给客户端，
-                // 而不是报一个会误导的 503/404。
-                if let Some(err) = last_failure {
-                    state.metrics.record_tunnel_retry("no-alternative");
-                    return error_response(
-                        StatusCode::BAD_GATEWAY,
-                        format!("{err}; no other agent available to retry"),
-                    );
-                }
-                return match reason {
-                    AcquireError::NoAgent => {
-                        error_response(StatusCode::SERVICE_UNAVAILABLE, "no edge available")
-                    }
-                    AcquireError::NoModel => {
-                        error_response(StatusCode::NOT_FOUND, "model not found on any agent")
-                    }
-                    AcquireError::AtCapacity => {
-                        error_response(StatusCode::TOO_MANY_REQUESTS, "agent at capacity")
-                    }
-                };
-            }
+    let (entry, slot, mut recv, mut send) =
+        match routing::open_and_send(&state, &model, &request, request_id).await {
+            Ok(routed) => routed,
+            Err(failure) => return error_response(failure.status, failure.message),
         };
-
-        // 记下本次选中的连接：重试时不会再选它（否则重试没有意义）。
-        tried.push(entry.stable_id);
-
-        let stream = match open_tunnel(&mut entry, state.tunnel_op_timeout).await {
-            Ok(s) => s,
-            Err(failure) => {
-                // 开流超时有两种成因，**不能用同一个动作处置**：
-                //
-                //   忙：这条连接的在途请求已经顶到它的承载上限（声明的 max_concurrency
-                //       与端点流额度取小），开流是在排队等额度回收 → 排队超时是正常背压。
-                //       此时摘除等于把"局部过载"升级成"整台 agent 下线"：连接被关 →
-                //       agent 重连 → 注册表瞬间为空 → 期间所有请求 503。实测过一次
-                //       30s 压测 +6835 次 registry-empty，根因就在这里。
-                //   死：并没到承载上限却开不出流 → 没有任何排队理由，这才是坏连接。
-                //
-                // 所以只有"死"才摘除；"忙"只记指标 + 换下一条连接（重试逻辑与下面共用）。
-                let busy = matches!(failure, OpenFailure::TimedOut)
-                    && !entry.open_timeout_is_fatal(state.max_open_tunnel_streams);
-                let err = failure.message();
-                if busy {
-                    state.metrics.record_tunnel_open_timeout("busy");
-                    warn!(
-                        request_id,
-                        agent = %entry.agent_id,
-                        inflight = entry.inflight.load(std::sync::atomic::Ordering::Relaxed),
-                        max_concurrency = entry.max_concurrency,
-                        stream_ceiling = state.max_open_tunnel_streams,
-                        timeout_ms = state.tunnel_op_timeout.as_millis(),
-                        "tunnel open timed out while agent is at capacity; not evicting, trying another agent"
-                    );
-                } else {
-                    state.metrics.record_tunnel_open_timeout("dead");
-                    warn!(
-                        agent = %entry.agent_id,
-                        timeout_ms = state.tunnel_op_timeout.as_millis(),
-                        "tunnel open timed out; evicting agent"
-                    );
-                    // 打不开流 = 这条连接已经死了 → 摘掉条目（连续超时足够才会真摘），
-                    // 然后换个 agent 重试；没有别的候选时把错误报给客户端。
-                    state.registry.evict(entry.stable_id);
-                }
-                if tried.len() >= MAX_TUNNEL_ATTEMPTS {
-                    state.metrics.record_tunnel_retry("failed");
-                    return error_response(
-                        if busy {
-                            StatusCode::TOO_MANY_REQUESTS
-                        } else {
-                            StatusCode::BAD_GATEWAY
-                        },
-                        if busy {
-                            "agent at capacity".to_string()
-                        } else {
-                            err
-                        },
-                    );
-                }
-                warn!(
-                    request_id,
-                    agent = %entry.agent_id,
-                    error = %err,
-                    "tunnel open failed; retrying on another agent"
-                ); // "忙"不算隧道故障：不写进 last_failure，这样即使最后挑不出别的 agent，
-                   // 客户端拿到的是"容量不足（429）"而不是误导性的"隧道坏了（502）"。
-                   //
-                   // 也**不**在这里记 agent_rejections——那个计数器统计的是"最终没被服务的请求"
-                   // （按原因分）。这次重试可能成功，提前记会虚增容量告警；真正挑不出候选时，
-                   // 下一轮 `try_acquire_excluding` 会自己记 `all-candidates-at-capacity`。
-                if !busy {
-                    last_failure = Some(err);
-                }
-                continue;
-            }
-        };
-        let (recv, mut send) = stream.split();
-
-        if let Err(e) = tunnel_write(
-            &mut send,
-            &request,
-            state.tunnel_op_timeout,
-            request_id,
-            &entry.agent_id,
-        )
-        .await
-        {
-            state.registry.evict(entry.stable_id);
-            if tried.len() >= MAX_TUNNEL_ATTEMPTS {
-                state.metrics.record_tunnel_retry("failed");
-                return error_response(StatusCode::BAD_GATEWAY, e);
-            }
-            warn!(
-                request_id,
-                agent = %entry.agent_id,
-                error = %e,
-                "request frame write failed; retrying on another agent"
-            );
-            last_failure = Some(e);
-            continue;
-        }
-
-        if tried.len() > 1 {
-            // 这次是重试成功的：对客户端是一次不可见的自愈。
-            state.metrics.record_tunnel_retry("ok");
-        }
-        break (entry, slot, recv, send);
-    };
 
     debug!(request_id, "proxying request to agent");
 
@@ -365,7 +198,7 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
         .iter()
         .any(|(k, v)| k.eq_ignore_ascii_case("content-type") && v.contains("text/event-stream"));
     tokio::spawn(async move {
-        forward_body(
+        let end = forward_body(
             &mut recv,
             &mut send,
             request_id,
@@ -382,6 +215,7 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
             is_stream,
         )
         .await;
+        debug!(request_id, end = ?end, "response forwarding finished");
     });
 
     let mut builder = Response::builder().status(status);
@@ -430,147 +264,6 @@ async fn read_head(recv: &mut s2n_quic::stream::ReceiveStream) -> anyhow::Result
                     502,
                     "upstream closed before responding".into(),
                 ));
-            }
-        }
-    }
-}
-
-/// 往客户端方向送一块的结果。三种情况处置完全不同，必须分开。
-enum SendOutcome {
-    /// 客户端取走了。
-    Delivered,
-    /// 接收端已被丢弃 = 客户端断开/连接结束 → 取消上游（现状语义）。
-    ClientGone,
-    /// 通道满且 `stall` 内一直没人取 = 客户端**还连着但不再消费**响应体。
-    ///
-    /// 这一档以前不存在（`tx.send().await` 没有超时），正是"在途请求永久占住准入槽位"
-    /// 的另一半原因：通道容量 32，客户端一停，发送端就在这里永久 park，
-    /// 而准入票据（`Admission`）随 response body 一起挂在同一个任务上。
-    Stalled,
-}
-
-/// 带停滞超时地往客户端送一块。
-///
-/// 语义与请求体侧一致（见 `read_body_with_stall`）：**有进展就不超时**。客户端只要还在
-/// 消费，通道就不会满，超时永远不会触发；只有"连着但一个字节都不取"才判定僵住。
-async fn send_to_client(
-    tx: &mpsc::Sender<Result<Bytes, String>>,
-    item: Result<Bytes, String>,
-    stall: Duration,
-) -> SendOutcome {
-    match tokio::time::timeout(stall, tx.send(item)).await {
-        Ok(Ok(())) => SendOutcome::Delivered,
-        Ok(Err(_)) => SendOutcome::ClientGone,
-        Err(_) => SendOutcome::Stalled,
-    }
-}
-
-/// 把响应体帧流转发到通道；任一端关闭时向对端发 Cancel。
-/// `slot` 持有期间占用 agent 并发槽位，随任务结束释放。
-///
-/// `idle_timeout` 是**逐帧空闲**超时（响应阶段，SSE 长流靠"有帧就不超时"活着）；
-/// `op_timeout` 只用于取消帧的写——隧道坏掉时连 Cancel 都可能写不出去，绝不能在这里
-/// 阻塞（这正是"客户端已断开却发现不了"的死角）。
-///
-/// 参数确实多（流的两半、通道、三个超时、票据、指标、用量记账、请求元信息），但它们都是
-/// 这个后台任务**必须独占持有**的资源；打包成 struct 只是把同一张清单换个地方写，不会让
-/// 这个函数更难懂。
-#[allow(clippy::too_many_arguments)]
-async fn forward_body(
-    recv: &mut s2n_quic::stream::ReceiveStream,
-    send: &mut s2n_quic::stream::SendStream,
-    request_id: u64,
-    tx: mpsc::Sender<Result<Bytes, String>>,
-    idle_timeout: Duration,
-    client_stall: Duration,
-    op_timeout: Duration,
-    _slot: crate::registry::SlotGuard,
-    metrics: crate::metrics::Metrics,
-    key_store: crate::storage::KeyStore,
-    key_id: String,
-    key_name: String,
-    prompt_est: u64,
-    is_stream: bool,
-) {
-    let mut usage = UsageCollector::new(key_store, key_id, key_name, prompt_est, is_stream);
-    loop {
-        let frame = tokio::time::timeout(idle_timeout, read_frame(recv)).await;
-        match frame {
-            Ok(Ok(Some(Frame::ProxyResponseBody { chunk, .. }))) => {
-                match send_to_client(&tx, Ok(Bytes::from(chunk.clone())), client_stall).await {
-                    SendOutcome::Delivered => {}
-                    SendOutcome::ClientGone => {
-                        // 客户端已断开 → 取消上游；仍结算已转发部分
-                        warn!(request_id, "client disconnected, cancelling upstream");
-                        usage.observe(&chunk);
-                        tunnel_cancel(send, request_id, op_timeout).await;
-                        let _ = send.finish();
-                        usage.finish();
-                        return;
-                    }
-                    SendOutcome::Stalled => {
-                        // 客户端还在连接上、但不再消费响应体：以前这里会永久 park，
-                        // 于是准入票据永不释放（实测云端沉淀 8 个僵尸槽位，只能重启）。
-                        // 现在主动放弃：取消上游（别让 agent 继续烧 token）、结束响应体
-                        // （丢掉 tx → 客户端看到流被截断/连接关闭，这是诚实的失败信号）。
-                        metrics.record_client_stall("response-body");
-                        warn!(
-                            request_id,
-                            stall_ms = client_stall.as_millis(),
-                            "client stopped consuming the response body; cancelling upstream and releasing the slot"
-                        );
-                        usage.observe(&chunk);
-                        tunnel_cancel(send, request_id, op_timeout).await;
-                        let _ = send.finish();
-                        usage.finish();
-                        return;
-                    }
-                }
-                usage.observe(&chunk);
-                metrics.add_bytes_out(chunk.len());
-            }
-            Ok(Ok(Some(Frame::ProxyResponseEnd { .. }))) => {
-                let _ = send.finish();
-                usage.finish();
-                return;
-            }
-            Ok(Ok(Some(Frame::Error { code, message, .. }))) => {
-                let _ = send_to_client(
-                    &tx,
-                    Err(format!("upstream error {code}: {message}")),
-                    client_stall,
-                )
-                .await;
-                let _ = send.finish();
-                usage.finish();
-                return;
-            }
-            Ok(Ok(Some(_))) => {}
-            Ok(Ok(None)) => {
-                let _ = send_to_client(
-                    &tx,
-                    Err("upstream closed the stream early".into()),
-                    client_stall,
-                )
-                .await;
-                usage.finish();
-                return;
-            }
-            Ok(Err(e)) => {
-                let _ = send_to_client(&tx, Err(format!("tunnel read failed: {e}")), client_stall)
-                    .await;
-                usage.finish();
-                return;
-            }
-            Err(_) => {
-                // 空闲超时 → 取消上游；结算已转发部分
-                warn!(request_id, "upstream idle timeout, cancelling");
-                let _ =
-                    send_to_client(&tx, Err("upstream idle timeout".into()), client_stall).await;
-                tunnel_cancel(send, request_id, op_timeout).await;
-                let _ = send.finish();
-                usage.finish();
-                return;
             }
         }
     }
