@@ -23,8 +23,6 @@ use crate::{auth::authenticate, state::AppState};
 use forward::forward_body;
 use tunnel::tunnel_cancel;
 
-static NEXT_REQUEST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
 /// 从请求 body 提取路由所需模型：顶层 `model` 字段（OpenAI 兼容语义，必填）。
 /// 缺失 / 非字符串 / 空串 → Err（调用方返回 400）。
 fn extract_model(body: &[u8]) -> Result<String, ()> {
@@ -42,12 +40,9 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
     let method = req.method().clone();
     let uri = req.uri().clone();
     let headers = req.headers().clone();
-    let request_id = headers
-        .get("x-request-id")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("req-"))
-        .and_then(|n| n.parse::<u64>().ok())
-        .unwrap_or_else(|| NEXT_REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    // 隧道 id 与 HTTP 层同源（crate::request_id）：middleware 已把规范化的 req-{n}
+    // 写回入站 headers，UUID 客户端也不例外，于是两边不会再各自计数、周期性撞号。
+    let request_id = crate::request_id::tunnel_id_from_headers(&headers);
 
     // 认证 + 限流（per-key 令牌桶）：拿不到身份的唯一出路就是把它还给客户端。
     let key = match authenticate(&state, &headers).await {
@@ -94,9 +89,9 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
         Some(q) => format!("{}?{q}", uri.path()),
         None => uri.path().to_string(),
     };
-    // request_id 在函数最开头就算好了（因为它要出现在"读 body 停滞"这类早期日志里）
-    // 隧道 request_id 复用 HTTP 层 x-request-id 的数字部分（metrics_middleware 注入，
-    // 格式 req-{n}）——HTTP 日志 / 隧道帧 / 响应头三方对账一致；无该头时自增兜底。
+    // request_id 在函数最开头就算好了（因为它要出现在"读 body 停滞"这类早期日志里）。
+    // 隧道 request_id 与 HTTP 层 x-request-id 同源（crate::request_id）：
+    // middleware 注入规范化的 req-{n}，本函数沿用它，响应头/日志/隧道帧三方同一个数字。
     // 请求帧在选路之前就构造好：重试换的是连接，请求内容不变（body 已整包在手，可重放）。
     let request = Frame::ProxyRequest {
         request_id,

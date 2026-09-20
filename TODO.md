@@ -35,9 +35,10 @@
          404→`not_found_error`、409→`conflict_error`、429→`rate_limit_error`、
          5xx→`server_error`、其余→`api_error`
       2. **429 响应带 `Retry-After: 60`**（限流/配额拒绝，SDK/脚本退避依赖）
-      3. **`x-request-id` 响应头**：metrics_middleware 生成/透传（客户端自带则沿用），
-         并写入站 headers 供 proxy 复用为隧道 request_id——HTTP 层/隧道帧/日志
-         三方对账一致；proxy 无该头时自增兜底
+      3. **`x-request-id` 响应头**：metrics_middleware 确定隧道 id（`req-<u64>` 沿用、
+         其他形状分配新号，唯一分配器见 `gateway::request_id`），规范化的 `req-{n}`
+         写回入站 headers 供 proxy 复用为隧道 request_id——HTTP 层/隧道帧/日志
+         三方对账一致；响应头回显客户端原值，不一致时日志另记 `client_request_id`
       （测试：error.type 映射单测 + 429 Retry-After 单测 + x-request-id 中间件单测 +
        e2e `e2e_openai_error_semantics`：401/400/404/429/503 各状态码的 type 与头）
 
@@ -426,11 +427,16 @@
       （`proxy/mod.rs:27-29`），但 `admin.rs:34/110/121/156/166` 与 `http.rs:117` 手搓了 5 种
       不一致的 type（`auth_error` / `invalid_request` / `gateway_error` / `not_found`）。
       修法：admin 与 UI fallback 也走同一个构造器/映射表。
-- [ ] **`x-request-id` 只在 `req-<u64>` 形状下才等于隧道 `request_id`**：`proxy/mod.rs:168-173`
-      只认 `strip_prefix("req-")`，其他形状（Codex/DSH 发的是 UUID 形态）回落到**第二个**静态计数器
-      （`proxy/mod.rs:25`，与 `http.rs:320` 的计数器都从 1 开始）→ 数值撞车；P0 宣称的
-      "HTTP 层 / 隧道帧 / 日志三方对账一致"在真实客户端上并不成立。修法：统一 id 生成器，
-      客户端 id 原样进隧道（改名叫 trace id）或帧内改用字符串。
+- [x] **`x-request-id` 只在 `req-<u64>` 形状下才等于隧道 `request_id`（已修）**：
+      拆分前 `metrics_middleware` 与 `proxy` 各持一个从 1 开始的静态计数器，UUID 客户端
+      （Codex/DSH 的真实形态）让两个数列独立递增 → 撞号；e2e 在旧代码上实测同一 agent
+      连续收到 `request_id = [1,1,2,2,3,3]`（先红后绿：
+      `chain.rs::e2e_tunnel_request_id_is_unique_across_x_request_id_shapes`）。
+      修法：`gateway::request_id` 作**唯一**分配器（`req-<u64>` 沿用、其他形状分配新号），
+      中间件把规范化的 `req-{n}` 写回入站 headers 供 `proxy` 原样使用；响应头仍回显客户端
+      原值，两者不一致时访问日志同时记 `request_id` 与 `client_request_id`。
+      **未**采用"帧内改用字符串"：动协议字段类型要改 proto/agent/mock-llm 三处，
+      收益只是省掉那条日志映射。
 - [ ] **`extract_model` 卡住非 chat 的 `/v1/*`**：`proxy/mod.rs:142-147` 对 `http.rs:46-53`
       catch-all 注册的**所有方法与路径**都要求 body 是带 `model` 的 JSON → `GET /v1/files`、
       `DELETE /v1/files/{id}`、multipart（`/v1/audio/transcriptions`）现在一律 400，

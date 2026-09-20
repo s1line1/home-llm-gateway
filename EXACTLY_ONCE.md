@@ -40,7 +40,7 @@
 | agent 每条流一个任务，读到 `ProxyRequest` 后才构造上游 HTTP 请求 | `agent/src/stream.rs` | 去重表的插入点就在"读到完整帧之后、调用上游之前" |
 | `Cancel` 帧通过 watch 通道触发上游取消 | `agent/src/stream.rs` | 去重命中"等待复用"时要与取消联动（见 §4.5） |
 | 请求体在网关侧已整包在手（`Bytes`） | `gateway/src/proxy/mod.rs` | 重放不需要重新读客户端 |
-| `request_id` 现在是 `x-request-id` 的数字部分或网关进程内自增 | `gateway/src/http.rs`、`proxy/mod.rs` | **只在单实例内唯一**，多实例/重启会撞号 → 必须换标识（§4.1） |
+| `request_id` 现在是 `x-request-id` 的数字部分，否则取网关进程内自增号（唯一分配器） | `gateway/src/request_id.rs`（`http/observability.rs`、`proxy/mod.rs` 共用） | **只在单实例内唯一**，多实例/重启会撞号 → 必须换标识（§4.1） |
 
 ## 4. 设计
 
