@@ -458,3 +458,87 @@ async fn e2e_concurrent_cold_requests_hash_once() {
     agent.shutdown().await;
     gw.shutdown().await;
 }
+
+/// 规格：**客户端断开后，agent 槽位必须立刻释放**，不能等到上游下次产出。
+///
+/// 场景是"上游静默"：`/v1/slow_body` 立刻回响应头，之后 3s（`SLOW_BODY_STALL`）才吐第一块。
+/// 客户端拿到响应头就断开——此时网关正停在 `forward_body` 的 `read_frame` 上，`tx.send`
+/// 根本不会被调用。
+///
+/// 修复前：断开只能在 `tx.send()` 失败时被发现 → 要么等上游 3s 后吐帧，要么等满
+/// `idle_timeout`（本用例给 30s）才发 Cancel、才释放槽位。这就是 `REBUILD.md` §4.7 登记的
+/// 缺口，而"用户看到卡顿就取消"是最常见的交互形态。
+/// 修复后：`tx.closed()` 与 `read_frame` 在同一个 `select!` 里，断开即时可见。
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn e2e_client_disconnect_while_upstream_is_silent_releases_the_slot() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    // idle（request_timeout）给 30s：让"等上游产出"与"立刻释放"清楚区分
+    let (gw, agent, base, key) = start_stack(4, |o| {
+        o.request_timeout = Duration::from_secs(30);
+        o.admin_token = Some("admin-token".into());
+    })
+    .await;
+
+    let mut sock = tokio::net::TcpStream::connect(gw.http_addr).await.unwrap();
+    let body = br#"{"model":"mock-llm","stream":true}"#;
+    let head = format!(
+        "POST /v1/slow_body HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {key}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    sock.write_all(head.as_bytes()).await.unwrap();
+    sock.write_all(body).await.unwrap();
+    sock.flush().await.unwrap();
+
+    // 收到响应头 → 网关已进入 forward_body（正在等上游正文）
+    let mut buf = [0u8; 512];
+    let n = tokio::time::timeout(Duration::from_secs(5), sock.read(&mut buf))
+        .await
+        .expect("响应头必须在 5s 内到达（slow_body 立刻回头）")
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"),
+        "应先拿到 200 响应头，实际：{:?}",
+        String::from_utf8_lossy(&buf[..n])
+    );
+
+    let client = reqwest::Client::new();
+    let inflight = || async {
+        let v: serde_json::Value = client
+            .get(format!("{base}/admin/agents"))
+            .header("Authorization", "Bearer admin-token")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        v[0]["inflight"].as_u64().unwrap_or(0)
+    };
+
+    // 先确认槽位真被占上了，否则这条用例会假通过
+    let t_hold = std::time::Instant::now();
+    while inflight().await == 0 && t_hold.elapsed() < Duration::from_secs(2) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(inflight().await, 1, "请求应在途占住 1 个槽位");
+
+    drop(sock); // ← 客户端断开
+
+    let t0 = std::time::Instant::now();
+    while inflight().await != 0 {
+        assert!(
+            t0.elapsed() < Duration::from_millis(1500),
+            "客户端已断开，槽位却仍被占着 {:?}（上游还要静默 3s、idle 给的是 30s）——\
+             说明断开没有被即时发现",
+            t0.elapsed()
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    agent.shutdown().await;
+    gw.shutdown().await;
+}
