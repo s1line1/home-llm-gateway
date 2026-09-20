@@ -570,7 +570,7 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
     let metrics = state.metrics.clone();
     let key_store = state.key_store.clone();
     // 请求 body 的 prompt 估算（仅在无 usage 时使用）
-    let prompt_est = crate::usage::estimate_prompt_tokens(&body);
+    let prompt_est = crate::usage_meter::estimate_prompt_tokens(&body);
     // SSE 响应是流式（usage 在每个 chunk 尾部，逐块预过滤）；非 SSE 为整包 JSON
     let is_stream = out_headers
         .iter()
@@ -657,7 +657,7 @@ struct UsageCollector {
     /// SSE（content-type: text/event-stream）。
     is_stream: bool,
     /// 已提取的 usage（精确来源；流式多次出现取最后一次）。
-    extracted: Option<crate::usage::ExtractedUsage>,
+    extracted: Option<crate::usage_meter::ExtractedUsage>,
     /// 非流式整包缓冲。
     buf: Vec<u8>,
     /// 已转发字节（估算 completion 用）。
@@ -691,7 +691,7 @@ impl UsageCollector {
     fn observe(&mut self, chunk: &[u8]) {
         self.bytes_forwarded += chunk.len() as u64;
         if self.is_stream {
-            if let Some(d) = crate::usage::extract_usage(chunk) {
+            if let Some(d) = crate::usage_meter::extract_usage(chunk) {
                 self.extracted = Some(d);
             }
         } else if self.buf.len() < 32 * 1024 * 1024 {
@@ -724,7 +724,7 @@ impl UsageCollector {
     fn resolve_delta(&mut self) -> UsageDelta {
         // 非流式：整包缓冲，End 后统一解析（避免 JSON 跨块切到 usage 字段）
         if !self.is_stream {
-            if let Some(d) = crate::usage::extract_usage(&self.buf) {
+            if let Some(d) = crate::usage_meter::extract_usage(&self.buf) {
                 self.extracted = Some(d);
             }
         }

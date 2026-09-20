@@ -18,8 +18,8 @@ pub mod quic;
 pub mod ratelimit;
 pub mod registry;
 pub mod tls;
-pub mod usage;
 pub mod usage_flush;
+pub mod usage_meter;
 
 // 再导出：保住 `gateway::{Gateway, GatewayConfig, TlsPem}` 这些既有导入路径
 // （src/config.rs、main.rs 与 tests/e2e/* 都按这些路径引用）。

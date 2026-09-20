@@ -133,7 +133,7 @@ struct UsageRecord {
     ever_flushed: bool,
 }
 
-/// 一次请求的用量增量（usage 提取见 `crate::usage`）。
+/// 一次请求的用量增量（usage 提取见 `crate::usage_meter`）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct UsageDelta {
     pub prompt_tokens: u64,
