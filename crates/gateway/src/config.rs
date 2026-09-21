@@ -65,10 +65,20 @@ pub struct ConfigFile {
     /// 只在"摘除"这条路径上生效（连续 3 次同因隧道失败），不影响正常请求。
     /// 取值要与 `head_timeout_secs` 同量级才有意义：在途请求里既有"已送达上游、模型正在
     /// 生成"的，也有"还在等响应头"的（槽位覆盖整段响应头等待）——**比 `head_timeout_secs`
-    /// 小，就会把本来还在合法等待响应头的请求一起掐断**。也不能太大，否则 agent 迟迟
-    /// 察觉不到自己被摘除，变回"自认为在线的僵尸"。`0` = 不等、立刻关。
+    /// 小，就会把本来还在合法等待响应头的请求一起掐断**（配小了启动时会打一条 WARN）。
+    /// 也不能太大，否则 agent 迟迟察觉不到自己被摘除，变回"自认为在线的僵尸"。
+    /// `0` = 不等、立刻关。默认与 `head_timeout_secs` 相同（15s，2026-09 由 5s 上调）。
     #[serde(default = "default_evict_close_grace_secs")]
     evict_close_grace_secs: u64,
+    /// 「响应头静默」判据里**对端还在说话时**的静默容忍上限（秒）。
+    ///
+    /// 只在"响应头超时"这条路径上生效：窗口（`4 × head_timeout_secs`）内没有成功响应头时，
+    /// 若对端的心跳还新鲜且静默没超过本值，就仍然按"慢"处理、不摘除（见
+    /// `Options::head_silent_grace` 与评估 §5 H2）。
+    /// 默认 120（= `timeout_secs`，一条请求的寿命）；**不能小于 `4 × head_timeout_secs`**，
+    /// 否则这一层不会生效。`0` = 关掉这一层（回到"窗口一过就判死"）。
+    #[serde(default = "default_head_silent_grace_secs")]
+    head_silent_grace_secs: u64,
     /// 每个 API Key 每分钟请求上限（0 = 不限流）
     #[serde(default)]
     rate_limit_per_min: u32,
@@ -173,6 +183,10 @@ fn default_head_timeout_secs() -> u64 {
 fn default_evict_close_grace_secs() -> u64 {
     Options::DEFAULT_EVICT_CLOSE_GRACE.as_secs()
 }
+/// 「对端还活着」时的静默容忍上限默认值（秒）。见 `Options::head_silent_grace`。
+fn default_head_silent_grace_secs() -> u64 {
+    Options::DEFAULT_HEAD_SILENT_GRACE.as_secs()
+}
 /// 客户端停滞阈值默认值（秒）。见字段注释：语义是"该方向不再有字节流动"，
 /// 所以对慢而持续的传输无影响；60s 足以覆盖人类可感知的正常停顿。
 fn default_client_stall_secs() -> u64 {
@@ -249,6 +263,7 @@ pub fn from_file(cfg: ConfigFile) -> anyhow::Result<GatewayConfig> {
             tunnel_op_timeout: Duration::from_secs(cfg.tunnel_op_secs),
             head_timeout: Duration::from_secs(cfg.head_timeout_secs),
             evict_close_grace: Duration::from_secs(cfg.evict_close_grace_secs),
+            head_silent_grace: Duration::from_secs(cfg.head_silent_grace_secs),
             agent_stale_after: Duration::from_secs(cfg.agent_stale_secs),
             client_stall: Duration::from_secs(cfg.client_stall_secs),
             shutdown_flush_timeout: Duration::from_secs(cfg.shutdown_flush_secs),
@@ -428,6 +443,7 @@ rate_limit_per_min: 60
             "tunnel_op_secs",
             "head_timeout_secs",
             "evict_close_grace_secs",
+            "head_silent_grace_secs",
             "max_open_tunnel_streams",
             "client_stall_secs",
             "shutdown_flush_secs",
@@ -441,6 +457,7 @@ rate_limit_per_min: 60
         assert_eq!(cfg.tunnel_op_secs, default_tunnel_op_secs());
         assert_eq!(cfg.head_timeout_secs, default_head_timeout_secs());
         assert_eq!(cfg.evict_close_grace_secs, default_evict_close_grace_secs());
+        assert_eq!(cfg.head_silent_grace_secs, default_head_silent_grace_secs());
         assert_eq!(
             cfg.max_open_tunnel_streams,
             default_max_open_tunnel_streams()
@@ -550,6 +567,10 @@ rate_limit_per_min: 60
         assert_eq!(
             opts.evict_close_grace, d.evict_close_grace,
             "evict_close_grace_secs"
+        );
+        assert_eq!(
+            opts.head_silent_grace, d.head_silent_grace,
+            "head_silent_grace_secs"
         );
         assert_eq!(
             opts.agent_stale_after, d.agent_stale_after,

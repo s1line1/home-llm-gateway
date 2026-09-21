@@ -496,12 +496,14 @@
       `HeadOutcome::Error(u16, String)` 用裸状态码。
 - [ ] **死代码 / 死常量**：`KeyStore::authorize_id`（`storage/mod.rs:210`）、`Metrics::request_count`
       （`metrics.rs:98`）、`HISTORY_LEN` 被导出但 `useMetricsHistory.ts:41` 硬编码 `60`。
-- [ ] **`Atomic::fetch_update` 已弃用 → 改 `try_update`**：`registry.rs:406`（`try_acquire`
+- [x] **`Atomic::fetch_update` 已弃用 → 改 `try_update`**：`registry.rs:406`（`try_acquire`
       抢并发槽位那处）。nightly 1.100.0 的措辞是 `deprecated: renamed to try_update for
       consistency`——**纯改名**，签名与返回值语义完全一致（本地实测对照：成功路径两边都
       `Ok(prev)`、闭包返 `None` 时两边都 `Err(cur)`，原子终值也相同）。`try_update` 在
       **stable 1.97.1 上就能编译**，所以不必等新 stable，一行即可消掉未来的 deprecation 警告；
       注意它现在只在 nightly 报警，稳定版 CI 不会提示（这也是"工具链没锁版本"那条的连带损失）。
+      **2026-09 已改**：`try_acquire_excluding` 里现在是 `try_update`（该处行号已随重构移动到
+      `registry.rs` 的抢槽位分支内），并在原处留了"为什么用 `try_update`"的注释。
 
 ### 本次一并修掉的文档漂移（无需再动代码）
 

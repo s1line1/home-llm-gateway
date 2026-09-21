@@ -146,9 +146,18 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
             //
             // 这条判据由注册表给出（判定与记账、摘除在同一处），本模块只把它映射成
             // 指标标签与日志文案——那些是外部契约，留在原处。
+            //
+            // 判据有**两层**（第二层见评估 §5 H2）：窗口内有过成功响应头 → 只是慢；
+            // 窗口过了但**对端还在说话**（心跳新鲜）且静默没超过 `head_silent_grace` → 仍算慢。
+            // 第二层不可省：`last_head_ok` 的唯一刷新点就是成功响应头，所以当**所有**请求都慢过
+            // `head_timeout` 时没有任何一次成功能刷新它，只按第一层就会误摘活着的 agent。
             let disposition = state.registry.report_head_timeout(
                 &entry,
-                state.head_alive_window,
+                crate::registry::HeadSilence {
+                    window: state.head_alive_window,
+                    peer_alive_window: state.agent_stale_after,
+                    stuck_after: state.head_silent_grace,
+                },
                 state.evict_close_grace,
             );
             let last_head_ago_secs = entry.last_head_ago().map_or(0, |d| d.as_secs());

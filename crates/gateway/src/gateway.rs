@@ -91,6 +91,37 @@ impl Gateway {
         let quic_tls = tunnel.server_config()?;
         let https = opts.https.as_ref().map(TlsPem::server_config).transpose()?;
 
+        // 配置自检：**摘除宽限短于 `head_timeout`** 时吵一声。在途集合里包含"仍在等响应头"
+        // 的请求（槽位覆盖 `read_head`），所以宽限短于 `head_timeout` 就意味着：摘除发生后，
+        // 那些还在合法等待的请求会被宽限到期强制切断（评估 §5 H1）。默认值两者相等，
+        // 这条 WARN 只会在人为把宽限配小时出现——与 `quic.rs` 里"agent 声明容量 > 端点流额度"
+        // 那条同一风格：配置不一致要在启动时看得见，而不是等生产出事。
+        if opts.evict_close_grace < opts.head_timeout {
+            tracing::warn!(
+                evict_close_grace_secs = opts.evict_close_grace.as_secs(),
+                head_timeout_secs = opts.head_timeout.as_secs(),
+                "evict_close_grace_secs is shorter than head_timeout_secs: when an agent is \
+                 evicted, requests on that connection which are still legitimately waiting for a \
+                 response head will be cut at the grace deadline; raise evict_close_grace_secs \
+                 (or lower head_timeout_secs)"
+            );
+        }
+
+        // 同类自检：「对端还活着」那层静默宽限若**不严格长于窗口**（`4 × head_timeout`），
+        // 它永远不可能生效——窗口一过就已经按第一层判死了，延长无从谈起（评估 §5 H2 的修法
+        // 就是这么用的）。0 是**有意**关掉这一层，不算配错，所以那种情况不吵。
+        let head_window = opts.head_timeout * 4;
+        if !opts.head_silent_grace.is_zero() && opts.head_silent_grace <= head_window {
+            tracing::warn!(
+                head_silent_grace_secs = opts.head_silent_grace.as_secs(),
+                head_alive_window_secs = head_window.as_secs(),
+                "head_silent_grace_secs is not longer than the busy/dead window \
+                 (4 x head_timeout_secs): the second-tier check that tolerates silence while the \
+                 peer keeps heartbeating can never take effect; raise head_silent_grace_secs, or \
+                 set it to 0 to disable that tier on purpose"
+            );
+        }
+
         // ② 进程级副作用：在**绑任何 socket 之前**把 NOFILE 的 soft 抬到目标值（默认
         //    16384）。systemd 给的默认 soft 是 1024，生产水位（768 并发连接 → fd 峰值
         //    785）下是贴脸的，撞上时表现为"新连接被拒但进程健康"

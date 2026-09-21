@@ -39,18 +39,24 @@ enum Settled {
 /// 1. `t≈0`：`/v1/slow_body` 立刻回响应头、正文 3s 后才出第一块 → **一个已经过了响应头、
 ///    正在生成、且占着准入槽位的请求**（这正是"已送达上游"那一类）。它的响应头会刷新
 ///    `last_head_ok`，这是第 2 步要利用的事实。
-/// 2. `t≈0.5s`：等沉默超过 400ms 窗口——否则后面的响应头超时会被判成"只是慢"（那条判据的
-///    前提就是"窗口内还有成功响应头"）。
+/// 2. `t≈0.5s`：等沉默超过 400ms 窗口——否则后面的响应头超时会被判成"只是慢"。
 /// 3. `t≈0.5–0.8s`：同一连接上连打 3 个 `/v1/slow?ms=3000`，每个都在 `head_timeout` 后超时
 ///    且被判死 → 第 3 个达阈值 → 摘除。此时在途 = 正在生成的那个 + 本次失败的这个 = 2 > 1
-///    → `evict` 走**延迟关闭**，把连接交给 `close_when_drained` 与 `evict_close_grace`。
+///    → `evict` 走**延迟关闭**，把连接交给 `defer_close` 与 `evict_close_grace`。
 /// 4. 观察步骤 1 的请求在 `window` 内如何结束。
+///
+/// ⚠️ 这里必须把 `head_silent_grace` 压到 300ms：被测 agent 是**会心跳**的真 agent（测试里
+/// 200ms 一次），而判据的第二层（评估 §5 H2）对"心跳还新鲜"的对端会把静默宽限到
+/// `head_silent_grace`。不压小它，这三次超时会被判成"慢"，压根不会摘除，本用例就没有延迟关闭
+/// 可测。**不能改用 `request_timeout`**（它同时是转发空闲超时）：压小它会把下面那个 3s 的
+/// 在途正文提前掐断，那次切断就分不清是宽限期还是请求超时了。
 async fn eviction_while_generating(grace: Duration, window: Duration) -> (Duration, Settled) {
     let (gw, agent, base, key) = start_stack(4, |o| {
         o.head_timeout = Duration::from_millis(100);
         o.evict_close_grace = grace;
-        // 这两个保持默认（60s / 120s）即可：观察窗口只有几秒，所以"请求被打断"只可能来自
-        // 摘除的宽限期，而不是客户端停滞或请求超时——A/B 两组唯一不同的就是宽限期。
+        o.head_silent_grace = Duration::from_millis(300);
+        // `client_stall` / `request_timeout` 保持默认（60s / 120s）：观察窗口只有几秒，
+        // 所以"请求被打断"只可能来自摘除的宽限期——A/B 两组唯一不同的就是宽限期。
     })
     .await;
     let client = reqwest::Client::new();
