@@ -4,9 +4,9 @@
 //! TLS 材料（[`TlsPem`]、[`TunnelTls`]）与 rustls 配置构造在 [`crate::tls`]；端口绑定在
 //! 私有模块 `listen`；公网入口的 accept 循环在 [`crate::http`]。
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, time::Duration};
 
-use tokio::sync::Notify;
+use tokio::sync::watch;
 
 use crate::{
     error::GatewayError, http, listen, metrics::Metrics, nofile, quic, registry::Registry, state,
@@ -44,8 +44,9 @@ pub struct Gateway {
     shutdown_flush_timeout: Duration,
     /// [`Options::shutdown_grace`] 的副本：排空在途请求的最长等待。
     shutdown_grace: Duration,
-    /// 公网入口的"停止接受新连接"信号（片 A：先停 accept，再排空）。
-    shutdown: Arc<Notify>,
+    /// 关闭阶段的广播端（见 [`state::ShutdownPhase`]）：`Draining` 停 accept、
+    /// `Terminating` 让在途响应带明确事件收尾。
+    shutdown: watch::Sender<state::ShutdownPhase>,
     /// 在途请求读数（与 `hlmg_active_requests` 同一份计数）：排空的判据靠它。
     metrics: Metrics,
     registry: Registry,
@@ -102,19 +103,16 @@ impl Gateway {
         // ④ 进程内状态
         let registry = Registry::default();
         let metrics = Metrics::default();
-        // 公网入口的"停止接受新连接"信号；`shutdown` 时 `notify_one()` 它（片 A）。
-        let shutdown = Arc::new(Notify::new());
         let key_store = KeyStore::with_verified(
             opts.keys_file.clone(),
             opts.verified_cache_max,
             KeyStore::default_verified_ttl(),
         );
-        let app = http::app(state::AppState::new(
-            registry.clone(),
-            key_store.clone(),
-            metrics.clone(),
-            &opts,
-        ));
+        let app_state =
+            state::AppState::new(registry.clone(), key_store.clone(), metrics.clone(), &opts);
+        // 关闭阶段的发送端留在 `Gateway`；接收端给 accept 循环，在途响应各自 `subscribe()`。
+        let shutdown = app_state.shutdown.clone();
+        let app = http::app(app_state);
 
         // ⑤ 起任务。入列顺序有意义：用量 flusher 必须在 serve 任务之前就位（它按周期
         //    批量写库，见 `proxy::UsageCollector::finish`；关闭时由 `shutdown` 补最后一刀）。
@@ -125,7 +123,7 @@ impl Gateway {
                 app,
                 https,
                 opts.client_stall,
-                shutdown.clone(),
+                shutdown.subscribe(),
             ),
             tokio::spawn(quic::accept_loop(
                 sockets.server,
@@ -178,30 +176,36 @@ impl Gateway {
         self.tasks.iter().all(|t| !t.is_finished())
     }
 
-    /// 停网关：**先停 accept → 有界排空在途 → 有界落库 → abort 全部任务**。
+    /// 停网关：**停 accept → 有界排空 → 在途带明确事件收尾 → 有界落库 → abort**。
+    ///
+    /// 两个阶段通过 [`state::ShutdownPhase`] 广播：
+    /// - `Draining`：公网入口停止 accept（新连接被拒），**在途请求继续正常跑**；
+    /// - `Terminating`：宽限期到了仍有在途，就让它们带一个明确的"不完整"事件收尾
+    ///   （见 `proxy/forward.rs`），而不是被硬切。
     ///
     /// flush 并进来是为了消掉一个顺序陷阱：以前 `main.rs` 可以先 `shutdown()` 而忘了
     /// `flush_usage_on_shutdown()`，最后一个周期内的用量就随进程一起消失。落库是同步的
-    /// （一次 SQLite 事务，毫秒级），而且现在**排在排空之后**——排空期间结算的用量也会被
+    /// （一次 SQLite 事务，毫秒级），而且**排在排空与收尾之后**——这期间结算的用量也会被
     /// 这次落库带上。
     ///
-    /// **排空（片 A）**：先 `notify_one()` 让公网入口停止 accept（新连接被拒），再等
-    /// `hlmg_active_requests` 归零或到 [`Options::shutdown_grace`]。只停**公网入口**、
-    /// 不停 QUIC 端点——在途响应还要靠它从 agent 回来。到期仍有在途就记 WARN 并切断。
-    ///
-    /// **仍未做（片 B，TODO R12）**：到期前没有给在途流一个"明确的结束事件"，所以客户端
-    /// 仍可能看到 SSE 被截断、而不是可区分的正常结束。要求见 `REBUILD.md` §6-R12；登记见
-    /// `TODO.md`《重建蓝图 §6 未修项》R12。配套：`deploy/gateway.service` 的 `TimeoutStopSec`
-    /// 必须**大于** `shutdown_grace + shutdown_flush_timeout`，否则宽限期没走完就被 SIGKILL。
+    /// 只停**公网入口**、不停 QUIC 端点：在途响应还要靠它从 agent 回来。端点与任务一起在
+    /// 最后 abort 时消失。配套：`deploy/gateway.service` 的 `TimeoutStopSec` 必须**大于**
+    /// `shutdown_grace + shutdown_flush_timeout`（再加收尾窗口），否则没走完就被 SIGKILL。
     ///
     /// ⚠️ `registry.rs::close_when_drained` 是"摘除单个 agent 时等它在途请求收尾"，
     /// **不是进程退出路径**，别直接复用到这里。
     pub async fn shutdown(self) {
-        // ① 停 accept：只停公网入口（QUIC 端点要活到排空结束）。
-        self.shutdown.notify_one();
+        // ① 进入 Draining：公网入口停止 accept；在途请求继续正常跑。
+        let _ = self.shutdown.send(state::ShutdownPhase::Draining);
         // ② 排空在途 HTTP 请求（有界）。放在落库之前，排空期间结算的用量才会被带上。
         self.drain().await;
-        // ③ 有界强制落库：阻塞池 + 超时（见 [`Options::shutdown_flush_timeout`]）。
+        // ③ 宽限期到了仍有在途 → 进入 Terminating：它们会带一个明确的"不完整"事件收尾，
+        //    这里给一个发送窗口，让事件真的写出去。
+        if self.metrics.active_count() > 0 {
+            let _ = self.shutdown.send(state::ShutdownPhase::Terminating);
+            self.await_end_event_window().await;
+        }
+        // ④ 有界强制落库：阻塞池 + 超时（见 [`Options::shutdown_flush_timeout`]）。
         //    超时**不取消**那个阻塞任务（同步代码取消不了），只是不再等它。
         let store = self.key_store.clone();
         match run_bounded(self.shutdown_flush_timeout, move || {
@@ -217,7 +221,7 @@ impl Gateway {
                  (usage settled since the last periodic flush may be lost)"
             ),
         }
-        // ④ abort；`Drop` 还会再兜一次（对已结束的任务是 no-op）。用 `&self.tasks` 而不是
+        // ⑤ abort；`Drop` 还会再兜一次（对已结束的任务是 no-op）。用 `&self.tasks` 而不是
         //    `self.tasks`：`Gateway` 有 `Drop`，不能把字段移出去。
         for t in &self.tasks {
             t.abort();
@@ -240,14 +244,35 @@ impl Gateway {
                 tracing::warn!(
                     active,
                     grace_secs = grace.as_secs(),
-                    "shutdown grace elapsed with requests still in flight; cutting them"
+                    "shutdown grace elapsed with requests still in flight; announcing termination"
                 );
                 return;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
+
+    /// 宣布 `Terminating` 之后，等在途响应把明确事件写出去：在途归零或到
+    /// [`END_EVENT_WINDOW`] 为止。正常情况下一个调度周期内就归零。
+    async fn await_end_event_window(&self) {
+        let deadline = tokio::time::Instant::now() + END_EVENT_WINDOW;
+        loop {
+            if self.metrics.active_count() == 0 {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
 }
+
+/// 宣布 `Terminating` 后留给在途响应把"不完整"事件写出去的窗口。
+///
+/// 刻意不做成新旋钮：它只是"把事件从网关写到客户端"的调度余量，通常一两个调度周期就够；
+/// 给固定上限是为了不让一个不读的客户端拖住关闭。
+const END_EVENT_WINDOW: Duration = Duration::from_secs(1);
 
 /// 在阻塞池上跑 `f`，最多等 `limit`。
 ///

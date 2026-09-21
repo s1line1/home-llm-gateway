@@ -139,3 +139,62 @@ async fn e2e_shutdown_drains_in_flight_requests_before_returning() {
 
     agent.shutdown().await;
 }
+
+/// 规格：**关闭时给在途 SSE 一个可识别的"不完整"事件，并干净结束**（片 B）。
+///
+/// 用 `/v1/slow_body`：响应头立刻 200（`text/event-stream`），正文停 3s。
+/// 宽限期压到 300ms，于是关闭时这条流必然还在途 → 网关应主动收尾。
+///
+/// 判据必须同时排除两种"假绿"：
+/// - 连接被 reset/隧道断 → `resp.text()` 会**报错**，不是干净的流结束；
+/// - 用 `data: [DONE]` 收尾 → 那是**谎报正常完成**（客户端会把残缺结果当完整结果记账）。
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn e2e_shutdown_announces_incomplete_sse_instead_of_cutting() {
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    let (gw, agent, base, key) = start_stack(4, |o| {
+        o.shutdown_grace = Duration::from_millis(300);
+        o.client_stall = Duration::from_secs(5);
+        o.request_timeout = Duration::from_secs(30);
+    })
+    .await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{base}/v1/slow_body"))
+        .header("Authorization", format!("Bearer {key}"))
+        .json(&serde_json::json!({ "model": "mock-llm" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "SSE 响应头应当先到");
+
+    // 等它真的进入在途
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while metric_gauge(&base, "hlmg_active_requests").await == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "SSE 请求没有进入在途，测试前提不成立"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // 关闭网关（后台），同时把流读完
+    let shutdown = tokio::spawn(async move { gw.shutdown().await });
+    let text = match tokio::time::timeout(Duration::from_secs(10), resp.text()).await {
+        Ok(Ok(t)) => t,
+        Ok(Err(e)) => panic!("客户端读到的是连接错误而不是干净的流结束：{e}"),
+        Err(_) => panic!("响应体既没有结束也没有报错（挂住了）"),
+    };
+
+    assert!(
+        text.contains("gateway is shutting down"),
+        "在途 SSE 应当收到明确的'服务端关闭、本响应不完整'事件，实际：{text:?}"
+    );
+    assert!(
+        !text.contains("[DONE]"),
+        "不得用 `[DONE]` 收尾——那会谎报'模型答完了'：{text:?}"
+    );
+
+    shutdown.await.unwrap();
+    agent.shutdown().await;
+}

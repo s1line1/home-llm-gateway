@@ -15,8 +15,10 @@ use std::time::Duration;
 
 use axum::body::Bytes;
 use proto::{io::read_frame, Frame};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::warn;
+
+use crate::state::ShutdownPhase;
 
 use super::tunnel::tunnel_cancel;
 use super::usage::UsageCollector;
@@ -35,7 +37,7 @@ pub(super) enum SendOutcome {
     Stalled,
 }
 
-/// 响应转发结束的方式。**七个出口各自的处置不同**，以前它们只是散落的 `return`——
+/// 响应转发结束的方式。**八个出口各自的处置不同**，以前它们只是散落的 `return`——
 /// 日志能看出差别，返回值看不出来。显式化之后：调用方拿到一个可匹配的结论，
 /// 而第 9 步要修的那个缺口（客户端断开却因上游静默而未察觉）就落在 `ClientGone` 上。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,7 +56,15 @@ pub(super) enum ForwardEnd {
     ClientGone,
     /// 客户端连着但不再消费响应体（通道满且 `stall` 内无人取）→ 已发 Cancel。
     ClientStalled,
+    /// 网关关闭（`Terminating`）：已给客户端一个"不完整"事件、取消上游并结算。
+    GatewayShutdown,
 }
+
+/// 关闭时写给在途 SSE 的终止事件。
+///
+/// **必须与正常完成可区分**：`data: [DONE]` 是 OpenAI 的"正常结束"标记，用它收尾等于
+/// 谎报"模型答完了"——客户端会把残缺结果当完整结果记账/计费。所以这里发一个明确的 error 事件。
+const SHUTDOWN_SSE_EVENT: &[u8] = b"event: error\ndata: {\"error\":{\"message\":\"gateway is shutting down; this response is incomplete\",\"type\":\"server_error\"}}\n\n";
 
 /// 带停滞超时地往客户端送一块。
 ///
@@ -82,6 +92,14 @@ pub(super) async fn send_to_client(
 /// 参数确实多（流的两半、通道、三个超时、票据、指标、用量记账、请求元信息），但它们都是
 /// 这个后台任务**必须独占持有**的资源；打包成 struct 只是把同一张清单换个地方写，不会让
 /// 这个函数更难懂。
+/// `Terminating` 阶段，或发送端已消失（`Gateway` 被 drop）→ 该收尾了。
+///
+/// 判据是**阶段**而不是"是否变过"：`changed()` 只保证"变过"，而 `Draining` 阶段只停接新
+/// 请求，绝不该打断在途响应。
+fn shutdown_terminating(rx: &watch::Receiver<ShutdownPhase>) -> bool {
+    *rx.borrow() == ShutdownPhase::Terminating || rx.has_changed().is_err()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn forward_body(
     recv: &mut s2n_quic::stream::ReceiveStream,
@@ -98,6 +116,7 @@ pub(super) async fn forward_body(
     key_name: String,
     prompt_est: u64,
     is_stream: bool,
+    mut shutdown: watch::Receiver<ShutdownPhase>,
 ) -> ForwardEnd {
     let mut usage = UsageCollector::new(key_store, key_id, key_name, prompt_est, is_stream);
     loop {
@@ -112,6 +131,39 @@ pub(super) async fn forward_body(
         // **取消安全性**：`read_frame` 不是可取消安全的（REBUILD §R3 登记过），但这条分支与
         // 下面的空闲超时一样——取消后立刻 `finish()` 并彻底放弃这条流、不再读它，所以丢掉
         // 半读的帧无害。
+        // 网关进入 `Terminating`：给客户端一个明确事件，然后干净收尾。**不能**指望 abort 去切：
+        // 实测 drop `s2n_quic::Server` 并不会掐断已建立的 agent 连接。
+        if shutdown_terminating(&shutdown) {
+            if is_stream {
+                // 明确告知"不完整"；**绝不能**用 `[DONE]`（那等于谎报正常完成）。
+                match send_to_client(
+                    &tx,
+                    Ok(Bytes::from_static(SHUTDOWN_SSE_EVENT)),
+                    client_stall,
+                )
+                .await
+                {
+                    SendOutcome::Delivered => {}
+                    SendOutcome::ClientGone => {
+                        warn!(
+                            request_id,
+                            "client gone while announcing shutdown; cancelling upstream"
+                        )
+                    }
+                    SendOutcome::Stalled => {
+                        metrics.record_client_stall("response-body");
+                        warn!(
+                            request_id,
+                            "client stopped reading while announcing shutdown; cancelling upstream"
+                        );
+                    }
+                }
+            }
+            tunnel_cancel(send, request_id, op_timeout).await;
+            let _ = send.finish();
+            usage.finish();
+            return ForwardEnd::GatewayShutdown;
+        }
         let frame = tokio::select! {
             r = tokio::time::timeout(idle_timeout, read_frame(recv)) => r,
             _ = tx.closed() => {
@@ -123,6 +175,12 @@ pub(super) async fn forward_body(
                 let _ = send.finish();
                 usage.finish();
                 return ForwardEnd::ClientGone;
+            }
+            changed = shutdown.changed() => {
+                // 阶段变化或发送端消失：回到循环顶部统一判定。`changed()` 只报告"变过"，
+                // 所以 `Draining` 时顶部不会收尾，继续正常转发。
+                let _ = changed;
+                continue;
             }
         };
         match frame {
