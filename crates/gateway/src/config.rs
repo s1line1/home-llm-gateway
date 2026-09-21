@@ -89,9 +89,6 @@ pub struct ConfigFile {
     ///
     /// 取值必须 **≥ 任何 agent 声明的 max_concurrency**；注册时若发现 agent 声明超了，
     /// 网关会打 WARN（否则同样的排队超时会以更难查的形式复现）。0 = 用默认值。
-    ///
-    /// 取值必须 **≥ 任何 agent 声明的 max_concurrency**；注册时若发现 agent 声明超了，
-    /// 网关会打 WARN（否则同样的排队超时会以更难查的形式复现）。0 = 用默认值。
     #[serde(default = "default_max_open_tunnel_streams")]
     max_open_tunnel_streams: u32,
     /// 客户端"完全停滞"多久就放弃（秒）：请求体读不动、或响应体客户端不消费。
