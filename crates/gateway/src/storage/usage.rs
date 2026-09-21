@@ -156,7 +156,8 @@ impl UsageStore {
     /// 记录里维护 `flushed` 副本作为"已落库"标记：只写 `current != flushed` 的 key，
     /// 且**成功后才更新标记**，所以落库失败会在下一轮自动重试。
     ///
-    /// 返回本轮写入的 key 数；`force = true` 时忽略"是否变化"（用于关闭前落库）。
+    /// 返回本轮**已提交**的 key 数（任何一行失败 ⇒ 整批回滚 ⇒ 返回 0）；`force = true` 时
+    /// 忽略"是否变化"（用于关闭前落库）。
     pub(crate) fn flush_once(&self, force: bool) -> usize {
         // 准备阶段只在内存锁内做，不碰 SQLite。
         let batch: Vec<(String, UsageSnapshot)> = {
@@ -209,7 +210,12 @@ impl UsageStore {
                 Ok(_) => written += 1,
                 Err(e) => {
                     tracing::warn!(key_id = %key_id, "usage flush failed: {e}");
-                    return written; // 事务未提交，标记不动 → 下一轮重试
+                    // 这条语句失败 ⇒ 事务不会提交 ⇒ **整个批都会被回滚**。
+                    // 所以不能把此前已经执行成功的行数报出去：调用方（周期任务与关闭路径）
+                    // 会照着这个数打"已落库"的日志（`usage flushed before shutdown keys=N`），
+                    // 于是"静默丢用量 + 日志报成功"。返回 0 = 本轮什么都没落下。
+                    // 标记也没动（下面那段只在 commit 成功后执行）→ 下一轮会重试。
+                    return 0;
                 }
             }
         }
@@ -335,4 +341,68 @@ fn load_usage(conn: &Connection) -> rusqlite::Result<HashMap<String, UsageRecord
         );
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 规格：**事务回滚了就一行都不能报成"已写入"**（评估报告 §5 H1，既有记录 P1-5）。
+    ///
+    /// 造一个必然失败的批：给 `key_usage` 加一个触发器，让它在**本次事务内已有 2 行时** ABORT。
+    /// 于是无论批的遍历顺序如何，恒有 2 行成功、第 3 行失败 ⇒ 事务整体回滚。
+    /// 修好之前 `flush_once` 会返回 2（那两行已经不在库里了），而调用方会照着它打
+    /// "usage flushed before shutdown keys=2"——静默丢用量、日志却报成功。
+    #[test]
+    fn flush_reports_nothing_when_the_transaction_rolls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keys.db");
+        let store = crate::storage::KeyStore::new(Some(path.clone()));
+        let delta = UsageDelta {
+            prompt_tokens: 1,
+            completion_tokens: 2,
+            estimated: false,
+        };
+        let ids: Vec<String> = ["a", "b", "c"]
+            .iter()
+            .map(|n| {
+                let c = store.create((*n).into());
+                store.accumulate_usage(&c.record.id, n, &delta);
+                c.record.id
+            })
+            .collect();
+        assert_eq!(store.usage_snapshot().len(), 3, "前提：批里有 3 个 key");
+
+        // 让第 3 行必然失败（事务内计数达到 2 就 ABORT）
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER dbg_fail_third BEFORE INSERT ON key_usage
+             WHEN (SELECT COUNT(*) FROM key_usage) >= 2
+             BEGIN SELECT RAISE(ABORT, 'debug: forced row failure'); END;",
+        )
+        .unwrap();
+        drop(conn);
+
+        assert_eq!(
+            store.flush_usage_once(false),
+            0,
+            "事务回滚了，就不能把已回滚的行数报成已写入（修好前这里是 2）"
+        );
+        assert!(
+            store.usage_has_pending(),
+            "失败后标记不能推进，下一轮必须还会重试"
+        );
+
+        let conn = Connection::open(&path).unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM key_usage", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "整事务回滚，库里不该有任何一行");
+        for id in &ids {
+            assert!(
+                store.usage_of(id).is_some(),
+                "内存账本不受落库失败影响（/admin/usage 仍要能读到）"
+            );
+        }
+    }
 }
