@@ -1,12 +1,6 @@
-use std::{path::PathBuf, sync::Arc};
+use std::path::PathBuf;
 
-use gateway::{config, error::GatewayError};
-use proto::ALPN;
-use rustls::{
-    pki_types::{CertificateDer, PrivateKeyDer},
-    server::WebPkiClientVerifier,
-    RootCertStore,
-};
+use gateway::config;
 use s2n_quic::provider::tls::rustls::Server;
 use tracing::error;
 
@@ -15,17 +9,12 @@ async fn main() -> anyhow::Result<()> {
     let path = PathBuf::from("gateway-config.yml");
     let cfg = config::from_path(&path)?;
 
-    // 示例直接构建 rustls 配置 → 自己确保 provider 已装。
-    proto::crypto::provider();
-
     // 身份材料在 `cfg.tunnel` 下（必填），可调旋钮在 `cfg.opts` 下。
-    let tls = rustls_server_config(
-        &cfg.tunnel.ca_cert,
-        cfg.tunnel.server_cert.clone(),
-        cfg.tunnel.server_key.clone_key(),
-    )?; // 上面那份，含 mTLS
+    // `TunnelTls::server_config()` 直接给出 mTLS 的 rustls 配置：它含 ALPN，并自己确保
+    // rustls crypto provider 已安装（幂等）——所以这里不再自己复制一份构造逻辑。
+    let tls = cfg.tunnel.server_config()?;
     let mut server = s2n_quic::Server::builder()
-        .with_tls(Server::from(Arc::new(tls)))? // ← From<Arc<rustls::ServerConfig>>（s2n-quic-rustls/src/server.rs:60）
+        .with_tls(Server::from(tls))? // ← From<Arc<rustls::ServerConfig>>（s2n-quic-rustls/src/server.rs:60）
         .with_io(cfg.opts.quic_bind)? // SocketAddr 可直接传（provider/io.rs:57 impl_socket_addrs!(SocketAddr)）
         .start()?;
 
@@ -65,26 +54,4 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
-}
-
-fn rustls_server_config(
-    ca: &[CertificateDer<'static>],
-    cert: Vec<CertificateDer<'static>>,
-    key: PrivateKeyDer<'static>,
-) -> Result<rustls::ServerConfig, GatewayError> {
-    let mut roots = RootCertStore::empty();
-    for c in ca {
-        roots.add(c.clone())?
-    }
-    // let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
-    //     .build()
-    //     .map_err(|e| GatewayError::Other(format!("client verifier: {e}")))?;
-    let verifier = WebPkiClientVerifier::builder(Arc::new(roots)).build()?;
-    let mut tls = rustls::ServerConfig::builder()
-        .with_client_cert_verifier(verifier)
-        .with_single_cert(cert, key)?;
-
-    tls.alpn_protocols = vec![ALPN.to_vec()];
-
-    Ok(tls)
 }

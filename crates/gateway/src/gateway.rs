@@ -1,69 +1,22 @@
 //! 网关装配：配置（[`GatewayConfig`]）、启动（[`Gateway::start`]）、关闭（[`Gateway::shutdown`]）。
 //!
 //! 模块声明与再导出在 crate 根 `lib.rs`；启动旋钮（[`Options`]）在 [`crate::options`]；
-//! TLS 材料（[`TlsPem`]）与 rustls 配置构造在 [`crate::tls`]；端口绑定在私有模块 `listen`；
-//! 公网入口的 accept 循环在 [`crate::http`]。
+//! TLS 材料（[`TlsPem`]、[`TunnelTls`]）与 rustls 配置构造在 [`crate::tls`]；端口绑定在
+//! 私有模块 `listen`；公网入口的 accept 循环在 [`crate::http`]。
 
-use std::{net::SocketAddr, path::Path, sync::Arc, time::Duration};
-
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use std::{net::SocketAddr, time::Duration};
 
 use crate::{
-    error::GatewayError,
-    http, listen,
-    metrics::Metrics,
-    nofile, quic,
-    registry::Registry,
-    state,
-    storage::KeyStore,
-    tls::{self, TlsPem},
-    usage_flush,
+    error::GatewayError, http, listen, metrics::Metrics, nofile, quic, registry::Registry, state,
+    storage::KeyStore, tls::TlsPem, usage_flush,
 };
 
 /// 启动旋钮住在 [`crate::options`]；这里再导出，保住 `gateway::Options` 这个既有公开路径
 /// （`lib.rs` 与 `tests/e2e` 按它引用）。
 pub use crate::options::Options;
 
-/// 隧道侧的 mTLS 身份材料。**必填**，没有它网关证明不了任何 agent 的身份。
-///
-/// 刻意**不给 `Default`、也不放进 [`Options`]**：`PrivateKeyDer` 本身没有 `Default`，
-/// 所以"忘了配证书"在类型层面就构造不出来。反面例子是 `ca_cert: vec![]`——那在 rustls 里
-/// 是一套"谁也不信"的信任根：网关照常启动、日志照常写 ready，而每个 agent 的握手都被拒，
-/// 表现成"agent 永远注册不上"。身份材料与可调旋钮分开，就是为了让这类错误不可表达。
-#[derive(Debug)]
-pub struct TunnelTls {
-    /// 签发 agent 客户端证书的 CA 证书。
-    pub ca_cert: Vec<CertificateDer<'static>>,
-    pub server_cert: Vec<CertificateDer<'static>>,
-    pub server_key: PrivateKeyDer<'static>,
-}
-
-impl TunnelTls {
-    /// 从三个 PEM 文件装载（生产路径）。文件缺失 / 解析失败一律**启动即失败**。
-    pub fn from_pem_files(ca: &Path, cert: &Path, key: &Path) -> Result<Self, GatewayError> {
-        Ok(Self {
-            ca_cert: proto::pem::load_certs(ca).map_err(|e| {
-                GatewayError::Other(format!("cannot load ca cert {}: {e}", ca.display()))
-            })?,
-            server_cert: proto::pem::load_certs(cert).map_err(|e| {
-                GatewayError::Other(format!("cannot load cert {}: {e}", cert.display()))
-            })?,
-            server_key: proto::pem::load_key(key).map_err(|e| {
-                GatewayError::Other(format!("cannot load key {}: {e}", key.display()))
-            })?,
-        })
-    }
-
-    /// 构建 QUIC 隧道用的 mTLS rustls 配置。调用方拿到 `Arc` 才能交给 s2n-quic。
-    pub fn server_config(&self) -> Result<Arc<rustls::ServerConfig>, GatewayError> {
-        tls::rustls_server_tls(
-            &self.ca_cert,
-            self.server_cert.clone(),
-            self.server_key.clone_key(),
-        )
-        .map(Arc::new)
-    }
-}
+/// 隧道身份材料住在 [`crate::tls`]；同样再导出以保住 `gateway::TunnelTls` 路径。
+pub use crate::tls::TunnelTls;
 
 /// 启动配置：**必填的身份材料** + 全部可选项。
 ///
@@ -85,6 +38,8 @@ pub struct Gateway {
     /// 不留整个 `Options`（它已随 `AppState` 进 Router，再存一份就是同一状态两处），
     /// 只多存这一个"派生接口要用到"的标量。
     agent_stale_after: Duration,
+    /// [`Options::shutdown_flush_timeout`] 的副本：关闭时那次强制落库的等待上限。
+    shutdown_flush_timeout: Duration,
     registry: Registry,
     /// 用量落库需要在关闭前强制 flush 一次（见 [`Gateway::shutdown`]）。
     key_store: KeyStore,
@@ -168,6 +123,7 @@ impl Gateway {
             http_addr: sockets.http_addr,
             quic_addr: sockets.quic_addr,
             agent_stale_after: opts.agent_stale_after,
+            shutdown_flush_timeout: opts.shutdown_flush_timeout,
             registry,
             key_store,
             tasks,
@@ -223,13 +179,46 @@ impl Gateway {
     /// ⚠️ `registry.rs::close_when_drained` 是"摘除单个 agent 时等它在途请求收尾"，
     /// **不是进程退出路径**，别直接复用到这里。
     pub async fn shutdown(self) {
-        let n = self.key_store.flush_usage_blocking();
-        tracing::info!(keys = n, "usage flushed before shutdown");
+        // 强制落库跑在**阻塞池**上并带超时：它是阻塞式 SQLite 写，直接在 async worker 上跑
+        // 会占住一个 worker，卡住时更会连累整个 runtime（见 [`Options::shutdown_flush_timeout`]）。
+        // 超时**不取消**那个阻塞任务（同步代码取消不了），只是不再等它——所以下面的 WARN
+        // 说的是"可能没写完就继续往下走"。
+        let store = self.key_store.clone();
+        match run_bounded(self.shutdown_flush_timeout, move || {
+            store.flush_usage_blocking()
+        })
+        .await
+        {
+            Ok(Some(n)) => tracing::info!(keys = n, "usage flushed before shutdown"),
+            Ok(None) => tracing::warn!("usage flush task did not finish before shutdown"),
+            Err(()) => tracing::warn!(
+                timeout_ms = self.shutdown_flush_timeout.as_millis(),
+                "usage flush exceeded shutdown_flush_timeout; aborting tasks anyway \
+                 (usage settled since the last periodic flush may be lost)"
+            ),
+        }
         // 显式 abort 只是让这里读起来完整；`Drop` 还会再 abort 一次（对已结束的任务是 no-op）。
         // 注意用 `&self.tasks` 而不是 `self.tasks`：`Gateway` 有 `Drop`，不能把字段移出去。
         for t in &self.tasks {
             t.abort();
         }
+    }
+}
+
+/// 在阻塞池上跑 `f`，最多等 `limit`。
+///
+/// 返回 `Ok(Some(v))` = 正常完成；`Ok(None)` = 阻塞任务 panic；`Err(())` = 超时。
+/// 超时**不会**取消那个阻塞任务（Rust 取消不了同步代码），只是不再等它——所以调用方
+/// （[`Gateway::shutdown`]）必须接受"落库可能还没写完就继续往下走"。
+async fn run_bounded<F, T>(limit: Duration, f: F) -> Result<Option<T>, ()>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::time::timeout(limit, tokio::task::spawn_blocking(f)).await {
+        Ok(Ok(v)) => Ok(Some(v)),
+        Ok(Err(_join)) => Ok(None),
+        Err(_elapsed) => Err(()),
     }
 }
 
@@ -245,5 +234,39 @@ impl Drop for Gateway {
         for t in &self.tasks {
             t.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run_bounded;
+    use std::time::Duration;
+
+    /// 规格：**有界等待**——到点必须放弃，而不是陪着慢任务一起卡住。
+    ///
+    /// 这是关闭路径不挂死的保险：`shutdown` 的强制落库跑在阻塞池上，磁盘/库锁慢时只有
+    /// 这个超时能保证进程还能走到 abort 与退出（见 [`crate::Options::shutdown_flush_timeout`]）。
+    #[tokio::test]
+    async fn run_bounded_gives_up_at_the_deadline() {
+        let t0 = std::time::Instant::now();
+        let out = run_bounded(Duration::from_millis(20), || {
+            std::thread::sleep(Duration::from_millis(300));
+            7usize
+        })
+        .await;
+        assert_eq!(out, Err(()), "到点必须放弃等待");
+        assert!(
+            t0.elapsed() < Duration::from_millis(200),
+            "应在超时量级返回，而不是等满阻塞任务，实际 {:?}",
+            t0.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_bounded_returns_the_value_when_it_finishes() {
+        assert_eq!(
+            run_bounded(Duration::from_secs(5), || 7usize).await,
+            Ok(Some(7))
+        );
     }
 }

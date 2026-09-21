@@ -88,6 +88,15 @@ pub struct Options {
     /// **0 不是"不限"**：s2n-quic 里 0 意味着一条双向流都不许开（agent 连注册流都开不出来），
     /// 所以 0 会被 [`Options::stream_ceiling`] 归一到默认值。
     pub max_open_tunnel_streams: u32,
+    /// 关闭时强制落库的**等待上限**：超过它就放弃等待、继续 abort 任务。
+    ///
+    /// 为什么需要：`Gateway::shutdown` 的强制落库是阻塞式 SQLite 写，而
+    /// `deploy/gateway.service` 没设 `TimeoutStopSec`（systemd 默认 90s）。落库卡住时
+    /// （磁盘慢、库被别处占着）进程会一直等到被 SIGKILL——**反而丢掉这次强制落库**。
+    /// 有界之后 `shutdown` 至少能走完"abort 任务"并留下 WARN。
+    ///
+    /// 与 `TimeoutStopSec` 的关系：后者必须 **大于** 本值，否则宽限期没走完就被 SIGKILL。
+    pub shutdown_flush_timeout: Duration,
 }
 
 impl Options {
@@ -103,6 +112,8 @@ impl Options {
     pub const DEFAULT_CLIENT_STALL: Duration = Duration::from_secs(60);
     /// 每连接隧道流额度默认值（依据见 `config::default_max_open_tunnel_streams`）。
     pub const DEFAULT_MAX_OPEN_TUNNEL_STREAMS: u32 = 1024;
+    /// 关闭时强制落库的等待上限默认值。见 [`Options::shutdown_flush_timeout`]。
+    pub const DEFAULT_SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(10);
 
     /// 实际生效的 QUIC 双向流额度：`0` 归一到默认值。
     ///
@@ -136,6 +147,7 @@ impl Default for Options {
             rate_limit_per_min: 0,
             max_concurrent_requests: 0,
             max_open_tunnel_streams: Self::DEFAULT_MAX_OPEN_TUNNEL_STREAMS,
+            shutdown_flush_timeout: Self::DEFAULT_SHUTDOWN_FLUSH_TIMEOUT,
         }
     }
 }
