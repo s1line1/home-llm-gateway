@@ -25,49 +25,77 @@ async fn e2e_https_public_entry() {
     let base = format!("https://{}", gw.http_addr);
 
     // healthz 与根路径（管理页）走 HTTPS
-    let resp = client.get(format!("{base}/healthz")).send().await.unwrap();
+    //
+    // 每一步都过 `bounded`：这条测试原先一步超时都没有，一次真实卡住的表现是
+    // nextest 的 `TIMEOUT [180s]`（日志停在 agent 注册之后、不指向任何一步）。
+    // 步骤名要能直接对到下面的断言。
+    let resp = bounded(
+        "GET /healthz over TLS",
+        client.get(format!("{base}/healthz")).send(),
+    )
+    .await
+    .unwrap();
     assert_eq!(resp.status(), 200);
-    let resp = client.get(format!("{base}/")).send().await.unwrap();
+    let resp = bounded(
+        "GET / (admin UI) over TLS",
+        client.get(format!("{base}/")).send(),
+    )
+    .await
+    .unwrap();
     assert_eq!(resp.status(), 200);
 
     // 无 key → 401
-    let resp = client
-        .get(format!("{base}/v1/models"))
-        .send()
-        .await
-        .unwrap();
+    let resp = bounded(
+        "GET /v1/models without a key over TLS",
+        client.get(format!("{base}/v1/models")).send(),
+    )
+    .await
+    .unwrap();
     assert_eq!(resp.status(), 401);
 
     // 认证请求穿透到 mock
-    let resp = client
-        .get(format!("{base}/v1/models"))
-        .header("Authorization", format!("Bearer {key}"))
-        .send()
-        .await
-        .unwrap();
+    let resp = bounded(
+        "GET /v1/models with a key over TLS",
+        client
+            .get(format!("{base}/v1/models"))
+            .header("Authorization", format!("Bearer {key}"))
+            .send(),
+    )
+    .await
+    .unwrap();
     assert_eq!(resp.status(), 200);
-    let models: serde_json::Value = resp.json().await.unwrap();
+    let models: serde_json::Value = bounded("read /v1/models body", resp.json()).await.unwrap();
     assert_eq!(models["data"][0]["id"], "mock-llm");
 
     // SSE 流式同样走 HTTPS
-    let resp = client
-        .post(format!("{base}/v1/chat/completions"))
-        .header("Authorization", format!("Bearer {key}"))
-        .json(&serde_json::json!({
-            "model": "mock-llm",
-            "stream": true,
-            "messages": [{"role": "user", "content": "https 流式"}]
-        }))
-        .send()
+    let resp = bounded(
+        "POST /v1/chat/completions (SSE) over TLS",
+        client
+            .post(format!("{base}/v1/chat/completions"))
+            .header("Authorization", format!("Bearer {key}"))
+            .json(&serde_json::json!({
+                "model": "mock-llm",
+                "stream": true,
+                "messages": [{"role": "user", "content": "https 流式"}]
+            }))
+            .send(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200);
+    let text = bounded("read the SSE body to [DONE]", resp.text())
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200);
-    let text = resp.text().await.unwrap();
     assert!(text.contains("data: [DONE]"), "missing [DONE]: {text}");
 
     // 裸 TCP 发非 TLS 字节 → 握手失败（服务端走 warn 分支，连接不崩溃）
     use tokio::io::AsyncWriteExt;
-    let mut raw = tokio::net::TcpStream::connect(gw.http_addr).await.unwrap();
+    let mut raw = bounded(
+        "raw TCP connect to the TLS entry",
+        tokio::net::TcpStream::connect(gw.http_addr),
+    )
+    .await
+    .unwrap();
     let _ = raw
         .write_all(b"GET / HTTP/1.1\r\n\r\nnot a tls handshake")
         .await;
@@ -75,11 +103,16 @@ async fn e2e_https_public_entry() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // 握手失败后 HTTPS 服务仍正常
-    let resp = client.get(format!("{base}/healthz")).send().await.unwrap();
+    let resp = bounded(
+        "GET /healthz over TLS after the failed handshake",
+        client.get(format!("{base}/healthz")).send(),
+    )
+    .await
+    .unwrap();
     assert_eq!(resp.status(), 200);
 
-    agent.shutdown().await;
-    gw.shutdown().await;
+    bounded("agent shutdown", agent.shutdown()).await;
+    bounded("gateway shutdown", gw.shutdown()).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

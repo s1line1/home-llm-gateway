@@ -14,7 +14,7 @@
 //! ## 这个模块做什么
 //!
 //! 1. **缓存**：`sha256(token) → (key_id, key_name, cred_version)`。只键于 sha256，
-//!    **不存明文 token**；容量有界（默认 1024），满时淘汰最旧的一项。
+//!    **不存明文 token**；容量有界（默认 1650，见 `super::DEFAULT_VERIFIED_MAX`），满时淘汰最旧的一项。
 //! 2. **单飞（single-flight）**：同一个 token 的并发请求**串行化**，只有第一个跑
 //!    argon2，其余等它的结果 —— 这才是把峰值从 `并发数 × 19MiB` 压到
 //!    `同时首用的不同 token 数 × 19MiB` 的关键；只缓存不单飞的话，一波并发仍各算一次。
@@ -60,8 +60,17 @@ type FlightSlot = std::sync::Arc<Mutex<()>>;
 pub(crate) struct VerifiedCache {
     entries: Mutex<HashMap<String, Verified>>,
     inflight: Mutex<HashMap<String, FlightSlot>>,
+    /// 命中缓存、**没有跑 argon2** 的次数（指标 `hlmg_key_verify_hits_total`）。
     hits: std::sync::atomic::AtomicU64,
-    misses: std::sync::atomic::AtomicU64,
+    /// **真跑过 argon2 的次数**（指标 `hlmg_key_verify_misses_total`）。
+    ///
+    /// 为什么它不叫"缓存未命中"：自增点在"将要跑 argon2"那一处（[`Self::note_argon2`]），
+    /// 而不是在 [`Self::put`]。差别只在一种配置上，但那正是最需要这个计数器的配置——
+    /// `verified_cache_max: 0` 时走"每请求完整校验"，**根本不经过 `put`**，若把自增点放在
+    /// `put`，这个计数器在持续烧 argon2 的场景下会恒为 0（指标 HELP 一直写的是"ran argon2"）。
+    ///
+    /// 注意错 token 不在其中：它的 `sha256` 不同 ⇒ `runtime` 查不到 ⇒ 按设计**不跑 argon2**。
+    argon2_runs: std::sync::atomic::AtomicU64,
 }
 
 impl VerifiedCache {
@@ -79,6 +88,12 @@ impl VerifiedCache {
             return Some(hit.record.clone());
         }
         None
+    }
+
+    /// 记一次"真的跑了 argon2"。由 `KeyStore::verify_and_count` 在**调用 argon2 之前**调用。
+    pub(crate) fn note_argon2(&self) {
+        self.argon2_runs
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// 校验成功后写入（容量满时淘汰最旧一条）。
@@ -101,8 +116,6 @@ impl VerifiedCache {
                 verified_at: Instant::now(),
             },
         );
-        self.misses
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// 按 key id 失效（删除 key 时调用；记录从 runtime 表消失本身已能拦住，这里是双保险）。
@@ -128,11 +141,14 @@ impl VerifiedCache {
         self.inflight.lock().unwrap().remove(lookup);
     }
 
-    /// (hits, misses)：用于 `/metrics` 与排障。
+    /// `(缓存命中数, 真跑 argon2 的次数)`：供 `/metrics` 观察 argon2 复用情况。
+    ///
+    /// 对应指标 `hlmg_key_verify_hits_total` 与 `hlmg_key_verify_misses_total`
+    /// （后者的名字是历史包袱，口径见 [`Self::note_argon2`]）。
     pub(crate) fn counters(&self) -> (u64, u64) {
         (
             self.hits.load(std::sync::atomic::Ordering::Relaxed),
-            self.misses.load(std::sync::atomic::Ordering::Relaxed),
+            self.argon2_runs.load(std::sync::atomic::Ordering::Relaxed),
         )
     }
 

@@ -25,17 +25,22 @@ use std::{
     collections::HashMap,
     path::PathBuf,
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU64, Ordering},
         Arc, Mutex, RwLock,
     },
     time::Duration,
 };
 
 use rusqlite::Connection;
-use serde::Serialize;
+
+use crate::error::GatewayError;
 
 pub mod hash;
+mod usage;
 pub mod verified;
+
+/// 用量记账/落库的类型由私有模块 `usage` 定义，路径 `crate::storage::UsageDelta` 保持不变。
+pub use usage::{KeyUsageInfo, UsageDelta};
 
 use crate::storage::hash::{generate_id_key, hash_argon2, lookup_of, now_secs, verify_argon2};
 
@@ -48,25 +53,17 @@ struct KeyStoreInner {
     /// 动态 key，key = lookup（sha256(token) 十六进制），value = 记录。
     runtime: RwLock<HashMap<String, KeyRecord>>,
     /// SQLite 持久化连接（None = 仅内存，如 db 打开失败时降级）。
-    db: Mutex<Option<Connection>>,
-    /// per-key 用量（key = key id；吊销 key 后记录保留，可审计）。
     ///
-    /// 存的是**绝对累计值快照**而不是"只加不减的 cell"：这样 `flush_usage` 可以
-    /// 把内存值直接 UPSERT 进库（幂等），不需要"取走增量"那一步——也就不会出现
-    /// "取走之后落库失败 ⇒ 这段用量永久丢失"的窗口。
-    usage: RwLock<HashMap<String, UsageRecord>>,
+    /// **与用量记账共享**（`Arc`）：连接是**资源**（凭据写穿与用量落库都用它），
+    /// 而状态刻意不共享——`runtime` 归凭据、`usage` 归 `usage::UsageStore`。
+    db: Arc<Mutex<Option<Connection>>>,
+    /// per-key 用量：记账 + 批量落库（独立模块，见 `usage`）。
+    usage: usage::UsageStore,
     /// 已验证身份缓存（argon2 结果复用）+ 单飞；容量 0 = 关闭（每请求都校验）。
     verified: verified::VerifiedCache,
     /// 已验证缓存的容量上限与有效期。
     verified_max: usize,
     verified_ttl: Duration,
-    /// 本实例真正跑过多少次 argon2。
-    ///
-    /// 刻意做成**每实例**计数而不是全局静态：全局计数会被同一个测试进程里其他测试
-    /// 的 argon2 调用污染（实测并行跑全量 lib 时，一个只应 1 次的断言会被顶到 2 次）。
-    /// 每实例计数天然隔离，测试也就不必串行化。开销可忽略——每次自增都伴随一次
-    /// argon2（毫秒级），一个原子加不构成噪声。
-    argon2_runs: AtomicUsize,
     /// 凭据代数：**只在凭据相关变更时**自增（创建/吊销/轮换）。
     /// 每条记录带一个 `cred_version`，变更后旧缓存条目的版本对不上 → 立即失效。
     cred_generation: AtomicU64,
@@ -91,55 +88,6 @@ pub struct KeyRecord {
 pub struct CreatedKey {
     pub record: KeyRecord,
     pub plaintext: String,
-}
-
-/// 每 key 的用量明细（/admin/usage 序列化用）。
-#[derive(Debug, Clone, Serialize)]
-pub struct KeyUsageInfo {
-    pub key_id: String,
-    /// key 名称快照（吊销后仍可审计名称）。
-    pub name: String,
-    pub prompt_tokens: u64,
-    pub completion_tokens: u64,
-    pub total_tokens: u64,
-    pub requests: u64,
-    /// 其中多少次请求走了估算降级（上游未提供 usage）。
-    pub estimated_requests: u64,
-    /// 最后使用时间（unix 秒）。
-    pub last_used_at: u64,
-}
-
-/// 一次用量的绝对累计值（= 内存里的真相）。落库写的也是它，而不是增量：
-/// 这样落库天然幂等、重启后不会重复累加，也不会像增量那样"丢一条就永久少一条"。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct UsageSnapshot {
-    name: String,
-    prompt_tokens: u64,
-    completion_tokens: u64,
-    requests: u64,
-    estimated_requests: u64,
-    last_used_at: u64,
-}
-
-/// 用量表里的一条：内存真相 + "已落库"的副本。
-///
-/// `flushed == current` 表示库里已经是这个值，无需再写——所以静默期完全不会碰 SQLite，
-/// 有流量时也只在 flush 周期内各 key 写一次（而不是每请求一次）。
-#[derive(Debug, Default)]
-struct UsageRecord {
-    current: UsageSnapshot,
-    flushed: UsageSnapshot,
-    /// 是否成功落过库。用于区分"从未落库"（即使值未变也要补写一次）与"已一致"。
-    ever_flushed: bool,
-}
-
-/// 一次请求的用量增量（usage 提取见 `crate::usage_meter`）。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct UsageDelta {
-    pub prompt_tokens: u64,
-    pub completion_tokens: u64,
-    /// 是否估算来源（上游未提供 usage）。
-    pub estimated: bool,
 }
 
 /// 已验证身份缓存的默认容量：每条 ~100 字节，1650 条约 165KB。
@@ -253,25 +201,19 @@ impl KeyStore {
             },
             None => HashMap::new(),
         };
-        let usage = match &db {
-            Some(conn) => match load_usage(conn) {
-                Ok(map) => map,
-                Err(e) => {
-                    tracing::warn!("usage db load failed: {e}; using empty usage store");
-                    HashMap::new()
-                }
-            },
-            None => HashMap::new(),
-        };
+        // 连接是**资源**：凭据写穿与用量落库共用它，因此包一层 `Arc`；
+        // 而状态各自独占——`runtime` 留在这里，用量账本交给 `usage::UsageStore`
+        //（它在构造时自己从 `key_usage` 载入，失败只告警并按空账本继续）。
+        let db = Arc::new(Mutex::new(db));
+        let usage = usage::UsageStore::new(db.clone());
         Self {
             inner: Arc::new(KeyStoreInner {
                 runtime: RwLock::new(runtime),
-                db: Mutex::new(db),
-                usage: RwLock::new(usage),
+                db,
+                usage,
                 verified: verified::VerifiedCache::default(),
                 verified_max: max,
                 verified_ttl: ttl,
-                argon2_runs: AtomicUsize::new(0),
                 cred_generation: AtomicU64::new(1),
             }),
         }
@@ -376,7 +318,13 @@ impl KeyStore {
     }
 
     /// 创建动态 key 并持久化；返回记录与仅此一次的明文 key。
-    pub fn create(&self, name: String) -> CreatedKey {
+    ///
+    /// **顺序是"先落库、后进内存"**：落库失败就返回 `Err`，内存与库都不变——否则会出现
+    /// "管理页显示一把重启后就消失的 key"（评估 §5 H2 / 记录 P2-9），而且那把 key 的明文
+    /// 已经交给了调用方，收不回来。
+    ///
+    /// 纯内存模式（`db = None`，库打不开时的降级）没有可落库的对象，直接成功。
+    pub fn create(&self, name: String) -> Result<CreatedKey, GatewayError> {
         let (id, plaintext) = generate_id_key();
         let lookup = lookup_of(&plaintext);
         let key_hash = hash_argon2(&plaintext);
@@ -389,13 +337,9 @@ impl KeyStore {
             enabled: true,
             cred_version: self.bump_cred_generation(),
         };
-        self.inner
-            .runtime
-            .write()
-            .unwrap()
-            .insert(record.lookup.clone(), record.clone());
+        // ① 先落库。失败 → 直接把错误交给调用方（admin 映射 500），内存一个字都不改。
         if let Some(conn) = self.inner.db.lock().unwrap().as_mut() {
-            let r = conn.execute(
+            conn.execute(
                 "INSERT OR REPLACE INTO api_keys (id, lookup, key_hash, name, created_at, enabled)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 rusqlite::params![
@@ -406,13 +350,16 @@ impl KeyStore {
                     record.created_at as i64,
                     1i64
                 ],
-            );
-            if let Err(e) = r {
-                tracing::warn!("api key persist failed: {e}");
-            }
+            )?;
         }
+        // ② 再进内存：此后授权立即可用。
+        self.inner
+            .runtime
+            .write()
+            .unwrap()
+            .insert(record.lookup.clone(), record.clone());
         tracing::info!(id = %record.id, name = %record.name, "api key created");
-        CreatedKey { record, plaintext }
+        Ok(CreatedKey { record, plaintext })
     }
 
     /// 列出动态 key（不含明文；由调用方决定展示形式）。
@@ -429,8 +376,30 @@ impl KeyStore {
         v
     }
 
-    /// 吊销动态 key；成功返回 true。
-    pub fn delete(&self, id: &str) -> bool {
+    /// 吊销动态 key：`Ok(true)` = 真的删掉了，`Ok(false)` = 本来就不存在；
+    /// `Err` = **没能落库，什么都没变**（key 仍然可用）。
+    ///
+    /// **顺序是"先落库、后改内存"**，理由与 [`Self::create`] 对称：内存先删的话，落库失败时
+    /// 会出现"内存说没了、库还在"——重启后 `load_keys` 把 key 复活（评估 §5 H2 / 记录 P1-4）；
+    /// 更糟的是**重试也救不回来**：内存里已经查不到它，重试只会返回"不存在"，而库里那行还在。
+    /// 先落库之后，失败时内存原样（key 仍可用），重试会重新尝试删除并最终自愈。
+    pub fn delete(&self, id: &str) -> Result<bool, GatewayError> {
+        // 先看它在不在：不在就是 404，且**不碰库**（与旧语义一致）。
+        if !self
+            .inner
+            .runtime
+            .read()
+            .unwrap()
+            .values()
+            .any(|r| r.id == id)
+        {
+            return Ok(false);
+        }
+        // ① 先落库。失败 → Err，内存原样。
+        if let Some(conn) = self.inner.db.lock().unwrap().as_mut() {
+            conn.execute("DELETE FROM api_keys WHERE id = ?1", rusqlite::params![id])?;
+        }
+        // ② 再改内存 + 失效缓存 + 推进代数（并发双删时只有一个拿到 true）。
         let mut removed = false;
         {
             let mut runtime = self.inner.runtime.write().unwrap();
@@ -448,257 +417,80 @@ impl KeyStore {
             // 双保险，且保证"任何凭据变更都会让旧身份失效"这条不变量成立。
             self.inner.verified.invalidate_by_id(id);
             self.bump_cred_generation();
-            if let Some(conn) = self.inner.db.lock().unwrap().as_mut() {
-                let r = conn.execute("DELETE FROM api_keys WHERE id = ?1", rusqlite::params![id]);
-                if let Err(e) = r {
-                    tracing::warn!("api key delete persist failed: {e}");
-                }
-            }
             tracing::info!(id = %id, "api key revoked");
         }
-        removed
+        Ok(removed)
     }
 
-    /// 记录一次用量并**立即同步落库**（= `accumulate_usage` + `persist_usage`）。
+    /// 记录一次用量并**立即同步落库**（= 内存累加 + 落库）。
     /// 吊销的 key 也有可能在途请求刚结束——按 key_id 独立累计，记录保留可审计。
     ///
-    /// 仅测试使用：生产路径只做内存累加，落库交给后台周期任务
-    /// （`usage_flush::spawn`）与关闭前的强制 flush。这里保留同步组合是为了让
-    /// 测试能一步写完就读库断言，因此用 `cfg(test)` 挡在生产代码之外。
+    /// 仅测试使用：生产路径只做内存累加，见 [`Self::accumulate_usage`]。
     #[cfg(test)]
     pub fn record_usage(&self, key_id: &str, name: &str, delta: &UsageDelta) {
-        self.accumulate_usage(key_id, name, delta);
-        self.persist_usage(key_id, name, delta);
+        self.inner.usage.record(key_id, name, delta);
+    }
+
+    /// 校验一次 argon2，并计入"真跑过 argon2"的次数（指标与测试断言共用这一个来源）。
+    fn verify_and_count(&self, token: &str, key_hash: &str) -> bool {
+        self.inner.verified.note_argon2();
+        verify_argon2(token, key_hash)
+    }
+
+    /// 本实例累计跑过多少次 argon2（测试断言用）。
+    ///
+    /// 它不再单独计数：直接读 `VerifiedCache` 的计数器——也就是 `/metrics` 的
+    /// `hlmg_key_verify_misses_total` 的来源，避免同一个事实在两处各记一份。
+    #[cfg(test)]
+    pub fn argon2_runs(&self) -> usize {
+        self.inner.verified.counters().1 as usize
     }
 
     /// 只做内存累加：纳秒级、无 IO，用于让 `/admin/usage`（读的正是这份内存计数）
     /// 在响应返回时立即一致。
-    /// 校验一次 argon2，并在测试构建下记一次本实例的调用数。
-    fn verify_and_count(&self, token: &str, key_hash: &str) -> bool {
-        self.inner.argon2_runs.fetch_add(1, Ordering::SeqCst);
-        verify_argon2(token, key_hash)
-    }
-
-    /// 本实例累计跑过多少次 argon2（测试断言用；每实例隔离，不受其他测试影响）。
-    #[cfg(test)]
-    pub fn argon2_runs(&self) -> usize {
-        self.inner.argon2_runs.load(Ordering::SeqCst)
-    }
-
+    ///
+    /// 实现与契约见 `usage::UsageStore::accumulate`：**这里只是转发**，不保留独立逻辑。
     pub fn accumulate_usage(&self, key_id: &str, name: &str, delta: &UsageDelta) {
-        let mut usage = self.inner.usage.write().unwrap();
-        let rec = usage.entry(key_id.to_string()).or_default();
-        if rec.current.name.is_empty() {
-            rec.current.name = name.to_string();
-        }
-        rec.current.prompt_tokens += delta.prompt_tokens;
-        rec.current.completion_tokens += delta.completion_tokens;
-        rec.current.requests += 1;
-        if delta.estimated {
-            rec.current.estimated_requests += 1;
-        }
-        rec.current.last_used_at = now_secs();
+        self.inner.usage.accumulate(key_id, name, delta);
     }
 
     /// 是否有"内存值尚未落库"的 key（静默期返回 false，调用方可跳过整轮 flush）。
     pub fn usage_has_pending(&self) -> bool {
-        self.inner
-            .usage
-            .read()
-            .unwrap()
-            .values()
-            .any(|r| !r.ever_flushed || r.current != r.flushed)
+        self.inner.usage.has_pending()
     }
 
-    /// 把内存里的用量**绝对累计值**批量落库（一个事务，每个 key 一行）。
-    ///
-    /// 这是量到量级差异的关键改动：原来每个请求都要 spawn 一个阻塞任务去抢全局 `db`
-    /// 锁写一行，实测把 2 vCPU 的上限摁在约 190 QPS（云端 515 个线程里 514 个卡在
-    /// futex 等这把锁）。改成"按周期把各 key 的最新值覆盖写一次"之后，写库次数从
-    /// 每请求一次降到每周期一次，且写的是绝对值——幂等、丢不掉、重启不重复累加。
-    ///
-    /// 记录里维护 `flushed` 副本作为"已落库"标记：只写 `current != flushed` 的 key，
-    /// 且**成功后才更新标记**，所以落库失败会在下一轮自动重试。
+    /// 把内存里的用量**绝对累计值**批量落库（实现与契约见 `usage::UsageStore::flush_once`：
+    /// 绝对值 → 幂等、重启不重复累加；成功提交后才更新"已落库"标记 → 失败下轮重试）。
     ///
     /// 返回本轮写入的 key 数；`force = true` 时忽略"是否变化"（用于关闭前落库）。
     pub fn flush_usage_once(&self, force: bool) -> usize {
-        // 准备阶段只在内存锁内做，不碰 SQLite。
-        let batch: Vec<(String, UsageSnapshot)> = {
-            let usage = self.inner.usage.read().unwrap();
-            usage
-                .iter()
-                .filter(|(_, r)| force || !r.ever_flushed || r.current != r.flushed)
-                .map(|(k, r)| (k.clone(), r.current.clone()))
-                .collect()
-        };
-        if batch.is_empty() {
-            return 0;
-        }
-
-        let mut conn = self.inner.db.lock().unwrap();
-        let Some(conn) = conn.as_mut() else {
-            return 0; // 无持久化（内存模式）：没有库可写
-        };
-        let tx = match conn.transaction() {
-            Ok(tx) => tx,
-            Err(e) => {
-                tracing::warn!("usage flush: begin transaction failed: {e}");
-                return 0;
-            }
-        };
-        let mut written = 0usize;
-        for (key_id, snap) in &batch {
-            let r = tx.execute(
-                "INSERT INTO key_usage
-                 (key_id, name, prompt_tokens, completion_tokens, requests, estimated_requests, last_used_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                 ON CONFLICT(key_id) DO UPDATE SET
-                   name = excluded.name,
-                   prompt_tokens = excluded.prompt_tokens,
-                   completion_tokens = excluded.completion_tokens,
-                   requests = excluded.requests,
-                   estimated_requests = excluded.estimated_requests,
-                   last_used_at = excluded.last_used_at",
-                rusqlite::params![
-                    key_id,
-                    snap.name,
-                    snap.prompt_tokens as i64,
-                    snap.completion_tokens as i64,
-                    snap.requests as i64,
-                    snap.estimated_requests as i64,
-                    snap.last_used_at as i64
-                ],
-            );
-            match r {
-                Ok(_) => written += 1,
-                Err(e) => {
-                    tracing::warn!(key_id = %key_id, "usage flush failed: {e}");
-                    return written; // 事务未提交，标记不动 → 下一轮重试
-                }
-            }
-        }
-        if let Err(e) = tx.commit() {
-            tracing::warn!("usage flush: commit failed: {e}");
-            return 0;
-        }
-        // 提交成功后才更新"已落库"标记。
-        let mut usage = self.inner.usage.write().unwrap();
-        for (key_id, snap) in batch {
-            if let Some(rec) = usage.get_mut(&key_id) {
-                rec.flushed = snap;
-                rec.ever_flushed = true;
-            }
-        }
-        written
+        self.inner.usage.flush_once(force)
     }
 
     /// 关闭前落库：把全部 key 的当前值无条件写一次（可能包含未变化的，代价可忽略）。
     pub fn flush_usage_blocking(&self) -> usize {
-        self.flush_usage_once(true)
+        self.inner.usage.flush_blocking()
     }
 
-    /// 把一次用量**增量**写穿到 SQLite（旧的每请求写库路径，仅测试用）。
+    /// 把一次用量**增量**写穿到 SQLite（旧的每请求写库路径，**仅测试用**）。
     ///
-    /// 生产路径已改为 `flush_usage_once`：按周期把各 key 的**绝对累计值**批量写一次。
-    /// 增量写在热点上每次都要抢全局 `db` 锁 + 提交一次事务，实测把 2 vCPU 的吞吐
-    /// 摁在约 190 QPS（云端 515 线程 / 514 个卡在 futex 等锁），所以这里只留给测试
-    /// 构造"库里已有某值"的场景。**阻塞调用**，不要放回请求路径。
+    /// 生产路径已改为 [`Self::flush_usage_once`]：按周期把各 key 的绝对累计值批量写一次。
+    /// 增量写每次都要抢全局 `db` 锁并提交事务，实测把 2 vCPU 的吞吐摁在约 190 QPS，
+    /// 所以只留给测试构造"库里已有某值"的场景。**阻塞调用**，不要放回请求路径。
     #[cfg(test)]
     pub fn persist_usage(&self, key_id: &str, name: &str, delta: &UsageDelta) {
-        if let Some(conn) = self.inner.db.lock().unwrap().as_mut() {
-            let r = conn.execute(
-                "INSERT INTO key_usage
-                 (key_id, name, prompt_tokens, completion_tokens, requests, estimated_requests, last_used_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                 ON CONFLICT(key_id) DO UPDATE SET
-                   name = excluded.name,
-                   prompt_tokens = key_usage.prompt_tokens + excluded.prompt_tokens,
-                   completion_tokens = key_usage.completion_tokens + excluded.completion_tokens,
-                   requests = key_usage.requests + excluded.requests,
-                   estimated_requests = key_usage.estimated_requests + excluded.estimated_requests,
-                   last_used_at = excluded.last_used_at",
-                rusqlite::params![
-                    key_id,
-                    name,
-                    delta.prompt_tokens as i64,
-                    delta.completion_tokens as i64,
-                    1i64,
-                    delta.estimated as i64,
-                    now_secs() as i64
-                ],
-            );
-            if let Err(e) = r {
-                tracing::warn!("usage persist failed: {e}");
-            }
-        }
+        self.inner.usage.persist(key_id, name, delta);
     }
 
     /// 单个 key 的用量快照（无记录 → None）。
     pub fn usage_of(&self, key_id: &str) -> Option<KeyUsageInfo> {
-        let usage = self.inner.usage.read().unwrap();
-        let rec = usage.get(key_id)?;
-        Some(cell_to_info(key_id, &rec.current))
+        self.inner.usage.of(key_id)
     }
 
     /// 全部 key 的用量快照（按 key_id 排序）。
     pub fn usage_snapshot(&self) -> Vec<KeyUsageInfo> {
-        let usage = self.inner.usage.read().unwrap();
-        let mut out: Vec<KeyUsageInfo> = usage
-            .iter()
-            .map(|(id, rec)| cell_to_info(id, &rec.current))
-            .collect();
-        out.sort_by(|a, b| a.key_id.cmp(&b.key_id));
-        out
+        self.inner.usage.snapshot()
     }
-}
-
-/// 把原子单元转成可序列化的明细。
-fn cell_to_info(key_id: &str, snap: &UsageSnapshot) -> KeyUsageInfo {
-    KeyUsageInfo {
-        key_id: key_id.to_string(),
-        name: snap.name.clone(),
-        prompt_tokens: snap.prompt_tokens,
-        completion_tokens: snap.completion_tokens,
-        total_tokens: snap.prompt_tokens + snap.completion_tokens,
-        requests: snap.requests,
-        estimated_requests: snap.estimated_requests,
-        last_used_at: snap.last_used_at,
-    }
-}
-
-/// 从 SQLite 加载用量（key = key_id）。
-fn load_usage(conn: &Connection) -> rusqlite::Result<HashMap<String, UsageRecord>> {
-    let mut out = HashMap::new();
-    let mut stmt = conn.prepare(
-        "SELECT key_id, name, prompt_tokens, completion_tokens, requests, estimated_requests, last_used_at
-         FROM key_usage",
-    )?;
-    let rows = stmt.query_map([], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            UsageSnapshot {
-                name: r.get::<_, String>(1)?,
-                prompt_tokens: r.get::<_, i64>(2)?.max(0) as u64,
-                completion_tokens: r.get::<_, i64>(3)?.max(0) as u64,
-                requests: r.get::<_, i64>(4)?.max(0) as u64,
-                estimated_requests: r.get::<_, i64>(5)?.max(0) as u64,
-                last_used_at: r.get::<_, i64>(6)?.max(0) as u64,
-            },
-        ))
-    })?;
-    for row in rows {
-        let (key_id, snap) = row?;
-        // 库里的值既是"当前累计"的起点，也正好是"已落库"状态。
-        out.insert(
-            key_id,
-            UsageRecord {
-                current: snap.clone(),
-                flushed: snap,
-                ever_flushed: true,
-            },
-        );
-    }
-    Ok(out)
 }
 
 /// 迁移旧版库（明文 key 表，无 lookup/key_hash 列）为 argon2 哈希存储。
@@ -811,7 +603,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("keys.db");
         let store = KeyStore::new(Some(path.clone()));
-        let created = store.create("dsh".into());
+        let created = store.create("dsh".into()).unwrap();
         assert!(
             store.authorize(&created.plaintext),
             "new key should authorize"
@@ -831,7 +623,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("keys.db");
         let store = KeyStore::new(Some(path.clone()));
-        let created = store.create("sec".into());
+        let created = store.create("sec".into()).unwrap();
         drop(store); // 确保落盘
 
         let bytes = std::fs::read(&path).unwrap();
@@ -855,15 +647,15 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("keys.db");
         let store = KeyStore::new(Some(path.clone()));
-        let created = store.create("x".into());
+        let created = store.create("x".into()).unwrap();
         assert!(store.authorize(&created.plaintext));
-        assert!(store.delete(&created.record.id));
+        assert!(store.delete(&created.record.id).unwrap());
         assert!(
             !store.authorize(&created.plaintext),
             "revoked key must be rejected"
         );
         assert!(
-            !store.delete(&created.record.id),
+            !store.delete(&created.record.id).unwrap(),
             "deleting twice returns false"
         );
 
@@ -894,7 +686,7 @@ mod tests {
         let store = KeyStore::new(Some(path.clone()));
         assert!(!store.authorize("anything"));
         // 降级为仅内存后，动态 key 仍可用
-        let created = store.create("mem".into());
+        let created = store.create("mem".into()).unwrap();
         assert!(store.authorize(&created.plaintext));
     }
 
@@ -903,7 +695,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("keys.db");
         let store = KeyStore::new(Some(path.clone()));
-        let created = store.create("usage-test".into());
+        let created = store.create("usage-test".into()).unwrap();
         let id = created.record.id.clone();
 
         // 3 次请求：2 次精确 usage + 1 次估算
@@ -954,7 +746,7 @@ mod tests {
 
         // 吊销 key 后 usage 记录仍保留（key 删了，用量表独立）
         let store2 = KeyStore::new(Some(path.clone()));
-        store2.delete(&id);
+        store2.delete(&id).unwrap();
         drop(store2);
         let store3 = KeyStore::new(Some(path));
         let kept = store3.usage_of(&id).unwrap();
@@ -966,8 +758,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("keys.db");
         let store = KeyStore::new(Some(path.clone()));
-        let a = store.create("batch-a".into());
-        let b = store.create("batch-b".into());
+        let a = store.create("batch-a".into()).unwrap();
+        let b = store.create("batch-b".into()).unwrap();
         let delta = UsageDelta {
             prompt_tokens: 10,
             completion_tokens: 20,
@@ -1017,7 +809,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("keys.db");
         let store = KeyStore::new(Some(path.clone()));
-        let created = store.create("shutdown".into());
+        let created = store.create("shutdown".into()).unwrap();
         store.accumulate_usage(
             &created.record.id,
             "shutdown",
@@ -1061,7 +853,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("keys.db");
         let store = KeyStore::new(Some(path.clone()));
-        let created = store.create("y".into());
+        let created = store.create("y".into()).unwrap();
         assert!(store.authorize(&created.plaintext));
         assert_eq!(store.list().len(), 1);
         assert!(path.exists(), "sqlite db file should be created");
@@ -1233,10 +1025,80 @@ mod tests {
         let store = KeyStore::new(Some(path.clone()));
         assert_eq!(store.list().len(), 0);
         // 结构已修复：新 key 可正常创建并持久化
-        let created = store.create("new".into());
+        let created = store.create("new".into()).unwrap();
         drop(store);
         let reloaded = KeyStore::new(Some(path.clone()));
         assert!(reloaded.authorize(&created.plaintext));
+    }
+
+    /// 规格：**持久化失败时不能声称"创建成功"**（评估报告 §5 H2 / 记录 P2-9）。
+    ///
+    /// 触发方式：给 `api_keys` 加一个必然 ABORT 的 INSERT 触发器——磁盘满 / I/O 错误 /
+    /// `SQLITE_BUSY` 在真实世界里就是这一支。今天 `create` 先写内存、后落库，落库失败只
+    /// `warn!` 然后照常返回 → 管理页显示一把**重启后就消失**的 key。
+    #[test]
+    fn create_that_fails_to_persist_leaves_no_key() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keys.db");
+        let store = KeyStore::new(Some(path.clone()));
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER dbg_reject_insert BEFORE INSERT ON api_keys
+                 BEGIN SELECT RAISE(ABORT, 'debug: persist refused'); END;",
+            )
+            .unwrap();
+        }
+
+        assert!(
+            store.create("cannot-persist".into()).is_err(),
+            "落库失败必须让调用方知道（admin 要回 500，而不是 201 + 一把假 key）"
+        );
+        assert!(
+            store.list().is_empty(),
+            "落库失败就不该留下任何条目——重启后它会消失，等于发了一把假 key"
+        );
+        let conn = Connection::open(&path).unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM api_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "库里当然也没有");
+    }
+
+    /// 规格：**吊销落库失败时 key 必须仍然可用**（评估报告 §5 H2 / 记录 P1-4）。
+    ///
+    /// 与上一条对称：今天 `delete` 先删内存、后落库，落库失败只 `warn!` 却仍返回 `true`
+    /// → admin 回 204、日志写 "api key revoked"，而重启后 `load_keys` 会把 key 复活。
+    /// 正确语义只有两种：内存与库**一起变**，或**都不变**——绝不能"内存说没了、库还在"。
+    #[test]
+    fn delete_that_fails_to_persist_keeps_the_key_usable() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keys.db");
+        let store = KeyStore::new(Some(path.clone()));
+        let created = store.create("cannot-delete".into()).unwrap();
+        assert!(store.authorize(&created.plaintext), "前提：这把 key 可用");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER dbg_reject_delete BEFORE DELETE ON api_keys
+                 BEGIN SELECT RAISE(ABORT, 'debug: persist refused'); END;",
+            )
+            .unwrap();
+        }
+
+        assert!(
+            store.delete(&created.record.id).is_err(),
+            "吊销没能落库必须让调用方知道（admin 要回 500）"
+        );
+        assert!(
+            store.authorize(&created.plaintext),
+            "吊销没能落库时 key 必须仍然可用——否则操作员看到 204、重启后它又活了"
+        );
+        let conn = Connection::open(&path).unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM api_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "库里那一行也还在");
     }
 }
 
@@ -1282,7 +1144,7 @@ mod verified_tests {
         let _cheap = CheapArgon2::install();
         // 这是把内存峰值从 `并发数 × 19MiB` 压到 `1 × 19MiB` 的核心契约
         let store = KeyStore::new(None);
-        let key = store.create("one".into());
+        let key = store.create("one".into()).unwrap();
         let (calls, results) = hammer(&store, &key.plaintext, 8);
         assert_eq!(calls, 1, "同一个 token 的 8 个并发请求只应跑 1 次 argon2");
         assert!(results.iter().all(|ok| *ok), "所有并发请求都应当通过");
@@ -1293,7 +1155,7 @@ mod verified_tests {
     fn warm_token_never_hashes_again() {
         let _cheap = CheapArgon2::install();
         let store = KeyStore::new(None);
-        let key = store.create("warm".into());
+        let key = store.create("warm".into()).unwrap();
         assert!(store.authorize(&key.plaintext)); // 首次：算一次（create 那次不算）
         let before = store.argon2_runs();
         for _ in 0..50 {
@@ -1310,7 +1172,7 @@ mod verified_tests {
         let _cheap = CheapArgon2::install();
         // cache_max = 0 → 每个请求都完整校验（与改造前语义一致）
         let key = KeyStore::with_verified(None, 0, DEFAULT_VERIFIED_TTL);
-        let token = key.create("nocache".into()).plaintext;
+        let token = key.create("nocache".into()).unwrap().plaintext;
         let before = key.argon2_runs();
         for _ in 0..3 {
             assert!(key.authorize(&token));
@@ -1319,7 +1181,7 @@ mod verified_tests {
 
         // 对照：开启缓存时，首个请求填缓存（1 次 argon2），之后不再跑
         let warm = KeyStore::new(None);
-        let token2 = warm.create("cached".into()).plaintext;
+        let token2 = warm.create("cached".into()).unwrap().plaintext;
         assert!(warm.authorize(&token2)); // 预热：这一次是缓存未命中
         let before2 = warm.argon2_runs();
         for _ in 0..3 {
@@ -1331,16 +1193,43 @@ mod verified_tests {
         assert_eq!(on, 0, "开启缓存且已预热后不应再跑 argon2，实际 {on}");
     }
 
+    /// 规格：**关闭缓存时，每一次校验都要计入"真跑了 argon2"**（评估 §6 的指标口径）。
+    ///
+    /// `hlmg_key_verify_misses_total` 的 HELP 写的是 "Key verifications that ran argon2"，
+    /// 而它的自增点原先在 `put`——缓存关闭时走的是"每请求完整校验"那一支，**根本不经过 `put`**。
+    /// 于是这个计数器在 `verified_cache_max: 0` 下恒为 0：每请求都在跑 19MiB argon2，
+    /// 而运维在唯一会持续烧 argon2 的配置里看不到任何负载。
+    ///
+    /// （注意：错 token 走不到这里——`sha256` 不同 ⇒ runtime 查不到 ⇒ **按设计不跑 argon2**，
+    /// 既有单测 `authorize_rejects_unknown_lookup_without_argon2` 钉着这一点，所以那种负载
+    /// 本来就不该被算成 argon2 次数。）
+    #[test]
+    #[serial]
+    fn counter_counts_argon2_runs_when_the_cache_is_disabled() {
+        let _cheap = CheapArgon2::install();
+        let store = KeyStore::with_verified(None, 0, DEFAULT_VERIFIED_TTL);
+        let token = store.create("nocache-metric".into()).unwrap().plaintext;
+        for _ in 0..3 {
+            assert!(store.authorize(&token));
+        }
+        let (hits, misses) = store.verified_counters();
+        assert_eq!(hits, 0, "缓存关闭时不可能命中");
+        assert_eq!(
+            misses, 3,
+            "3 次校验 = 3 次 argon2，必须都计入（修好前这里是 0）"
+        );
+    }
+
     #[test]
     #[serial]
     fn revoke_takes_effect_immediately() {
         let _cheap = CheapArgon2::install();
         // 缓存**不得**延长吊销窗口：delete 后必须立刻 401
         let store = KeyStore::new(None);
-        let key = store.create("revoke".into());
+        let key = store.create("revoke".into()).unwrap();
         assert!(store.authorize(&key.plaintext));
         assert!(store.authorize(&key.plaintext)); // 已进缓存
-        assert!(store.delete(&key.record.id));
+        assert!(store.delete(&key.record.id).unwrap());
         assert!(
             !store.authorize(&key.plaintext),
             "吊销后必须立即失效（不允许缓存放行）"
@@ -1357,7 +1246,7 @@ mod verified_tests {
         let _cheap = CheapArgon2::install();
         // 模拟"改 key 但不 bump 版本"以外的正确路径：bump 之后旧缓存条目必须失效
         let store = KeyStore::new(None);
-        let key = store.create("bump".into());
+        let key = store.create("bump".into()).unwrap();
         assert!(store.authorize(&key.plaintext));
         let before = store.argon2_runs();
         assert!(store.authorize(&key.plaintext));
@@ -1387,7 +1276,7 @@ mod verified_tests {
         let _cheap = CheapArgon2::install();
         // TTL 到期后重算（不改变"吊销即时"这条，只影响多久重付一次 argon2 的钱）
         let store = KeyStore::with_verified(None, DEFAULT_VERIFIED_MAX, Duration::from_millis(50));
-        let key = store.create("ttl".into());
+        let key = store.create("ttl".into()).unwrap();
         assert!(store.authorize(&key.plaintext));
         std::thread::sleep(Duration::from_millis(80));
         let before = store.argon2_runs();
@@ -1402,7 +1291,7 @@ mod verified_tests {
         let store = KeyStore::with_verified(None, 2, DEFAULT_VERIFIED_TTL);
         let mut tokens = Vec::new();
         for i in 0..5 {
-            let k = store.create(format!("k{i}"));
+            let k = store.create(format!("k{i}")).unwrap();
             assert!(store.authorize(&k.plaintext));
             tokens.push(k.plaintext);
         }
@@ -1430,7 +1319,7 @@ mod verified_tests {
         let _cheap = CheapArgon2::install();
         // 命中路径不得绕过校验：拿别人的 token 永远进不去
         let store = KeyStore::new(None);
-        let good = store.create("good".into());
+        let good = store.create("good".into()).unwrap();
         assert!(store.authorize(&good.plaintext));
         assert!(!store.authorize("sk-deadbeef"));
         assert!(!store.authorize(&format!("{}x", good.plaintext)));

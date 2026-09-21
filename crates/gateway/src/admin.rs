@@ -108,7 +108,14 @@ pub async fn create_key(
     // argon2 哈希 + SQLite 写穿较重，移到阻塞线程池，避免卡 async worker
     let store = state.key_store.clone();
     let created = match tokio::task::spawn_blocking(move || store.create(name)).await {
-        Ok(c) => c,
+        Ok(Ok(c)) => c,
+        // 落库失败：**什么都没创建**（key 也没发出去），必须让运维看到失败而不是 201。
+        Ok(Err(e)) => {
+            return crate::openai::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("key creation failed; no key was created: {e}"),
+            );
+        }
         Err(e) => {
             return crate::openai::error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -142,7 +149,15 @@ pub async fn create_key(
 pub async fn delete_key(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     let store = state.key_store.clone();
     let removed = match tokio::task::spawn_blocking(move || store.delete(&id)).await {
-        Ok(r) => r,
+        Ok(Ok(r)) => r,
+        // 落库失败：**吊销没有生效**，那把 key 仍然可用——文案要说清这一点，
+        // 否则运维看到 500 会以为"至少内存里删掉了"（评估 §5 H2 / 记录 P1-4）。
+        Ok(Err(e)) => {
+            return crate::openai::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("key deletion failed; the key is still valid: {e}"),
+            );
+        }
         Err(e) => {
             return crate::openai::error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
