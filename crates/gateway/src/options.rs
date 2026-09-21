@@ -97,6 +97,12 @@ pub struct Options {
     ///
     /// 与 `TimeoutStopSec` 的关系：后者必须 **大于** 本值，否则宽限期没走完就被 SIGKILL。
     pub shutdown_flush_timeout: Duration,
+    /// 关闭时等待**在途请求**收尾的最长时间：超时就切断。
+    ///
+    /// 顺序是"先停 accept（不再接新请求）→ 等在途归零或到本时限 → 有界落库 → abort 任务"。
+    /// 取值权衡：太短则长回答被硬切（客户端看到 SSE 截断），太长则 `systemctl restart`
+    /// 迟迟不返回。它与 [`Options::shutdown_flush_timeout`] 之和必须落在 `TimeoutStopSec` 之内。
+    pub shutdown_grace: Duration,
 }
 
 impl Options {
@@ -114,6 +120,8 @@ impl Options {
     pub const DEFAULT_MAX_OPEN_TUNNEL_STREAMS: u32 = 1024;
     /// 关闭时强制落库的等待上限默认值。见 [`Options::shutdown_flush_timeout`]。
     pub const DEFAULT_SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(10);
+    /// 关闭排空的等待上限默认值。见 [`Options::shutdown_grace`]。
+    pub const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(15);
 
     /// 实际生效的 QUIC 双向流额度：`0` 归一到默认值。
     ///
@@ -148,6 +156,7 @@ impl Default for Options {
             max_concurrent_requests: 0,
             max_open_tunnel_streams: Self::DEFAULT_MAX_OPEN_TUNNEL_STREAMS,
             shutdown_flush_timeout: Self::DEFAULT_SHUTDOWN_FLUSH_TIMEOUT,
+            shutdown_grace: Self::DEFAULT_SHUTDOWN_GRACE,
         }
     }
 }

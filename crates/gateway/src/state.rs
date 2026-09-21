@@ -16,12 +16,27 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use tokio::sync::watch;
+
 use crate::metrics::Metrics;
 use crate::options::Options;
 use crate::ratelimit::RateLimiter;
 use crate::registry::Registry;
 use crate::storage::KeyStore;
 use crate::ui::{resolve_ui, IndexHtml};
+
+/// 关闭阶段。`Running` → `Draining` → `Terminating`，只向一个方向走。
+///
+/// `Gateway::shutdown` 通过 [`AppState::shutdown`] 这个 `watch` 通道广播它，两类消费者：
+/// - **accept 循环**（`http/entry.rs`）：`Draining` 起停止接受新连接，但在途请求继续跑；
+/// - **每条在途响应**（`proxy/forward.rs`）：`Terminating` 起带一个明确的"不完整"事件收尾，
+///   而不是被硬切。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ShutdownPhase {
+    Running,
+    Draining,
+    Terminating,
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -64,6 +79,9 @@ pub struct AppState {
     /// `ui_dir` 不可用的具体原因（None = 没配 ui_dir，或配了且可用）。
     /// 由启动时 [`resolve_ui`] 判定后写入，占位页会把它显示出来——否则用户只看到白屏/通用文案。
     pub ui_problem: Option<String>,
+    /// 关闭阶段的广播端。见 [`ShutdownPhase`]：`Gateway::shutdown` 发，accept 循环与
+    /// 在途响应任务收（各自 `subscribe()` 一个接收端）。
+    pub shutdown: watch::Sender<ShutdownPhase>,
 }
 
 impl AppState {
@@ -97,6 +115,11 @@ impl AppState {
             ui,
             ui_index,
             ui_problem,
+            // 关闭通道由 `AppState` 自己建：接收端各自 `subscribe()`，所以起始的接收端丢弃即可。
+            shutdown: {
+                let (tx, _rx) = watch::channel(ShutdownPhase::Running);
+                tx
+            },
         }
     }
 }

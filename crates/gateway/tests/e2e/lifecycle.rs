@@ -84,3 +84,117 @@ async fn e2e_is_serving_reports_a_running_gateway() {
     assert!(gw.is_serving(), "刚启动、三个主任务都在跑时应为 true");
     gw.shutdown().await;
 }
+
+/// 规格：**关闭先排空在途请求，再 abort**（片 A：停 accept → 排空 → abort）。
+///
+/// 判据故意**不看"请求最终成功没有"**（那取决于 QUIC 端点 drop 的语义），而是看
+/// `shutdown()` 返回时在途请求是否已经结束：修好前 `shutdown` 立刻 abort，1.5s 的慢请求
+/// 还在飞；修好后会等 `hlmg_active_requests` 归零（或到宽限期）才返回。
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn e2e_shutdown_drains_in_flight_requests_before_returning() {
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    let (gw, agent, base, key) = start_stack(4, |_| {}).await;
+    let client = reqwest::Client::new();
+    // 在途请求必须**读完响应体**：准入票据绑在 body 上，不消费 body 就永远算"在途"。
+    let inflight = tokio::spawn({
+        let client = client.clone();
+        let url = format!("{base}/v1/slow?ms=1500");
+        let auth = format!("Bearer {key}");
+        async move {
+            let resp = client
+                .post(url)
+                .header("Authorization", auth)
+                .json(&serde_json::json!({ "model": "mock-llm" }))
+                .send()
+                .await
+                .unwrap();
+            let status = resp.status();
+            let _ = resp.text().await;
+            status
+        }
+    });
+
+    // 等它真的进入在途（否则"排空"可能只是还没有请求）
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while metric_gauge(&base, "hlmg_active_requests").await == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "慢请求没有进入在途，测试前提不成立"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    gw.shutdown().await;
+
+    assert!(
+        inflight.is_finished(),
+        "shutdown 返回时在途请求必须已经结束（排空），而不是被硬切"
+    );
+    assert_eq!(
+        inflight.await.unwrap(),
+        reqwest::StatusCode::OK,
+        "在途请求应当自然结束"
+    );
+
+    agent.shutdown().await;
+}
+
+/// 规格：**关闭时给在途 SSE 一个可识别的"不完整"事件，并干净结束**（片 B）。
+///
+/// 用 `/v1/slow_body`：响应头立刻 200（`text/event-stream`），正文停 3s。
+/// 宽限期压到 300ms，于是关闭时这条流必然还在途 → 网关应主动收尾。
+///
+/// 判据必须同时排除两种"假绿"：
+/// - 连接被 reset/隧道断 → `resp.text()` 会**报错**，不是干净的流结束；
+/// - 用 `data: [DONE]` 收尾 → 那是**谎报正常完成**（客户端会把残缺结果当完整结果记账）。
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn e2e_shutdown_announces_incomplete_sse_instead_of_cutting() {
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    let (gw, agent, base, key) = start_stack(4, |o| {
+        o.shutdown_grace = Duration::from_millis(300);
+        o.client_stall = Duration::from_secs(5);
+        o.request_timeout = Duration::from_secs(30);
+    })
+    .await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{base}/v1/slow_body"))
+        .header("Authorization", format!("Bearer {key}"))
+        .json(&serde_json::json!({ "model": "mock-llm" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "SSE 响应头应当先到");
+
+    // 等它真的进入在途
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while metric_gauge(&base, "hlmg_active_requests").await == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "SSE 请求没有进入在途，测试前提不成立"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // 关闭网关（后台），同时把流读完
+    let shutdown = tokio::spawn(async move { gw.shutdown().await });
+    let text = match tokio::time::timeout(Duration::from_secs(10), resp.text()).await {
+        Ok(Ok(t)) => t,
+        Ok(Err(e)) => panic!("客户端读到的是连接错误而不是干净的流结束：{e}"),
+        Err(_) => panic!("响应体既没有结束也没有报错（挂住了）"),
+    };
+
+    assert!(
+        text.contains("gateway is shutting down"),
+        "在途 SSE 应当收到明确的'服务端关闭、本响应不完整'事件，实际：{text:?}"
+    );
+    assert!(
+        !text.contains("[DONE]"),
+        "不得用 `[DONE]` 收尾——那会谎报'模型答完了'：{text:?}"
+    );
+
+    shutdown.await.unwrap();
+    agent.shutdown().await;
+}

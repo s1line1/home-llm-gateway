@@ -48,9 +48,10 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let gw = Gateway::start(cfg).await?;
     tracing::info!(http = %gw.http_addr, quic = %gw.quic_addr, "Gateway ready");
     shutdown_signal().await;
-    tracing::info!("shutting down gateway (no drain; usage flushed first)");
-    // 用量落库已并进 shutdown：先强制写一次（否则最后一个 flush 周期内的用量会随进程
-    // 一起消失），再 abort 任务。以前这里要记得先调 flush_usage_on_shutdown —— 现在忘不了。
+    tracing::info!("shutting down gateway (draining in-flight requests, then flushing usage)");
+    // `shutdown` 现在是四阶段：停 accept（在途继续）→ 排空（或在途带明确事件收尾）→
+    // 有界强制落库 → abort。落库**排在最后**，所以排空期间结算的用量也在里面；以前这里要记得
+    // 先调 flush_usage_on_shutdown —— 现在忘不了。
     gw.shutdown().await;
     Ok(())
 }

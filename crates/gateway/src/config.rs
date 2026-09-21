@@ -110,6 +110,9 @@ pub struct ConfigFile {
     /// 关闭时强制用量落库的等待上限（秒）。见 `Options::shutdown_flush_timeout`。
     #[serde(default = "default_shutdown_flush_secs")]
     shutdown_flush_secs: u64,
+    /// 关闭时等待在途请求收尾的上限（秒）。见 `Options::shutdown_grace`。
+    #[serde(default = "default_shutdown_grace_secs")]
+    shutdown_grace_secs: u64,
     /// 公网入口 HTTPS 证书 PEM（提供后启用 TLS，与 tls_key 成对）
     #[serde(default)]
     tls_cert: Option<PathBuf>,
@@ -165,6 +168,10 @@ fn default_client_stall_secs() -> u64 {
 /// 关闭落库等待上限默认值（秒）。见 `Options::shutdown_flush_timeout`。
 fn default_shutdown_flush_secs() -> u64 {
     Options::DEFAULT_SHUTDOWN_FLUSH_TIMEOUT.as_secs()
+}
+/// 关闭排空等待上限默认值（秒）。见 `Options::shutdown_grace`。
+fn default_shutdown_grace_secs() -> u64 {
+    Options::DEFAULT_SHUTDOWN_GRACE.as_secs()
 }
 /// 每连接隧道流额度默认值。
 ///
@@ -231,6 +238,7 @@ pub fn from_file(cfg: ConfigFile) -> anyhow::Result<GatewayConfig> {
             agent_stale_after: Duration::from_secs(cfg.agent_stale_secs),
             client_stall: Duration::from_secs(cfg.client_stall_secs),
             shutdown_flush_timeout: Duration::from_secs(cfg.shutdown_flush_secs),
+            shutdown_grace: Duration::from_secs(cfg.shutdown_grace_secs),
             rate_limit_per_min: cfg.rate_limit_per_min,
             max_concurrent_requests: cfg.max_concurrent_requests,
             // 原样带过去：`0 → 默认值`的归一只有一处，在 `Options::stream_ceiling()`。
@@ -408,6 +416,7 @@ rate_limit_per_min: 60
             "max_open_tunnel_streams",
             "client_stall_secs",
             "shutdown_flush_secs",
+            "shutdown_grace_secs",
         ] {
             assert!(
                 text.contains(key),
@@ -422,6 +431,7 @@ rate_limit_per_min: 60
         );
         assert_eq!(cfg.client_stall_secs, default_client_stall_secs());
         assert_eq!(cfg.shutdown_flush_secs, default_shutdown_flush_secs());
+        assert_eq!(cfg.shutdown_grace_secs, default_shutdown_grace_secs());
     }
 
     /// 规格：**流额度不能是 0**。
@@ -530,6 +540,7 @@ rate_limit_per_min: 60
             opts.shutdown_flush_timeout, d.shutdown_flush_timeout,
             "shutdown_flush_secs"
         );
+        assert_eq!(opts.shutdown_grace, d.shutdown_grace, "shutdown_grace_secs");
         assert_eq!(opts.verified_cache_max, d.verified_cache_max);
         assert_eq!(opts.rate_limit_per_min, d.rate_limit_per_min);
         assert_eq!(opts.max_concurrent_requests, d.max_concurrent_requests);
