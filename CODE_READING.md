@@ -134,7 +134,7 @@ web/src/components/   ← 布局/图表/UI（无依赖 SVG 图表）
 2. **读完 registry** → `cargo test -p gateway --lib registry` 看并发占位测试
 3. **读完 keystore** → Admin API 创建/吊销 key，`sqlite3 keys.db` 确认只存 argon2 哈希
 4. **压测一次** → `make bench-k6 KEY=sk-xxx`（或 oha），观察 admission control 的 429
-5. **读完关闭流程** → 起 gateway，`kill -TERM`，看 `received SIGTERM` → `shutting down gateway (no drain; usage flushed first)` 日志
+5. **读完关闭流程** → 起 gateway，`kill -TERM`，看 `received SIGTERM` → `shutting down gateway (draining in-flight requests, then flushing usage)` → `usage flushed before shutdown keys=N` 日志
 
 ---
 

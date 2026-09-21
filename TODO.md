@@ -180,10 +180,11 @@
         `README.md` 已在本次审查中补上"每台机器 `agent_id` 必须唯一"的警告与排障行。
       注：网关侧"踢旧连接"的机制本身是对的（同机重连接管），无需改动——现在的问题只是它
       会被配置撞车误触发。
-- [x] **进程级优雅关闭（部分）**：gateway/agent 注册 SIGTERM/SIGINT（`tokio::signal`），收到后打 INFO 日志
-      → 调用 `Gateway::shutdown()` / `Agent::shutdown()` 退出；
+- [x] **进程级优雅关闭（网关侧已补齐 drain）**：gateway/agent 注册 SIGTERM/SIGINT（`tokio::signal`），
+      收到后打 INFO 日志 → 调用 `Gateway::shutdown()` / `Agent::shutdown()` 退出；
       覆盖 systemd stop、Ctrl+C、harness job_kill 场景（对应 OPTIMIZATION.md A1 ✅）。
-      **网关侧只保证"已结算用量不丢"，没有 drain**：在途 SSE 会被立即 abort（硬切），见下方 R12 drain 式关闭。
+      网关侧现在是**两阶段有界关闭**（先停 accept 并排空，宽限期后才带明确事件切断），见下方
+      R12 drain 式关闭；**agent 侧仍是立即 abort（无排空）**。
 - [ ] **多 CA 信任根 + 动态增删（每 agent 独立 CA，gateway 不停机）**：
       目标：每个 agent 用独立 CA 签发证书，gateway 维护全部 CA 的信任根集合；
       运行时热添加/移除单个 CA——移除即吊销该 CA 下所有 agent（新连接被拒，
@@ -541,9 +542,9 @@
       `INSERT ... ON CONFLICT`，实测把 2 vCPU 的上限摁在约 190 QPS（云端 515 个线程里 514 个
       卡在 futex 等同一把 `db` 锁）。现改为：热路径只做内存累加 → 后台每 1s 一个事务批量写
       **绝对累计值**（幂等、重启不重复累加）→ **SIGTERM/SIGINT 时强制再落库一次**，日志
-      `usage flushed before shutdown keys=N`，正常关闭不丢**已结算**数据（flush 之后、abort 之前在途
-      请求结算的用量不在其列，见 R12 drain 式关闭；SIGKILL/断电仍会丢最后一个
-      flush 周期 ≤1s 的用量）。顺带开 `journal_mode=WAL` + `synchronous=NORMAL`。
+      `usage flushed before shutdown keys=N`。关闭时先排空/收尾、**最后**才强制落库，所以排空与收尾
+      期间结算的用量也在里面；仍可能丢的只有"强制落库之后、进程退出之前"那一瞬（SIGKILL/断电则丢
+      最后一个 flush 周期 ≤1s 的用量）。顺带开 `journal_mode=WAL` + `synchronous=NORMAL`。
       可信口径（只数 `status="200"`，同时记录 200 占比）下的对比在云端做：每请求 CPU 从
       0.55–0.9ms（改造前，2.1 核 ÷ 190 QPS）降到 **0.30ms**（改造后，0.149 核 ÷ 496 QPS），
       同一台 2 vCPU 的吞吐 ≈190 → **≈496**。⚠️ 当时那组本机 `oha` 对照的绝对 QPS
@@ -587,13 +588,19 @@
       探针答不出"隧道入口还活着吗 / 还有几个 agent 注册 / 持久化可写吗"。
       （闸门豁免这一半已修：`/healthz` 用 `limit = 0` 绕过准入，单测
       `observability::tests::healthz_is_exempt_from_the_admission_gate` 锁住。）
-- [ ] **R12 drain 式关闭**：`Gateway::shutdown`（`crates/gateway/src/gateway.rs:324`）目前只是
-      `abort()` 掉三个任务（HTTP 入口〔TLS 与明文共用一个任务〕、QUIC accept、用量 flusher），**没有排空**——
-      `systemctl restart`（SIGTERM）会把在途 SSE 流切断，客户端看到的是"流被截断"而非正常结束；
-      agent 的隧道连接随进程消失、靠自身退避（≤30s）重连。做法：先停 accept → 宽限期 →
-      到期前给在途流一个明确的结束/错误事件 → 再 abort。配套 `TimeoutStopSec`
-      （`deploy/gateway.service` 未设 = systemd 默认 90s）必须 > 宽限期，且 `shutdown` 里的
-      `KeyStore::flush_usage_blocking()` 是阻塞式 SQLite 写、无超时，卡住就只能等那 90s 后的 SIGKILL。
+- [x] **R12 drain 式关闭（已实施）**：`Gateway::shutdown`（`crates/gateway/src/gateway.rs`）
+      现在是**有界四阶段关闭**：
+      ① **停 accept**：广播 `ShutdownPhase::Draining`，公网入口的 accept 循环返回并 drop
+         `TcpListener`（新连接被拒），**在途请求继续正常跑**；
+      ② **排空**：等 `hlmg_active_requests` 归零或到 `shutdown_grace_secs`（默认 15s）；
+      ③ **收尾**：到期仍有在途 → 广播 `Terminating`，在途 **SSE** 收到一个明确的
+         `event: error`「response is incomplete」事件后**干净结束**（刻意不用 `data: [DONE]`：
+         那是"正常完成"标记，用它等于谎报），同时向上游发 Cancel 并结算已转发用量；
+         **非 SSE 没有合法的"追加事件"语义**，只能诚实截断。随后给 1s 收尾窗口；
+      ④ **有界落库**（`shutdown_flush_secs`，默认 10s，跑在阻塞池上）→ **abort** 三个任务。
+      配套：`deploy/gateway.service` 未设 `TimeoutStopSec`（systemd 默认 90s），必须**大于**
+      `shutdown_grace_secs + shutdown_flush_secs + 1s 收尾窗口`。验收见
+      `crates/gateway/tests/e2e/lifecycle.rs`（排空、在途 SSE 事件两条）。
       注：`registry.rs::close_when_drained` 是"摘除单个 agent"用的，不是进程退出路径。
 
 **已修、不要再照 §6 做一遍的**：R7 票据绑响应 body（钉点时即正确）、R10 的
