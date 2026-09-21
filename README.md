@@ -683,7 +683,7 @@ agent 侧心跳超时→主动断开→重连握手超时（**已修**，见下�
 - **热路径只做内存累加**（`UsageCollector::finish` → `KeyStore::accumulate_usage`），纳秒级、无 IO；
 - **后台任务按周期（1s）批量落库**（`usage_flush::spawn` → `KeyStore::flush_usage_once`），一个事务里把有变化的 key 各写一行；
 - **写的是绝对累计值而不是增量**：库里始终收敛到内存的真相，天然幂等、重启不会重复累加，也不存在"增量被取走但落库失败 ⇒ 永久少一段"的窗口；
-- **关闭前强制落库**：`main` 收到 SIGTERM/SIGINT 后先 `Gateway::flush_usage_on_shutdown()`（阻塞写一次）再停服务，日志会打 `usage flushed before shutdown keys=N`；
+- **关闭前强制落库**：`main` 收到 SIGTERM/SIGINT 后调用 `Gateway::shutdown()`——它**先**把用量强制落库一次（阻塞写），**再** abort 所有任务；日志会打 `usage flushed before shutdown keys=N`；
 - 顺带开启 `journal_mode=WAL` + `synchronous=NORMAL`。
 
 **触发条件是"时间"，不是"攒够多少条"**（`usage_flush.rs`）：

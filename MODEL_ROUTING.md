@@ -64,7 +64,7 @@ Bearer 认证 + 限流）；`["*"]` 不贡献条目。✅
 |---|---|---|
 | 1 | `crates/gateway/src/registry.rs` | `try_acquire(stale_after, model)`；模型过滤候选；精确优先排序；`AcquireError::NoModel`；`healthy_models()` 聚合辅助 |
 | 2 | `crates/gateway/src/proxy/mod.rs` | `extract_model`；proxy 用 model 调 try_acquire；NoModel→404（认证限流已移到 `crates/gateway/src/auth.rs` 的 `authenticate`） |
-| 3 | `crates/gateway/src/http.rs` | `/v1/models` 静态路由（优先于 `/v1/{*rest}`）；`models_route` 聚合 + 认证限流 |
+| 3 | `crates/gateway/src/http/mod.rs` | `/v1/models` 静态路由（优先于 `/v1/{*rest}`）；`models_route` 聚合 + 认证限流 |
 | 4 | `crates/agent/src/config.rs` + `agent_config.example.yml` | `models` 字段语义注释更新（edge 能力声明、`*` 兜底） |
 | 5 | 测试 | 单测：模型匹配/精确优先/通配兜底/回落/无 model 400/healthy_models；e2e：双 edge 异构模型路由 + 聚合 + 通配兜底 + 400 |
 
@@ -73,7 +73,7 @@ Bearer 认证 + 限流）；`["*"]` 不贡献条目。✅
 ## 5. 实施分步（已完成）
 
 1. **阶段 1（路由核心）**：registry + proxy 改动 + 单测 ✅
-2. **阶段 2（/v1/models 聚合）**：http.rs 路由 + handler + 单测 ✅
+2. **阶段 2（/v1/models 聚合）**：http/mod.rs 路由 + handler + 单测 ✅
 3. **阶段 3（回归 + 文档）**：e2e 双 edge 异构场景 + README/DESIGN/TODO 更新 ✅
 
 ## 6. 明确本轮不做（防蔓延）

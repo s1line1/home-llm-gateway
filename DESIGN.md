@@ -247,7 +247,7 @@
 
 - key 校验改为"先哈希定位、再恒定时间比较"，避免全表遍历 ✅ 已实施（`sha256(token)` lookup 索引 + argon2 校验，见 `gateway/src/storage/`；恒定时间比较落在 admin token 上）
 - SQLite 写操作（create/revoke）挪到 `spawn_blocking`，不阻塞 async runtime ✅ 已实施（OPTIMIZATION.md C2；keystore argon2/落库走阻塞线程池）
-- QUIC 流上限调优：`max_concurrent_bidi_streams` 默认 100，高并发流场景上调 ✅ 已实施（网关侧调到 1000，见 `gateway/src/tls.rs`）
+- QUIC 流上限调优：s2n-quic 默认 100，高并发流场景上调 ✅ 已实施（网关侧 `max_open_tunnel_streams` 默认 **1024**，见 `gateway.rs` 的 `DEFAULT_MAX_OPEN_TUNNEL_STREAMS`，应用点在 `listen.rs`）
 - 慢上游排队：agent 满时先排队（带超时）而非直接 429
 - SSE 流式转发增加内存缓冲上限，防慢客户端拖垮
 
