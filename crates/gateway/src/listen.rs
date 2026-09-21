@@ -6,7 +6,7 @@
 
 use std::{net::SocketAddr, sync::Arc};
 
-use crate::{error::GatewayError, gateway::Options, nofile};
+use crate::{error::GatewayError, nofile, options::Options};
 
 /// 已绑好的两个入口。两个地址都是**真实**地址（配置 `:0` 时是内核分配的临时端口）。
 pub(crate) struct Sockets {

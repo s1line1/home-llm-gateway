@@ -11,7 +11,7 @@ use axum::{
     response::Response,
 };
 
-use crate::gateway::Options;
+use crate::options::Options;
 use crate::state::AppState;
 use crate::{metrics::Metrics, registry::Registry, storage::KeyStore};
 

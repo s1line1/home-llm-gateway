@@ -15,6 +15,7 @@ mod listen;
 pub mod metrics;
 pub mod nofile;
 pub mod openai;
+pub mod options;
 pub mod proxy;
 pub mod quic;
 pub mod ratelimit;
