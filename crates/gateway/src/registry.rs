@@ -44,7 +44,7 @@ pub struct Entry {
     pub conn: s2n_quic::connection::Handle,
     pub stable_id: usize,
     /// 注册时的 agent_id。`try_acquire` 只交出 `Entry`（HashMap 的 key 不在其中），
-    /// 而隧道写超时后需要按 stable_id 把这条坏连接摘掉（见 [`Registry::evict`]），
+    /// 而隧道写超时后需要按 stable_id 把这条坏连接摘掉（内部走 `Registry::evict`），
     /// 所以 id 必须随条目一起带出来。
     pub agent_id: String,
     pub models: Vec<String>,
@@ -79,9 +79,15 @@ pub struct Entry {
 }
 
 /// 一次隧道失败的原因。[`Registry::evict`] 按它**分别**计连续次数，互不充值对方的阈值。
+///
+/// **内部类型**：调用方不再自己判断该记哪一种，而是通过 [`Registry::report_open_timeout`]、
+/// [`Registry::report_open_failed`]、[`Registry::report_head_timeout`]、
+/// [`Registry::report_write_failed`] 四个入口上报"发生了什么"，由注册表决定原因与后果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EvictCause {
-    /// 开流超时，且未达到这条连接的承载上限 → 判定为死（见 [`Entry::open_timeout_is_fatal`]）。
+enum EvictCause {
+    /// 开流这条路失败：**超时且未达承载上限**（见 [`Entry::open_timeout_is_fatal`]），
+    /// 或**直接返回错误**（见 [`Registry::report_open_failed`]）。两者在注册表看来是同一件事
+    /// ——开不出流——所以共用这一条计数。
     OpenTimeout,
     /// 响应头静默超时 → 判定为死（见 [`Entry::head_timeout_is_fatal`]）。
     HeadTimeout,
@@ -102,7 +108,10 @@ fn epoch() -> std::time::Instant {
 }
 
 /// 自 `epoch` 起的毫秒数（用于 `last_head_ok` 这类无锁时间戳）。
-pub fn now_millis() -> u64 {
+///
+/// **内部函数**：对外只通过 [`Entry::last_head_ago`] 暴露"安静了多久"，进程相对时钟与
+/// `NEVER` 哨兵都不出注册表。
+fn now_millis() -> u64 {
     epoch().elapsed().as_millis() as u64
 }
 
@@ -145,6 +154,19 @@ impl Entry {
         now_millis().saturating_sub(last) > window.as_millis() as u64
     }
 
+    /// 距**最近一次真的收到响应头**过了多久；`None` = 从未收到过。
+    ///
+    /// 只给失败路径的日志用（"这条隧道到底安静了多久"）。把 `NEVER` 哨兵与进程相对时钟
+    /// 都挡在注册表里面——调用方原先要自己 `now_millis() - last_head_ok.load(..)`，
+    /// 那等于让每个调用方都知道哨兵的存在。
+    pub fn last_head_ago(&self) -> Option<Duration> {
+        let last = self.last_head_ok.load(Ordering::Relaxed);
+        if last == NEVER {
+            return None;
+        }
+        Some(Duration::from_millis(now_millis().saturating_sub(last)))
+    }
+
     pub fn open_timeout_is_fatal(&self, stream_ceiling: u32) -> bool {
         let ceiling = stream_ceiling.max(1);
         let effective = if self.max_concurrency == 0 {
@@ -154,6 +176,25 @@ impl Entry {
         };
         self.inflight.load(Ordering::Relaxed) < effective
     }
+}
+
+/// 一次隧道失败的**处置**：注册表判定，调用方只负责渲染。
+///
+/// 为什么是一个类型而不是 `bool`：三个调用点问的是同一个问题的三种问法——"还有额度吗"
+/// （开流超时）、"最近还干活吗"（响应头超时）、"是不是直接失败了"（写帧）。判据只该存在
+/// 一处，而**后果**（记哪条 strike、要不要摘除、要不要关连接）也只该由那一处决定。
+/// 以前两个调用方各自把 `open_timeout_is_fatal` / `head_timeout_is_fatal` 与
+/// `matches!(failure, TimedOut)` 拼成 `busy` 布尔量，再各自决定记哪个指标、回什么状态码——
+/// "什么算忙、什么算死"这条策略因此散在两个模块里。
+///
+/// **调用方拿它做什么**：只映射成对外的文案与指标标签（`busy`/`dead`、`slow`/`silent`、
+/// `backpressure`/`broken`）以及状态码。那些是外部契约，留在原处。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Disposition {
+    /// 只是一时受阻（忙 / 慢 / 背压）：**不计 strike、不摘除**，调用方按容量或超时回应。
+    Transient,
+    /// 判定为**死**：已计一次 strike（连续达到阈值时，条目已被移出路由并安排关闭）。
+    Fatal,
 }
 
 impl Registry {
@@ -224,7 +265,8 @@ impl Registry {
     /// 第一次超时就把条目摘掉，而连接其实完好、agent 也毫不知情，于是每 5s 心跳继续
     /// 刷新 `last_seen`、注册表里却没有它，所有请求 `503 registry-empty`（占比 92.6%）。
     ///
-    /// 阈值对**每一种原因**各自适用（见 [`EvictCause`]）。
+    /// 阈值对**每一种原因**各自适用（内部按 `EvictCause` 分开记；对外的入口是
+    /// [`Registry::report_open_timeout`] 等四个方法）。
     pub const TUNNEL_TIMEOUTS_BEFORE_EVICT: u32 = 3;
 
     /// 一次**成功收到响应头**：清掉全部连续失败计数，并记下"这条隧道最近真的在干活"。
@@ -244,7 +286,63 @@ impl Registry {
         }
     }
 
+    /// 上报一次「**开流超时**」，由注册表判定是**忙**还是**死**。
+    ///
+    /// 判据在 [`Entry::open_timeout_is_fatal`]：在途已达这条连接的承载上限 → 只是排队等额度
+    /// （[`Disposition::Transient`]，**不记账**）；没到上限却开不出流 → 死。
+    /// 返回 [`Disposition::Fatal`] 时**已经**记过一次 strike，连续到阈值时条目也已被摘除；
+    /// 调用方只需把它映射成文案、指标标签与状态码。
+    pub fn report_open_timeout(
+        &self,
+        entry: &Entry,
+        stream_ceiling: u32,
+        close_grace: Duration,
+    ) -> Disposition {
+        if entry.open_timeout_is_fatal(stream_ceiling) {
+            self.evict(entry.stable_id, EvictCause::OpenTimeout, close_grace);
+            Disposition::Fatal
+        } else {
+            Disposition::Transient
+        }
+    }
+
+    /// 上报一次「**开流直接失败**」（不是超时）。没有"忙"这种可能，直接记账。
+    pub fn report_open_failed(&self, entry: &Entry, close_grace: Duration) {
+        self.evict(entry.stable_id, EvictCause::OpenTimeout, close_grace);
+    }
+
+    /// 上报一次「**响应头超时**」，由注册表判定是**慢**还是**死**。
+    ///
+    /// 判据在 [`Entry::head_timeout_is_fatal`]：`alive_window` 内有过成功响应头 → 只是被链路
+    /// 或上游堵住（[`Disposition::Transient`]，只回 504、**不计 strike**）；一次都没有 → 死。
+    /// 窗口由 `AppState::head_alive_window`（`head_timeout × 4`）派生。
+    pub fn report_head_timeout(
+        &self,
+        entry: &Entry,
+        alive_window: Duration,
+        close_grace: Duration,
+    ) -> Disposition {
+        if entry.head_timeout_is_fatal(alive_window) {
+            self.evict(entry.stable_id, EvictCause::HeadTimeout, close_grace);
+            Disposition::Fatal
+        } else {
+            Disposition::Transient
+        }
+    }
+
+    /// 上报一次「**写请求帧直接失败**」（不是超时）。同样没有判据，直接记账。
+    ///
+    /// 写**超时**不走这里——那是连接级背压（同一条连接上的流共享发送缓冲/UDP socket），
+    /// 见 `WriteFailure::is_tunnel_broken`。
+    pub fn report_write_failed(&self, entry: &Entry, close_grace: Duration) {
+        self.evict(entry.stable_id, EvictCause::TunnelWriteFailed, close_grace);
+    }
+
     /// 记录一次隧道失败，并在**同一原因连续**达到阈值时摘除条目。
+    ///
+    /// **内部实现**：调用方走 [`Self::report_open_timeout`] / [`Self::report_head_timeout`] /
+    /// [`Self::report_broken_tunnel`]——那三个方法才是"判定 + 记账 + 摘除"的对外入口，
+    /// 本方法只负责"给定原因就记一笔"这一层。
     ///
     /// `cause` 决定计哪一条连续计数（见 [`EvictCause`]）：不同原因的阈值互不充值——
     /// 否则三种不同的轻微失败会凑满一个阈值，把健康连接摘掉。
@@ -258,12 +356,7 @@ impl Registry {
     /// `window` 一样采取**每调用注入**——注册表自己不存配置。
     ///
     /// 返回是否真的摘掉了（false = 计数未达阈值，或条目已被别人摘掉/替换）。
-    pub fn evict(
-        &self,
-        stable_id: usize,
-        cause: EvictCause,
-        close_grace: Duration,
-    ) -> EvictOutcome {
+    fn evict(&self, stable_id: usize, cause: EvictCause, close_grace: Duration) -> EvictOutcome {
         let mut inner = self.inner.write().unwrap();
         let hit = inner
             .iter()
@@ -485,10 +578,13 @@ impl Registry {
     }
 }
 
-/// 摘除后的收尾方式。存在的意义有二：让调用方/测试能区分"立刻关闭"与"等在途收尾"，
+/// 摘除后的收尾方式。存在的意义有二：让**注册表内部与测试**能区分"立刻关闭"与"等在途收尾"，
 /// 以及把"为什么不能立刻关"这件事写进类型里（见 [`Registry::evict`]）。
+///
+/// **内部类型**：对外只暴露 [`Disposition`]（"忙还是死"）。调用方今天没有任何一处需要知道
+/// "这次是延迟关闭还是立刻关闭"——把它摆到公共接口上只会是没人消费的宽度。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EvictOutcome {
+enum EvictOutcome {
     /// 连续超时未达阈值：条目保留，只累计计数。
     BelowThreshold { consecutive: u32 },
     /// 已摘除且连接已立即关闭（没有别的在途请求会被牵连）。

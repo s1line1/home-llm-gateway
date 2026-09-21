@@ -143,13 +143,16 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
             //       重连期间注册表为空 → **全量 503**（一次压测 1 026 次 head timeout、
             //       `registry-empty` +3 753）。局部超载不该变成全站不可用。
             //   死：窗口内一次都没回过 → 没有任何"只是慢"的理由，走原来的连续 3 次摘除。
-            let fatal = entry.head_timeout_is_fatal(state.head_alive_window);
-            let last_head_ago_secs = (crate::registry::now_millis().saturating_sub(
-                entry
-                    .last_head_ok
-                    .load(std::sync::atomic::Ordering::Relaxed),
-            )) / 1000;
-            if fatal {
+            //
+            // 这条判据由注册表给出（判定与记账、摘除在同一处），本模块只把它映射成
+            // 指标标签与日志文案——那些是外部契约，留在原处。
+            let disposition = state.registry.report_head_timeout(
+                &entry,
+                state.head_alive_window,
+                state.evict_close_grace,
+            );
+            let last_head_ago_secs = entry.last_head_ago().map_or(0, |d| d.as_secs());
+            if matches!(disposition, crate::registry::Disposition::Fatal) {
                 state.metrics.record_head_timeout("silent");
                 warn!(
                     request_id,
@@ -157,11 +160,6 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
                     last_head_ago_secs,
                     window_secs = state.head_alive_window.as_secs(),
                     "upstream head timeout and the agent has been silent; evicting agent"
-                );
-                state.registry.evict(
-                    entry.stable_id,
-                    crate::registry::EvictCause::HeadTimeout,
-                    state.evict_close_grace,
                 );
             } else {
                 state.metrics.record_head_timeout("slow");

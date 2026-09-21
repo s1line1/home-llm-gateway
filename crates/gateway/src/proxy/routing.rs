@@ -12,15 +12,20 @@
 //! - **"忙"不写进 `last_failure`**：否则最后挑不出候选时，客户端拿到的是误导性的
 //!   502"隧道坏了"，而真实原因是容量不足（429）。
 //!
-//! 状态码与文案在**判定处就地决定**（只有那里知道是忙是死、注册表处于什么状态），
-//! 调用方只负责把 [`RouteFailure`] 渲染成响应。
+//! 分工（2026-09 起）：**"忙还是死"的判定在注册表**（`Registry::report_open_timeout` /
+//! `report_head_timeout` 返回 [`Disposition`]，判定与记账、摘除在同一处），本模块只负责
+//! **渲染**——状态码、文案，以及"换一条重试"这个本模块自己的决定。上面的两条实测事故写在
+//! 注册表的判据文档里（`Entry::open_timeout_is_fatal`），因为它们描述的是那条策略的由来。
+//!
+//! 状态码与文案留在本模块就地决定：只有这里知道这次请求是第几次尝试、还有没有别的候选
+//! （同样的 502 在"还能重试"和"没得试了"两种处境下含义不同）。
 
 use axum::http::StatusCode;
 use proto::Frame;
 use s2n_quic::stream::{ReceiveStream, SendStream};
 use tracing::warn;
 
-use crate::registry::{AcquireError, Entry, EvictCause, SlotGuard};
+use crate::registry::{AcquireError, Disposition, Entry, SlotGuard};
 use crate::state::AppState;
 
 use super::tunnel::{open_tunnel, tunnel_write, OpenFailure};
@@ -125,9 +130,23 @@ pub(super) async fn open_and_send(
                 //       30s 压测 +6835 次 registry-empty，根因就在这里。
                 //   死：并没到承载上限却开不出流 → 没有任何排队理由，这才是坏连接。
                 //
-                // 所以只有"死"才摘除；"忙"只记指标 + 换下一条连接（重试逻辑与下面共用）。
-                let busy = matches!(failure, OpenFailure::TimedOut)
-                    && !entry.open_timeout_is_fatal(state.max_open_tunnel_streams);
+                // 这条判据（忙/死）由注册表给出，本模块只把结果映射成**对外契约**：
+                // 指标标签、状态码、文案、以及要不要换连接重试。
+                let disposition = match &failure {
+                    OpenFailure::TimedOut => state.registry.report_open_timeout(
+                        &entry,
+                        state.max_open_tunnel_streams,
+                        state.evict_close_grace,
+                    ),
+                    // 直接失败：连接确实不能用了，没有"忙"这一说。
+                    OpenFailure::Failed(_) => {
+                        state
+                            .registry
+                            .report_open_failed(&entry, state.evict_close_grace);
+                        Disposition::Fatal
+                    }
+                };
+                let busy = matches!(disposition, Disposition::Transient);
                 let err = failure.message();
                 if busy {
                     state.metrics.record_tunnel_open_timeout("busy");
@@ -147,13 +166,8 @@ pub(super) async fn open_and_send(
                         timeout_ms = state.tunnel_op_timeout.as_millis(),
                         "tunnel open timed out; evicting agent"
                     );
-                    // 打不开流 = 这条连接已经死了 → 摘掉条目（连续超时足够才会真摘），
-                    // 然后换个 agent 重试；没有别的候选时把错误报给客户端。
-                    state.registry.evict(
-                        entry.stable_id,
-                        EvictCause::OpenTimeout,
-                        state.evict_close_grace,
-                    );
+                    // 条目已由上面的 report_* 记过一笔（连续次数足够时才会真摘），
+                    // 接着换个 agent 重试；没有别的候选时把错误报给客户端。
                 }
                 if tried.len() >= MAX_TUNNEL_ATTEMPTS {
                     state.metrics.record_tunnel_retry("failed");
@@ -199,14 +213,13 @@ pub(super) async fn open_and_send(
         .await
         {
             // 写**超时**是连接级背压，不是死亡（与开流臂的 busy 同源）：不摘除，只重试。
-            // 只有"写直接失败"才说明这条连接确实不可用，计一次 strike。
+            // 只有"写直接失败"才说明这条连接确实不可用——判据在 `WriteFailure::is_tunnel_broken`
+            // （那个分类本身也是深模块，见 `tunnel.rs`），这里只上报事实。
             state.metrics.record_tunnel_write_failure(failure.class());
             if failure.is_tunnel_broken() {
-                state.registry.evict(
-                    entry.stable_id,
-                    EvictCause::TunnelWriteFailed,
-                    state.evict_close_grace,
-                );
+                state
+                    .registry
+                    .report_write_failed(&entry, state.evict_close_grace);
             }
             let e = failure.message();
             if tried.len() >= MAX_TUNNEL_ATTEMPTS {

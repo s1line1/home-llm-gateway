@@ -106,11 +106,16 @@ async fn e2e_silent_agent_is_still_evicted_after_the_window() {
     })
     .await;
     let client = reqwest::Client::new();
+    let connections_before = metric_gauge(&base, "hlmg_agent_connections_total").await;
 
     // 一个个慢请求打过去（每个都超过 head_timeout），中间**不做**任何成功请求，
-    // 让沉默时间跨过 400ms 窗口；第 4 个之后应当已经判死 → 摘除 → 重连。
-    let mut saw_silent = false;
-    for _ in 0..6 {
+    // 让沉默时间跨过 400ms 窗口。
+    //
+    // ⚠️ **不能一看到 `class="silent"` 就收工**：这条连接**从未**回过响应头，所以第一次
+    // 超时就已经判死（"从未有过"不给宽限，见 `Entry::head_timeout_is_fatal`），`silent`
+    // 第一个请求就出现了。要验的是"**连续 3 次**（`TUNNEL_TIMEOUTS_BEFORE_EVICT`）之后
+    // 真的摘除"，所以必须打满阈值以上。
+    for i in 1..=4 {
         let resp = client
             .post(format!("{base}/v1/slow?ms=800"))
             .header("Authorization", format!("Bearer {key}"))
@@ -120,26 +125,40 @@ async fn e2e_silent_agent_is_still_evicted_after_the_window() {
             .unwrap();
         assert!(
             matches!(resp.status().as_u16(), 502..=504),
-            "慢请求应当失败，实际 {}",
+            "第 {i} 次慢请求应当失败，实际 {}",
             resp.status()
         );
         tokio::time::sleep(Duration::from_millis(150)).await;
-        let text = client
-            .get(format!("{base}/metrics"))
-            .send()
-            .await
-            .unwrap()
-            .text()
-            .await
-            .unwrap();
-        if text.contains("hlmg_upstream_head_timeouts_total{class=\"silent\"}") {
-            saw_silent = true;
+    }
+    let text = client
+        .get(format!("{base}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        text.contains("hlmg_upstream_head_timeouts_total{class=\"silent\"}"),
+        "沉默超过窗口之后必须出现 class=\"silent\"（否则坏连接永远摘不掉）：{text}"
+    );
+
+    // ⚠️ 光有 `class="silent"` **不足以**证明"真的摘除了"——一个"只加计数不摘除"的实现
+    // 照样能让这个标签出现（这正是本用例原先的漏洞，见 `docs/PROJECT_SCAN.md` P2-16：
+    // 它当时只断言状态码与标签，从没驱动到阈值、也没看连接计数）。
+    // 摘除会关连接 → 被测 agent 察觉后重连 → `hlmg_agent_connections_total`（累计连接次数）+1。
+    let mut reconnected = false;
+    for _ in 0..40 {
+        if metric_gauge(&base, "hlmg_agent_connections_total").await > connections_before {
+            reconnected = true;
             break;
         }
+        tokio::time::sleep(Duration::from_millis(125)).await;
     }
     assert!(
-        saw_silent,
-        "沉默超过窗口之后必须出现 class=\"silent\"（否则坏连接永远摘不掉）"
+        reconnected,
+        "连续 3 次判死之后必须真的摘除并关闭连接（agent 重连 → 连接计数 +1，之前是 \
+         {connections_before}）；只出现 class=\"silent\" 而连接计数不变，说明计了数却没摘"
     );
 
     agent.shutdown().await;
