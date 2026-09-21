@@ -19,6 +19,14 @@ services:
     image: home-llm-gateway
     container_name: gateway
     restart: unless-stopped
+    # ⑥ `docker stop` / compose 重启留给容器的宽限时间，**必须大于网关自身的最坏关闭耗时**，
+    #    否则 Docker 会在 SIGKILL 处把还没走完的优雅关闭直接掐断：
+    #      shutdown_grace_secs(默认 15) + END_EVENT_WINDOW(1s) + shutdown_flush_secs(默认 10) ≈ 26s
+    #    Docker 默认只有 **10s**。真机实测（一条在途 SSE 流 + `docker stop`）：网关在 15s 排空
+    #    窗口用尽时才转入 Terminating 并向客户端发出"响应不完整"事件，然后才刷用量退出——也就是
+    #    说按默认 10s 会在**事件发出之前**就 SIGKILL，排空（片 A）与在途告知（片 B）双双失效。
+    #    调大了配置里的 shutdown_grace_secs / shutdown_flush_secs 时，这里要同步调大。
+    stop_grace_period: 30s
     # 日志重定向到固定路径。三条注意：
     #   ① ENTRYPOINT 已是 gateway，所以必须同时换 entrypoint，否则 `sh -c` 会被当成
     #      gateway 的参数喂进去（就是上面第 ① 条坑的另一种形式）；
