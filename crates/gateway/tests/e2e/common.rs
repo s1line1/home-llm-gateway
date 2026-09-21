@@ -100,6 +100,41 @@ pub fn parse_key_pem(pem: &str) -> PrivateKeyDer<'static> {
         .unwrap()
 }
 
+/// 单个 e2e 步骤的墙钟上限（见 [`bounded`]）。
+///
+/// **取值 30s 是被两边夹出来的**：下界要高于网关自己在测试基线下的所有合法上限
+/// （`head_timeout` 5s + 转发空闲 `request_timeout` 10s，关闭路径最坏
+/// `shutdown_grace` 15s + `shutdown_flush_timeout` 10s + 收尾窗口 1s ≈ 26s）；
+/// 上界要低于 `.config/nextest.toml` 的 `slow-timeout` 周期（60s），否则失败会被
+/// nextest 先报成 TIMEOUT，丢掉步骤名这一关键信息。
+///
+/// 为什么需要它：e2e 里绝大多数 await **没有**任何超时（PROJECT_SCAN P2-17）。网关侧
+/// 每一步虽然都有界，但"客户端一步卡住"在两种 runner 下的表现完全不同——
+/// nextest 会在 180s 后杀掉进程、只留一句 TIMEOUT；`cargo test`（`make test`）下
+/// 整条 e2e 是 `#[serial]` 的，一处卡住 = 套件无限期挂起。有了它，卡住会变成一条
+/// **带步骤名**的失败。
+pub const STEP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 等 `fut` 完成，最多 [`STEP_TIMEOUT`]；超时则 panic 并点出是哪一步。
+pub async fn bounded<F: std::future::Future>(step: &str, fut: F) -> F::Output {
+    bounded_within(STEP_TIMEOUT, step, fut).await
+}
+
+/// 同 [`bounded`]，窗口可指定（守卫自身的哨兵测试要毫秒级窗口，见文件末尾的测试模块）。
+pub async fn bounded_within<F: std::future::Future>(
+    limit: Duration,
+    step: &str,
+    fut: F,
+) -> F::Output {
+    match tokio::time::timeout(limit, fut).await {
+        Ok(v) => v,
+        Err(_) => panic!(
+            "e2e step {step:?} did not finish within {limit:?}; \
+             the gateway or the mock upstream stalled at this step"
+        ),
+    }
+}
+
 pub async fn start_mock_llm(name: &str) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -353,4 +388,81 @@ pub async fn spawn_raw_agent(
         let _keep_alive = (client, conn, reg_recv);
         std::future::pending::<()>().await;
     });
+}
+
+#[cfg(test)]
+mod step_guard_tests {
+    use super::{bounded_within, STEP_TIMEOUT};
+    use std::time::Duration;
+
+    /// 守卫**不能吞掉结果**：正常完成的步骤原样返回。
+    #[tokio::test]
+    async fn a_step_that_finishes_returns_its_value() {
+        let v = bounded_within(Duration::from_secs(5), "fast step", async { 7u8 }).await;
+        assert_eq!(v, 7);
+    }
+
+    /// [`STEP_TIMEOUT`] 的取值不是随手挑的，两侧都是硬约束——把它钉住，免得日后有人
+    /// 顺着"再宽松点免抖动"把它调到 nextest 周期之上，于是失败又被报成 TIMEOUT、
+    /// 步骤名这个唯一有用的信息再次丢掉。
+    #[test]
+    fn the_step_window_sits_between_the_gateway_bound_and_the_nextest_period() {
+        // 收尾窗口是 `gateway.rs` 的私有常量 END_EVENT_WINDOW（1s），按 1s 记。
+        let worst_gateway_bound = gateway::Options::DEFAULT_SHUTDOWN_GRACE
+            + gateway::Options::DEFAULT_SHUTDOWN_FLUSH_TIMEOUT
+            + Duration::from_secs(1);
+        assert!(
+            STEP_TIMEOUT > worst_gateway_bound,
+            "窗口 {STEP_TIMEOUT:?} 必须高于网关关闭路径的最坏上限 {worst_gateway_bound:?}"
+        );
+        assert!(
+            STEP_TIMEOUT < Duration::from_secs(60),
+            "窗口 {STEP_TIMEOUT:?} 必须低于 nextest 的 slow-timeout 周期(60s)，\
+             否则失败会被 TIMEOUT 抢先、丢掉步骤名"
+        );
+    }
+
+    /// 守卫自身的哨兵：卡住的步骤必须**带着步骤名**失败，而不是静静挂住。
+    ///
+    /// 用 `bounded_within` 传毫秒级窗口，生产值 [`STEP_TIMEOUT`] 只在被测代码里生效
+    /// （30s 的窗口没法进单元测试）。
+    #[tokio::test]
+    #[should_panic(expected = "stalled step")]
+    async fn a_stalled_step_fails_with_its_name_instead_of_hanging() {
+        bounded_within(
+            Duration::from_millis(20),
+            "stalled step",
+            std::future::pending::<()>(),
+        )
+        .await;
+    }
+
+    /// **复现被报告的那个症状**：对端 accept 了连接却永远不说话（TLS 握手永远等不到
+    /// ServerHello），客户端一步卡死。这正是 `https::e2e_https_public_entry` 那次
+    /// 180s TIMEOUT 的形状——`slow-timeout` 只能告诉你"有个测试卡了 180s"，
+    /// 而带上守卫之后失败会点名是**哪一步**卡了。
+    #[tokio::test]
+    #[should_panic(expected = "GET /healthz over TLS")]
+    async fn a_black_hole_listener_fails_the_step_that_talks_to_it() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // accept 之后把 socket **留着不放**：关闭会变成 EOF（客户端立刻报错），
+        // 而这里要的是"连上了但永远没有响应"。
+        tokio::spawn(async move {
+            let _held = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap();
+        bounded_within(
+            Duration::from_millis(300),
+            "GET /healthz over TLS",
+            client.get(format!("https://{addr}/healthz")).send(),
+        )
+        .await
+        .unwrap();
+    }
 }
