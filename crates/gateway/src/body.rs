@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use axum::body::Bytes;
 
-/// 请求体上限。**只此一处定义**：`http.rs` 的 `DefaultBodyLimit` 层的值取自这里，
+/// 请求体上限。**只此一处定义**：`http/mod.rs` 的 `DefaultBodyLimit` 层的值取自这里，
 /// 而手动逐块读 body 时（见 `read_body_with_stall`）也用它——两处若各写一个数字，
 /// 早晚会漂移成一个"提取器放行、这里拒绝（或反过来）"的鬼故事。
 pub const MAX_REQUEST_BODY: usize = 16 * 1024 * 1024;
@@ -115,7 +115,7 @@ mod tests {
     }
 
     /// 上限由本进程判（改成手动读 body 之后，提取器层的 `DefaultBodyLimit` 不再生效），
-    /// 且必须与 `http.rs` 那一层用**同一个常量**。
+    /// 且必须与 `http/mod.rs` 那一层用**同一个常量**。
     #[tokio::test]
     async fn body_read_enforces_the_size_limit() {
         let body = delayed_body(3, Duration::from_millis(1), 1024);

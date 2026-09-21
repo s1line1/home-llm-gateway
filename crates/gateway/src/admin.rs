@@ -168,7 +168,7 @@ mod tests {
     use std::time::Duration;
 
     use crate::{
-        gateway::Options, metrics::Metrics, registry::Registry, state::AppState, storage::KeyStore,
+        metrics::Metrics, options::Options, registry::Registry, state::AppState, storage::KeyStore,
     };
 
     fn test_state() -> AppState {

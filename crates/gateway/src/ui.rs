@@ -5,7 +5,7 @@
 //! （`ServeDir`、SPA fallback、占位页）。
 //!
 //! 单独成模块是为了**断开依赖环**：`AppState::new` 需要这个判定，而 `AppState` 定义在
-//! `state.rs`；把它留在 `http.rs` 会让依赖变成 `state → http → state`。
+//! `state.rs`；把它留在 `http` 里会让依赖变成 `state → http → state`。
 //!
 //! 为什么判定不能只看"有没有 index.html"：前端**源码**目录同样有 index.html——
 //! Vite 的 `web/index.html` 里是 `<script type="module" src="/src/main.tsx">`，网关会把
@@ -98,7 +98,7 @@ pub enum UiDirCheck {
     MissingAsset(String),
 }
 
-/// 判定 `ui_dir` 是否是一份可托管的产物。放在 http.rs：只有这个模块知道
+/// 判定 `ui_dir` 是否是一份可托管的产物。放在 `http` 模块：只有这里知道
 /// "一份前端产物长什么样、怎么被托管"，lib.rs 只负责在启动时按结果编排。
 pub fn check_ui_dir(dir: &Path) -> UiDirCheck {
     let Ok(html) = std::fs::read_to_string(dir.join("index.html")) else {

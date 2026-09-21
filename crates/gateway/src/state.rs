@@ -1,15 +1,14 @@
 //! 请求处理共享状态：[`AppState`] —— 路由、代理、管理接口与认证都用它。
 //!
-//! 为什么它不在 `http.rs` 里：它曾是"路由模块"的一部分，而真正的消费者跨越了每一层
+//! 为什么它不在 `http` 模块里：它曾是"路由模块"的一部分，而真正的消费者跨越了每一层
 //! （`proxy`、`auth`、`admin`、metrics 中间件）。那样会让路由层成为所有人的上游，
 //! 并形成 `http <-> proxy` 的模块环。搬到这里之后那三个层只**读**它，环没有了：
 //! `state <- {http, proxy, auth, admin}`。
 //!
-//! **仍剩一条反向边**：本模块依赖 [`crate::gateway::Options`]（`new` 的入参），而
-//! `gateway.rs` 要用 `AppState` 装配，于是 `state <-> gateway`。它比被消掉的那个环弱得多——
-//! `Options` 是**纯数据**（无行为、无 I/O、无状态），这条边只指向一个类型定义。
-//! 要彻底消掉得把 `Options` 从 `gateway.rs` 挪进自己的模块，且 `lib.rs` 必须 re-export
-//! 以保住 `gateway::Options` 这个既有路径（`tests/e2e` 按它引用）。留待需要时再做。
+//! **反向边已消**：`new` 的入参 [`Options`] 住在叶子模块 [`crate::options`]，本模块
+//! **不再依赖 `gateway.rs`**——原先那条 `state <-> gateway` 随 `Options` 搬家一起消掉了。
+//! `gateway::Options` 这个既有公开路径由 `gateway.rs` 再导出继续保住（`lib.rs` 与
+//! `tests/e2e` 按它引用）。
 //!
 //! `new` 承担**全部派生**（`head_alive_window`、`RateLimiter`、`stream_ceiling`、UI 判定），
 //! 所以每个派生量在整仓库只存在一处；调用方只给一个 [`Options`]。
@@ -17,8 +16,8 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::gateway::Options;
 use crate::metrics::Metrics;
+use crate::options::Options;
 use crate::ratelimit::RateLimiter;
 use crate::registry::Registry;
 use crate::storage::KeyStore;
