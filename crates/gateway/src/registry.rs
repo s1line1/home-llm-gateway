@@ -34,6 +34,14 @@ pub struct AgentInfo {
     pub last_seen_secs_ago: u64,
 }
 
+/// `agent_id → Entry` 的注册表，外加准入（`try_acquire*`）与隧道失败的判定/记账。
+///
+/// **两条锁纪律**（都是事故换来的，改动这里的任何方法前先看一眼）：
+/// - **写锁下只碰 map 与原子量**：不 `spawn`、不调传输句柄。`tokio::spawn` 若在守卫内 panic，
+///   守卫会在 unwind 中释放 → 锁**永久中毒**，之后每一次注册/心跳/选路都跟着 panic
+///   （见 `Registry::evict` 与 [`Registry::register`] 的写法：动作一律留到锁外）。
+/// - **心跳只取读锁**（见 [`Registry::heartbeat`]）：它只是刷新一个原子毫秒值，
+///   不该与正在选路的读路径互斥。
 #[derive(Clone, Default)]
 pub struct Registry {
     inner: Arc<RwLock<HashMap<String, Entry>>>,
@@ -281,33 +289,42 @@ impl Registry {
         conn: s2n_quic::connection::Handle,
     ) -> usize {
         let stable_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
-        let mut inner = self.inner.write().unwrap();
-        if let Some(old) = inner.get(&agent_id) {
-            if old.stable_id != stable_id {
-                warn!(agent = %agent_id, "duplicate agent connection, closing old one");
-                old.conn.close(0u32.into())
-            }
+        // 写锁下只碰 map（与 `evict` 同一条纪律）：被顶替的那条连接的关闭动作留到锁外，
+        // 免得把传输调用夹在守卫里。
+        let superseded = {
+            let mut inner = self.inner.write().unwrap();
+            let superseded = match inner.get(&agent_id) {
+                Some(old) if old.stable_id != stable_id => {
+                    warn!(agent = %agent_id, "duplicate agent connection, closing old one");
+                    Some(old.conn.clone())
+                }
+                _ => None,
+            };
+            inner.insert(
+                agent_id.clone(),
+                Entry {
+                    conn,
+                    stable_id,
+                    agent_id,
+                    models,
+                    max_concurrency,
+                    inflight: Arc::new(AtomicU32::new(0)),
+                    open_timeouts: Arc::new(AtomicU32::new(0)),
+                    head_timeouts: Arc::new(AtomicU32::new(0)),
+                    tunnel_write_failures: Arc::new(AtomicU32::new(0)),
+                    // 注册不是"活着"的证据：注册只说明连接建起来了，而这条判据问的是
+                    // "**响应头**最近有没有流动"。所以从 NEVER 开始——一条注册后从不回响应头的
+                    // 坏隧道必须能被原来的连续 3 次规则摘掉，不能因为"刚注册"而获得宽限
+                    // （这条正是既有 e2e `e2e_dead_tunnel_fails_fast_instead_of_hanging` 钉住的）。
+                    last_head_ok: Arc::new(AtomicU64::new(NEVER)),
+                    last_seen_millis: Arc::new(AtomicU64::new(now_millis())),
+                },
+            );
+            superseded
+        };
+        if let Some(old) = superseded {
+            old.close(0u32.into());
         }
-        inner.insert(
-            agent_id.clone(),
-            Entry {
-                conn,
-                stable_id,
-                agent_id,
-                models,
-                max_concurrency,
-                inflight: Arc::new(AtomicU32::new(0)),
-                open_timeouts: Arc::new(AtomicU32::new(0)),
-                head_timeouts: Arc::new(AtomicU32::new(0)),
-                tunnel_write_failures: Arc::new(AtomicU32::new(0)),
-                // 注册不是"活着"的证据：注册只说明连接建起来了，而这条判据问的是
-                // "**响应头**最近有没有流动"。所以从 NEVER 开始——一条注册后从不回响应头的
-                // 坏隧道必须能被原来的连续 3 次规则摘掉，不能因为"刚注册"而获得宽限
-                // （这条正是既有 e2e `e2e_dead_tunnel_fails_fast_instead_of_hanging` 钉住的）。
-                last_head_ok: Arc::new(AtomicU64::new(NEVER)),
-                last_seen_millis: Arc::new(AtomicU64::new(now_millis())),
-            },
-        );
         stable_id
     }
 
@@ -433,33 +450,41 @@ impl Registry {
     ///
     /// 返回是否真的摘掉了（false = 计数未达阈值，或条目已被别人摘掉/替换）。
     fn evict(&self, stable_id: usize, cause: EvictCause, close_grace: Duration) -> EvictOutcome {
-        let mut inner = self.inner.write().unwrap();
-        let hit = inner
-            .iter()
-            .find(|(_, e)| e.stable_id == stable_id)
-            .map(|(k, e)| (k.clone(), e.clone()));
-        let Some((agent_id, entry)) = hit else {
-            return EvictOutcome::NotFound;
-        };
-        let strikes = match cause {
-            EvictCause::OpenTimeout => &entry.open_timeouts,
-            EvictCause::HeadTimeout => &entry.head_timeouts,
-            EvictCause::TunnelWriteFailed => &entry.tunnel_write_failures,
-        };
-        let n = strikes.fetch_add(1, Ordering::Relaxed) + 1;
-        if n < Self::TUNNEL_TIMEOUTS_BEFORE_EVICT {
-            warn!(
-                agent = %agent_id,
-                consecutive = n,
-                threshold = Self::TUNNEL_TIMEOUTS_BEFORE_EVICT,
-                cause = ?cause,
-                "tunnel failure; keeping the entry for now"
-            );
-            return EvictOutcome::BelowThreshold { consecutive: n };
-        }
+        // 写锁的范围**只够**做 map 与原子量的事：查找、计 strike、移出路由、读在途数。
+        // 关闭连接与 spawn 调度一律留到锁外——`tokio::spawn` 若在守卫内 panic，守卫会在
+        // unwind 中释放 → 锁**永久中毒**，之后每一次 register/heartbeat/选路都跟着 panic
+        // （评估 §5 H3）。这条纪律对 `register` 同样适用。
+        let (agent_id, entry, n, inflight) = {
+            let mut inner = self.inner.write().unwrap();
+            let hit = inner
+                .iter()
+                .find(|(_, e)| e.stable_id == stable_id)
+                .map(|(k, e)| (k.clone(), e.clone()));
+            let Some((agent_id, entry)) = hit else {
+                return EvictOutcome::NotFound;
+            };
+            let strikes = match cause {
+                EvictCause::OpenTimeout => &entry.open_timeouts,
+                EvictCause::HeadTimeout => &entry.head_timeouts,
+                EvictCause::TunnelWriteFailed => &entry.tunnel_write_failures,
+            };
+            let n = strikes.fetch_add(1, Ordering::Relaxed) + 1;
+            if n < Self::TUNNEL_TIMEOUTS_BEFORE_EVICT {
+                warn!(
+                    agent = %agent_id,
+                    consecutive = n,
+                    threshold = Self::TUNNEL_TIMEOUTS_BEFORE_EVICT,
+                    cause = ?cause,
+                    "tunnel failure; keeping the entry for now"
+                );
+                return EvictOutcome::BelowThreshold { consecutive: n };
+            }
 
-        // ① 先移出路由：后续请求不会再选中它（这一步与关闭时机无关）。
-        inner.remove(&agent_id);
+            // ① 先移出路由：后续请求不会再选中它（这一步与关闭时机无关）。
+            inner.remove(&agent_id);
+            let inflight = entry.inflight.load(Ordering::Relaxed);
+            (agent_id, entry, n, inflight)
+        };
 
         // ② 再决定何时关闭连接。**不能立刻关**：这条连接上往往还有别的在途请求，
         //    而它们在 `inflight` 里有两类，**两类都不该被连带打断**：
@@ -468,12 +493,18 @@ impl Registry {
         //      · **还在等响应头的**——槽位是从 `try_acquire` 取得、一直持有到响应结束的
         //        （`routing.rs` 取得 → `proxy/mod.rs` 的 `read_head` → `forward.rs` 持有），
         //        所以它们也在 `inflight` 里；它们并没有出错，只是还没轮到回包。
-        //    所以在途归零后再关；超过宽限期也强制关，否则 agent 永远是僵尸
-        //    （宽限期由调用方注入，见 `Options::evict_close_grace`）。
-        let inflight = entry.inflight.load(Ordering::Relaxed);
-        let outcome = if inflight <= 1 {
+        //    所以在途归零后再关；超过宽限期也强制关，否则 agent 永远是僵尸。
+        //    调度与期限都在 `crate::evict_close` 里（连同"默认 5s 偏短"这个已知取舍）。
+        if inflight <= 1 {
             // 只有当前这个失败请求占着槽位 → 关掉不会牵连别人。
+            // 而且要**立刻**关，好让 agent 察觉并重连，别变回僵尸。
             entry.conn.close(0u32.into());
+            warn!(
+                agent = %agent_id,
+                consecutive = n,
+                cause = ?cause,
+                "agent evicted (repeated tunnel failures); closing connection so one side notices"
+            );
             EvictOutcome::RemovedClosed
         } else {
             warn!(
@@ -483,18 +514,14 @@ impl Registry {
                 grace_secs = close_grace.as_secs(),
                 "agent evicted; deferring connection close until in-flight requests drain"
             );
-            close_when_drained(entry, close_grace);
-            EvictOutcome::RemovedClosedLater { inflight }
-        };
-        if outcome == EvictOutcome::RemovedClosed {
-            warn!(
-                agent = %agent_id,
-                consecutive = n,
-                cause = ?cause,
-                "agent evicted (repeated tunnel failures); closing connection so one side notices"
+            crate::evict_close::defer_close(
+                entry.conn.clone(),
+                entry.inflight.clone(),
+                &entry.agent_id,
+                close_grace,
             );
+            EvictOutcome::RemovedClosedLater { inflight }
         }
-        outcome
     }
 
     pub fn len(&self) -> usize {
@@ -674,32 +701,6 @@ enum EvictOutcome {
     RemovedClosedLater { inflight: u32 },
     /// 条目已不存在（被别人摘掉，或已被新连接替换）。
     NotFound,
-}
-
-/// 等在途请求收尾（或超过 `grace`）再关闭连接，避免打断已经在途的请求。
-///
-/// `grace` 由 [`Registry::evict`] 的调用方从 [`crate::Options::evict_close_grace`] 传入——
-/// 这个值原先在这里硬编码成 5s，比 `head_timeout`（15s）还短，于是摘除发生时仍在等响应头
-/// 的请求会被一并掐断。默认值现在住在 `Options`，这里不再有决定行为的裸常量。
-fn close_when_drained(entry: Entry, grace: Duration) {
-    tokio::spawn(async move {
-        let deadline = tokio::time::Instant::now() + grace;
-        loop {
-            if entry.inflight.load(Ordering::Relaxed) == 0 {
-                break;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                warn!(
-                    agent = %entry.agent_id,
-                    inflight = entry.inflight.load(Ordering::Relaxed),
-                    "evicted connection still had in-flight requests at the grace deadline; closing anyway"
-                );
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-        entry.conn.close(0u32.into());
-    });
 }
 
 /// 拒绝请求时的注册表诊断快照（仅日志/指标用）。
