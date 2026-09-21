@@ -59,11 +59,8 @@ struct KeyStoreInner {
     db: Arc<Mutex<Option<Connection>>>,
     /// per-key 用量：记账 + 批量落库（独立模块，见 `usage`）。
     usage: usage::UsageStore,
-    /// 已验证身份缓存（argon2 结果复用）+ 单飞；容量 0 = 关闭（每请求都校验）。
+    /// 已验证身份缓存（argon2 结果复用）+ 单飞 + 它自己的容量/有效期策略。
     verified: verified::VerifiedCache,
-    /// 已验证缓存的容量上限与有效期。
-    verified_max: usize,
-    verified_ttl: Duration,
     /// 凭据代数：**只在凭据相关变更时**自增（创建/吊销/轮换）。
     /// 每条记录带一个 `cred_version`，变更后旧缓存条目的版本对不上 → 立即失效。
     cred_generation: AtomicU64,
@@ -211,9 +208,7 @@ impl KeyStore {
                 runtime: RwLock::new(runtime),
                 db,
                 usage,
-                verified: verified::VerifiedCache::default(),
-                verified_max: max,
-                verified_ttl: ttl,
+                verified: verified::VerifiedCache::new(max, ttl),
                 cred_generation: AtomicU64::new(1),
             }),
         }
@@ -240,76 +235,23 @@ impl KeyStore {
 
     /// 校验并返回 key 记录。
     ///
+    /// **协议不在这里**：快路径 → 单飞 → 双检 → 校验 → 写缓存全在
+    /// `verified::VerifiedCache::verify_or_cached` 里，本函数只提供两个动作——
+    /// "按 lookup 取当前记录"（读 `runtime`）与"真跑一次 argon2"。
+    ///
     /// 热路径（有缓存时）只做三件事：`sha256(token)` → O(1) 查表 → 比对凭据版本，
     /// **不跑 argon2**；只有缓存未命中（首次见到该 token、版本变了、或缓存关闭）才校验。
     ///
-    /// 单飞：同一个 token 的并发请求串行化，只有第一个真正跑 argon2，其余等它的结果——
-    /// 这是把内存峰值从 `并发数 × 19MiB` 压到 `同时首用的不同 token 数 × 19MiB` 的关键。
+    /// 记录以**值**交给协议（`load` 里 `.cloned()`），于是 `runtime` 的读锁在 argon2
+    /// 之前就放开了：建/吊销（写锁）不会再被一次 10–30ms 的冷校验堵住（评估 §5 N1）。
+    /// 这不是"记得 drop"，是接口形状决定的——闭包没法把守卫借出去。
     pub fn authorize_record(&self, token: &str) -> Option<KeyRecord> {
         let lookup = lookup_of(token);
-
-        // ① 快路径：记录在、启用中、缓存里有同版本的身份 → 直接放行（不跑 argon2）
-        if self.inner.verified_max > 0 {
-            let runtime = self.inner.runtime.read().unwrap();
-            let rec = runtime.get(&lookup)?;
-            if !rec.enabled {
-                return None;
-            }
-            let version = rec.cred_version;
-            drop(runtime);
-            if let Some(hit) = self
-                .inner
-                .verified
-                .get(&lookup, version, self.inner.verified_ttl)
-            {
-                return Some(hit);
-            }
-        }
-
-        // ② 缓存关闭：保持旧语义（每次请求都完整校验）
-        if self.inner.verified_max == 0 {
-            let runtime = self.inner.runtime.read().unwrap();
-            return match runtime.get(&lookup) {
-                Some(rec) if rec.enabled && self.verify_and_count(token, &rec.key_hash) => {
-                    Some(rec.clone())
-                }
-                _ => None,
-            };
-        }
-
-        // ③ 未命中：单飞 + 校验
-        let slot = self.inner.verified.flight(&lookup);
-        let out = {
-            let _guard = slot.lock().unwrap();
-            // 双检：等锁期间可能已被同 token 的并发请求填好了
-            let runtime = self.inner.runtime.read().unwrap();
-            let rec = match runtime.get(&lookup) {
-                Some(r) if r.enabled => r,
-                _ => {
-                    drop(runtime);
-                    self.inner.verified.release_flight(&lookup);
-                    return None;
-                }
-            };
-            if let Some(hit) =
-                self.inner
-                    .verified
-                    .get(&lookup, rec.cred_version, self.inner.verified_ttl)
-            {
-                Some(hit)
-            } else if self.verify_and_count(token, &rec.key_hash) {
-                let rec = rec.clone();
-                drop(runtime);
-                self.inner
-                    .verified
-                    .put(&lookup, rec.clone(), self.inner.verified_max);
-                Some(rec)
-            } else {
-                None
-            }
-        };
-        self.inner.verified.release_flight(&lookup);
-        out
+        self.inner.verified.verify_or_cached(
+            &lookup,
+            || self.inner.runtime.read().unwrap().get(&lookup).cloned(),
+            |rec| verify_argon2(token, &rec.key_hash),
+        )
     }
 
     /// (缓存命中, 未命中/校验次数)：供 `/metrics` 观察 argon2 复用情况。
@@ -431,16 +373,11 @@ impl KeyStore {
         self.inner.usage.record(key_id, name, delta);
     }
 
-    /// 校验一次 argon2，并计入"真跑过 argon2"的次数（指标与测试断言共用这一个来源）。
-    fn verify_and_count(&self, token: &str, key_hash: &str) -> bool {
-        self.inner.verified.note_argon2();
-        verify_argon2(token, key_hash)
-    }
-
     /// 本实例累计跑过多少次 argon2（测试断言用）。
     ///
-    /// 它不再单独计数：直接读 `VerifiedCache` 的计数器——也就是 `/metrics` 的
+    /// 它不单独计数：直接读 `VerifiedCache` 的计数器——也就是 `/metrics` 的
     /// `hlmg_key_verify_misses_total` 的来源，避免同一个事实在两处各记一份。
+    /// 自增点见 `verified::VerifiedCache::probe_once`（"将要跑 argon2"那一处）。
     #[cfg(test)]
     pub fn argon2_runs(&self) -> usize {
         self.inner.verified.counters().1 as usize
@@ -1300,15 +1237,18 @@ mod verified_tests {
             "缓存条目数不得超过配置上限，实际 {}",
             store.inner.verified.len()
         );
-        // 缓存**只键于 sha256(token)**：拿明文 token 当键永远查不到，也不该存明文
+        // 缓存**只键于 sha256(token)**：键全 64 位十六进制，且没有任何一个是明文 token
+        let keys = store.inner.verified.keys();
+        assert_eq!(keys.len(), store.inner.verified.len());
+        assert!(
+            keys.iter()
+                .all(|k| k.len() == 64 && k.chars().all(|c| c.is_ascii_hexdigit())),
+            "缓存键必须是 sha256 十六进制，实际 {keys:?}"
+        );
         for t in &tokens {
             assert!(
-                store
-                    .inner
-                    .verified
-                    .get(t, 1, DEFAULT_VERIFIED_TTL)
-                    .is_none(),
-                "缓存不得以明文 token 为键"
+                !keys.contains(t),
+                "缓存不得以明文 token 为键：{t} 出现在 {keys:?}"
             );
         }
     }
