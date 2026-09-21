@@ -39,32 +39,41 @@ pub struct Registry {
     inner: Arc<RwLock<HashMap<String, Entry>>>,
 }
 
+/// 注册表里的一条 agent 连接：身份 + 传输句柄 + 健康计数。
+///
+/// **字段全部私有**，外部只能通过只读访问器（[`Entry::stable_id`]、[`Entry::agent_id`]、
+/// [`Entry::max_concurrency`]、[`Entry::inflight`]、[`Entry::open_stream`]）与判据方法看它。
+/// 为什么必须这样：`try_acquire` 会把 `Entry` **克隆出去**给调用方长期持有（响应结束前都在），
+/// 而克隆里的 `Arc<Atomic*>` 与注册表里那份是**同一块内存**——字段一旦可写，
+/// 任何持有者都能改在途数、改计数、甚至关掉这条连接，注册表就没法在自己的边界内保证
+/// "连续失败计数"这类不变量了。访问器给的是值（`usize`/`u32`/`&str`）或受控动作
+/// （[`Entry::open_stream`]），不是那块内存本身。
 #[derive(Debug, Clone)]
 pub struct Entry {
-    pub conn: s2n_quic::connection::Handle,
-    pub stable_id: usize,
+    conn: s2n_quic::connection::Handle,
+    stable_id: usize,
     /// 注册时的 agent_id。`try_acquire` 只交出 `Entry`（HashMap 的 key 不在其中），
     /// 而隧道写超时后需要按 stable_id 把这条坏连接摘掉（内部走 `Registry::evict`），
     /// 所以 id 必须随条目一起带出来。
-    pub agent_id: String,
-    pub models: Vec<String>,
-    pub max_concurrency: u32,
+    agent_id: String,
+    models: Vec<String>,
+    max_concurrency: u32,
     /// 当前在途请求数（admission control）。
-    pub inflight: Arc<AtomicU32>,
-    pub last_seen: Instant,
+    inflight: Arc<AtomicU32>,
+    last_seen: Instant,
     /// 连续"**开流**超时且判定为死"的次数（判据见 [`Entry::open_timeout_is_fatal`]）。
     ///
     /// **每一种失败原因各有一条计数**（开流 / 响应头 / 写帧失败）：混在一起时，三种
     /// **不同**的轻微失败会凑满同一个阈值，把一条其实健康的连接摘掉；而且一种失败达到
     /// 阈值后，另一种的"连续"语义会被无声改写。
-    pub open_timeouts: Arc<AtomicU32>,
+    open_timeouts: Arc<AtomicU32>,
     /// 连续"**响应头**静默超时"的次数（判据见 [`Entry::head_timeout_is_fatal`]）。
-    pub head_timeouts: Arc<AtomicU32>,
+    head_timeouts: Arc<AtomicU32>,
     /// 连续"**写请求帧直接失败**"的次数。
     ///
     /// 只有"写直接返回错误"计这里；**写超时不计**——那是连接级背压（共享发送缓冲/拥塞），
     /// 不是隧道死亡。写帧超时的死亡检出交给开流与响应头两条判据。
-    pub tunnel_write_failures: Arc<AtomicU32>,
+    tunnel_write_failures: Arc<AtomicU32>,
     /// **最近一次真的收到响应头**的时刻（自 `epoch` 起的毫秒数）。
     ///
     /// 初值是 `NEVER`（从未收到过）。**注册不算"活着"**：注册只证明连接建起来了，
@@ -75,7 +84,7 @@ pub struct Entry {
     /// 把**健康但被堵住**的 agent 摘掉（实测：出口 0.4 MB/s 饱和时 1 026 次
     /// `upstream head timeout; evicting agent`，随后全量 503）。有了这个时间戳，
     /// 响应头超时就能像开流超时那样区分"忙/慢"与"死"（见 [`Entry::head_timeout_is_fatal`]）。
-    pub last_head_ok: Arc<AtomicU64>,
+    last_head_ok: Arc<AtomicU64>,
 }
 
 /// 一次隧道失败的原因。[`Registry::evict`] 按它**分别**计连续次数，互不充值对方的阈值。
@@ -116,6 +125,43 @@ fn now_millis() -> u64 {
 }
 
 impl Entry {
+    /// 这条条目的连接身份：进程内唯一、**永不复用**（见 [`Registry::register`] 的说明）。
+    pub fn stable_id(&self) -> usize {
+        self.stable_id
+    }
+
+    /// 注册时声明的 agent_id。
+    pub fn agent_id(&self) -> &str {
+        &self.agent_id
+    }
+
+    /// agent 声明的并发上限（`0` = 不限）。只用于日志/展示。
+    pub fn max_concurrency(&self) -> u32 {
+        self.max_concurrency
+    }
+
+    /// 当前在途请求数。**含正在等响应头的那一类**（槽位从 `try_acquire` 取得，一直持有到
+    /// 响应结束）。只给日志/展示用——判据请走 [`Self::open_timeout_is_fatal`]，
+    /// 不要拿这个数自己推"忙还是死"。
+    pub fn inflight(&self) -> u32 {
+        self.inflight.load(Ordering::Relaxed)
+    }
+
+    /// 在这条连接上打开一条双向流。
+    ///
+    /// **超时策略不在这里**：多久算超时是 `Options::tunnel_op_timeout`，由调用方
+    /// （`proxy::tunnel::open_tunnel`）用 `tokio::time::timeout` 包住。本方法的作用是把
+    /// 传输句柄挡在注册表里面——否则每个想开流的模块都得拿到 `s2n_quic::connection::Handle`，
+    /// 也就等于拿到了"关掉这条连接"的能力。
+    ///
+    /// 需要 `&mut self`：`s2n_quic::connection::Handle::open_bidirectional_stream` 自身就是
+    /// `&mut self`（它在句柄内部记流状态）。这是唯一一处需要 `Entry` 可变借用的地方。
+    pub async fn open_stream(
+        &mut self,
+    ) -> Result<s2n_quic::stream::BidirectionalStream, s2n_quic::connection::Error> {
+        self.conn.open_bidirectional_stream().await
+    }
+
     /// 一次「开流超时」是否足以判定这条连接**已死**（该摘除）。
     ///
     /// 为什么不能一律摘除：`open_bidirectional_stream()` 在**连接级流额度**排满时会

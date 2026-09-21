@@ -83,7 +83,7 @@ pub(super) async fn open_tunnel(
     entry: &mut crate::registry::Entry,
     op_timeout: Duration,
 ) -> Result<s2n_quic::stream::BidirectionalStream, OpenFailure> {
-    match tokio::time::timeout(op_timeout, entry.conn.open_bidirectional_stream()).await {
+    match tokio::time::timeout(op_timeout, entry.open_stream()).await {
         Ok(Ok(s)) => Ok(s),
         Ok(Err(e)) => Err(OpenFailure::Failed(format!("tunnel open failed: {e}"))),
         Err(_) => Err(OpenFailure::TimedOut),
