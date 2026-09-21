@@ -162,5 +162,26 @@ async fn e2e_write_timeout_does_not_evict_the_agent() {
         "出现 503 说明 agent 已被摘除（registry 空了）"
     );
 
+    // ④ 专用指标：写超时必须记成 backpressure，且不得出现 broken
+    let backpressure = metric_gauge(
+        &base,
+        "hlmg_tunnel_write_failures_total{class=\"backpressure\"}",
+    )
+    .await;
+    assert!(
+        backpressure >= 3,
+        "三次写超时应记入 backpressure，实际 {backpressure}"
+    );
+    let text = reqwest::get(format!("{base}/metrics"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        !text.contains("hlmg_tunnel_write_failures_total{class=\"broken\"}"),
+        "写**超时**不得被记成 broken（那会把背压说成坏连接）：{text}"
+    );
+
     gw.shutdown().await;
 }

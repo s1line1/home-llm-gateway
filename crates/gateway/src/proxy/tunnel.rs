@@ -60,6 +60,14 @@ impl WriteFailure {
     pub(super) fn is_tunnel_broken(&self) -> bool {
         matches!(self, WriteFailure::Failed(_))
     }
+
+    /// 指标分类：`backpressure`（超时）或 `broken`（写直接失败）。
+    pub(super) fn class(&self) -> &'static str {
+        match self {
+            WriteFailure::TimedOut => "backpressure",
+            WriteFailure::Failed(_) => "broken",
+        }
+    }
 }
 
 /// 打开一条隧道流（带超时）。
@@ -139,5 +147,8 @@ mod tests {
             WriteFailure::Failed("connection closed".into()).is_tunnel_broken(),
             "写直接返回错误才是坏隧道"
         );
+        // 指标分类与上面的判定同源，不得各写一套
+        assert_eq!(WriteFailure::TimedOut.class(), "backpressure");
+        assert_eq!(WriteFailure::Failed("x".into()).class(), "broken");
     }
 }
