@@ -52,21 +52,41 @@ pub struct Entry {
     /// 当前在途请求数（admission control）。
     pub inflight: Arc<AtomicU32>,
     pub last_seen: Instant,
-    /// 连续"隧道控制操作超时"次数。只有**连续**超时才判定连接已死——
-    /// 单次超时在高并发下是排队造成的假象（开流/写帧要过连接级流管理器）。
-    /// 任何一次成功都会把它清零（见 `note_tunnel_op_ok`）。
-    pub tunnel_op_timeouts: Arc<AtomicU32>,
+    /// 连续"**开流**超时且判定为死"的次数（判据见 [`Entry::open_timeout_is_fatal`]）。
+    ///
+    /// **每一种失败原因各有一条计数**（开流 / 响应头 / 写帧失败）：混在一起时，三种
+    /// **不同**的轻微失败会凑满同一个阈值，把一条其实健康的连接摘掉；而且一种失败达到
+    /// 阈值后，另一种的"连续"语义会被无声改写。
+    pub open_timeouts: Arc<AtomicU32>,
+    /// 连续"**响应头**静默超时"的次数（判据见 [`Entry::head_timeout_is_fatal`]）。
+    pub head_timeouts: Arc<AtomicU32>,
+    /// 连续"**写请求帧直接失败**"的次数。
+    ///
+    /// 只有"写直接返回错误"计这里；**写超时不计**——那是连接级背压（共享发送缓冲/拥塞），
+    /// 不是隧道死亡。写帧超时的死亡检出交给开流与响应头两条判据。
+    pub tunnel_write_failures: Arc<AtomicU32>,
     /// **最近一次真的收到响应头**的时刻（自 `epoch` 起的毫秒数）。
     ///
     /// 初值是 `NEVER`（从未收到过）。**注册不算"活着"**：注册只证明连接建起来了，
     /// 而这条判据问的是响应头有没有在流动。
     ///
-    /// 为什么要单独记它：`tunnel_op_timeouts` 这一套只回答"连续失败了几次"，回答不了
+    /// 为什么要单独记它：上面那几条计数只回答"连续失败了几次"，回答不了
     /// "这条隧道最近还干不干活"。链路被堵住时是"一个响应头都收不到"，于是计数必然爬到阈值，
     /// 把**健康但被堵住**的 agent 摘掉（实测：出口 0.4 MB/s 饱和时 1 026 次
     /// `upstream head timeout; evicting agent`，随后全量 503）。有了这个时间戳，
     /// 响应头超时就能像开流超时那样区分"忙/慢"与"死"（见 [`Entry::head_timeout_is_fatal`]）。
     pub last_head_ok: Arc<AtomicU64>,
+}
+
+/// 一次隧道失败的原因。[`Registry::evict`] 按它**分别**计连续次数，互不充值对方的阈值。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvictCause {
+    /// 开流超时，且未达到这条连接的承载上限 → 判定为死（见 [`Entry::open_timeout_is_fatal`]）。
+    OpenTimeout,
+    /// 响应头静默超时 → 判定为死（见 [`Entry::head_timeout_is_fatal`]）。
+    HeadTimeout,
+    /// 写请求帧**直接失败**（非超时）→ 连接确已不可用。
+    TunnelWriteFailed,
 }
 
 /// "从未收到过响应头"的哨兵值。
@@ -166,7 +186,9 @@ impl Registry {
                 models,
                 max_concurrency,
                 inflight: Arc::new(AtomicU32::new(0)),
-                tunnel_op_timeouts: Arc::new(AtomicU32::new(0)),
+                open_timeouts: Arc::new(AtomicU32::new(0)),
+                head_timeouts: Arc::new(AtomicU32::new(0)),
+                tunnel_write_failures: Arc::new(AtomicU32::new(0)),
                 // 注册不是"活着"的证据：注册只说明连接建起来了，而这条判据问的是
                 // "**响应头**最近有没有流动"。所以从 NEVER 开始——一条注册后从不回响应头的
                 // 坏隧道必须能被原来的连续 3 次规则摘掉，不能因为"刚注册"而获得宽限
@@ -195,32 +217,44 @@ impl Registry {
         }
     }
 
-    /// 连续隧道操作超时的阈值：达到它才认为"这条连接真的死了"。
+    /// 同一原因的连续隧道失败阈值：达到它才认为"这条连接真的死了"。
     ///
-    /// 取 3 而不是 1：单次超时在高并发下是**排队假象**——开流/写帧都要过连接级流管理器，
+    /// 取 3 而不是 1：单次失败在高并发下是**排队假象**——开流/写帧都要过连接级流管理器，
     /// 768 并发时很容易超过 `tunnel_op_secs`。实测（2026-09-17，双 agent/768 并发）：
     /// 第一次超时就把条目摘掉，而连接其实完好、agent 也毫不知情，于是每 5s 心跳继续
     /// 刷新 `last_seen`、注册表里却没有它，所有请求 `503 registry-empty`（占比 92.6%）。
+    ///
+    /// 阈值对**每一种原因**各自适用（见 [`EvictCause`]）。
     pub const TUNNEL_TIMEOUTS_BEFORE_EVICT: u32 = 3;
 
-    /// 一次隧道控制操作成功：清掉连续超时计数。
+    /// 一次**成功收到响应头**：清掉全部连续失败计数，并记下"这条隧道最近真的在干活"。
+    ///
+    /// 为什么一次成功要清三种计数：一次真正回来的响应头证明的是"这条隧道现在是通的"，
+    /// 对开流、写帧、响应头三条判据都是同一份证据。唯一的调用点在响应头那一支
+    /// （`proxy/mod.rs`）——**开流或写帧成功不算**：agent 卡死时流照样能开、帧也照样写得出去，
+    /// 只是永远不回帧。
     pub fn note_tunnel_op_ok(&self, stable_id: usize) {
         let inner = self.inner.read().unwrap();
         if let Some(e) = inner.values().find(|e| e.stable_id == stable_id) {
-            e.tunnel_op_timeouts.store(0, Ordering::Relaxed);
+            e.open_timeouts.store(0, Ordering::Relaxed);
+            e.head_timeouts.store(0, Ordering::Relaxed);
+            e.tunnel_write_failures.store(0, Ordering::Relaxed);
             // 顺手记下"这条隧道最近真的回过响应头"——响应头超时的"忙/死"判据靠它。
             e.last_head_ok.store(now_millis(), Ordering::Relaxed);
         }
     }
 
-    /// 记录一次隧道控制操作超时，并在**连续**超时达到阈值时摘除条目。
+    /// 记录一次隧道失败，并在**同一原因连续**达到阈值时摘除条目。
+    ///
+    /// `cause` 决定计哪一条连续计数（见 [`EvictCause`]）：不同原因的阈值互不充值——
+    /// 否则三种不同的轻微失败会凑满一个阈值，把健康连接摘掉。
     ///
     /// 关键：摘除时**同时关闭连接**。只删条目不关连接会留下"僵尸"——agent 侧看不到
     /// 任何异常（心跳照通、连接照开），却永远无法再被路由；agent 只有等到自己判断
     /// 连接不可用才会重连，而那一刻可能永远不来。
     ///
     /// 返回是否真的摘掉了（false = 计数未达阈值，或条目已被别人摘掉/替换）。
-    pub fn evict(&self, stable_id: usize) -> EvictOutcome {
+    pub fn evict(&self, stable_id: usize, cause: EvictCause) -> EvictOutcome {
         let mut inner = self.inner.write().unwrap();
         let hit = inner
             .iter()
@@ -229,13 +263,19 @@ impl Registry {
         let Some((agent_id, entry)) = hit else {
             return EvictOutcome::NotFound;
         };
-        let n = entry.tunnel_op_timeouts.fetch_add(1, Ordering::Relaxed) + 1;
+        let strikes = match cause {
+            EvictCause::OpenTimeout => &entry.open_timeouts,
+            EvictCause::HeadTimeout => &entry.head_timeouts,
+            EvictCause::TunnelWriteFailed => &entry.tunnel_write_failures,
+        };
+        let n = strikes.fetch_add(1, Ordering::Relaxed) + 1;
         if n < Self::TUNNEL_TIMEOUTS_BEFORE_EVICT {
             warn!(
                 agent = %agent_id,
                 consecutive = n,
                 threshold = Self::TUNNEL_TIMEOUTS_BEFORE_EVICT,
-                "tunnel op timed out; keeping the entry for now"
+                cause = ?cause,
+                "tunnel failure; keeping the entry for now"
             );
             return EvictOutcome::BelowThreshold { consecutive: n };
         }
@@ -268,7 +308,8 @@ impl Registry {
             warn!(
                 agent = %agent_id,
                 consecutive = n,
-                "agent evicted (tunnel op timed out repeatedly); closing connection so one side notices"
+                cause = ?cause,
+                "agent evicted (repeated tunnel failures); closing connection so one side notices"
             );
         }
         outcome
@@ -619,14 +660,14 @@ mod tests {
         let (_e2, g2) = reg.try_acquire(stale, "m").unwrap();
         let (_e3, g3) = reg.try_acquire(stale, "m").unwrap();
         assert_eq!(
-            reg.evict(id),
+            reg.evict(id, EvictCause::OpenTimeout),
             EvictOutcome::BelowThreshold { consecutive: 1 }
         );
         assert_eq!(
-            reg.evict(id),
+            reg.evict(id, EvictCause::OpenTimeout),
             EvictOutcome::BelowThreshold { consecutive: 2 }
         );
-        match reg.evict(id) {
+        match reg.evict(id, EvictCause::OpenTimeout) {
             EvictOutcome::RemovedClosedLater { inflight } => {
                 assert!(inflight >= 3, "应报出当时的在途数，实际 {inflight}")
             }
@@ -641,14 +682,17 @@ mod tests {
         let id2 = reg2.register("idle".into(), vec!["*".into()], 8, conn2.clone());
         let (_e4, _g4) = reg2.try_acquire(stale, "m").unwrap();
         assert!(matches!(
-            reg2.evict(id2),
+            reg2.evict(id2, EvictCause::OpenTimeout),
             EvictOutcome::BelowThreshold { .. }
         ));
         assert!(matches!(
-            reg2.evict(id2),
+            reg2.evict(id2, EvictCause::OpenTimeout),
             EvictOutcome::BelowThreshold { .. }
         ));
-        assert_eq!(reg2.evict(id2), EvictOutcome::RemovedClosed);
+        assert_eq!(
+            reg2.evict(id2, EvictCause::OpenTimeout),
+            EvictOutcome::RemovedClosed
+        );
     }
 
     /// 契约：**换 agent 重试时必须排除刚失败的那条连接**。
@@ -696,28 +740,86 @@ mod tests {
 
         // 前两次超时：条目保留
         assert!(matches!(
-            reg.evict(id),
+            reg.evict(id, EvictCause::OpenTimeout),
             EvictOutcome::BelowThreshold { consecutive: 1 }
         ));
         assert_eq!(reg.len(), 1);
         assert!(matches!(
-            reg.evict(id),
+            reg.evict(id, EvictCause::OpenTimeout),
             EvictOutcome::BelowThreshold { consecutive: 2 }
         ));
         assert_eq!(reg.len(), 1);
         // 中途一次成功 → 计数清零，重新从头累计
         reg.note_tunnel_op_ok(id);
         assert!(matches!(
-            reg.evict(id),
+            reg.evict(id, EvictCause::OpenTimeout),
             EvictOutcome::BelowThreshold { consecutive: 1 }
         ));
         assert_eq!(reg.len(), 1);
         // 再来两次（累计到 3）→ 摘除；此时只有本请求占槽位 → 立即关闭
-        assert!(matches!(reg.evict(id), EvictOutcome::BelowThreshold { .. }));
-        assert!(matches!(reg.evict(id), EvictOutcome::RemovedClosed));
+        assert!(matches!(
+            reg.evict(id, EvictCause::OpenTimeout),
+            EvictOutcome::BelowThreshold { .. }
+        ));
+        assert!(matches!(
+            reg.evict(id, EvictCause::OpenTimeout),
+            EvictOutcome::RemovedClosed
+        ));
         assert_eq!(reg.len(), 0);
         // 已摘除后再调用：无害
-        assert_eq!(reg.evict(id), EvictOutcome::NotFound);
+        assert_eq!(
+            reg.evict(id, EvictCause::OpenTimeout),
+            EvictOutcome::NotFound
+        );
+    }
+
+    /// 规格：**每一种失败原因各有自己的"连续"计数**。
+    ///
+    /// 计数混在一起时，三种**不同**的轻微失败会凑满同一个阈值，把一条其实健康的连接摘掉；
+    /// 而且任何一种失败达到阈值后，另一种失败的"连续"语义就被无声地改写了。云端实测里
+    /// "开流超时"与"响应头超时"是两条独立的事故线（`routing.rs:122-125`、
+    /// `head_timeout.rs:3-9`），它们的阈值不能互相充值。
+    #[tokio::test]
+    async fn strike_counters_are_independent_per_cause() {
+        let reg = Registry::default();
+        let conn = test_connection().await;
+        let id = reg.register("t".into(), vec!["*".into()], 4, conn.clone());
+
+        // 两种失败各记两次：各自都还差一次，谁都不该摘除
+        for expected in 1..=2 {
+            assert!(
+                matches!(
+                    reg.evict(id, EvictCause::OpenTimeout),
+                    EvictOutcome::BelowThreshold { consecutive } if consecutive == expected
+                ),
+                "开流超时应独立计数到 {expected}"
+            );
+            assert!(
+                matches!(
+                    reg.evict(id, EvictCause::HeadTimeout),
+                    EvictOutcome::BelowThreshold { consecutive } if consecutive == expected
+                ),
+                "响应头超时应独立计数到 {expected}"
+            );
+        }
+        assert_eq!(
+            reg.len(),
+            1,
+            "2 次开流 + 2 次响应头 = 4 次失败，但没有任何**一种**达到阈值"
+        );
+
+        // 第三种原因也从 1 开始，不受前两种影响
+        assert!(matches!(
+            reg.evict(id, EvictCause::TunnelWriteFailed),
+            EvictOutcome::BelowThreshold { consecutive: 1 }
+        ));
+
+        // 只有某一种真正连续到阈值才摘除
+        assert_eq!(
+            reg.evict(id, EvictCause::OpenTimeout),
+            EvictOutcome::RemovedClosed
+        );
+        assert_eq!(reg.len(), 0);
     }
 
     /// 可观测性契约：**注册条目数**与**可路由数**必须能分开看。

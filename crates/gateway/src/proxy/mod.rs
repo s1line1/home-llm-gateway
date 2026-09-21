@@ -158,7 +158,9 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
                     window_secs = state.head_alive_window.as_secs(),
                     "upstream head timeout and the agent has been silent; evicting agent"
                 );
-                state.registry.evict(entry.stable_id);
+                state
+                    .registry
+                    .evict(entry.stable_id, crate::registry::EvictCause::HeadTimeout);
             } else {
                 state.metrics.record_head_timeout("slow");
                 warn!(

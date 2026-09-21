@@ -20,7 +20,7 @@ use proto::Frame;
 use s2n_quic::stream::{ReceiveStream, SendStream};
 use tracing::warn;
 
-use crate::registry::{AcquireError, Entry, SlotGuard};
+use crate::registry::{AcquireError, Entry, EvictCause, SlotGuard};
 use crate::state::AppState;
 
 use super::tunnel::{open_tunnel, tunnel_write, OpenFailure};
@@ -149,7 +149,9 @@ pub(super) async fn open_and_send(
                     );
                     // 打不开流 = 这条连接已经死了 → 摘掉条目（连续超时足够才会真摘），
                     // 然后换个 agent 重试；没有别的候选时把错误报给客户端。
-                    state.registry.evict(entry.stable_id);
+                    state
+                        .registry
+                        .evict(entry.stable_id, EvictCause::OpenTimeout);
                 }
                 if tried.len() >= MAX_TUNNEL_ATTEMPTS {
                     state.metrics.record_tunnel_retry("failed");
@@ -185,7 +187,7 @@ pub(super) async fn open_and_send(
         };
         let (recv, mut send) = stream.split();
 
-        if let Err(e) = tunnel_write(
+        if let Err(failure) = tunnel_write(
             &mut send,
             request,
             state.tunnel_op_timeout,
@@ -194,7 +196,14 @@ pub(super) async fn open_and_send(
         )
         .await
         {
-            state.registry.evict(entry.stable_id);
+            // 写**超时**是连接级背压，不是死亡（与开流臂的 busy 同源）：不摘除，只重试。
+            // 只有"写直接失败"才说明这条连接确实不可用，计一次 strike。
+            if failure.is_tunnel_broken() {
+                state
+                    .registry
+                    .evict(entry.stable_id, EvictCause::TunnelWriteFailed);
+            }
+            let e = failure.message();
             if tried.len() >= MAX_TUNNEL_ATTEMPTS {
                 state.metrics.record_tunnel_retry("failed");
                 return Err(RouteFailure {
