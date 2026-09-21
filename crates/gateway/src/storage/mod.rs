@@ -25,7 +25,7 @@ use std::{
     collections::HashMap,
     path::PathBuf,
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU64, Ordering},
         Arc, Mutex, RwLock,
     },
     time::Duration,
@@ -39,7 +39,7 @@ pub mod hash;
 mod usage;
 pub mod verified;
 
-/// 用量记账/落库的类型由 [`usage`] 定义，路径 `crate::storage::UsageDelta` 保持不变。
+/// 用量记账/落库的类型由私有模块 `usage` 定义，路径 `crate::storage::UsageDelta` 保持不变。
 pub use usage::{KeyUsageInfo, UsageDelta};
 
 use crate::storage::hash::{generate_id_key, hash_argon2, lookup_of, now_secs, verify_argon2};
@@ -55,22 +55,15 @@ struct KeyStoreInner {
     /// SQLite 持久化连接（None = 仅内存，如 db 打开失败时降级）。
     ///
     /// **与用量记账共享**（`Arc`）：连接是**资源**（凭据写穿与用量落库都用它），
-    /// 而状态刻意不共享——`runtime` 归凭据、`usage` 归 [`usage::UsageStore`]。
+    /// 而状态刻意不共享——`runtime` 归凭据、`usage` 归 `usage::UsageStore`。
     db: Arc<Mutex<Option<Connection>>>,
-    /// per-key 用量：记账 + 批量落库（独立模块，见 [`usage`]）。
+    /// per-key 用量：记账 + 批量落库（独立模块，见 `usage`）。
     usage: usage::UsageStore,
     /// 已验证身份缓存（argon2 结果复用）+ 单飞；容量 0 = 关闭（每请求都校验）。
     verified: verified::VerifiedCache,
     /// 已验证缓存的容量上限与有效期。
     verified_max: usize,
     verified_ttl: Duration,
-    /// 本实例真正跑过多少次 argon2。
-    ///
-    /// 刻意做成**每实例**计数而不是全局静态：全局计数会被同一个测试进程里其他测试
-    /// 的 argon2 调用污染（实测并行跑全量 lib 时，一个只应 1 次的断言会被顶到 2 次）。
-    /// 每实例计数天然隔离，测试也就不必串行化。开销可忽略——每次自增都伴随一次
-    /// argon2（毫秒级），一个原子加不构成噪声。
-    argon2_runs: AtomicUsize,
     /// 凭据代数：**只在凭据相关变更时**自增（创建/吊销/轮换）。
     /// 每条记录带一个 `cred_version`，变更后旧缓存条目的版本对不上 → 立即失效。
     cred_generation: AtomicU64,
@@ -221,7 +214,6 @@ impl KeyStore {
                 verified: verified::VerifiedCache::default(),
                 verified_max: max,
                 verified_ttl: ttl,
-                argon2_runs: AtomicUsize::new(0),
                 cred_generation: AtomicU64::new(1),
             }),
         }
@@ -439,22 +431,25 @@ impl KeyStore {
         self.inner.usage.record(key_id, name, delta);
     }
 
-    /// 校验一次 argon2，并在测试构建下记一次本实例的调用数。
+    /// 校验一次 argon2，并计入"真跑过 argon2"的次数（指标与测试断言共用这一个来源）。
     fn verify_and_count(&self, token: &str, key_hash: &str) -> bool {
-        self.inner.argon2_runs.fetch_add(1, Ordering::SeqCst);
+        self.inner.verified.note_argon2();
         verify_argon2(token, key_hash)
     }
 
-    /// 本实例累计跑过多少次 argon2（测试断言用；每实例隔离，不受其他测试影响）。
+    /// 本实例累计跑过多少次 argon2（测试断言用）。
+    ///
+    /// 它不再单独计数：直接读 `VerifiedCache` 的计数器——也就是 `/metrics` 的
+    /// `hlmg_key_verify_misses_total` 的来源，避免同一个事实在两处各记一份。
     #[cfg(test)]
     pub fn argon2_runs(&self) -> usize {
-        self.inner.argon2_runs.load(Ordering::SeqCst)
+        self.inner.verified.counters().1 as usize
     }
 
     /// 只做内存累加：纳秒级、无 IO，用于让 `/admin/usage`（读的正是这份内存计数）
     /// 在响应返回时立即一致。
     ///
-    /// 实现与契约见 [`usage::UsageStore::accumulate`]：**这里只是转发**，不保留独立逻辑。
+    /// 实现与契约见 `usage::UsageStore::accumulate`：**这里只是转发**，不保留独立逻辑。
     pub fn accumulate_usage(&self, key_id: &str, name: &str, delta: &UsageDelta) {
         self.inner.usage.accumulate(key_id, name, delta);
     }
@@ -464,7 +459,7 @@ impl KeyStore {
         self.inner.usage.has_pending()
     }
 
-    /// 把内存里的用量**绝对累计值**批量落库（实现与契约见 [`usage::UsageStore::flush_once`]：
+    /// 把内存里的用量**绝对累计值**批量落库（实现与契约见 `usage::UsageStore::flush_once`：
     /// 绝对值 → 幂等、重启不重复累加；成功提交后才更新"已落库"标记 → 失败下轮重试）。
     ///
     /// 返回本轮写入的 key 数；`force = true` 时忽略"是否变化"（用于关闭前落库）。
@@ -1196,6 +1191,33 @@ mod verified_tests {
 
         assert_eq!(off, 3, "关闭缓存时每请求各跑一次，实际 {off}");
         assert_eq!(on, 0, "开启缓存且已预热后不应再跑 argon2，实际 {on}");
+    }
+
+    /// 规格：**关闭缓存时，每一次校验都要计入"真跑了 argon2"**（评估 §6 的指标口径）。
+    ///
+    /// `hlmg_key_verify_misses_total` 的 HELP 写的是 "Key verifications that ran argon2"，
+    /// 而它的自增点原先在 `put`——缓存关闭时走的是"每请求完整校验"那一支，**根本不经过 `put`**。
+    /// 于是这个计数器在 `verified_cache_max: 0` 下恒为 0：每请求都在跑 19MiB argon2，
+    /// 而运维在唯一会持续烧 argon2 的配置里看不到任何负载。
+    ///
+    /// （注意：错 token 走不到这里——`sha256` 不同 ⇒ runtime 查不到 ⇒ **按设计不跑 argon2**，
+    /// 既有单测 `authorize_rejects_unknown_lookup_without_argon2` 钉着这一点，所以那种负载
+    /// 本来就不该被算成 argon2 次数。）
+    #[test]
+    #[serial]
+    fn counter_counts_argon2_runs_when_the_cache_is_disabled() {
+        let _cheap = CheapArgon2::install();
+        let store = KeyStore::with_verified(None, 0, DEFAULT_VERIFIED_TTL);
+        let token = store.create("nocache-metric".into()).unwrap().plaintext;
+        for _ in 0..3 {
+            assert!(store.authorize(&token));
+        }
+        let (hits, misses) = store.verified_counters();
+        assert_eq!(hits, 0, "缓存关闭时不可能命中");
+        assert_eq!(
+            misses, 3,
+            "3 次校验 = 3 次 argon2，必须都计入（修好前这里是 0）"
+        );
     }
 
     #[test]
