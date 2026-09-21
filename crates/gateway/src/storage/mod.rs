@@ -37,12 +37,57 @@ use crate::error::GatewayError;
 
 pub mod hash;
 mod usage;
-pub mod verified;
+mod verified;
 
 /// 用量记账/落库的类型由私有模块 `usage` 定义，路径 `crate::storage::UsageDelta` 保持不变。
 pub use usage::{KeyUsageInfo, UsageDelta};
 
 use crate::storage::hash::{generate_id_key, hash_argon2, lookup_of, now_secs, verify_argon2};
+
+/// 加锁并**忽略中毒**：本模块（含 `verified` / `usage`）唯一允许的加锁方式。
+///
+/// 锁里的东西全是内存映射（`HashMap` / `Option<Connection>` / 单飞槽的 `()`），守卫内
+/// panic 不会把它们变成非法状态，继续用是安全的；而 `.unwrap()` 会把**一次** panic
+/// 放大成永久的全站故障（评估 §5 H4）：`runtime` 中毒 ⇒ 之后每个 `/v1/*` 都 500，
+/// `inflight` 中毒 ⇒ 该 key 的单飞槽永久卡死，`db` 中毒 ⇒ 建/吊销全部 500。
+///
+/// 触发链不必是"认证逻辑自己写错"：守卫内任何一次 panic（越界、`unwrap`、断言、
+/// 第三方库）都会让那把锁永久中毒，所以这里是**兜底**，不是给某段代码开脱。
+fn lock_or_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 同 [`lock_or_recover`]，用于 `RwLock` 的读侧。
+fn read_or_recover<T>(l: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    l.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 同 [`lock_or_recover`]，用于 `RwLock` 的写侧。
+fn write_or_recover<T>(l: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    l.write().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 把库文件权限收紧到 `0600`（评估 §7 步骤 6 / P3-7）。
+///
+/// 库文件是按调用方 umask 创建的（常见 0644），而它通常放在 `/etc/home-llm-gateway/`
+/// 下（`DEPLOY.md` 的目录清单）。库里只有 argon2 哈希与 sha256 lookup，属纵深防御；
+/// 但升级/拷贝过来的旧库往往仍是宽权限，所以**每次打开都收紧一次**。
+///
+/// 失败只告警：只读挂载或某些文件系统不支持 `chmod` 不该让网关起不来。
+#[cfg(unix)]
+fn tighten_db_to_owner(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+        tracing::warn!(
+            path = %path.display(),
+            "sqlite: cannot tighten keys.db to 0600 (non-fatal): {e}"
+        );
+    }
+}
+
+/// 非 unix 平台没有 `0600` 这个语义（Windows 的 ACL 不按位表示），保持原样。
+#[cfg(not(unix))]
+fn tighten_db_to_owner(_path: &std::path::Path) {}
 
 #[derive(Clone)]
 pub struct KeyStore {
@@ -66,19 +111,50 @@ struct KeyStoreInner {
     cred_generation: AtomicU64,
 }
 
-#[derive(Clone, Debug)]
+/// 一条动态 key 的记录。**凭据字段不出本模块**：`key_hash` 是 argon2 的 PHC 串、
+/// `lookup` 是 sha256(明文)，两者都够用来做离线爆破，所以它们（以及内部代数
+/// `cred_version`）都是 crate 可见，不对外暴露；外部能看到的只有 [`Self::id`]、
+/// [`Self::name`]、[`Self::created_at`]、[`Self::enabled`] —— 与 `/admin/keys` 的
+/// 线格式一致。
+///
+/// 刻意**不实现 `Debug`**：`{:?}` 会把 `key_hash` 打进日志，而记录本身没有任何需要
+/// `Debug` 的场景（评估 §7 步骤 6）。
+#[derive(Clone)]
 pub struct KeyRecord {
-    pub id: String,
+    pub(crate) id: String,
     /// argon2 哈希（PHC 格式，如 `$argon2id$v=19$m=19456,t=2,p=1$...`），非明文。
-    pub key_hash: String,
+    pub(crate) key_hash: String,
     /// 快速索引：sha256(明文 key) 的十六进制，授权时 O(1) 定位记录。
-    pub lookup: String,
-    pub name: String,
-    pub created_at: u64,
-    pub enabled: bool,
+    pub(crate) lookup: String,
+    pub(crate) name: String,
+    pub(crate) created_at: u64,
+    pub(crate) enabled: bool,
     /// 凭据版本：写入时取当时代数。任何凭据相关变更（吊销/轮换）都会让代数自增，
     /// 从而让基于旧版本建立的已验证缓存**立即失效**（见 `verified` 模块）。
-    pub cred_version: u64,
+    pub(crate) cred_version: u64,
+}
+
+impl KeyRecord {
+    /// key id：对外标识（`/admin/keys`、访问日志、用量表都用它）。
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// 展示用名字（建 key 时给的，可为空字符串）。
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// 创建时间（Unix 秒）。
+    pub fn created_at(&self) -> u64 {
+        self.created_at
+    }
+
+    /// 是否启用。注意**吊销**不是靠它：吊销会把记录从 `runtime` 表里删掉（见
+    /// [`KeyStore::delete`]），所以"查得到 + enabled"才代表可用。
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
 }
 
 /// `create()` 的返回：记录 + 仅此一次的明文 key（之后不再可获取）。
@@ -133,6 +209,9 @@ impl KeyStore {
         let db = match &file {
             Some(path) => match Connection::open(path) {
                 Ok(mut conn) => {
+                    // ① 权限先收紧：库文件刚被创建（或已存在）就以 0600 收口，
+                    //    不靠运维记得 `chmod`（见 `tighten_db_to_owner`）。
+                    tighten_db_to_owner(path);
                     // ② 顺带做的持久化设置：WAL + synchronous=NORMAL。
                     // 落库已经改成"按周期批量"，提交次数从每请求一次降到每周期一次；
                     // 这两条让剩下的那几次提交不必每次都 fsync 主库（云端实测每次
@@ -224,13 +303,11 @@ impl KeyStore {
     }
 
     /// 校验 token 是否为启用中的动态 key（sha256 定位 + argon2 校验）。
+    ///
+    /// 生产路径走 [`Self::authorize_record`]（`auth.rs` 需要 id 与 name）；这个布尔形态
+    /// 是给 **benches 与库调用方**的便利入口，网关自身不调用它。
     pub fn authorize(&self, token: &str) -> bool {
         self.authorize_record(token).is_some()
-    }
-
-    /// 校验并返回 key id（argon2 一次；authorize 的带返回值版本）。
-    pub fn authorize_id(&self, token: &str) -> Option<String> {
-        self.authorize_record(token).map(|r| r.id.clone())
     }
 
     /// 校验并返回 key 记录。
@@ -249,7 +326,7 @@ impl KeyStore {
         let lookup = lookup_of(token);
         self.inner.verified.verify_or_cached(
             &lookup,
-            || self.inner.runtime.read().unwrap().get(&lookup).cloned(),
+            || read_or_recover(&self.inner.runtime).get(&lookup).cloned(),
             |rec| verify_argon2(token, &rec.key_hash),
         )
     }
@@ -280,7 +357,7 @@ impl KeyStore {
             cred_version: self.bump_cred_generation(),
         };
         // ① 先落库。失败 → 直接把错误交给调用方（admin 映射 500），内存一个字都不改。
-        if let Some(conn) = self.inner.db.lock().unwrap().as_mut() {
+        if let Some(conn) = lock_or_recover(&self.inner.db).as_mut() {
             conn.execute(
                 "INSERT OR REPLACE INTO api_keys (id, lookup, key_hash, name, created_at, enabled)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -295,22 +372,14 @@ impl KeyStore {
             )?;
         }
         // ② 再进内存：此后授权立即可用。
-        self.inner
-            .runtime
-            .write()
-            .unwrap()
-            .insert(record.lookup.clone(), record.clone());
+        write_or_recover(&self.inner.runtime).insert(record.lookup.clone(), record.clone());
         tracing::info!(id = %record.id, name = %record.name, "api key created");
         Ok(CreatedKey { record, plaintext })
     }
 
     /// 列出动态 key（不含明文；由调用方决定展示形式）。
     pub fn list(&self) -> Vec<KeyRecord> {
-        let mut v: Vec<KeyRecord> = self
-            .inner
-            .runtime
-            .read()
-            .unwrap()
+        let mut v: Vec<KeyRecord> = read_or_recover(&self.inner.runtime)
             .values()
             .cloned()
             .collect();
@@ -327,24 +396,20 @@ impl KeyStore {
     /// 先落库之后，失败时内存原样（key 仍可用），重试会重新尝试删除并最终自愈。
     pub fn delete(&self, id: &str) -> Result<bool, GatewayError> {
         // 先看它在不在：不在就是 404，且**不碰库**（与旧语义一致）。
-        if !self
-            .inner
-            .runtime
-            .read()
-            .unwrap()
+        if !read_or_recover(&self.inner.runtime)
             .values()
             .any(|r| r.id == id)
         {
             return Ok(false);
         }
         // ① 先落库。失败 → Err，内存原样。
-        if let Some(conn) = self.inner.db.lock().unwrap().as_mut() {
+        if let Some(conn) = lock_or_recover(&self.inner.db).as_mut() {
             conn.execute("DELETE FROM api_keys WHERE id = ?1", rusqlite::params![id])?;
         }
         // ② 再改内存 + 失效缓存 + 推进代数（并发双删时只有一个拿到 true）。
         let mut removed = false;
         {
-            let mut runtime = self.inner.runtime.write().unwrap();
+            let mut runtime = write_or_recover(&self.inner.runtime);
             runtime.retain(|_, r| {
                 if r.id == id {
                     removed = true;
@@ -1037,6 +1102,101 @@ mod tests {
             .unwrap();
         assert_eq!(rows, 1, "库里那一行也还在");
     }
+
+    /// 规格（评估 §5 H4 / §7 步骤 6）：**守卫内 panic 之后，认证热路径不能永久 500**。
+    ///
+    /// `runtime` 是热路径第一站，也是全局共享的：它一旦中毒，`.read().unwrap()` 会让
+    /// 之后**每个** `/v1/*` 都 panic（进程活着、指标还在跑，但全站 500）。锁里的数据只是
+    /// 内存映射，守卫内 panic 不会让它变成非法状态，所以继续用是安全的。
+    #[test]
+    #[serial]
+    fn a_poisoned_runtime_lock_does_not_take_the_gateway_down() {
+        let store = KeyStore::new(None);
+        let key = store.create("poison-runtime".into()).unwrap();
+        assert!(store.authorize(&key.plaintext), "前提：这把 key 可用");
+
+        // 持写锁时 panic：锁中毒，但表本身仍然合法
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = store.inner.runtime.write().unwrap();
+            panic!("poison the runtime lock");
+        }));
+        assert!(poisoned.is_err(), "前提：panic 确实发生了");
+        assert!(
+            store.inner.runtime.is_poisoned(),
+            "前提：锁确实中毒了（否则这条测试没测到东西）"
+        );
+
+        // 中毒之后：读（授权/列表）与写（建 key）都必须照常工作
+        assert!(store.authorize(&key.plaintext), "锁中毒不应让所有请求 500");
+        assert!(store.create("after-poison".into()).is_ok());
+        assert_eq!(store.list().len(), 2);
+    }
+
+    /// 同 [`a_poisoned_runtime_lock_does_not_take_the_gateway_down`]，但针对**落库连接**
+    /// 那把锁（`db`）：它同时服务凭据写穿与用量落库，中毒后不该让"建 key"直接 500。
+    #[test]
+    #[serial]
+    fn a_poisoned_db_lock_still_lets_credential_writes_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = KeyStore::new(Some(dir.path().join("keys.db")));
+
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = store.inner.db.lock().unwrap();
+            panic!("poison the db lock");
+        }));
+        assert!(poisoned.is_err(), "前提：panic 确实发生了");
+        assert!(store.inner.db.is_poisoned(), "前提：锁确实中毒了");
+
+        let created = store
+            .create("after-poison-db".into())
+            .expect("锁中毒后仍应能落库");
+        assert!(store.authorize(&created.plaintext));
+        // 库里确实有一行（不是只改了内存）
+        let conn = Connection::open(dir.path().join("keys.db")).unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM api_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "锁中毒不该把落库也堵死");
+    }
+
+    /// 规格（评估 §7 步骤 6 / P3-7）：`keys.db` 由网关自己收紧到 **0600**，不靠运维记得
+    /// `chmod`（`DEPLOY.md` 的检查清单今天就是这么要求的）。
+    ///
+    /// 库里只有 argon2 哈希与 sha256 lookup，属纵深防御；但**升级/拷贝过来的旧库**往往是
+    /// 0644，所以打开已存在的文件时也要顺手收紧——这条才是确定性的红检（新建文件是否
+    /// 已经是 0600 取决于跑测试的 umask）。
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn keys_db_is_tightened_to_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode_of =
+            |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keys.db");
+        let store = KeyStore::new(Some(path.clone()));
+        store.create("perm".into()).unwrap(); // 让 WAL/SHM 也建起来
+
+        assert_eq!(mode_of(&path), 0o600, "新建的 keys.db 必须是 0600");
+        // WAL/SHM 装着同一份数据，权限不能比主库宽
+        for suffix in ["-wal", "-shm"] {
+            let side = dir.path().join(format!("keys.db{suffix}"));
+            if side.exists() {
+                assert_eq!(
+                    mode_of(&side),
+                    0o600,
+                    "keys.db{suffix} 的权限必须与主库一致"
+                );
+            }
+        }
+
+        // 已经存在的宽权限库：打开时也要收紧（升级/拷贝场景）
+        drop(store);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let _store = KeyStore::new(Some(path.clone()));
+        assert_eq!(mode_of(&path), 0o600, "打开已存在的库也要收紧到 0600");
+    }
 }
 
 #[cfg(test)]
@@ -1170,10 +1330,6 @@ mod verified_tests {
         assert!(
             !store.authorize(&key.plaintext),
             "吊销后必须立即失效（不允许缓存放行）"
-        );
-        assert!(
-            !store.authorize_id(&key.plaintext).is_some(),
-            "吊销后 authorize_id 同样应为 None"
         );
     }
 

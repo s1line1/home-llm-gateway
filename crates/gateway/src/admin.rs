@@ -42,12 +42,12 @@ pub async fn list_keys(State(state): State<AppState>) -> Json<serde_json::Value>
         .list()
         .into_iter()
         .map(|r| {
-            let usage = state.key_store.usage_of(&r.id);
+            let usage = state.key_store.usage_of(r.id());
             json!({
-                "id": r.id,
-                "name": r.name,
-                "created_at": r.created_at,
-                "enabled": r.enabled,
+                "id": r.id(),
+                "name": r.name(),
+                "created_at": r.created_at(),
+                "enabled": r.enabled(),
                 "prefix": "sk-••••",
                 "usage": usage.map(|u| json!({
                     "prompt_tokens": u.prompt_tokens,
@@ -126,11 +126,11 @@ pub async fn create_key(
     (
         StatusCode::CREATED,
         Json(json!({
-            "id": created.record.id,
+            "id": created.record.id(),
             "key": created.plaintext,
-            "name": created.record.name,
-            "created_at": created.record.created_at,
-            "enabled": created.record.enabled,
+            "name": created.record.name(),
+            "created_at": created.record.created_at(),
+            "enabled": created.record.enabled(),
             "prefix": "sk-••••",
             "usage": {
                 "prompt_tokens": 0,

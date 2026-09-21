@@ -38,13 +38,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::KeyRecord;
+use super::{lock_or_recover, KeyRecord};
 
 /// 缓存中的一条已验证身份：**整条记录 + 校验时间**。
 ///
 /// 存整条记录（而不是只存 id/name）是为了让热路径拿到 enabled/cred_version 时
 /// 与缓存快照来自**同一份数据**，避免"读表得到的版本"和"缓存里的版本"分属两次读取。
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct Verified {
     record: KeyRecord,
     verified_at: Instant,
@@ -171,7 +171,7 @@ impl VerifiedCache {
         let mut probe = Some(probe);
         loop {
             let slot = self.flight(lookup);
-            let _guard = slot.lock().unwrap();
+            let _guard = lock_or_recover(&slot);
             // 拿到锁之后**先确认这个槽还是当前那一个**：等锁期间前一个持有者可能已经
             // 收尾并删掉表项（甚至已有别人新建了槽）。这时必须重取当前槽再进临界区，
             // 否则"我"与"新槽的持有者"会同时跑 argon2——这正是 H3 的另一半。
@@ -217,7 +217,7 @@ impl VerifiedCache {
     /// 只回答"能不能放行"，不返回记录本身——记录由调用方交给 [`Self::verify_or_cached`]
     /// 的 `load` 提供，所以这里不需要克隆，调用方也拿不到过期的副本。
     fn is_cached(&self, lookup: &str, cred_version: u64) -> bool {
-        let entries = self.entries.lock().unwrap();
+        let entries = lock_or_recover(&self.entries);
         let Some(hit) = entries.get(lookup) else {
             return false;
         };
@@ -239,7 +239,7 @@ impl VerifiedCache {
 
     /// 校验成功后写入（容量满时淘汰最旧一条）。只在缓存开启时被调用。
     fn put(&self, lookup: &str, record: KeyRecord) {
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = lock_or_recover(&self.entries);
         if entries.len() >= self.max_entries && !entries.contains_key(lookup) {
             // 淘汰最旧（verified_at 最小）的一条；缓存很小，线性扫描足够
             if let Some(oldest) = entries
@@ -261,17 +261,12 @@ impl VerifiedCache {
 
     /// 按 key id 失效（删除 key 时调用；记录从 runtime 表消失本身已能拦住，这里是双保险）。
     pub(crate) fn invalidate_by_id(&self, key_id: &str) {
-        self.entries
-            .lock()
-            .unwrap()
-            .retain(|_, v| v.record.id != key_id);
+        lock_or_recover(&self.entries).retain(|_, v| v.record.id != key_id);
     }
 
     /// 取该 token 的单飞槽位：同一 token 的并发校验会串行执行。
     fn flight(&self, lookup: &str) -> FlightSlot {
-        self.inflight
-            .lock()
-            .unwrap()
+        lock_or_recover(&self.inflight)
             .entry(lookup.to_string())
             .or_default()
             .clone()
@@ -279,16 +274,14 @@ impl VerifiedCache {
 
     /// 表项是否**仍是**这一个槽（[`Self::verify_or_cached`] 等锁之后要重新确认）。
     fn is_current(&self, lookup: &str, slot: &FlightSlot) -> bool {
-        self.inflight
-            .lock()
-            .unwrap()
+        lock_or_recover(&self.inflight)
             .get(lookup)
             .is_some_and(|cur| Arc::ptr_eq(cur, slot))
     }
 
     /// 只在表项**仍是** `slot` 时删除：迟到的释放绝不动别人的活槽（评估 §5 H3）。
     fn remove_if_current(&self, lookup: &str, slot: &FlightSlot) {
-        let mut inflight = self.inflight.lock().unwrap();
+        let mut inflight = lock_or_recover(&self.inflight);
         if inflight
             .get(lookup)
             .is_some_and(|cur| Arc::ptr_eq(cur, slot))
@@ -311,19 +304,19 @@ impl VerifiedCache {
     /// 当前缓存条目数（测试用）。
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.entries.lock().unwrap().len()
+        lock_or_recover(&self.entries).len()
     }
 
     /// 当前在用的单飞槽数（测试用）：正常收尾后必须归零，否则 `inflight` 随调用无界增长。
     #[cfg(test)]
     pub(crate) fn inflight_len(&self) -> usize {
-        self.inflight.lock().unwrap().len()
+        lock_or_recover(&self.inflight).len()
     }
 
     /// 当前缓存里的键（测试用）：用来钉"缓存只键于 `sha256(token)`、从不存明文"。
     #[cfg(test)]
     pub(crate) fn keys(&self) -> Vec<String> {
-        self.entries.lock().unwrap().keys().cloned().collect()
+        lock_or_recover(&self.entries).keys().cloned().collect()
     }
 }
 
@@ -540,5 +533,52 @@ mod tests {
         }));
         assert!(panicked.is_err(), "probe 的 panic 必须照常传播");
         assert_eq!(cache.inflight_len(), 0, "unwind 也要归还槽位");
+
+        // 而且这把 key 不能就此永久失败：下一次校验照常完成
+        // （守卫已把表项清掉，所以这里拿到的是新槽；"中毒的锁也能用"由下一条用例覆盖）
+        assert!(
+            cache
+                .verify_or_cached("k", || Some(record(1)), |_| true)
+                .is_some(),
+            "一次 panic 之后，同一个 lookup 必须还能校验"
+        );
+    }
+
+    /// H4（评估 §7 步骤 6）：`entries` / `inflight` 中毒后也必须能继续服务。
+    ///
+    /// 锁里只是缓存映射与槽位表，守卫内 panic 不会让它们变成非法状态；而 `.unwrap()`
+    /// 会让一次 panic 变成"之后每次认证都 500"（`entries`）或"这把 key 永久卡死"
+    /// （`inflight`）。
+    #[test]
+    fn a_poisoned_cache_lock_does_not_take_authentication_down() {
+        let cache = cache();
+        let poison = |f: &dyn Fn()| {
+            assert!(
+                catch_unwind(AssertUnwindSafe(f)).is_err(),
+                "前提：panic 发生了"
+            );
+        };
+        poison(&|| {
+            let _g = cache.entries.lock().unwrap();
+            panic!("poison entries");
+        });
+        poison(&|| {
+            let _g = cache.inflight.lock().unwrap();
+            panic!("poison inflight");
+        });
+        assert!(
+            cache.entries.is_poisoned() && cache.inflight.is_poisoned(),
+            "前提：两把锁都中毒了"
+        );
+
+        assert!(
+            cache
+                .verify_or_cached("k", || Some(record(1)), |_| true)
+                .is_some(),
+            "锁中毒后仍应能校验并写缓存"
+        );
+        assert_eq!(cache.len(), 1, "写缓存这条路径也要走通");
+        assert_eq!(cache.inflight_len(), 0, "槽位照常归还");
+        assert_eq!(cache.counters(), (0, 1));
     }
 }
