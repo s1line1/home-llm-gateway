@@ -34,7 +34,7 @@ services:
     # 与镜像 WORKDIR 一致；配置里的相对路径（ui_dir 等）以此为基准
     working_dir: /etc/home-llm-gateway
     ports:
-      - "9090:9090" # HTTP/HTTPS 入口，对应配置里的 listen_addr
+      - "9090:9090" # HTTP/HTTPS 入口：**必须与配置里的 listen_addr 一致**（本仓库示例配置是 8443，按你的 gateway-config.yml 填）
       - "4433:4433/udp" # QUIC 隧道入口，对应 quic_addr。**必须是 /udp**
     volumes:
       # 单挂载、同路径：配置 + 证书 + keys.db 都在这一个目录里（最省事，配置零改动）

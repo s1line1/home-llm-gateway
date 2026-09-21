@@ -79,7 +79,7 @@ async fn e2e_startup_raises_the_nofile_soft_limit_in_the_real_process() {
 /// 为什么值得一条测试：这条顺序**只能**靠测试钉住——把 `start` 里那两行对调，编译、
 /// clippy 与其余用例全都照样通过（`Gateway.nofile` 字段只保证 `install()` 被调用过，
 /// 不保证它发生在校验之后）。而副作用是有后果的：`deploy/gateway.service` 是
-/// `Restart=always`，配置写错时会反复重试，每次都去改一遍进程的 fd 额度。
+/// `Restart=on-failure`，配置写错时进程非零退出会被反复重启，每次都去改一遍进程的 fd 额度。
 ///
 /// 断言口径与上一条相同：直接读**进程自己**的限额，不信自家日志或返回值。
 #[cfg(unix)]

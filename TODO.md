@@ -180,9 +180,10 @@
         `README.md` 已在本次审查中补上"每台机器 `agent_id` 必须唯一"的警告与排障行。
       注：网关侧"踢旧连接"的机制本身是对的（同机重连接管），无需改动——现在的问题只是它
       会被配置撞车误触发。
-- [x] **进程级优雅关闭**：gateway/agent 注册 SIGTERM/SIGINT（`tokio::signal`），收到后打 INFO 日志
-      → 调用 `Gateway::shutdown()` / `Agent::shutdown()` 干净退出；
-      覆盖 systemd stop、Ctrl+C、harness job_kill 场景（对应 OPTIMIZATION.md A1 ✅）
+- [x] **进程级优雅关闭（部分）**：gateway/agent 注册 SIGTERM/SIGINT（`tokio::signal`），收到后打 INFO 日志
+      → 调用 `Gateway::shutdown()` / `Agent::shutdown()` 退出；
+      覆盖 systemd stop、Ctrl+C、harness job_kill 场景（对应 OPTIMIZATION.md A1 ✅）。
+      **网关侧只保证"已结算用量不丢"，没有 drain**：在途 SSE 会被立即 abort（硬切），见下方 R12 drain 式关闭。
 - [ ] **多 CA 信任根 + 动态增删（每 agent 独立 CA，gateway 不停机）**：
       目标：每个 agent 用独立 CA 签发证书，gateway 维护全部 CA 的信任根集合；
       运行时热添加/移除单个 CA——移除即吊销该 CA 下所有 agent（新连接被拒，
@@ -256,7 +257,7 @@
       测试：lib 单测（占 1 槽后第 2 请求 429 / 0 不限 / 释放后恢复）+ e2e
       `e2e_http_concurrent_request_limit`（limit=1 并发两慢请求 → 200 + 429）
 - [ ] **请求体大小限制可配置（C 档，可选）**：`DefaultBodyLimit::max(16MB)` 硬编码
-      （http.rs）——多模态图像/大上下文请求 413 无法调；config 加字段即可
+      （`http/mod.rs`，上限常量在 `body.rs`）——多模态图像/大上下文请求 413 无法调；config 加字段即可
 - [ ] **首次部署 bootstrap（B 档，可选）**：第一个 API key 目前必须走 admin API
       （admin_token 配置文件明文）；考虑"首次启动自动建默认 key"或引导提示
 - [ ] **usage 数据保留策略（B 档，可选）**：`key_usage` 无限累积（reset 是待定项）——
@@ -480,7 +481,7 @@
 - [x] **重复逻辑（认证+限流这一半已修，2026-09）**：`proxy` 曾内联复制一份已封装的
       认证 + 限流。现在两条路径（`/v1/{*rest}` 与 `/v1/models`）都走 `auth::authenticate`，
       401/429 的文案与顺序只存在一处：`auth.rs`。另一半未修：`Accept: text/html` 探测
-      仍复制两份（`http.rs:103-107` 与 `:197-201`）。
+      仍复制两份（`http/ui.rs:34` 与 `http/api.rs:53`）。
 - [x] **`UsageCollector` 位置与自我声明矛盾（2026-09 已修）**：它原先是"有状态的状态机住在
       `proxy/mod.rs`"，与 `usage_meter.rs` 自称"只含纯函数"、OPTIMIZATION S1 把 proxy 限定为
       "代理转发"三方矛盾。**两个选项都没选**：它没有搬进 `usage_meter.rs`（那会让"纯函数"
@@ -540,7 +541,8 @@
       `INSERT ... ON CONFLICT`，实测把 2 vCPU 的上限摁在约 190 QPS（云端 515 个线程里 514 个
       卡在 futex 等同一把 `db` 锁）。现改为：热路径只做内存累加 → 后台每 1s 一个事务批量写
       **绝对累计值**（幂等、重启不重复累加）→ **SIGTERM/SIGINT 时强制再落库一次**，日志
-      `usage flushed before shutdown keys=N`，正常关闭不丢数据（仅 SIGKILL/断电会丢最后一个
+      `usage flushed before shutdown keys=N`，正常关闭不丢**已结算**数据（flush 之后、abort 之前在途
+      请求结算的用量不在其列，见 R12 drain 式关闭；SIGKILL/断电仍会丢最后一个
       flush 周期 ≤1s 的用量）。顺带开 `journal_mode=WAL` + `synchronous=NORMAL`。
       可信口径（只数 `status="200"`，同时记录 200 占比）下的对比在云端做：每请求 CPU 从
       0.55–0.9ms（改造前，2.1 核 ÷ 190 QPS）降到 **0.30ms**（改造后，0.149 核 ÷ 496 QPS），
@@ -585,13 +587,13 @@
       探针答不出"隧道入口还活着吗 / 还有几个 agent 注册 / 持久化可写吗"。
       （闸门豁免这一半已修：`/healthz` 用 `limit = 0` 绕过准入，单测
       `observability::tests::healthz_is_exempt_from_the_admission_gate` 锁住。）
-- [ ] **R12 drain 式关闭**：`Gateway::shutdown`（`crates/gateway/src/lib.rs:290`）目前只是
-      `abort()` 掉四个任务（两个 HTTP 监听、QUIC accept、用量 flusher），**没有排空**——
+- [ ] **R12 drain 式关闭**：`Gateway::shutdown`（`crates/gateway/src/gateway.rs:324`）目前只是
+      `abort()` 掉三个任务（HTTP 入口〔TLS 与明文共用一个任务〕、QUIC accept、用量 flusher），**没有排空**——
       `systemctl restart`（SIGTERM）会把在途 SSE 流切断，客户端看到的是"流被截断"而非正常结束；
       agent 的隧道连接随进程消失、靠自身退避（≤30s）重连。做法：先停 accept → 宽限期 →
       到期前给在途流一个明确的结束/错误事件 → 再 abort。配套 `TimeoutStopSec`
-      （`deploy/gateway.service` 未设 = systemd 默认 90s）必须 > 宽限期，且 `flush_usage_on_shutdown`
-      是阻塞式 SQLite 写、无超时，卡住就只能等那 90s 后的 SIGKILL。
+      （`deploy/gateway.service` 未设 = systemd 默认 90s）必须 > 宽限期，且 `shutdown` 里的
+      `KeyStore::flush_usage_blocking()` 是阻塞式 SQLite 写、无超时，卡住就只能等那 90s 后的 SIGKILL。
       注：`registry.rs::close_when_drained` 是"摘除单个 agent"用的，不是进程退出路径。
 
 **已修、不要再照 §6 做一遍的**：R7 票据绑响应 body（钉点时即正确）、R10 的
