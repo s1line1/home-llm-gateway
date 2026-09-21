@@ -6,7 +6,7 @@ use std::{
         atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
         Arc, RwLock,
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use serde::Serialize;
@@ -60,7 +60,16 @@ pub struct Entry {
     max_concurrency: u32,
     /// 当前在途请求数（admission control）。
     inflight: Arc<AtomicU32>,
-    last_seen: Instant,
+    /// 最近一次心跳的时刻（自 `epoch` 起的毫秒数）。
+    ///
+    /// 与 `last_head_ok` **共用同一个时间基准**。早先这里存 `Instant`、那边存相对毫秒：
+    /// 两套时钟并存时"心跳新鲜"与"响应头新鲜"没法直接对账，而且 `Instant` 不是原子类型，
+    /// 只能靠写锁 + `get_mut` 才能改——于是每来一帧心跳都要独占整张表（见
+    /// [`Registry::heartbeat`]）。换成原子毫秒之后这两件事一起解决。
+    ///
+    /// 用 `Arc` 包一层是为了让 `Entry: Clone`（`AtomicU64` 自身不是 `Clone`），与同结构里
+    /// `inflight` / 三个 strike 计数 / `last_head_ok` 保持同一种形状。
+    last_seen_millis: Arc<AtomicU64>,
     /// 连续"**开流**超时且判定为死"的次数（判据见 [`Entry::open_timeout_is_fatal`]）。
     ///
     /// **每一种失败原因各有一条计数**（开流 / 响应头 / 写帧失败）：混在一起时，三种
@@ -122,6 +131,21 @@ fn epoch() -> std::time::Instant {
 /// `NEVER` 哨兵都不出注册表。
 fn now_millis() -> u64 {
     epoch().elapsed().as_millis() as u64
+}
+
+/// 距上次心跳过了多久（毫秒）。
+fn since_millis(last_seen_millis: u64, now_millis: u64) -> u64 {
+    now_millis.saturating_sub(last_seen_millis)
+}
+
+/// 心跳是否仍在新鲜期内（= 这条条目参与路由与模型聚合）。
+///
+/// **这条判据原先在五个地方各写一遍**（`healthy_count`、`status`、`snapshot`、
+/// `try_acquire_excluding`、`healthy_models`）。口径一旦分叉，"可路由的 agent 数"与
+/// "选路时真正被过滤掉的数量"就对不上——而这两个数正是排查"所有请求 503"时唯一能互相
+/// 对照的东西（见 `hlmg_agents` 与 `hlmg_agents_healthy` 的 HELP）。
+fn is_fresh(last_seen_millis: u64, now_millis: u64, stale_after: Duration) -> bool {
+    since_millis(last_seen_millis, now_millis) < stale_after.as_millis() as u64
 }
 
 impl Entry {
@@ -281,15 +305,21 @@ impl Registry {
                 // 坏隧道必须能被原来的连续 3 次规则摘掉，不能因为"刚注册"而获得宽限
                 // （这条正是既有 e2e `e2e_dead_tunnel_fails_fast_instead_of_hanging` 钉住的）。
                 last_head_ok: Arc::new(AtomicU64::new(NEVER)),
-                last_seen: Instant::now(),
+                last_seen_millis: Arc::new(AtomicU64::new(now_millis())),
             },
         );
         stable_id
     }
 
+    /// 刷新某条条目的心跳时刻。
+    ///
+    /// **只取读锁**：刷新心跳只是往一个原子量里写毫秒数，不需要独占整张表。以前这里用
+    /// `write()` + `get_mut()`，因为 `Instant` 不是原子类型、只能靠可变借用来写——代价是
+    /// 每来一帧心跳（agent 侧每 5s 一帧，多 agent 时叠加）就把**所有正在选路的读锁**挡在门外。
+    /// 换成原子毫秒后，这个热点不再与路由争锁。
     pub fn heartbeat(&self, agent_id: &str) {
-        if let Some(e) = self.inner.write().unwrap().get_mut(agent_id) {
-            e.last_seen = Instant::now();
+        if let Some(e) = self.inner.read().unwrap().get(agent_id) {
+            e.last_seen_millis.store(now_millis(), Ordering::Relaxed);
         }
     }
 
@@ -309,7 +339,7 @@ impl Registry {
     /// 取 3 而不是 1：单次失败在高并发下是**排队假象**——开流/写帧都要过连接级流管理器，
     /// 768 并发时很容易超过 `tunnel_op_secs`。实测（2026-09-17，双 agent/768 并发）：
     /// 第一次超时就把条目摘掉，而连接其实完好、agent 也毫不知情，于是每 5s 心跳继续
-    /// 刷新 `last_seen`、注册表里却没有它，所有请求 `503 registry-empty`（占比 92.6%）。
+    /// 刷新心跳时刻（那时注册表里已经没有它）、所有请求 `503 registry-empty`（占比 92.6%）。
     ///
     /// 阈值对**每一种原因**各自适用（内部按 `EvictCause` 分开记；对外的入口是
     /// [`Registry::report_open_timeout`] 等四个方法）。
@@ -479,21 +509,23 @@ impl Registry {
     /// "agent 掉了"，实际是"注册表里有、但全部不健康"。
     pub fn healthy_count(&self, stale_after: Duration) -> usize {
         let inner = self.inner.read().unwrap();
+        let now = now_millis();
         inner
             .values()
-            .filter(|e| e.last_seen.elapsed() < stale_after)
+            .filter(|e| is_fresh(e.last_seen_millis.load(Ordering::Relaxed), now, stale_after))
             .count()
     }
 
     /// 挑不出候选时的诊断快照（只用于失败路径的日志/指标，不进热路径）。
     pub fn status(&self, stale_after: Duration) -> RegistryStatus {
         let inner = self.inner.read().unwrap();
-        let now = Instant::now();
+        let now = now_millis();
         let mut healthy = 0usize;
         let mut oldest: Option<Duration> = None;
         for e in inner.values() {
-            let age = now.duration_since(e.last_seen);
-            if age < stale_after {
+            let last = e.last_seen_millis.load(Ordering::Relaxed);
+            let age = Duration::from_millis(since_millis(last, now));
+            if is_fresh(last, now, stale_after) {
                 healthy += 1;
             }
             oldest = Some(match oldest {
@@ -515,7 +547,7 @@ impl Registry {
     /// 返回全部已注册 agent 的明细快照（按 agent_id 排序）。
     pub fn snapshot(&self) -> Vec<AgentInfo> {
         let inner = self.inner.read().unwrap();
-        let now = Instant::now();
+        let now = now_millis();
         let mut out: Vec<AgentInfo> = inner
             .iter()
             .map(|(id, e)| AgentInfo {
@@ -523,7 +555,8 @@ impl Registry {
                 models: e.models.clone(),
                 max_concurrency: e.max_concurrency,
                 inflight: e.inflight.load(Ordering::Relaxed),
-                last_seen_secs_ago: now.duration_since(e.last_seen).as_secs(),
+                last_seen_secs_ago: since_millis(e.last_seen_millis.load(Ordering::Relaxed), now)
+                    / 1000,
             })
             .collect();
         out.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
@@ -534,9 +567,10 @@ impl Registry {
     /// `["*"]` 不贡献条目（全匹配，但具体能跑什么只有上游知道）。
     pub fn healthy_models(&self, stale_after: Duration) -> Vec<String> {
         let inner = self.inner.read().unwrap();
+        let now = now_millis();
         let mut out: Vec<String> = inner
             .values()
-            .filter(|e| e.last_seen.elapsed() < stale_after)
+            .filter(|e| is_fresh(e.last_seen_millis.load(Ordering::Relaxed), now, stale_after))
             .flat_map(|e| e.models.iter().filter(|m| m.as_str() != "*").cloned())
             .collect();
         out.sort();
@@ -568,9 +602,10 @@ impl Registry {
         exclude: &[usize],
     ) -> Result<(Entry, SlotGuard), AcquireError> {
         let inner = self.inner.read().unwrap();
+        let now = now_millis();
         let mut candidates: Vec<&Entry> = inner
             .values()
-            .filter(|e| e.last_seen.elapsed() < stale_after)
+            .filter(|e| is_fresh(e.last_seen_millis.load(Ordering::Relaxed), now, stale_after))
             .filter(|e| !exclude.contains(&e.stable_id))
             .collect();
         if candidates.is_empty() {
@@ -588,7 +623,7 @@ impl Registry {
             (
                 !exact,
                 e.inflight.load(Ordering::Relaxed),
-                std::cmp::Reverse(e.last_seen),
+                std::cmp::Reverse(e.last_seen_millis.load(Ordering::Relaxed)),
             )
         });
         for candidate in candidates {
