@@ -441,13 +441,28 @@ impl Registry {
         });
         for candidate in candidates {
             let entry = candidate.clone();
-            let acquired = entry.max_concurrency == 0
-                || entry
+            // `max_concurrency == 0` = 不限：**不做上限判定**，但自增必须照做。
+            // `inflight` 不只是准入闸门，它同时是另外三处的输入：开流超时的忙/死判据
+            // （[`Entry::open_timeout_is_fatal`]，`0` 时以端点流额度为上限）、摘除时
+            // "是否还有别人在途"（[`Registry::evict`] 的 `inflight <= 1`）、以及下面
+            // `sort_by_key` 的负载排序键。
+            //
+            // 曾经写成 `entry.max_concurrency == 0 || …fetch_update(…)`：短路使"不增"，
+            // 而 `SlotGuard::drop` 仍然"减" → `AtomicU32` 下溢回绕成 4294967295。
+            // 后果是开流判据对该连接永久失效、每次摘除都白等满宽限期、这台 agent 永远排
+            // 最后、`/admin/agents` 显示天文数字。回归测试：
+            // `max_concurrency_zero_always_acquires_and_still_counts_inflight`。
+            let acquired = if entry.max_concurrency == 0 {
+                let _ = entry.inflight.fetch_add(1, Ordering::Relaxed);
+                true
+            } else {
+                entry
                     .inflight
                     .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                         (n < entry.max_concurrency).then_some(n + 1)
                     })
-                    .is_ok();
+                    .is_ok()
+            };
             if acquired {
                 let guard = SlotGuard(entry.inflight.clone());
                 return Ok((entry, guard));
@@ -905,14 +920,55 @@ mod tests {
         assert!(reg.try_acquire(Duration::from_secs(10), "qwen2.5").is_ok());
     }
 
+    /// 规格：`max_concurrency == 0` = 不限（永远拿得到槽位），但**计数仍然必须真实**。
+    ///
+    /// `0` 只关掉"准入上限"这一件事；`inflight` 同时还是另外三处的输入：
+    /// 开流超时的忙/死（[`Entry::open_timeout_is_fatal`]）、摘除时"是否还有别人在途"
+    /// （[`Registry::evict`] 的 `inflight <= 1`）、以及负载排序（`try_acquire_excluding`
+    /// 的 `sort_by_key`）。只减不加会让 `AtomicU32` **下溢回绕成 4294967295**：开流判据
+    /// 永久失效、每次摘除都白等满宽限期、这台 agent 永远排最后、`/admin/agents` 显示天文数字
+    /// （已记录：`docs/PROJECT_SCAN.md` P1-3）。
     #[tokio::test]
-    async fn max_concurrency_zero_always_acquires() {
+    async fn max_concurrency_zero_always_acquires_and_still_counts_inflight() {
         let reg = Registry::default();
         let conn = test_connection().await;
         reg.register("z".into(), vec!["*".into()], 0, conn.clone()); // 0 = 不限
-        for _ in 0..5 {
-            let (_entry, _slot) = reg.try_acquire(Duration::from_secs(10), "qwen2.5").unwrap();
+
+        // ① 只减不加 → 下溢：拿 5 次再**全部归还**，计数必须回到 0。
+        //    在未修的实现里这里会读到 4294967295（`AtomicU32` 回绕），正是 P1-3 记录的形态。
+        {
+            let mut slots = Vec::new();
+            for _ in 0..5 {
+                let (_entry, slot) = reg.try_acquire(Duration::from_secs(10), "qwen2.5").unwrap();
+                slots.push(slot);
+            }
+            drop(slots);
         }
+        assert_eq!(
+            reg.snapshot()[0].inflight,
+            0,
+            "拿 5 次再全部归还后必须回到 0；只减不加会下溢成 4294967295"
+        );
+
+        // ② 而且过程里必须如实累加：不限并发不等于不计数
+        let mut slots = Vec::new();
+        for expected in 1..=5u32 {
+            let (entry, slot) = reg.try_acquire(Duration::from_secs(10), "qwen2.5").unwrap();
+            slots.push(slot);
+            assert_eq!(
+                entry.inflight.load(Ordering::Relaxed),
+                expected,
+                "不限并发也必须如实计数：开流判据、摘除判据、负载排序都读这个数"
+            );
+        }
+        assert_eq!(reg.snapshot()[0].inflight, 5, "运维看到的在途数同样要真实");
+
+        drop(slots);
+        assert_eq!(
+            reg.snapshot()[0].inflight,
+            0,
+            "最后一次释放后必须回到 0；下溢会变成 4294967295"
+        );
     }
 
     #[tokio::test]
