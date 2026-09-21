@@ -120,7 +120,7 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
         Ok(Ok(HeadOutcome::Head(s, h))) => {
             // 对端真的回了响应头 = 这条隧道是活的 → 清掉连续超时计数。
             // （开流成功不能作为判据：agent 卡死时流照样能开，只是永远不回帧。）
-            state.registry.note_tunnel_op_ok(entry.stable_id);
+            state.registry.note_tunnel_op_ok(entry.stable_id());
             (s, h)
         }
         Ok(Ok(HeadOutcome::Error(code, message))) => {
@@ -156,7 +156,7 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
                 state.metrics.record_head_timeout("silent");
                 warn!(
                     request_id,
-                    agent = %entry.agent_id,
+                    agent = %entry.agent_id(),
                     last_head_ago_secs,
                     window_secs = state.head_alive_window.as_secs(),
                     "upstream head timeout and the agent has been silent; evicting agent"
@@ -165,7 +165,7 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
                 state.metrics.record_head_timeout("slow");
                 warn!(
                     request_id,
-                    agent = %entry.agent_id,
+                    agent = %entry.agent_id(),
                     last_head_ago_secs,
                     "upstream head timeout while the agent is still answering; not evicting"
                 );

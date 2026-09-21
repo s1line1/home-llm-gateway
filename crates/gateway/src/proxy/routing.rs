@@ -116,7 +116,7 @@ pub(super) async fn open_and_send(
         };
 
         // 记下本次选中的连接：重试时不会再选它（否则重试没有意义）。
-        tried.push(entry.stable_id);
+        tried.push(entry.stable_id());
 
         let stream = match open_tunnel(&mut entry, state.tunnel_op_timeout).await {
             Ok(s) => s,
@@ -152,9 +152,9 @@ pub(super) async fn open_and_send(
                     state.metrics.record_tunnel_open_timeout("busy");
                     warn!(
                         request_id,
-                        agent = %entry.agent_id,
-                        inflight = entry.inflight.load(std::sync::atomic::Ordering::Relaxed),
-                        max_concurrency = entry.max_concurrency,
+                        agent = %entry.agent_id(),
+                        inflight = entry.inflight(),
+                        max_concurrency = entry.max_concurrency(),
                         stream_ceiling = state.max_open_tunnel_streams,
                         timeout_ms = state.tunnel_op_timeout.as_millis(),
                         "tunnel open timed out while agent is at capacity; not evicting, trying another agent"
@@ -162,7 +162,7 @@ pub(super) async fn open_and_send(
                 } else {
                     state.metrics.record_tunnel_open_timeout("dead");
                     warn!(
-                        agent = %entry.agent_id,
+                        agent = %entry.agent_id(),
                         timeout_ms = state.tunnel_op_timeout.as_millis(),
                         "tunnel open timed out; evicting agent"
                     );
@@ -186,7 +186,7 @@ pub(super) async fn open_and_send(
                 }
                 warn!(
                     request_id,
-                    agent = %entry.agent_id,
+                    agent = %entry.agent_id(),
                     error = %err,
                     "tunnel open failed; retrying on another agent"
                 ); // "忙"不算隧道故障：不写进 last_failure，这样即使最后挑不出别的 agent，
@@ -208,7 +208,7 @@ pub(super) async fn open_and_send(
             request,
             state.tunnel_op_timeout,
             request_id,
-            &entry.agent_id,
+            entry.agent_id(),
         )
         .await
         {
@@ -237,7 +237,7 @@ pub(super) async fn open_and_send(
             }
             warn!(
                 request_id,
-                agent = %entry.agent_id,
+                agent = %entry.agent_id(),
                 error = %e,
                 "request frame write failed; retrying on another agent"
             );
