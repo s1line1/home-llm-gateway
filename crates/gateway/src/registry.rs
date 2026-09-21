@@ -78,6 +78,12 @@ pub struct Entry {
     /// 用 `Arc` 包一层是为了让 `Entry: Clone`（`AtomicU64` 自身不是 `Clone`），与同结构里
     /// `inflight` / 三个 strike 计数 / `last_head_ok` 保持同一种形状。
     last_seen_millis: Arc<AtomicU64>,
+    /// **收到过心跳**的时刻（自 `epoch` 起的毫秒数）；初值 `NEVER` = 从未收到过。
+    ///
+    /// 与 `last_seen_millis` 刻意分开：那个在注册时就写了一次（"刚注册的 agent 可以立刻
+    /// 参与路由"）。而"对端还活着吗"要的是**它说过话**这个事实——注册本身不算说话。
+    /// 用途见 [`Entry::peer_alive`]（响应头静默判据的第二层）。
+    last_heartbeat_millis: Arc<AtomicU64>,
     /// 连续"**开流**超时且判定为死"的次数（判据见 [`Entry::open_timeout_is_fatal`]）。
     ///
     /// **每一种失败原因各有一条计数**（开流 / 响应头 / 写帧失败）：混在一起时，三种
@@ -156,6 +162,20 @@ fn is_fresh(last_seen_millis: u64, now_millis: u64, stale_after: Duration) -> bo
     since_millis(last_seen_millis, now_millis) < stale_after.as_millis() as u64
 }
 
+/// 「响应头静默」判据需要的三个时间窗。
+///
+/// 三个都是 `Duration`、语义却完全不同（窗口 / 对端活着 / 静默上限），所以用结构体传而不是
+/// 三个位置参数——顺序写错不会有任何编译错误，只会让判据悄悄变松或变紧。
+#[derive(Debug, Clone, Copy)]
+pub struct HeadSilence {
+    /// "忙/死"窗口：这么久内有过成功响应头就只是慢。= `head_timeout × 4`。
+    pub window: Duration,
+    /// "对端还活着"的判据：心跳在这个时间内 = 它还在说话。= `agent_stale_after`。
+    pub peer_alive_window: Duration,
+    /// 对端活着时，静默最多可以被宽限到多久。= `Options::head_silent_grace`（默认一条请求的寿命）。
+    pub stuck_after: Duration,
+}
+
 impl Entry {
     /// 这条条目的连接身份：进程内唯一、**永不复用**（见 [`Registry::register`] 的说明）。
     pub fn stable_id(&self) -> usize {
@@ -213,23 +233,53 @@ impl Entry {
     ///
     /// 与 [`Entry::open_timeout_is_fatal`] 同一套思路，但问的是另一个问题：开流超时问
     /// "还有额度吗"，响应头超时问 **"这条隧道最近还在干活吗"**——因为响应头超时的两种成因
-    /// 在现象上完全一样（15s 内没等到头），区别只在于"是被堵住的慢"还是"真的没有了"。
+    /// 在现象上完全一样（`head_timeout` 内没等到头），区别只在于"是被堵住的慢"还是"真的没有了"。
     ///
-    /// 判据：`window` 内**有过**成功响应头 → 只是在慢（返回 `false`，调用方只回 504、不计 strike、
-    /// 不摘除）；从未有过、或窗口内一次都没有 → 死（走原来的连续 3 次摘除）。
+    /// **两层口径**（第二层是 2026-09 为修"均匀慢流量"那条误判加的，见评估报告 §5 H2）：
     ///
-    /// "从未有过"直接判死是有意的：没有成功响应头就**没有"只是慢"的证据**。否则一条注册后
-    /// 从不回包的坏隧道会被宽限一个窗口，坏连接的检出被推迟（既有 e2e 就钉着这一点）。
+    /// 1. `window` 内**有过**成功响应头 → 只是慢（返回 `false`，调用方只回 504、不计 strike）。
+    /// 2. 窗口已过，但**对端还在说话**（心跳新鲜，见 `Entry::peer_alive`）且静默没超过
+    ///    `stuck_after` → 仍然只是慢。为什么需要它：`last_head_ok` 的唯一刷新点就是成功响应头
+    ///    本身，所以一旦**所有**请求都慢过 `head_timeout`（大模型首字节慢、上游排队、链路被堵），
+    ///    就没有任何一次成功能刷新它，窗口必然走完 → 一条活得好好的 agent 被摘除 → 关连接 →
+    ///    agent 重连 → 注册表为空 → 全量 503，**正是这条判据本来要防的那条链**（2026-09-18 实测）。
+    ///    对端还在发心跳就说明它还在说话；而"数据面被堵住的慢"与"数据面卡死"在网关侧**观察上
+    ///    无法区分**，这一层选择"宁可晚摘，不误摘"。
+    /// 3. 其余 → 死：窗口已过，且（对端不再说话 **或** 静默已超过 `stuck_after`）。
     ///
-    /// 代价与兜底：真死但"最近刚成功过"的 agent 会晚 `window` 才被摘除。这不影响路由——
-    /// 真死的 agent 心跳会停，`agent_stale_after` 会先把它从候选里剔掉；而进程直接消失时，
-    /// QUIC 连接关闭会走 `remove_if_same` 正常摘除，根本不经过这里。
-    pub fn head_timeout_is_fatal(&self, window: Duration) -> bool {
-        let last = self.last_head_ok.load(Ordering::Relaxed);
-        if last == NEVER {
+    /// **"从未回过响应头"仍然是快路径**：没有成功响应头就**没有"它能服务"的证据**，于是不做
+    /// 第 2 层的延长，直接交给连续 3 次摘除（既有 e2e
+    /// `e2e_dead_tunnel_fails_fast_instead_of_hanging` 钉着这一点）。已知代价：一条**注册后
+    /// 一次都没回包**、但还在心跳的连接（例如首字节一直慢过 `head_timeout`）仍会在 3 次之后
+    /// 被摘除——这是这一层明确不覆盖的形态。
+    ///
+    /// 代价与兜底（第一层的旧账）：真死但"最近刚成功过"的 agent 会晚 `window` 才被摘除。
+    /// 这不影响路由——真死的 agent 心跳会停，`agent_stale_after` 会先把它从候选里剔掉；
+    /// 而进程直接消失时，QUIC 连接关闭会走 `remove_if_same` 正常摘除，根本不经过这里。
+    /// 第二层的代价：一条**心跳正常但数据面卡死**的连接要等到静默超过 `stuck_after`
+    /// （默认一条请求的寿命）才会被摘除，这期间它的每个请求都要白等一次 `head_timeout` 再拿 504。
+    pub fn head_timeout_is_fatal(&self, ctx: HeadSilence) -> bool {
+        let silence = self.last_head_ago();
+        let Some(silence) = silence else {
+            // 从未回过响应头：无"它能服务"的证据 → 快路径判死（见上）。
             return true;
+        };
+        if silence <= ctx.window {
+            return false;
         }
-        now_millis().saturating_sub(last) > window.as_millis() as u64
+        // 窗口已过。对端还在说话，且沉默还没到"一条请求的寿命"→ 更像被堵住，不摘。
+        !(self.peer_alive(ctx.peer_alive_window) && silence <= ctx.stuck_after)
+    }
+
+    /// 对端最近还在说话吗：**收到过心跳**，且心跳在 `window` 内。
+    ///
+    /// 注意它与 `last_seen` **不是同一个问题**：`last_seen` 在注册时就写过一次（用于"刚注册
+    /// 的 agent 可以立刻参与路由"），所以"注册时间戳很新"不能当成"对端还活着"。这里要的是
+    /// "收到过心跳"这个**事实**，因此单独记 `last_heartbeat_millis`，初值 `NEVER`——一个注册后
+    /// 什么都不做的对端（既有 e2e 里的"裸 agent"）永远不满足它。
+    fn peer_alive(&self, window: Duration) -> bool {
+        let hb = self.last_heartbeat_millis.load(Ordering::Relaxed);
+        hb != NEVER && is_fresh(hb, now_millis(), window)
     }
 
     /// 距**最近一次真的收到响应头**过了多久；`None` = 从未收到过。
@@ -318,6 +368,8 @@ impl Registry {
                     // （这条正是既有 e2e `e2e_dead_tunnel_fails_fast_instead_of_hanging` 钉住的）。
                     last_head_ok: Arc::new(AtomicU64::new(NEVER)),
                     last_seen_millis: Arc::new(AtomicU64::new(now_millis())),
+                    // 注册**不算**"对端说过话"：初值 NEVER，等真收到心跳才算。
+                    last_heartbeat_millis: Arc::new(AtomicU64::new(NEVER)),
                 },
             );
             superseded
@@ -336,7 +388,10 @@ impl Registry {
     /// 换成原子毫秒后，这个热点不再与路由争锁。
     pub fn heartbeat(&self, agent_id: &str) {
         if let Some(e) = self.inner.read().unwrap().get(agent_id) {
-            e.last_seen_millis.store(now_millis(), Ordering::Relaxed);
+            let now = now_millis();
+            e.last_seen_millis.store(now, Ordering::Relaxed);
+            // 同时也是"对端说过话"的证据：响应头静默判据的第二层靠它（见 `Entry::peer_alive`）。
+            e.last_heartbeat_millis.store(now, Ordering::Relaxed);
         }
     }
 
@@ -411,16 +466,18 @@ impl Registry {
 
     /// 上报一次「**响应头超时**」，由注册表判定是**慢**还是**死**。
     ///
-    /// 判据在 [`Entry::head_timeout_is_fatal`]：`alive_window` 内有过成功响应头 → 只是被链路
-    /// 或上游堵住（[`Disposition::Transient`]，只回 504、**不计 strike**）；一次都没有 → 死。
-    /// 窗口由 `AppState::head_alive_window`（`head_timeout × 4`）派生。
+    /// 判据在 [`Entry::head_timeout_is_fatal`]，**两层**：窗口内有过成功响应头 → 只是被链路或
+    /// 上游堵住（[`Disposition::Transient`]，只回 504、**不计 strike**）；窗口过了但**对端还在
+    /// 说话**（心跳新鲜）且静默没超过"一条请求的寿命" → 仍然算慢（这是 2026-09 为修"均匀慢流量"
+    /// 那条误判加的，见评估 §5 H2）；其余 → 死。窗口与两个时限都由调用方从 `AppState` 传入
+    /// （见 [`HeadSilence`]）。
     pub fn report_head_timeout(
         &self,
         entry: &Entry,
-        alive_window: Duration,
+        silence: HeadSilence,
         close_grace: Duration,
     ) -> Disposition {
-        if entry.head_timeout_is_fatal(alive_window) {
+        if entry.head_timeout_is_fatal(silence) {
             self.evict(entry.stable_id, EvictCause::HeadTimeout, close_grace);
             Disposition::Fatal
         } else {
@@ -499,7 +556,7 @@ impl Registry {
         //        （`routing.rs` 取得 → `proxy/mod.rs` 的 `read_head` → `forward.rs` 持有），
         //        所以它们也在 `inflight` 里；它们并没有出错，只是还没轮到回包。
         //    所以在途归零后再关；超过宽限期也强制关，否则 agent 永远是僵尸。
-        //    调度与期限都在 `crate::evict_close` 里（连同"默认 5s 偏短"这个已知取舍）。
+        //    调度与期限都在 `crate::evict_close` 里（连同"宽限不得短于 head_timeout"那条约束）。
         if inflight <= 1 {
             // 只有当前这个失败请求占着槽位 → 关掉不会牵连别人。
             // 而且要**立刻**关，好让 agent 察觉并重连，别变回僵尸。
@@ -758,7 +815,7 @@ mod tests {
     use rcgen::{CertificateParams, KeyPair};
     use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 
-    /// 摘除宽限：单测不关心具体时长（那由 `Options::evict_close_grace` 决定，默认 5s），
+    /// 摘除宽限：单测不关心具体时长（那由 `Options::evict_close_grace` 决定，默认 15s），
     /// 给一个固定值即可。
     const GRACE: Duration = Duration::from_secs(5);
 
@@ -1371,10 +1428,11 @@ mod tests {
             "额度先于容量耗尽时，超时同样是背压（这正是要告警的配置不一致）"
         );
     }
-    /// 规格：**响应头超时要能区分"最近还在干活"与"真的没有了"**。
+    /// 规格：**响应头超时要能区分"最近还在干活"与"真的没有了"**（判据第一层）。
     ///
     /// 这条判据是"链路被堵住 → 健康 agent 被摘除 → 全量 503"的唯一出口：窗口内有过成功响应头
     /// 就只是慢（不摘除），窗口内一次都没有才算死。窗口本身由 `4 × head_timeout` 派生（见 `state.rs`）。
+    /// 第二层（对端还活着时的延长）在下面那条用例里。
     ///
     /// ⚠️ 时间基准 `epoch()` 是**首次使用时才创建**的，所以测试进程刚起来时 `now_millis()`
     /// 接近 0——不能用"把时间戳减去 10 秒"来伪造沉默（会被 saturating 压到 0）。这里改为
@@ -1385,18 +1443,24 @@ mod tests {
         let conn = test_connection().await;
         reg.register("alive".into(), vec!["*".into()], 4, conn);
         let (entry, _guard) = reg.try_acquire(Duration::from_secs(10), "qwen2.5").unwrap();
+        // 本用例只考第一层：`stuck_after` 给 0（对端活着也延长不了），对端也**从未心跳**。
+        let only_window = |window: Duration| HeadSilence {
+            window,
+            peer_alive_window: Duration::from_secs(15),
+            stuck_after: Duration::ZERO,
+        };
 
         // ① 刚注册但**从未回过响应头** → 没有"只是慢"的证据 → 判死
         //    （否则注册后从不回包的坏隧道会被宽限一个窗口才摘除）
         assert!(
-            entry.head_timeout_is_fatal(Duration::from_secs(60)),
+            entry.head_timeout_is_fatal(only_window(Duration::from_secs(60))),
             "从未收到过响应头时不该被当成「只是慢」"
         );
 
         // ② 收到过响应头 → 仍在窗口内 → 只是慢（这条是判据最该避免的误判）
-        reg.note_tunnel_op_ok(entry.stable_id);
+        reg.note_tunnel_op_ok(entry.stable_id());
         assert!(
-            !entry.head_timeout_is_fatal(Duration::from_secs(60)),
+            !entry.head_timeout_is_fatal(only_window(Duration::from_secs(60))),
             "刚刚回过响应头的隧道被判定为死"
         );
 
@@ -1404,19 +1468,80 @@ mod tests {
         //    同一次沉默、只改窗口就翻转结论，说明判据确实由"沉默时长 vs 窗口"决定。
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
-            entry.head_timeout_is_fatal(Duration::from_millis(1)),
+            entry.head_timeout_is_fatal(only_window(Duration::from_millis(1))),
             "沉默 50ms > 窗口 1ms → 必须判死（否则坏连接永远摘不掉）"
         );
         assert!(
-            !entry.head_timeout_is_fatal(Duration::from_secs(60)),
+            !entry.head_timeout_is_fatal(only_window(Duration::from_secs(60))),
             "沉默 50ms < 窗口 60s → 只是慢，不能判死"
         );
 
         // ④ 期间只要再成功收到一次响应头，窗口重新开始计时
-        reg.note_tunnel_op_ok(entry.stable_id);
+        reg.note_tunnel_op_ok(entry.stable_id());
         assert!(
-            !entry.head_timeout_is_fatal(Duration::from_millis(1)),
+            !entry.head_timeout_is_fatal(only_window(Duration::from_millis(1))),
             "刚回过响应头就该立刻回到「只是慢」，否则连续计数的语义不成立"
+        );
+    }
+
+    /// 规格（判据第二层，评估 §5 H2）：**对端还在说话时，窗口过了也不判死**——
+    /// 均匀慢流量（所有请求都慢过 `head_timeout`）不能摘掉一条活着的 agent。
+    ///
+    /// 为什么必须单独钉：`last_head_ok` 的唯一刷新点就是成功响应头，所以"所有请求都慢"时
+    /// 没有任何一次成功能刷新它，第一层必然走到"判死"。这一层用"收到过心跳"作为对端活着的
+    /// 证据把容忍度延长到 `stuck_after`（一条请求的寿命）。
+    #[tokio::test]
+    async fn head_silence_is_tolerated_while_the_peer_keeps_heartbeating() {
+        let reg = Registry::default();
+        let conn = test_connection().await;
+        reg.register("slow-but-alive".into(), vec!["*".into()], 4, conn);
+        let (entry, _guard) = reg.try_acquire(Duration::from_secs(10), "qwen2.5").unwrap();
+
+        // 先让它"回过一次响应头"，然后沉默 50ms（把窗口压到 1ms 来跨过边界，同上面的技巧）。
+        reg.note_tunnel_op_ok(entry.stable_id());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // ① 对端**从未心跳** → 只有第一层 → 判死（这就是既有 e2e 钉的"裸 agent"形态）
+        assert!(
+            entry.head_timeout_is_fatal(HeadSilence {
+                window: Duration::from_millis(1),
+                peer_alive_window: Duration::from_secs(15),
+                stuck_after: Duration::from_secs(120),
+            }),
+            "对端从未说过话时不该获得延长"
+        );
+
+        // ② 收到心跳 → 对端还活着 → 沉默没超过 stuck_after → **不判死**（H2 要的就是这一格）
+        reg.heartbeat("slow-but-alive");
+        let alive = HeadSilence {
+            window: Duration::from_millis(1),
+            peer_alive_window: Duration::from_secs(15),
+            stuck_after: Duration::from_secs(120),
+        };
+        assert!(
+            !entry.head_timeout_is_fatal(alive),
+            "对端还在心跳、沉默也远没到一条请求的寿命，不该判死（均匀慢流量误摘）"
+        );
+
+        // ③ 但静默超过 stuck_after 就判死：心跳正常、数据面却长时间一声不响 = 卡死，
+        //    不能让它永远留在路由里（否则每个请求都白等一次 head_timeout）。
+        assert!(
+            entry.head_timeout_is_fatal(HeadSilence {
+                stuck_after: Duration::from_millis(1),
+                ..alive
+            }),
+            "沉默超过一条请求的寿命后必须判死，否则数据面卡死的连接永远摘不掉"
+        );
+
+        // ④ 心跳也停了 → 回到"只看窗口"。
+        //    用 `peer_alive_window = 0` 表示"心跳一律不算新鲜"，比"压到 1ms 再睡几毫秒"确定：
+        //    刚发出的心跳在同一个毫秒里 `since == 0`，1ms 的窗口仍然算新鲜（这里踩过一次）。
+        assert!(
+            entry.head_timeout_is_fatal(HeadSilence {
+                peer_alive_window: Duration::ZERO,
+                ..alive
+            }),
+            "心跳过期后不该再享有延长"
         );
     }
 }

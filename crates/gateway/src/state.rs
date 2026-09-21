@@ -56,6 +56,8 @@ pub struct AppState {
     /// 默认 5s 短于 15s，意味着摘除发生时仍在等响应头的在途请求会被一并掐断——这个值该
     /// 调到多少是策略决策（见评估报告 §5 H1），本字段只负责让它可配、可回滚。
     pub evict_close_grace: Duration,
+    /// 「响应头静默」判据里对端还在说话时的静默容忍上限。见 [`crate::Options::head_silent_grace`]。
+    pub head_silent_grace: Duration,
     /// 客户端停滞阈值：请求体/响应体两个方向"完全没动静"多久就放弃。
     /// 见 [`crate::Options::client_stall`]——没有它，在途请求会永久占住准入槽位。
     pub client_stall: Duration,
@@ -113,6 +115,7 @@ impl AppState {
             tunnel_op_timeout: opts.tunnel_op_timeout,
             head_timeout: opts.head_timeout,
             evict_close_grace: opts.evict_close_grace,
+            head_silent_grace: opts.head_silent_grace,
             head_alive_window: opts.head_timeout * 4,
             client_stall: opts.client_stall,
             rate_limiter: RateLimiter::new(opts.rate_limit_per_min),

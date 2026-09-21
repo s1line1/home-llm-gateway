@@ -164,3 +164,90 @@ async fn e2e_silent_agent_is_still_evicted_after_the_window() {
     agent.shutdown().await;
     gw.shutdown().await;
 }
+
+/// 规格（判据第二层，评估 §5 H2）：**均匀慢流量不该摘掉一条还在心跳的 agent**。
+///
+/// 上一条用例的反面之所以成立，靠的是它"每次慢请求之间插一个正常请求"——也就是永远维持着
+/// "窗口内有过成功响应头"这个前提。可一旦**所有**请求都慢过 `head_timeout`（大模型首字节慢、
+/// 上游排队、链路被堵），就没有任何一次成功能刷新 `last_head_ok`，窗口必然走完 →
+/// 一条活得好好的 agent 被摘除 → 关连接 → agent 重连 → 注册表为空 → 全量 503——
+/// 正是这条判据本来要防的那条链（2026-09-18 实测过一次）。
+///
+/// 第二层的作用：对端还在发心跳 = 它还在说话，于是静默被宽限到 `head_silent_grace`
+/// （默认一条请求的寿命）。本用例把该值留在 5s（远大于测试时长），于是这几次超时应当
+/// **全部记 `slow`、一次 `silent` 都没有、也不该发生重连**。
+///
+/// 反过来说：修第二层之前，这些超时会被判死，第 3 次就摘除 → `silent` 出现 + 连接计数 +1，
+/// 两条断言都会失败。
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn e2e_uniformly_slow_traffic_does_not_evict_a_heartbeating_agent() {
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    let (gw, agent, base, key) = start_stack(4, |o| {
+        o.head_timeout = Duration::from_millis(100); // 窗口 = 4 × 100ms = 400ms
+        o.client_stall = Duration::from_secs(5);
+        // 第二层的上界给足：本例只验"对端活着就别误摘"，不验上界（上界由 registry 的单测钉）。
+        o.head_silent_grace = Duration::from_secs(5);
+    })
+    .await;
+    let client = reqwest::Client::new();
+
+    // 先建立一个"最近成功过响应头"的事实（同时也让判据不走"从未回过"那条快路径）。
+    let ok = client
+        .post(format!("{base}/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {key}"))
+        .json(&serde_json::json!({ "model": "mock-llm", "messages": [{"role":"user","content":"hi"}] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status().as_u16(), 200, "先要有一个成功请求");
+    let connections_before = metric_gauge(&base, "hlmg_agent_connections_total").await;
+
+    // 之后**只有慢请求**，中间不做任何成功请求——这就是"均匀慢流量"的形状。
+    // 每个都在 100ms 后超时（上游 3s 才回），累计沉默很快跨过 400ms 窗口。
+    for i in 1..=4 {
+        let resp = client
+            .post(format!("{base}/v1/slow?ms=3000"))
+            .header("Authorization", format!("Bearer {key}"))
+            .json(&serde_json::json!({ "model": "mock-llm" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            504,
+            "第 {i} 次慢请求应当 504（上游慢过 head_timeout）"
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+
+    let text = client
+        .get(format!("{base}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        !text.contains("hlmg_upstream_head_timeouts_total{class=\"silent\"}"),
+        "对端一直在心跳、静默也远未超过 head_silent_grace，不该出现 silent（误摘）：{text}"
+    );
+    assert!(
+        text.contains("hlmg_upstream_head_timeouts_total{class=\"slow\"}"),
+        "这些超时应当全部记成 slow（被堵住的慢）：{text}"
+    );
+    assert_eq!(
+        metric_gauge(&base, "hlmg_agent_connections_total").await,
+        connections_before,
+        "agent 被摘除并重连了（连接次数 {connections_before} → 更多）——均匀慢流量被当成了死"
+    );
+    assert_eq!(
+        gw.agent_count(),
+        1,
+        "均匀慢流量下条目必须还在路由里（第二层把它判成「慢」）"
+    );
+
+    agent.shutdown().await;
+    gw.shutdown().await;
+}

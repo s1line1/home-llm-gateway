@@ -68,16 +68,33 @@ pub struct Options {
     pub head_timeout: Duration,
     /// 摘除一条连接后，**等它在途请求收尾的最长时间**：超时就强制关闭。
     ///
-    /// 为什么它必须可配（原先硬编码 5s）：这条宽限期要保护的正是"已经在途"的请求，
-    /// 而在途集合**包含两种**——已经送达 agent、模型正在生成的（早过了响应头那一关），
-    /// 以及**仍在等响应头**的（槽位从 `try_acquire` 取得，一直持有到响应结束，覆盖
-    /// `read_head`）。所以它的合理取值与 [`Options::head_timeout`] 和
-    /// [`Options::request_timeout`] 同量级才有意义：**比 `head_timeout` 短，就会掐断
-    /// 本来还在合法等待响应头的请求**（默认 5s < 15s，正是这条）。
+    /// 这条宽限期要保护的正是"已经在途"的请求，而在途集合**包含两类**——已经送达 agent、
+    /// 模型正在生成的，以及**仍在等响应头**的（槽位从 `try_acquire` 取得、一直持有到响应结束，
+    /// 覆盖 `read_head`）。由此得到判据：**不得短于 [`Options::head_timeout`]**，否则会在别人
+    /// 还在合法等响应头的时候把连接掐掉（默认值 2026-09 已由 5s 上调到与它相等的 15s；
+    /// 配置得比它短时启动会打一条 WARN）。
     ///
     /// 反方向也不能无限大：连接迟迟不关，agent 侧察觉不到自己被摘除，就变回"自认为在线的
-    /// 僵尸"（心跳照通、连接照开、请求永远路由不到它）。`0` 表示不等、立刻关。
+    /// 僵尸"（心跳照通、连接照开、请求永远路由不到它）。它仍远小于
+    /// [`Options::request_timeout`]，所以**长回答在被摘除的连接上依然会被切断**——这是本机制
+    /// 没有消除的取舍（见评估报告 §5 H1）。`0` 表示不等、立刻关。
     pub evict_close_grace: Duration,
+    /// 「响应头静默」判据：**对端还在说话时**，静默最多可以被宽限到多久。
+    ///
+    /// 背景（评估报告 §5 H2）："忙/死"那条判据靠"最近有没有成功响应头"来分辨，而它的唯一
+    /// 刷新点就是成功响应头本身。于是一旦**所有**请求都慢过 `head_timeout`（大模型首字节慢、
+    /// 上游排队、链路被堵），就没有任何一次成功能刷新它 → 窗口必然走完 → 一条**活得好好的**
+    /// agent 被摘除（2026-09-18 那条事故链）。这一层用"对端还在发心跳"作为它活着的证据，
+    /// 把静默的容忍度延长到这里为止。
+    ///
+    /// 默认取 [`Options::DEFAULT_REQUEST_TIMEOUT`]（一条请求的寿命）：静默超过一整个请求的
+    /// 寿命、心跳却还在，那更像**数据面卡死**而不是"慢"——那正是这条判据本来要抓的东西，
+    /// 所以给它一个上界，而不是"心跳还在就永不摘除"（否则卡死的连接会永远留在路由里，
+    /// 每个请求白等一次 `head_timeout` 再拿 504）。
+    ///
+    /// **注意**：它对"从未回过响应头"的连接不生效——那一支保持原来的快路径（见
+    /// `Entry::head_timeout_is_fatal`）：注册后一个响应头都没回过，就没有任何"它能服务"的证据。
+    pub head_silent_grace: Duration,
     /// 超过该时长未心跳的 agent 视为失联。
     pub agent_stale_after: Duration,
     /// 客户端"完全停滞"多久就放弃：请求体读不动 / 响应体客户端不消费。
@@ -126,10 +143,17 @@ impl Options {
     pub const DEFAULT_HEAD_TIMEOUT: Duration = Duration::from_secs(15);
     /// 摘除后等待在途请求收尾的宽限默认值。
     ///
-    /// **保持历史值 5s 不动**：把它调到与 `head_timeout` 同量级（或改成对关闭阶段感知）
-    /// 是一次**策略决策**，不是重构——那件事必须单独定、单独测，不能顺手夹带在"把常量
-    /// 变成旋钮"这一步里。这一步只让这个值变得可达（可配置、可回滚）。
-    pub const DEFAULT_EVICT_CLOSE_GRACE: Duration = Duration::from_secs(5);
+    /// **与 [`Options::DEFAULT_HEAD_TIMEOUT`] 相等（15s），这是有意的**（2026-09 由 5s 上调）：
+    /// 宽限短于 `head_timeout` 时，宽限到期会掐断"仍在合法等响应头"的在途请求；取等之后
+    /// 这一类不再被宽限切断，正在生成的那一类保护也从 5s 提到 15s。另一头的代价是僵尸窗口
+    /// 从 5s 变成 15s——与 [`Options::DEFAULT_AGENT_STALE_AFTER`] 同量级，不会更久。
+    /// 两者的大小关系由本文件末尾的单测钉住，防止被无声改回去。
+    pub const DEFAULT_EVICT_CLOSE_GRACE: Duration = Duration::from_secs(15);
+    /// 「对端还在说话时」静默容忍上限的默认值。
+    ///
+    /// 取 [`Options::DEFAULT_REQUEST_TIMEOUT`]（120s）：语义是"一条请求的寿命"——静默比一条
+    /// 请求活得还久、心跳却仍在，那就不再像"慢"了。
+    pub const DEFAULT_HEAD_SILENT_GRACE: Duration = Self::DEFAULT_REQUEST_TIMEOUT;
     /// agent 失联判定默认值。
     pub const DEFAULT_AGENT_STALE_AFTER: Duration = Duration::from_secs(15);
     /// 客户端停滞阈值默认值。
@@ -169,6 +193,7 @@ impl Default for Options {
             tunnel_op_timeout: Self::DEFAULT_TUNNEL_OP_TIMEOUT,
             head_timeout: Self::DEFAULT_HEAD_TIMEOUT,
             evict_close_grace: Self::DEFAULT_EVICT_CLOSE_GRACE,
+            head_silent_grace: Self::DEFAULT_HEAD_SILENT_GRACE,
             agent_stale_after: Self::DEFAULT_AGENT_STALE_AFTER,
             client_stall: Self::DEFAULT_CLIENT_STALL,
             rate_limit_per_min: 0,
@@ -177,5 +202,39 @@ impl Default for Options {
             shutdown_flush_timeout: Self::DEFAULT_SHUTDOWN_FLUSH_TIMEOUT,
             shutdown_grace: Self::DEFAULT_SHUTDOWN_GRACE,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 契约：**摘除宽限不得短于 `head_timeout`**。
+    ///
+    /// 这不是风格偏好。在途集合里包含"仍在等响应头"的请求（槽位从 `try_acquire` 取得、
+    /// 一直持有到响应结束，覆盖 `read_head`），而 `head_timeout` 正是它们自己会超时的时刻；
+    /// 宽限比它短，就等于在别人还在合法等待时把连接掐掉——这就是评估报告 §5 H1 的全部内容。
+    /// 断言放这里，是为了让"把宽限调小"这类改动无法静默通过。
+    #[test]
+    fn default_evict_close_grace_is_not_shorter_than_head_timeout() {
+        assert!(
+            Options::DEFAULT_EVICT_CLOSE_GRACE >= Options::DEFAULT_HEAD_TIMEOUT,
+            "摘除宽限（{:?}）短于 head_timeout（{:?}）：摘除会掐断仍在合法等响应头的请求",
+            Options::DEFAULT_EVICT_CLOSE_GRACE,
+            Options::DEFAULT_HEAD_TIMEOUT
+        );
+    }
+
+    /// 契约：**「对端还活着」的静默宽限必须长于"忙/死"窗口**，否则第二层判据形同虚设
+    /// （窗口还没走完就已经按第一层处理了，延长无从谈起）。
+    #[test]
+    fn default_head_silent_grace_exceeds_the_busy_dead_window() {
+        let window = Options::DEFAULT_HEAD_TIMEOUT * 4; // AppState::head_alive_window 的派生式
+        assert!(
+            Options::DEFAULT_HEAD_SILENT_GRACE > window,
+            "head_silent_grace（{:?}）不长于窗口（{:?}）：第二层判据不会生效",
+            Options::DEFAULT_HEAD_SILENT_GRACE,
+            window
+        );
     }
 }
