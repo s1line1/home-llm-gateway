@@ -253,11 +253,12 @@ pub async fn start_gateway_with(tune: impl FnOnce(&mut Options, &TestCerts)) -> 
     tune(&mut opts, &certs);
 
     let gw = Gateway::start(GatewayConfig {
-        tunnel: TunnelTls {
-            ca_cert: certs.ca.clone(),
-            server_cert: certs.server_cert_der.clone(),
-            server_key: certs.server_key_der.clone_key(),
-        },
+        tunnel: TunnelTls::from_der(
+            certs.ca.clone(),
+            certs.server_cert_der.clone(),
+            certs.server_key_der.clone_key(),
+        )
+        .expect("e2e certs are non-empty"),
         opts,
     })
     .await
