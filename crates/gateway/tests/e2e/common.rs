@@ -297,3 +297,59 @@ pub async fn start_stack(
     let TestGateway { gw, key, base, .. } = t;
     (gw, agent, base, key)
 }
+
+/// 起一个**裸 QUIC agent**：注册成功后什么都不做——**不读请求流、不回帧、也不发心跳**。
+///
+/// 连接被移进一个永不结束的 keep-alive 任务：既保证它活到测试结束，也保证没有任何代码
+/// 会去 accept/read 请求流。两个用途：
+/// - 写背压：请求帧撑爆对端流控窗口 → `tunnel_write` 超时（见 `write_backpressure`）；
+/// - 可路由性：注册后从不心跳 → `last_seen` 过期，`agent_count()` 仍计入它、
+///   `healthy_agent_count()` 不计（见 `lifecycle`）。
+pub async fn spawn_raw_agent(
+    gw: &Gateway,
+    certs: &TestCerts,
+    agent_id: &str,
+    max_concurrency: u32,
+) {
+    let client = s2n_quic::Client::builder()
+        .with_tls(s2n_quic::provider::tls::rustls::Client::from(
+            std::sync::Arc::new(
+                agent::tls::rustls_client_tls(
+                    &certs.ca,
+                    certs.client_cert.clone(),
+                    certs.client_key.clone_key(),
+                )
+                .unwrap(),
+            ),
+        ))
+        .unwrap()
+        .with_io("0.0.0.0:0")
+        .unwrap()
+        .start()
+        .unwrap();
+    let mut conn = client
+        .connect(s2n_quic::client::Connect::new(gw.quic_addr).with_server_name("localhost"))
+        .await
+        .unwrap();
+    let stream = conn.open_bidirectional_stream().await.unwrap();
+    let (mut reg_recv, mut reg_send) = stream.split();
+    write_frame(
+        &mut reg_send,
+        &Frame::Register {
+            agent_id: agent_id.into(),
+            models: vec!["mock-llm".into()],
+            max_concurrency,
+            version: "test".into(),
+        },
+    )
+    .await
+    .unwrap();
+    reg_send.finish().unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut reg_recv)).await;
+    wait_for_agents(gw, 1, Duration::from_secs(5)).await;
+
+    tokio::spawn(async move {
+        let _keep_alive = (client, conn, reg_recv);
+        std::future::pending::<()>().await;
+    });
+}

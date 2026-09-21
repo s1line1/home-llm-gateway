@@ -9,6 +9,7 @@ mod chain;
 mod common;
 mod head_timeout;
 mod https;
+mod lifecycle;
 mod metrics;
 mod nofile;
 mod stalls;

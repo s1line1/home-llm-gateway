@@ -4,7 +4,7 @@
 //! TLS 材料（[`TlsPem`]）与 rustls 配置构造在 [`crate::tls`]；端口绑定在私有模块 `listen`；
 //! 公网入口的 accept 循环在 [`crate::http`]。
 
-use std::{net::SocketAddr, path::Path, sync::Arc};
+use std::{net::SocketAddr, path::Path, sync::Arc, time::Duration};
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
@@ -80,6 +80,11 @@ pub struct Gateway {
     pub http_addr: SocketAddr,
     /// 实际绑定的 QUIC 地址（UDP）。
     pub quic_addr: SocketAddr,
+    /// [`Options::agent_stale_after`] 的副本：`healthy_agent_count()` 需要它。
+    ///
+    /// 不留整个 `Options`（它已随 `AppState` 进 Router，再存一份就是同一状态两处），
+    /// 只多存这一个"派生接口要用到"的标量。
+    agent_stale_after: Duration,
     registry: Registry,
     /// 用量落库需要在关闭前强制 flush 一次（见 [`Gateway::shutdown`]）。
     key_store: KeyStore,
@@ -162,6 +167,7 @@ impl Gateway {
         Ok(Self {
             http_addr: sockets.http_addr,
             quic_addr: sockets.quic_addr,
+            agent_stale_after: opts.agent_stale_after,
             registry,
             key_store,
             tasks,
@@ -169,9 +175,32 @@ impl Gateway {
         })
     }
 
-    /// 当前在线 agent 数（测试/可观测性用）。
+    /// 注册表里的条目数（**含心跳已过期、连接还没关的**）。
+    ///
+    /// 要"现在能被路由"的数量用 [`Self::healthy_agent_count`]：排查"所有请求 503"时
+    /// 两者必须分开看（见 `registry.rs` 的 `len` / `healthy_count`）。
     pub fn agent_count(&self) -> usize {
         self.registry.len()
+    }
+
+    /// 心跳未过期、**真正可路由**的 agent 数。
+    ///
+    /// 与 [`Self::agent_count`] 的区别：条目要等连接真正关闭才摘除，所以失联 agent 会被
+    /// `agent_count()` 算作"在线"却不参与路由——只看前者会把"有人注册但全部失联"误判成
+    /// "agent 掉了"。
+    pub fn healthy_agent_count(&self) -> usize {
+        self.registry.healthy_count(self.agent_stale_after)
+    }
+
+    /// 启动时那三个主任务（用量 flusher、HTTP 入口、QUIC accept）是否都还活着。
+    ///
+    /// 判据是 `JoinHandle::is_finished()`：任何一条结束（accept 出错、panic、被 abort）
+    /// 即返回 `false`。HTTP 入口死掉时进程、systemd 与 `/healthz` 全都正常，`hlmg_quic_accepting`
+    /// 又只覆盖 QUIC 入口——这是唯一能回答"入口还活着吗"的接口（并集报告 H1）。
+    ///
+    /// 注意它**不**覆盖每连接/每请求的派生任务，也不覆盖 `registry` 的摘除宽限任务。
+    pub fn is_serving(&self) -> bool {
+        self.tasks.iter().all(|t| !t.is_finished())
     }
 
     /// 停网关：**先强制把用量落库，再 abort 所有任务**。
@@ -196,7 +225,24 @@ impl Gateway {
     pub async fn shutdown(self) {
         let n = self.key_store.flush_usage_blocking();
         tracing::info!(keys = n, "usage flushed before shutdown");
-        for t in self.tasks {
+        // 显式 abort 只是让这里读起来完整；`Drop` 还会再 abort 一次（对已结束的任务是 no-op）。
+        // 注意用 `&self.tasks` 而不是 `self.tasks`：`Gateway` 有 `Drop`，不能把字段移出去。
+        for t in &self.tasks {
+            t.abort();
+        }
+    }
+}
+
+impl Drop for Gateway {
+    /// drop 而**没有**调 [`Gateway::shutdown`] 时的兜底：abort 所有任务，别把监听口与后台
+    /// flusher 留给进程——tokio 里 drop `JoinHandle` 只是 **detach**，任务会继续跑（并集
+    /// 报告 §5-H2 实测：drop 之后端口仍可 connect）。
+    ///
+    /// **刻意不做用量落库**：`flush_usage_blocking` 是阻塞式 SQLite 写，在析构里做会在
+    /// 不可预期的上下文（runtime worker、unwind）里阻塞；丢的只是最后一个 flush 周期
+    /// （≤1s），与崩溃同级。要"已结算用量不丢"就调 `shutdown()`（`main` 就是这么做的）。
+    fn drop(&mut self) {
+        for t in &self.tasks {
             t.abort();
         }
     }

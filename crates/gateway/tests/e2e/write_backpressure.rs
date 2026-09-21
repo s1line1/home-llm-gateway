@@ -13,59 +13,6 @@
 
 use super::common::*;
 
-/// 起一个裸 QUIC agent：注册成功，之后**绝不读**任何请求流。
-///
-/// 连接被移进一个永不结束的 keep-alive 任务：既保证它活到测试结束，也保证**没有任何**
-/// 代码会去 accept/read 请求流——这正是"慢读 agent"要复现的状态。
-async fn spawn_non_reading_agent(
-    gw: &Gateway,
-    certs: &TestCerts,
-    agent_id: &str,
-    max_concurrency: u32,
-) {
-    let client = s2n_quic::Client::builder()
-        .with_tls(s2n_quic::provider::tls::rustls::Client::from(
-            std::sync::Arc::new(
-                agent::tls::rustls_client_tls(
-                    &certs.ca,
-                    certs.client_cert.clone(),
-                    certs.client_key.clone_key(),
-                )
-                .unwrap(),
-            ),
-        ))
-        .unwrap()
-        .with_io("0.0.0.0:0")
-        .unwrap()
-        .start()
-        .unwrap();
-    let mut conn = client
-        .connect(s2n_quic::client::Connect::new(gw.quic_addr).with_server_name("localhost"))
-        .await
-        .unwrap();
-    let stream = conn.open_bidirectional_stream().await.unwrap();
-    let (mut reg_recv, mut reg_send) = stream.split();
-    write_frame(
-        &mut reg_send,
-        &Frame::Register {
-            agent_id: agent_id.into(),
-            models: vec!["mock-llm".into()],
-            max_concurrency,
-            version: "test".into(),
-        },
-    )
-    .await
-    .unwrap();
-    reg_send.finish().unwrap();
-    let _ = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut reg_recv)).await;
-    wait_for_agents(gw, 1, Duration::from_secs(5)).await;
-
-    tokio::spawn(async move {
-        let _keep_alive = (client, conn, reg_recv);
-        std::future::pending::<()>().await;
-    });
-}
-
 /// 规格：**写帧超时是背压，不得把 agent 摘除**。
 ///
 /// 修好前：写帧臂无条件 `evict`，连续 3 次写超时（默认阈值）就把 agent 摘掉——连接被关、
@@ -92,7 +39,7 @@ async fn e2e_write_timeout_does_not_evict_the_agent() {
     })
     .await;
 
-    spawn_non_reading_agent(&gw, &certs, "slow-reader", 4).await;
+    spawn_raw_agent(&gw, &certs, "slow-reader", 4).await;
     assert_eq!(gw.agent_count(), 1, "agent 应已注册");
     let connections_before = metric_gauge(&base, "hlmg_agent_connections_total").await;
 
