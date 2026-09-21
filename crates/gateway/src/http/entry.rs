@@ -6,12 +6,16 @@
 //!
 //! rustls 配置由调用方预先构建好传入：证书材料有问题要在**启动时**失败，而不是在这里
 //! 默默结束、留下一个"看起来启动了"的空壳进程。
+//!
+//! **关停（片 A）**：accept 循环通过一个 [`Notify`] 停止接受新连接——只停 accept，
+//! 已经建立的连接与在途请求继续跑，由 `Gateway::shutdown` 的排空阶段等它们收尾。
 
 use std::{sync::Arc, time::Duration};
 
 use axum::Router;
 use hyper::{body::Incoming, server::conn::http1, service::service_fn};
 use hyper_util::rt::TokioIo;
+use tokio::sync::Notify;
 use tokio_rustls::TlsAcceptor;
 use tower::Service as TowerService;
 use tracing::{info, warn};
@@ -22,11 +26,15 @@ use crate::io_stall;
 ///
 /// rustls 配置由调用方（`Gateway::start`）**预先构建好**传入：证书材料有问题要在
 /// 启动时就失败，而不是在这里默默结束、留下一个"看起来启动了"的空壳进程。
+///
+/// `shutdown` 被 `notify_one()` 之后循环退出、`TcpListener` 随函数返回被 drop——
+/// 于是**新连接被拒**，而已建立的连接不受影响（它们各自是独立任务）。
 pub(crate) fn spawn_entry(
     listener: tokio::net::TcpListener,
     app: Router,
     https: Option<Arc<rustls::ServerConfig>>,
     client_stall: Duration,
+    shutdown: Arc<Notify>,
 ) -> tokio::task::JoinHandle<()> {
     // 日志记**真实**监听地址：配置写 `:0` 时只有 `local_addr()` 知道内核给了哪个端口。
     match listener.local_addr() {
@@ -36,8 +44,8 @@ pub(crate) fn spawn_entry(
     }
     tokio::spawn(async move {
         let result = match https {
-            Some(cfg) => serve_https(listener, app, cfg, client_stall).await,
-            None => serve_plain(listener, app, client_stall).await,
+            Some(cfg) => serve_https(listener, app, cfg, client_stall, shutdown).await,
+            None => serve_plain(listener, app, client_stall, shutdown).await,
         };
         if let Err(e) = result {
             warn!("public entry stopped: {e}");
@@ -72,10 +80,17 @@ async fn serve_https(
     app: Router,
     server_config: Arc<rustls::ServerConfig>,
     client_stall: Duration,
+    shutdown: Arc<Notify>,
 ) -> anyhow::Result<()> {
     let acceptor = TlsAcceptor::from(server_config);
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let (stream, peer) = tokio::select! {
+            _ = shutdown.notified() => {
+                info!("shutdown requested; https public entry stops accepting new connections");
+                return Ok(());
+            }
+            accepted = listener.accept() => accepted?,
+        };
         let acceptor = acceptor.clone();
         let app = app.clone();
         tokio::spawn(async move {
@@ -93,9 +108,16 @@ async fn serve_plain(
     listener: tokio::net::TcpListener,
     app: Router,
     client_stall: Duration,
+    shutdown: Arc<Notify>,
 ) -> anyhow::Result<()> {
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let (stream, peer) = tokio::select! {
+            _ = shutdown.notified() => {
+                info!("shutdown requested; http public entry stops accepting new connections");
+                return Ok(());
+            }
+            accepted = listener.accept() => accepted?,
+        };
         let app = app.clone();
         tokio::spawn(async move { serve_conn(stream, app, peer, client_stall).await });
     }

@@ -23,10 +23,11 @@ WorkingDirectory=/etc/home-llm-gateway
 ExecStart=/usr/local/bin/gateway --config /etc/home-llm-gateway/gateway-config.yml
 Restart=on-failure
 RestartSec=3
-# 关闭：Gateway::shutdown 先做一次**有界**的用量落库（`shutdown_flush_secs`，默认 10s），
-# 再 abort 所有任务。若要设 TimeoutStopSec，必须 **大于** `shutdown_flush_secs`，
-# 否则宽限期还没走完就被 SIGKILL——超时就白设了。
-#     TimeoutStopSec=30
+# 关闭序列：停 accept（不再接新请求）→ 等在途请求收尾（`shutdown_grace_secs`，默认 15s）
+# → 强制落库（`shutdown_flush_secs`，默认 10s，有超时）→ abort 任务。
+# 若要设 TimeoutStopSec，必须 **大于** `shutdown_grace_secs + shutdown_flush_secs`，
+# 否则还没走完就被 SIGKILL——超时就白设了。
+#     TimeoutStopSec=60
 # 日志落盘（追加，重启不丢）。stdout/stderr 不再进 journald；
 # 查看：tail -f /var/log/home-llm-gateway/gateway.log
 # 建议配 logrotate 轮转（见 deploy/logrotate.example 或自行 crontab）。

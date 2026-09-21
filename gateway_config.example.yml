@@ -64,9 +64,13 @@ head_timeout_secs: 15
 # 客户端已僵住"时白烧 token。
 client_stall_secs: 60
 
-# 关闭时强制用量落库的等待上限（秒）：Gateway::shutdown 先把已结算用量写一次 SQLite，
-# 再 abort 任务；这是那次写的最长等待。超过就放弃等待、记 WARN 并继续 abort。
-# systemd 单元的 TimeoutStopSec 必须 **大于** 本值，否则宽限期没走完就被 SIGKILL。
+# 关闭序列：① 停 accept（不再接新请求）② 等在途请求收尾 ③ 强制落库 ④ abort 任务。
+# 本值 = ②的等待上限（秒）：到期仍有在途就记 WARN 并切断（长 SSE 会被截断）。
+shutdown_grace_secs: 15
+
+# = ③ 强制落库的等待上限（秒）：把已结算用量写一次 SQLite；超过就放弃等待、记 WARN 继续。
+# systemd 单元的 TimeoutStopSec 必须 **大于** `shutdown_grace_secs + shutdown_flush_secs`，
+# 否则还没走完就被 SIGKILL。
 shutdown_flush_secs: 10
 
 # agent 超过该秒数未心跳视为失联
