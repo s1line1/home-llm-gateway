@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::Parser;
 use gateway::Gateway;
@@ -27,7 +28,7 @@ fn main() -> anyhow::Result<()> {
         .enable_all()
         .build()?;
     let result = rt.block_on(run(Args::parse()));
-    rt.shutdown_timeout(std::time::Duration::ZERO);
+    rt.shutdown_timeout(Duration::ZERO);
     result
 }
 
