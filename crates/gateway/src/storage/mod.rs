@@ -32,10 +32,13 @@ use std::{
 };
 
 use rusqlite::Connection;
-use serde::Serialize;
 
 pub mod hash;
+mod usage;
 pub mod verified;
+
+/// 用量记账/落库的类型由 [`usage`] 定义，路径 `crate::storage::UsageDelta` 保持不变。
+pub use usage::{KeyUsageInfo, UsageDelta};
 
 use crate::storage::hash::{generate_id_key, hash_argon2, lookup_of, now_secs, verify_argon2};
 
@@ -48,13 +51,12 @@ struct KeyStoreInner {
     /// 动态 key，key = lookup（sha256(token) 十六进制），value = 记录。
     runtime: RwLock<HashMap<String, KeyRecord>>,
     /// SQLite 持久化连接（None = 仅内存，如 db 打开失败时降级）。
-    db: Mutex<Option<Connection>>,
-    /// per-key 用量（key = key id；吊销 key 后记录保留，可审计）。
     ///
-    /// 存的是**绝对累计值快照**而不是"只加不减的 cell"：这样 `flush_usage` 可以
-    /// 把内存值直接 UPSERT 进库（幂等），不需要"取走增量"那一步——也就不会出现
-    /// "取走之后落库失败 ⇒ 这段用量永久丢失"的窗口。
-    usage: RwLock<HashMap<String, UsageRecord>>,
+    /// **与用量记账共享**（`Arc`）：连接是**资源**（凭据写穿与用量落库都用它），
+    /// 而状态刻意不共享——`runtime` 归凭据、`usage` 归 [`usage::UsageStore`]。
+    db: Arc<Mutex<Option<Connection>>>,
+    /// per-key 用量：记账 + 批量落库（独立模块，见 [`usage`]）。
+    usage: usage::UsageStore,
     /// 已验证身份缓存（argon2 结果复用）+ 单飞；容量 0 = 关闭（每请求都校验）。
     verified: verified::VerifiedCache,
     /// 已验证缓存的容量上限与有效期。
@@ -91,55 +93,6 @@ pub struct KeyRecord {
 pub struct CreatedKey {
     pub record: KeyRecord,
     pub plaintext: String,
-}
-
-/// 每 key 的用量明细（/admin/usage 序列化用）。
-#[derive(Debug, Clone, Serialize)]
-pub struct KeyUsageInfo {
-    pub key_id: String,
-    /// key 名称快照（吊销后仍可审计名称）。
-    pub name: String,
-    pub prompt_tokens: u64,
-    pub completion_tokens: u64,
-    pub total_tokens: u64,
-    pub requests: u64,
-    /// 其中多少次请求走了估算降级（上游未提供 usage）。
-    pub estimated_requests: u64,
-    /// 最后使用时间（unix 秒）。
-    pub last_used_at: u64,
-}
-
-/// 一次用量的绝对累计值（= 内存里的真相）。落库写的也是它，而不是增量：
-/// 这样落库天然幂等、重启后不会重复累加，也不会像增量那样"丢一条就永久少一条"。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct UsageSnapshot {
-    name: String,
-    prompt_tokens: u64,
-    completion_tokens: u64,
-    requests: u64,
-    estimated_requests: u64,
-    last_used_at: u64,
-}
-
-/// 用量表里的一条：内存真相 + "已落库"的副本。
-///
-/// `flushed == current` 表示库里已经是这个值，无需再写——所以静默期完全不会碰 SQLite，
-/// 有流量时也只在 flush 周期内各 key 写一次（而不是每请求一次）。
-#[derive(Debug, Default)]
-struct UsageRecord {
-    current: UsageSnapshot,
-    flushed: UsageSnapshot,
-    /// 是否成功落过库。用于区分"从未落库"（即使值未变也要补写一次）与"已一致"。
-    ever_flushed: bool,
-}
-
-/// 一次请求的用量增量（usage 提取见 `crate::usage_meter`）。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct UsageDelta {
-    pub prompt_tokens: u64,
-    pub completion_tokens: u64,
-    /// 是否估算来源（上游未提供 usage）。
-    pub estimated: bool,
 }
 
 /// 已验证身份缓存的默认容量：每条 ~100 字节，1650 条约 165KB。
@@ -253,21 +206,16 @@ impl KeyStore {
             },
             None => HashMap::new(),
         };
-        let usage = match &db {
-            Some(conn) => match load_usage(conn) {
-                Ok(map) => map,
-                Err(e) => {
-                    tracing::warn!("usage db load failed: {e}; using empty usage store");
-                    HashMap::new()
-                }
-            },
-            None => HashMap::new(),
-        };
+        // 连接是**资源**：凭据写穿与用量落库共用它，因此包一层 `Arc`；
+        // 而状态各自独占——`runtime` 留在这里，用量账本交给 `usage::UsageStore`
+        //（它在构造时自己从 `key_usage` 载入，失败只告警并按空账本继续）。
+        let db = Arc::new(Mutex::new(db));
+        let usage = usage::UsageStore::new(db.clone());
         Self {
             inner: Arc::new(KeyStoreInner {
                 runtime: RwLock::new(runtime),
-                db: Mutex::new(db),
-                usage: RwLock::new(usage),
+                db,
+                usage,
                 verified: verified::VerifiedCache::default(),
                 verified_max: max,
                 verified_ttl: ttl,
@@ -459,20 +407,15 @@ impl KeyStore {
         removed
     }
 
-    /// 记录一次用量并**立即同步落库**（= `accumulate_usage` + `persist_usage`）。
+    /// 记录一次用量并**立即同步落库**（= 内存累加 + 落库）。
     /// 吊销的 key 也有可能在途请求刚结束——按 key_id 独立累计，记录保留可审计。
     ///
-    /// 仅测试使用：生产路径只做内存累加，落库交给后台周期任务
-    /// （`usage_flush::spawn`）与关闭前的强制 flush。这里保留同步组合是为了让
-    /// 测试能一步写完就读库断言，因此用 `cfg(test)` 挡在生产代码之外。
+    /// 仅测试使用：生产路径只做内存累加，见 [`Self::accumulate_usage`]。
     #[cfg(test)]
     pub fn record_usage(&self, key_id: &str, name: &str, delta: &UsageDelta) {
-        self.accumulate_usage(key_id, name, delta);
-        self.persist_usage(key_id, name, delta);
+        self.inner.usage.record(key_id, name, delta);
     }
 
-    /// 只做内存累加：纳秒级、无 IO，用于让 `/admin/usage`（读的正是这份内存计数）
-    /// 在响应返回时立即一致。
     /// 校验一次 argon2，并在测试构建下记一次本实例的调用数。
     fn verify_and_count(&self, token: &str, key_hash: &str) -> bool {
         self.inner.argon2_runs.fetch_add(1, Ordering::SeqCst);
@@ -485,220 +428,51 @@ impl KeyStore {
         self.inner.argon2_runs.load(Ordering::SeqCst)
     }
 
+    /// 只做内存累加：纳秒级、无 IO，用于让 `/admin/usage`（读的正是这份内存计数）
+    /// 在响应返回时立即一致。
+    ///
+    /// 实现与契约见 [`usage::UsageStore::accumulate`]：**这里只是转发**，不保留独立逻辑。
     pub fn accumulate_usage(&self, key_id: &str, name: &str, delta: &UsageDelta) {
-        let mut usage = self.inner.usage.write().unwrap();
-        let rec = usage.entry(key_id.to_string()).or_default();
-        if rec.current.name.is_empty() {
-            rec.current.name = name.to_string();
-        }
-        rec.current.prompt_tokens += delta.prompt_tokens;
-        rec.current.completion_tokens += delta.completion_tokens;
-        rec.current.requests += 1;
-        if delta.estimated {
-            rec.current.estimated_requests += 1;
-        }
-        rec.current.last_used_at = now_secs();
+        self.inner.usage.accumulate(key_id, name, delta);
     }
 
     /// 是否有"内存值尚未落库"的 key（静默期返回 false，调用方可跳过整轮 flush）。
     pub fn usage_has_pending(&self) -> bool {
-        self.inner
-            .usage
-            .read()
-            .unwrap()
-            .values()
-            .any(|r| !r.ever_flushed || r.current != r.flushed)
+        self.inner.usage.has_pending()
     }
 
-    /// 把内存里的用量**绝对累计值**批量落库（一个事务，每个 key 一行）。
-    ///
-    /// 这是量到量级差异的关键改动：原来每个请求都要 spawn 一个阻塞任务去抢全局 `db`
-    /// 锁写一行，实测把 2 vCPU 的上限摁在约 190 QPS（云端 515 个线程里 514 个卡在
-    /// futex 等这把锁）。改成"按周期把各 key 的最新值覆盖写一次"之后，写库次数从
-    /// 每请求一次降到每周期一次，且写的是绝对值——幂等、丢不掉、重启不重复累加。
-    ///
-    /// 记录里维护 `flushed` 副本作为"已落库"标记：只写 `current != flushed` 的 key，
-    /// 且**成功后才更新标记**，所以落库失败会在下一轮自动重试。
+    /// 把内存里的用量**绝对累计值**批量落库（实现与契约见 [`usage::UsageStore::flush_once`]：
+    /// 绝对值 → 幂等、重启不重复累加；成功提交后才更新"已落库"标记 → 失败下轮重试）。
     ///
     /// 返回本轮写入的 key 数；`force = true` 时忽略"是否变化"（用于关闭前落库）。
     pub fn flush_usage_once(&self, force: bool) -> usize {
-        // 准备阶段只在内存锁内做，不碰 SQLite。
-        let batch: Vec<(String, UsageSnapshot)> = {
-            let usage = self.inner.usage.read().unwrap();
-            usage
-                .iter()
-                .filter(|(_, r)| force || !r.ever_flushed || r.current != r.flushed)
-                .map(|(k, r)| (k.clone(), r.current.clone()))
-                .collect()
-        };
-        if batch.is_empty() {
-            return 0;
-        }
-
-        let mut conn = self.inner.db.lock().unwrap();
-        let Some(conn) = conn.as_mut() else {
-            return 0; // 无持久化（内存模式）：没有库可写
-        };
-        let tx = match conn.transaction() {
-            Ok(tx) => tx,
-            Err(e) => {
-                tracing::warn!("usage flush: begin transaction failed: {e}");
-                return 0;
-            }
-        };
-        let mut written = 0usize;
-        for (key_id, snap) in &batch {
-            let r = tx.execute(
-                "INSERT INTO key_usage
-                 (key_id, name, prompt_tokens, completion_tokens, requests, estimated_requests, last_used_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                 ON CONFLICT(key_id) DO UPDATE SET
-                   name = excluded.name,
-                   prompt_tokens = excluded.prompt_tokens,
-                   completion_tokens = excluded.completion_tokens,
-                   requests = excluded.requests,
-                   estimated_requests = excluded.estimated_requests,
-                   last_used_at = excluded.last_used_at",
-                rusqlite::params![
-                    key_id,
-                    snap.name,
-                    snap.prompt_tokens as i64,
-                    snap.completion_tokens as i64,
-                    snap.requests as i64,
-                    snap.estimated_requests as i64,
-                    snap.last_used_at as i64
-                ],
-            );
-            match r {
-                Ok(_) => written += 1,
-                Err(e) => {
-                    tracing::warn!(key_id = %key_id, "usage flush failed: {e}");
-                    return written; // 事务未提交，标记不动 → 下一轮重试
-                }
-            }
-        }
-        if let Err(e) = tx.commit() {
-            tracing::warn!("usage flush: commit failed: {e}");
-            return 0;
-        }
-        // 提交成功后才更新"已落库"标记。
-        let mut usage = self.inner.usage.write().unwrap();
-        for (key_id, snap) in batch {
-            if let Some(rec) = usage.get_mut(&key_id) {
-                rec.flushed = snap;
-                rec.ever_flushed = true;
-            }
-        }
-        written
+        self.inner.usage.flush_once(force)
     }
 
     /// 关闭前落库：把全部 key 的当前值无条件写一次（可能包含未变化的，代价可忽略）。
     pub fn flush_usage_blocking(&self) -> usize {
-        self.flush_usage_once(true)
+        self.inner.usage.flush_blocking()
     }
 
-    /// 把一次用量**增量**写穿到 SQLite（旧的每请求写库路径，仅测试用）。
+    /// 把一次用量**增量**写穿到 SQLite（旧的每请求写库路径，**仅测试用**）。
     ///
-    /// 生产路径已改为 `flush_usage_once`：按周期把各 key 的**绝对累计值**批量写一次。
-    /// 增量写在热点上每次都要抢全局 `db` 锁 + 提交一次事务，实测把 2 vCPU 的吞吐
-    /// 摁在约 190 QPS（云端 515 线程 / 514 个卡在 futex 等锁），所以这里只留给测试
-    /// 构造"库里已有某值"的场景。**阻塞调用**，不要放回请求路径。
+    /// 生产路径已改为 [`Self::flush_usage_once`]：按周期把各 key 的绝对累计值批量写一次。
+    /// 增量写每次都要抢全局 `db` 锁并提交事务，实测把 2 vCPU 的吞吐摁在约 190 QPS，
+    /// 所以只留给测试构造"库里已有某值"的场景。**阻塞调用**，不要放回请求路径。
     #[cfg(test)]
     pub fn persist_usage(&self, key_id: &str, name: &str, delta: &UsageDelta) {
-        if let Some(conn) = self.inner.db.lock().unwrap().as_mut() {
-            let r = conn.execute(
-                "INSERT INTO key_usage
-                 (key_id, name, prompt_tokens, completion_tokens, requests, estimated_requests, last_used_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                 ON CONFLICT(key_id) DO UPDATE SET
-                   name = excluded.name,
-                   prompt_tokens = key_usage.prompt_tokens + excluded.prompt_tokens,
-                   completion_tokens = key_usage.completion_tokens + excluded.completion_tokens,
-                   requests = key_usage.requests + excluded.requests,
-                   estimated_requests = key_usage.estimated_requests + excluded.estimated_requests,
-                   last_used_at = excluded.last_used_at",
-                rusqlite::params![
-                    key_id,
-                    name,
-                    delta.prompt_tokens as i64,
-                    delta.completion_tokens as i64,
-                    1i64,
-                    delta.estimated as i64,
-                    now_secs() as i64
-                ],
-            );
-            if let Err(e) = r {
-                tracing::warn!("usage persist failed: {e}");
-            }
-        }
+        self.inner.usage.persist(key_id, name, delta);
     }
 
     /// 单个 key 的用量快照（无记录 → None）。
     pub fn usage_of(&self, key_id: &str) -> Option<KeyUsageInfo> {
-        let usage = self.inner.usage.read().unwrap();
-        let rec = usage.get(key_id)?;
-        Some(cell_to_info(key_id, &rec.current))
+        self.inner.usage.of(key_id)
     }
 
     /// 全部 key 的用量快照（按 key_id 排序）。
     pub fn usage_snapshot(&self) -> Vec<KeyUsageInfo> {
-        let usage = self.inner.usage.read().unwrap();
-        let mut out: Vec<KeyUsageInfo> = usage
-            .iter()
-            .map(|(id, rec)| cell_to_info(id, &rec.current))
-            .collect();
-        out.sort_by(|a, b| a.key_id.cmp(&b.key_id));
-        out
+        self.inner.usage.snapshot()
     }
-}
-
-/// 把原子单元转成可序列化的明细。
-fn cell_to_info(key_id: &str, snap: &UsageSnapshot) -> KeyUsageInfo {
-    KeyUsageInfo {
-        key_id: key_id.to_string(),
-        name: snap.name.clone(),
-        prompt_tokens: snap.prompt_tokens,
-        completion_tokens: snap.completion_tokens,
-        total_tokens: snap.prompt_tokens + snap.completion_tokens,
-        requests: snap.requests,
-        estimated_requests: snap.estimated_requests,
-        last_used_at: snap.last_used_at,
-    }
-}
-
-/// 从 SQLite 加载用量（key = key_id）。
-fn load_usage(conn: &Connection) -> rusqlite::Result<HashMap<String, UsageRecord>> {
-    let mut out = HashMap::new();
-    let mut stmt = conn.prepare(
-        "SELECT key_id, name, prompt_tokens, completion_tokens, requests, estimated_requests, last_used_at
-         FROM key_usage",
-    )?;
-    let rows = stmt.query_map([], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            UsageSnapshot {
-                name: r.get::<_, String>(1)?,
-                prompt_tokens: r.get::<_, i64>(2)?.max(0) as u64,
-                completion_tokens: r.get::<_, i64>(3)?.max(0) as u64,
-                requests: r.get::<_, i64>(4)?.max(0) as u64,
-                estimated_requests: r.get::<_, i64>(5)?.max(0) as u64,
-                last_used_at: r.get::<_, i64>(6)?.max(0) as u64,
-            },
-        ))
-    })?;
-    for row in rows {
-        let (key_id, snap) = row?;
-        // 库里的值既是"当前累计"的起点，也正好是"已落库"状态。
-        out.insert(
-            key_id,
-            UsageRecord {
-                current: snap.clone(),
-                flushed: snap,
-                ever_flushed: true,
-            },
-        );
-    }
-    Ok(out)
 }
 
 /// 迁移旧版库（明文 key 表，无 lookup/key_hash 列）为 argon2 哈希存储。
