@@ -368,6 +368,11 @@ impl Registry {
     /// 对开流、写帧、响应头三条判据都是同一份证据。唯一的调用点在响应头那一支
     /// （`proxy/mod.rs`）——**开流或写帧成功不算**：agent 卡死时流照样能开、帧也照样写得出去，
     /// 只是永远不回帧。
+    ///
+    /// **这里是按 `stable_id` 的全表扫描**（`:238` 与 `evict` 的查找同理）：map 以 `agent_id`
+    /// 为键，而这条路径手上只有 `stable_id`。暂时不改成双索引：生产上 `n` 只有 1–4 个 agent
+    /// （云端实测 `hlmg_agents 1`），扫 4 个元素远比它旁边那次 HTTP 往返便宜。真要动它，
+    /// 先拿 profiling 说话（评估 §2 C4 的结论也是"别在没数据时动"）。
     pub fn note_tunnel_op_ok(&self, stable_id: usize) {
         let inner = self.inner.read().unwrap();
         if let Some(e) = inner.values().find(|e| e.stable_id == stable_id) {
@@ -567,6 +572,12 @@ impl Registry {
         }
     }
 
+    /// 注册表是否为空。
+    ///
+    /// **看起来没人调用，但删不得**：clippy 的 `len_without_is_empty` 是**默认开启**的，
+    /// 一个公开类型有 `pub fn len` 却没有 `is_empty` 就会告警（实测：删掉它会得到
+    /// `struct Registry has a public len method, but no is_empty method`，而 CI 跑的是
+    /// `clippy -- -D warnings`）。它是与 [`Self::len`] 配对存在的方法，不是死代码。
     pub fn is_empty(&self) -> bool {
         self.inner.read().unwrap().is_empty()
     }
@@ -611,6 +622,10 @@ impl Registry {
     /// 模型匹配语义：agent 声明的 `models` 含 `"*"`（全匹配/兜底）或含 `model`。
     /// 优先级：**精确声明该模型者优先于仅 `*` 通配者**（通配是兜底，不抢单）；
     /// 同级内按负载最轻优先，同等负载取最近心跳者（多 agent 均衡）。
+    ///
+    /// **生产路径走的是 [`Self::try_acquire_excluding`]**：`routing.rs` 总要把"刚失败的那条
+    /// 连接"排除掉（否则重试没有意义），所以本方法在 `crates/gateway/src` 里没有调用者。
+    /// 保留它是因为它是 `Registry` 公开 API 的一部分（库调用方与单测用），实现只有一行转发。
     pub fn try_acquire(
         &self,
         stale_after: Duration,
@@ -666,13 +681,17 @@ impl Registry {
             // 后果是开流判据对该连接永久失效、每次摘除都白等满宽限期、这台 agent 永远排
             // 最后、`/admin/agents` 显示天文数字。回归测试：
             // `max_concurrency_zero_always_acquires_and_still_counts_inflight`。
+            //
+            // 用 `try_update` 而不是 `fetch_update`：后者在 nightly 1.100.0 起被标记为
+            // `deprecated: renamed to try_update for consistency`（纯改名，签名与返回值
+            // 语义一致），`try_update` 在 stable 1.97.1 就有（见 `TODO.md` 的那条）。
             let acquired = if entry.max_concurrency == 0 {
                 let _ = entry.inflight.fetch_add(1, Ordering::Relaxed);
                 true
             } else {
                 entry
                     .inflight
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                         (n < entry.max_concurrency).then_some(n + 1)
                     })
                     .is_ok()
