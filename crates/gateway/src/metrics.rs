@@ -58,6 +58,13 @@ struct MetricsInner {
     /// 这个区分是排障的关键：`busy` 陡增说明容量不足（该扩容或调 `max_concurrency`），
     /// `dead` 陡增才是隧道/网络故障。两者在状态码上都会表现为 5xx/429。
     tunnel_open_timeouts: Mutex<HashMap<&'static str, u64>>,
+    /// 写请求帧失败的次数，按性质分：`backpressure` = 写超时（连接级背压，**不摘除**）、
+    /// `broken` = 写直接返回错误（坏连接，计 strike）。
+    ///
+    /// 与 `tunnel_open_timeouts` 分开：那条量"开不出流"，这条量"帧写不进去"。
+    /// `backpressure` 陡增说明 agent 读得慢或链路拥塞（该查 agent / 带宽），
+    /// `broken` 陡增才是隧道/网络故障。两者原先都不区分，写超时被当成死亡。
+    tunnel_write_failures: Mutex<HashMap<&'static str, u64>>,
 }
 
 impl Metrics {
@@ -144,6 +151,17 @@ impl Metrics {
         *self
             .inner
             .tunnel_open_timeouts
+            .lock()
+            .unwrap()
+            .entry(kind)
+            .or_insert(0) += 1;
+    }
+
+    /// 记录一次写请求帧失败（`kind`：`backpressure` = 写超时，`broken` = 写直接失败）。
+    pub fn record_tunnel_write_failure(&self, kind: &'static str) {
+        *self
+            .inner
+            .tunnel_write_failures
             .lock()
             .unwrap()
             .entry(kind)
@@ -303,6 +321,21 @@ impl Metrics {
                     out.push_str(&format!(
                         "hlmg_tunnel_open_timeouts_total{{class=\"{k}\"}} {}\n",
                         to[*k]
+                    ));
+                }
+            }
+        }
+        {
+            let wf = inner.tunnel_write_failures.lock().unwrap();
+            if !wf.is_empty() {
+                out.push_str("# HELP hlmg_tunnel_write_failures_total Request frames that could not be written to the tunnel; class=backpressure means the write timed out (connection-level backpressure, not evicted), class=broken means the write returned an error (connection treated as broken and evicted).\n");
+                out.push_str("# TYPE hlmg_tunnel_write_failures_total counter\n");
+                let mut kinds: Vec<&&str> = wf.keys().collect();
+                kinds.sort_unstable();
+                for k in kinds {
+                    out.push_str(&format!(
+                        "hlmg_tunnel_write_failures_total{{class=\"{k}\"}} {}\n",
+                        wf[*k]
                     ));
                 }
             }

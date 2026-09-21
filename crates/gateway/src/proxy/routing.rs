@@ -198,6 +198,7 @@ pub(super) async fn open_and_send(
         {
             // 写**超时**是连接级背压，不是死亡（与开流臂的 busy 同源）：不摘除，只重试。
             // 只有"写直接失败"才说明这条连接确实不可用，计一次 strike。
+            state.metrics.record_tunnel_write_failure(failure.class());
             if failure.is_tunnel_broken() {
                 state
                     .registry
@@ -206,6 +207,12 @@ pub(super) async fn open_and_send(
             let e = failure.message();
             if tried.len() >= MAX_TUNNEL_ATTEMPTS {
                 state.metrics.record_tunnel_retry("failed");
+                // 为什么这里保持 502，而不像开流臂的 busy 那样给 429：写超时**没有**"容量已满"
+                // 的正面证据——连接级背压由共享发送缓冲/UDP socket 决定，一条流也能把它填满，
+                // 在途流数不是有效代理（这正是本臂不复用 open_timeout_is_fatal 的原因）。
+                // 429 还会带上 `Retry-After: 60` 与 `error.type=rate_limit_error`，等于把
+                // "服务端这次刷不出去"说成"客户端发太多"，并让客户端白等一分钟。
+                // 背压与坏连接的区分由 `hlmg_tunnel_write_failures_total{class=…}` 与日志承担。
                 return Err(RouteFailure {
                     status: StatusCode::BAD_GATEWAY,
                     message: e,
