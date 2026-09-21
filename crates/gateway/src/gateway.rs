@@ -1,99 +1,22 @@
 //! 网关装配：配置（[`GatewayConfig`]）、启动（[`Gateway::start`]）、关闭（[`Gateway::shutdown`]）。
 //!
 //! 模块声明与再导出在 crate 根 `lib.rs`；启动旋钮（[`Options`]）在 [`crate::options`]；
-//! TLS 材料（[`TlsPem`]）与 rustls 配置构造在 [`crate::tls`]；端口绑定在私有模块 `listen`；
-//! 公网入口的 accept 循环在 [`crate::http`]。
+//! TLS 材料（[`TlsPem`]、[`TunnelTls`]）与 rustls 配置构造在 [`crate::tls`]；端口绑定在
+//! 私有模块 `listen`；公网入口的 accept 循环在 [`crate::http`]。
 
-use std::{net::SocketAddr, path::Path, sync::Arc, time::Duration};
-
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use std::{net::SocketAddr, time::Duration};
 
 use crate::{
-    error::GatewayError,
-    http, listen,
-    metrics::Metrics,
-    nofile, quic,
-    registry::Registry,
-    state,
-    storage::KeyStore,
-    tls::{self, TlsPem},
-    usage_flush,
+    error::GatewayError, http, listen, metrics::Metrics, nofile, quic, registry::Registry, state,
+    storage::KeyStore, tls::TlsPem, usage_flush,
 };
 
 /// 启动旋钮住在 [`crate::options`]；这里再导出，保住 `gateway::Options` 这个既有公开路径
 /// （`lib.rs` 与 `tests/e2e` 按它引用）。
 pub use crate::options::Options;
 
-/// 隧道侧的 mTLS 身份材料。**必填**，没有它网关证明不了任何 agent 的身份。
-///
-/// 刻意**不给 `Default`、也不放进 [`Options`]**：`PrivateKeyDer` 本身没有 `Default`，
-/// 所以"忘了配证书"在类型层面就构造不出来。反面例子是**空的** `ca_cert`——那在 rustls 里
-/// 是一套"谁也不信"的信任根：网关照常启动、日志照常写 ready，而每个 agent 的握手都被拒，
-/// 表现成"agent 永远注册不上"。
-///
-/// 字段**私有** + 只有一个校验构造器 [`TunnelTls::from_der`]：光靠"没有 `Default`"挡不住
-/// 空的 CA（那正是上面那个反面例子），所以这个不变量由构造点兜住。
-#[derive(Debug)]
-pub struct TunnelTls {
-    /// 签发 agent 客户端证书的 CA 证书。
-    ca_cert: Vec<CertificateDer<'static>>,
-    server_cert: Vec<CertificateDer<'static>>,
-    server_key: PrivateKeyDer<'static>,
-}
-
-impl TunnelTls {
-    /// 从已解析的 DER 材料构造隧道身份。**空 CA / 空证书链一律拒绝**。
-    ///
-    /// 这是本类型的唯一构造入口（外加读 PEM 的 [`Self::from_pem_files`]）。空的 `ca_cert`
-    /// 在 rustls 里是一套"谁也不信"的信任根：不拦的话网关照常启动、日志 ready，而每个 agent
-    /// 的握手都被拒，表现成"agent 永远注册不上"——排查成本极高。让它在**构造点**失败。
-    pub fn from_der(
-        ca_cert: Vec<CertificateDer<'static>>,
-        server_cert: Vec<CertificateDer<'static>>,
-        server_key: PrivateKeyDer<'static>,
-    ) -> Result<Self, GatewayError> {
-        if ca_cert.is_empty() {
-            return Err(GatewayError::Config(
-                "tunnel ca_cert is empty: rustls would build a trust root that trusts nobody, \
-                 so every agent handshake fails while the gateway still looks healthy"
-                    .into(),
-            ));
-        }
-        if server_cert.is_empty() {
-            return Err(GatewayError::Config("tunnel server_cert is empty".into()));
-        }
-        Ok(Self {
-            ca_cert,
-            server_cert,
-            server_key,
-        })
-    }
-
-    /// 从三个 PEM 文件装载（生产路径）。文件缺失 / 解析失败 / 材料为空一律**启动即失败**。
-    pub fn from_pem_files(ca: &Path, cert: &Path, key: &Path) -> Result<Self, GatewayError> {
-        Self::from_der(
-            proto::pem::load_certs(ca).map_err(|e| {
-                GatewayError::Other(format!("cannot load ca cert {}: {e}", ca.display()))
-            })?,
-            proto::pem::load_certs(cert).map_err(|e| {
-                GatewayError::Other(format!("cannot load cert {}: {e}", cert.display()))
-            })?,
-            proto::pem::load_key(key).map_err(|e| {
-                GatewayError::Other(format!("cannot load key {}: {e}", key.display()))
-            })?,
-        )
-    }
-
-    /// 构建 QUIC 隧道用的 mTLS rustls 配置。调用方拿到 `Arc` 才能交给 s2n-quic。
-    pub fn server_config(&self) -> Result<Arc<rustls::ServerConfig>, GatewayError> {
-        tls::rustls_server_tls(
-            &self.ca_cert,
-            self.server_cert.clone(),
-            self.server_key.clone_key(),
-        )
-        .map(Arc::new)
-    }
-}
+/// 隧道身份材料住在 [`crate::tls`]；同样再导出以保住 `gateway::TunnelTls` 路径。
+pub use crate::tls::TunnelTls;
 
 /// 启动配置：**必填的身份材料** + 全部可选项。
 ///
@@ -316,34 +239,8 @@ impl Drop for Gateway {
 
 #[cfg(test)]
 mod tests {
-    use super::{run_bounded, TunnelTls};
+    use super::run_bounded;
     use std::time::Duration;
-
-    /// 规格：**空的身份材料在构造点就被拒绝**。
-    ///
-    /// 空的 `ca_cert` 是 rustls 的"谁也不信"信任根：不拦的话网关照常启动、日志 ready，
-    /// 而每个 agent 握手都被拒（表现成"agent 永远注册不上"）。
-    #[test]
-    fn tunnel_tls_rejects_empty_identity_material() {
-        use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-
-        fn der(b: u8) -> CertificateDer<'static> {
-            CertificateDer::from(vec![b])
-        }
-        fn key() -> PrivateKeyDer<'static> {
-            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(vec![0u8]))
-        }
-
-        assert!(
-            TunnelTls::from_der(vec![], vec![der(1)], key()).is_err(),
-            "空 CA 必须被拒绝（它是'谁也不信'的信任根）"
-        );
-        assert!(
-            TunnelTls::from_der(vec![der(1)], vec![], key()).is_err(),
-            "空服务端证书链必须被拒绝"
-        );
-        assert!(TunnelTls::from_der(vec![der(1)], vec![der(2)], key()).is_ok());
-    }
 
     /// 规格：**有界等待**——到点必须放弃，而不是陪着慢任务一起卡住。
     ///
