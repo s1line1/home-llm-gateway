@@ -149,9 +149,11 @@ pub(super) async fn open_and_send(
                     );
                     // 打不开流 = 这条连接已经死了 → 摘掉条目（连续超时足够才会真摘），
                     // 然后换个 agent 重试；没有别的候选时把错误报给客户端。
-                    state
-                        .registry
-                        .evict(entry.stable_id, EvictCause::OpenTimeout);
+                    state.registry.evict(
+                        entry.stable_id,
+                        EvictCause::OpenTimeout,
+                        state.evict_close_grace,
+                    );
                 }
                 if tried.len() >= MAX_TUNNEL_ATTEMPTS {
                     state.metrics.record_tunnel_retry("failed");
@@ -200,9 +202,11 @@ pub(super) async fn open_and_send(
             // 只有"写直接失败"才说明这条连接确实不可用，计一次 strike。
             state.metrics.record_tunnel_write_failure(failure.class());
             if failure.is_tunnel_broken() {
-                state
-                    .registry
-                    .evict(entry.stable_id, EvictCause::TunnelWriteFailed);
+                state.registry.evict(
+                    entry.stable_id,
+                    EvictCause::TunnelWriteFailed,
+                    state.evict_close_grace,
+                );
             }
             let e = failure.message();
             if tried.len() >= MAX_TUNNEL_ATTEMPTS {

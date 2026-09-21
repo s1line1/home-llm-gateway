@@ -253,8 +253,17 @@ impl Registry {
     /// 任何异常（心跳照通、连接照开），却永远无法再被路由；agent 只有等到自己判断
     /// 连接不可用才会重连，而那一刻可能永远不来。
     ///
+    /// `close_grace` 是"移出路由之后最多再等多久就关连接"：由调用方从
+    /// [`crate::Options::evict_close_grace`] 传入。与 `stale_after`、`stream_ceiling`、
+    /// `window` 一样采取**每调用注入**——注册表自己不存配置。
+    ///
     /// 返回是否真的摘掉了（false = 计数未达阈值，或条目已被别人摘掉/替换）。
-    pub fn evict(&self, stable_id: usize, cause: EvictCause) -> EvictOutcome {
+    pub fn evict(
+        &self,
+        stable_id: usize,
+        cause: EvictCause,
+        close_grace: Duration,
+    ) -> EvictOutcome {
         let mut inner = self.inner.write().unwrap();
         let hit = inner
             .iter()
@@ -284,10 +293,14 @@ impl Registry {
         inner.remove(&agent_id);
 
         // ② 再决定何时关闭连接。**不能立刻关**：这条连接上往往还有别的在途请求，
-        //    而它们**已经把请求完整送达 agent、模型正在生成**——这些请求早就过了
-        //    响应头那一关，不属于"建立阶段可重试"的范围，被连带打断就是纯损失
-        //    （客户的这次生成白花钱、还拿不到结果）。
-        //    所以在途归零后再关；超过宽限期也强制关，否则 agent 永远是僵尸。
+        //    而它们在 `inflight` 里有两类，**两类都不该被连带打断**：
+        //      · 已经把请求完整送达 agent、模型正在生成的——早过了响应头那一关，
+        //        不属于"建立阶段可重试"的范围，打断就是纯损失（客户白花钱还拿不到结果）；
+        //      · **还在等响应头的**——槽位是从 `try_acquire` 取得、一直持有到响应结束的
+        //        （`routing.rs` 取得 → `proxy/mod.rs` 的 `read_head` → `forward.rs` 持有），
+        //        所以它们也在 `inflight` 里；它们并没有出错，只是还没轮到回包。
+        //    所以在途归零后再关；超过宽限期也强制关，否则 agent 永远是僵尸
+        //    （宽限期由调用方注入，见 `Options::evict_close_grace`）。
         let inflight = entry.inflight.load(Ordering::Relaxed);
         let outcome = if inflight <= 1 {
             // 只有当前这个失败请求占着槽位 → 关掉不会牵连别人。
@@ -298,10 +311,10 @@ impl Registry {
                 agent = %agent_id,
                 consecutive = n,
                 inflight,
-                grace_secs = EVICT_CLOSE_GRACE.as_secs(),
+                grace_secs = close_grace.as_secs(),
                 "agent evicted; deferring connection close until in-flight requests drain"
             );
-            close_when_drained(entry);
+            close_when_drained(entry, close_grace);
             EvictOutcome::RemovedClosedLater { inflight }
         };
         if outcome == EvictOutcome::RemovedClosed {
@@ -441,13 +454,28 @@ impl Registry {
         });
         for candidate in candidates {
             let entry = candidate.clone();
-            let acquired = entry.max_concurrency == 0
-                || entry
+            // `max_concurrency == 0` = 不限：**不做上限判定**，但自增必须照做。
+            // `inflight` 不只是准入闸门，它同时是另外三处的输入：开流超时的忙/死判据
+            // （[`Entry::open_timeout_is_fatal`]，`0` 时以端点流额度为上限）、摘除时
+            // "是否还有别人在途"（[`Registry::evict`] 的 `inflight <= 1`）、以及下面
+            // `sort_by_key` 的负载排序键。
+            //
+            // 曾经写成 `entry.max_concurrency == 0 || …fetch_update(…)`：短路使"不增"，
+            // 而 `SlotGuard::drop` 仍然"减" → `AtomicU32` 下溢回绕成 4294967295。
+            // 后果是开流判据对该连接永久失效、每次摘除都白等满宽限期、这台 agent 永远排
+            // 最后、`/admin/agents` 显示天文数字。回归测试：
+            // `max_concurrency_zero_always_acquires_and_still_counts_inflight`。
+            let acquired = if entry.max_concurrency == 0 {
+                let _ = entry.inflight.fetch_add(1, Ordering::Relaxed);
+                true
+            } else {
+                entry
                     .inflight
                     .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                         (n < entry.max_concurrency).then_some(n + 1)
                     })
-                    .is_ok();
+                    .is_ok()
+            };
             if acquired {
                 let guard = SlotGuard(entry.inflight.clone());
                 return Ok((entry, guard));
@@ -471,14 +499,14 @@ pub enum EvictOutcome {
     NotFound,
 }
 
-/// 摘除后等待在途请求收尾的宽限期上限。超过它就强制关闭——宁可打断，
-/// 也不能让一条已被摘除的连接永远留着（那样 agent 又变回"自认为在线的僵尸"）。
-pub const EVICT_CLOSE_GRACE: Duration = Duration::from_secs(5);
-
-/// 等在途请求收尾（或超过宽限期）再关闭连接，避免打断已经送达上游的请求。
-fn close_when_drained(entry: Entry) {
+/// 等在途请求收尾（或超过 `grace`）再关闭连接，避免打断已经在途的请求。
+///
+/// `grace` 由 [`Registry::evict`] 的调用方从 [`crate::Options::evict_close_grace`] 传入——
+/// 这个值原先在这里硬编码成 5s，比 `head_timeout`（15s）还短，于是摘除发生时仍在等响应头
+/// 的请求会被一并掐断。默认值现在住在 `Options`，这里不再有决定行为的裸常量。
+fn close_when_drained(entry: Entry, grace: Duration) {
     tokio::spawn(async move {
-        let deadline = tokio::time::Instant::now() + EVICT_CLOSE_GRACE;
+        let deadline = tokio::time::Instant::now() + grace;
         loop {
             if entry.inflight.load(Ordering::Relaxed) == 0 {
                 break;
@@ -532,6 +560,10 @@ mod tests {
     use super::*;
     use rcgen::{CertificateParams, KeyPair};
     use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+
+    /// 摘除宽限：单测不关心具体时长（那由 `Options::evict_close_grace` 决定，默认 5s），
+    /// 给一个固定值即可。
+    const GRACE: Duration = Duration::from_secs(5);
 
     /// 建一对本地 s2n-quic 端点，返回**客户端连接句柄**（无 mTLS，只为构造 Handle）。
     ///
@@ -660,14 +692,14 @@ mod tests {
         let (_e2, g2) = reg.try_acquire(stale, "m").unwrap();
         let (_e3, g3) = reg.try_acquire(stale, "m").unwrap();
         assert_eq!(
-            reg.evict(id, EvictCause::OpenTimeout),
+            reg.evict(id, EvictCause::OpenTimeout, GRACE),
             EvictOutcome::BelowThreshold { consecutive: 1 }
         );
         assert_eq!(
-            reg.evict(id, EvictCause::OpenTimeout),
+            reg.evict(id, EvictCause::OpenTimeout, GRACE),
             EvictOutcome::BelowThreshold { consecutive: 2 }
         );
-        match reg.evict(id, EvictCause::OpenTimeout) {
+        match reg.evict(id, EvictCause::OpenTimeout, GRACE) {
             EvictOutcome::RemovedClosedLater { inflight } => {
                 assert!(inflight >= 3, "应报出当时的在途数，实际 {inflight}")
             }
@@ -682,15 +714,15 @@ mod tests {
         let id2 = reg2.register("idle".into(), vec!["*".into()], 8, conn2.clone());
         let (_e4, _g4) = reg2.try_acquire(stale, "m").unwrap();
         assert!(matches!(
-            reg2.evict(id2, EvictCause::OpenTimeout),
+            reg2.evict(id2, EvictCause::OpenTimeout, GRACE),
             EvictOutcome::BelowThreshold { .. }
         ));
         assert!(matches!(
-            reg2.evict(id2, EvictCause::OpenTimeout),
+            reg2.evict(id2, EvictCause::OpenTimeout, GRACE),
             EvictOutcome::BelowThreshold { .. }
         ));
         assert_eq!(
-            reg2.evict(id2, EvictCause::OpenTimeout),
+            reg2.evict(id2, EvictCause::OpenTimeout, GRACE),
             EvictOutcome::RemovedClosed
         );
     }
@@ -740,35 +772,35 @@ mod tests {
 
         // 前两次超时：条目保留
         assert!(matches!(
-            reg.evict(id, EvictCause::OpenTimeout),
+            reg.evict(id, EvictCause::OpenTimeout, GRACE),
             EvictOutcome::BelowThreshold { consecutive: 1 }
         ));
         assert_eq!(reg.len(), 1);
         assert!(matches!(
-            reg.evict(id, EvictCause::OpenTimeout),
+            reg.evict(id, EvictCause::OpenTimeout, GRACE),
             EvictOutcome::BelowThreshold { consecutive: 2 }
         ));
         assert_eq!(reg.len(), 1);
         // 中途一次成功 → 计数清零，重新从头累计
         reg.note_tunnel_op_ok(id);
         assert!(matches!(
-            reg.evict(id, EvictCause::OpenTimeout),
+            reg.evict(id, EvictCause::OpenTimeout, GRACE),
             EvictOutcome::BelowThreshold { consecutive: 1 }
         ));
         assert_eq!(reg.len(), 1);
         // 再来两次（累计到 3）→ 摘除；此时只有本请求占槽位 → 立即关闭
         assert!(matches!(
-            reg.evict(id, EvictCause::OpenTimeout),
+            reg.evict(id, EvictCause::OpenTimeout, GRACE),
             EvictOutcome::BelowThreshold { .. }
         ));
         assert!(matches!(
-            reg.evict(id, EvictCause::OpenTimeout),
+            reg.evict(id, EvictCause::OpenTimeout, GRACE),
             EvictOutcome::RemovedClosed
         ));
         assert_eq!(reg.len(), 0);
         // 已摘除后再调用：无害
         assert_eq!(
-            reg.evict(id, EvictCause::OpenTimeout),
+            reg.evict(id, EvictCause::OpenTimeout, GRACE),
             EvictOutcome::NotFound
         );
     }
@@ -789,14 +821,14 @@ mod tests {
         for expected in 1..=2 {
             assert!(
                 matches!(
-                    reg.evict(id, EvictCause::OpenTimeout),
+                    reg.evict(id, EvictCause::OpenTimeout, GRACE),
                     EvictOutcome::BelowThreshold { consecutive } if consecutive == expected
                 ),
                 "开流超时应独立计数到 {expected}"
             );
             assert!(
                 matches!(
-                    reg.evict(id, EvictCause::HeadTimeout),
+                    reg.evict(id, EvictCause::HeadTimeout, GRACE),
                     EvictOutcome::BelowThreshold { consecutive } if consecutive == expected
                 ),
                 "响应头超时应独立计数到 {expected}"
@@ -810,13 +842,13 @@ mod tests {
 
         // 第三种原因也从 1 开始，不受前两种影响
         assert!(matches!(
-            reg.evict(id, EvictCause::TunnelWriteFailed),
+            reg.evict(id, EvictCause::TunnelWriteFailed, GRACE),
             EvictOutcome::BelowThreshold { consecutive: 1 }
         ));
 
         // 只有某一种真正连续到阈值才摘除
         assert_eq!(
-            reg.evict(id, EvictCause::OpenTimeout),
+            reg.evict(id, EvictCause::OpenTimeout, GRACE),
             EvictOutcome::RemovedClosed
         );
         assert_eq!(reg.len(), 0);
@@ -905,14 +937,55 @@ mod tests {
         assert!(reg.try_acquire(Duration::from_secs(10), "qwen2.5").is_ok());
     }
 
+    /// 规格：`max_concurrency == 0` = 不限（永远拿得到槽位），但**计数仍然必须真实**。
+    ///
+    /// `0` 只关掉"准入上限"这一件事；`inflight` 同时还是另外三处的输入：
+    /// 开流超时的忙/死（[`Entry::open_timeout_is_fatal`]）、摘除时"是否还有别人在途"
+    /// （[`Registry::evict`] 的 `inflight <= 1`）、以及负载排序（`try_acquire_excluding`
+    /// 的 `sort_by_key`）。只减不加会让 `AtomicU32` **下溢回绕成 4294967295**：开流判据
+    /// 永久失效、每次摘除都白等满宽限期、这台 agent 永远排最后、`/admin/agents` 显示天文数字
+    /// （已记录：`docs/PROJECT_SCAN.md` P1-3）。
     #[tokio::test]
-    async fn max_concurrency_zero_always_acquires() {
+    async fn max_concurrency_zero_always_acquires_and_still_counts_inflight() {
         let reg = Registry::default();
         let conn = test_connection().await;
         reg.register("z".into(), vec!["*".into()], 0, conn.clone()); // 0 = 不限
-        for _ in 0..5 {
-            let (_entry, _slot) = reg.try_acquire(Duration::from_secs(10), "qwen2.5").unwrap();
+
+        // ① 只减不加 → 下溢：拿 5 次再**全部归还**，计数必须回到 0。
+        //    在未修的实现里这里会读到 4294967295（`AtomicU32` 回绕），正是 P1-3 记录的形态。
+        {
+            let mut slots = Vec::new();
+            for _ in 0..5 {
+                let (_entry, slot) = reg.try_acquire(Duration::from_secs(10), "qwen2.5").unwrap();
+                slots.push(slot);
+            }
+            drop(slots);
         }
+        assert_eq!(
+            reg.snapshot()[0].inflight,
+            0,
+            "拿 5 次再全部归还后必须回到 0；只减不加会下溢成 4294967295"
+        );
+
+        // ② 而且过程里必须如实累加：不限并发不等于不计数
+        let mut slots = Vec::new();
+        for expected in 1..=5u32 {
+            let (entry, slot) = reg.try_acquire(Duration::from_secs(10), "qwen2.5").unwrap();
+            slots.push(slot);
+            assert_eq!(
+                entry.inflight.load(Ordering::Relaxed),
+                expected,
+                "不限并发也必须如实计数：开流判据、摘除判据、负载排序都读这个数"
+            );
+        }
+        assert_eq!(reg.snapshot()[0].inflight, 5, "运维看到的在途数同样要真实");
+
+        drop(slots);
+        assert_eq!(
+            reg.snapshot()[0].inflight,
+            0,
+            "最后一次释放后必须回到 0；下溢会变成 4294967295"
+        );
     }
 
     #[tokio::test]

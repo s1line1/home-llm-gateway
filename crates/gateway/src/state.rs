@@ -50,6 +50,12 @@ pub struct AppState {
     pub tunnel_op_timeout: Duration,
     /// 等待上游响应头（首字节）的超时。见 [`crate::Options`] 的说明。
     pub head_timeout: Duration,
+    /// 摘除一条连接后，等它在途请求收尾的宽限。见 [`crate::Options::evict_close_grace`]。
+    ///
+    /// 透传给 `registry::Registry::evict`。与 `head_timeout` 的大小关系是**刻意保留**的：
+    /// 默认 5s 短于 15s，意味着摘除发生时仍在等响应头的在途请求会被一并掐断——这个值该
+    /// 调到多少是策略决策（见评估报告 §5 H1），本字段只负责让它可配、可回滚。
+    pub evict_close_grace: Duration,
     /// 客户端停滞阈值：请求体/响应体两个方向"完全没动静"多久就放弃。
     /// 见 [`crate::Options::client_stall`]——没有它，在途请求会永久占住准入槽位。
     pub client_stall: Duration,
@@ -106,6 +112,7 @@ impl AppState {
             agent_stale_after: opts.agent_stale_after,
             tunnel_op_timeout: opts.tunnel_op_timeout,
             head_timeout: opts.head_timeout,
+            evict_close_grace: opts.evict_close_grace,
             head_alive_window: opts.head_timeout * 4,
             client_stall: opts.client_stall,
             rate_limiter: RateLimiter::new(opts.rate_limit_per_min),
