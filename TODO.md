@@ -541,7 +541,8 @@
       `INSERT ... ON CONFLICT`，实测把 2 vCPU 的上限摁在约 190 QPS（云端 515 个线程里 514 个
       卡在 futex 等同一把 `db` 锁）。现改为：热路径只做内存累加 → 后台每 1s 一个事务批量写
       **绝对累计值**（幂等、重启不重复累加）→ **SIGTERM/SIGINT 时强制再落库一次**，日志
-      `usage flushed before shutdown keys=N`，正常关闭不丢数据（仅 SIGKILL/断电会丢最后一个
+      `usage flushed before shutdown keys=N`，正常关闭不丢**已结算**数据（flush 之后、abort 之前在途
+      请求结算的用量不在其列，见 R12 drain 式关闭；SIGKILL/断电仍会丢最后一个
       flush 周期 ≤1s 的用量）。顺带开 `journal_mode=WAL` + `synchronous=NORMAL`。
       可信口径（只数 `status="200"`，同时记录 200 占比）下的对比在云端做：每请求 CPU 从
       0.55–0.9ms（改造前，2.1 核 ÷ 190 QPS）降到 **0.30ms**（改造后，0.149 核 ÷ 496 QPS），

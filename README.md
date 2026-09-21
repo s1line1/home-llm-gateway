@@ -712,7 +712,7 @@ if !store.usage_has_pending() { continue; }                // 无变化 → 整�
 
 | 事件 | 会丢多少用量 |
 |---|---|
-| 正常关闭（SIGTERM/SIGINT、systemd stop、Ctrl+C） | **0**（强制 flush） |
+| 正常关闭（SIGTERM/SIGINT、systemd stop、Ctrl+C） | **已结算的用量 0 丢失**（强制 flush）；flush 之后、abort 之前在途请求结算的用量会丢（无 drain，见 `TODO.md` R12） |
 | `kill -9`（SIGKILL） | 最多 **1 秒** |
 | 断电 / 宿主机崩溃 | 最多 1 秒，**且**可能丢最后一次提交（`synchronous=NORMAL` 抗进程崩溃、不抗断电） |
 

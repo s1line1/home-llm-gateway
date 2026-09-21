@@ -40,7 +40,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let gw = Gateway::start(cfg).await?;
     tracing::info!(http = %gw.http_addr, quic = %gw.quic_addr, "Gateway ready");
     shutdown_signal().await;
-    tracing::info!("graceful shutdown: stopping gateway");
+    tracing::info!("shutting down gateway (no drain; usage flushed first)");
     // 用量落库已并进 shutdown：先强制写一次（否则最后一个 flush 周期内的用量会随进程
     // 一起消失），再 abort 任务。以前这里要记得先调 flush_usage_on_shutdown —— 现在忘不了。
     gw.shutdown().await;
