@@ -366,7 +366,7 @@ mod tests {
         let ids: Vec<String> = ["a", "b", "c"]
             .iter()
             .map(|n| {
-                let c = store.create((*n).into());
+                let c = store.create((*n).into()).unwrap();
                 store.accumulate_usage(&c.record.id, n, &delta);
                 c.record.id
             })

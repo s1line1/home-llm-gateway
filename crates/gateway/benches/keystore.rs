@@ -9,7 +9,7 @@ use gateway::storage::KeyStore;
 
 fn bench_keystore(c: &mut Criterion) {
     let store = KeyStore::new(None);
-    let created = store.create("bench".into());
+    let created = store.create("bench".into()).unwrap();
     let plaintext = created.plaintext.clone();
     let _id = created.record.id;
 
@@ -17,7 +17,7 @@ fn bench_keystore(c: &mut Criterion) {
     c.bench_function("keystore/create-key", |b| {
         b.iter_batched(
             || KeyStore::new(None),
-            |s| black_box(s.create("bench".into())),
+            |s| black_box(s.create("bench".into()).unwrap()),
             criterion::BatchSize::SmallInput,
         )
     });

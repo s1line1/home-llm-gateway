@@ -428,7 +428,7 @@ mod tests {
 
         // 真实 KeyStore（argon2 校验真的会跑）；key 在计时任务起跑前先建好
         let store = KeyStore::new(None);
-        let created = store.create("blocking-test".into());
+        let created = store.create("blocking-test".into()).unwrap();
         let mut state = test_state(None);
         state.key_store = store;
         let router = app(state);
