@@ -18,9 +18,17 @@ struct Args {
     config: PathBuf,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    run(Args::parse()).await
+fn main() -> anyhow::Result<()> {
+    // 手动建 runtime（而不是 `#[tokio::main]`）：退出时要能**有界地**等待阻塞池。
+    // `Gateway::shutdown` 的强制落库跑在阻塞池上、有 `shutdown_flush_timeout` 超时；
+    // 若它超时，默认的 runtime drop 会**无限**等那个阻塞任务跑完，systemd 到点照样 SIGKILL
+    // ——超时就白设了。`shutdown` 已经等过它自己的超时，这里不再等。
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = rt.block_on(run(Args::parse()));
+    rt.shutdown_timeout(std::time::Duration::ZERO);
+    result
 }
 
 /// 启动网关主循环（独立函数，便于单元测试覆盖启动路径）。
