@@ -66,6 +66,18 @@ pub struct Options {
     ///
     /// 它**同时**决定 [`crate::state::AppState::head_alive_window`]（4 倍），不单独设旋钮。
     pub head_timeout: Duration,
+    /// 摘除一条连接后，**等它在途请求收尾的最长时间**：超时就强制关闭。
+    ///
+    /// 为什么它必须可配（原先硬编码 5s）：这条宽限期要保护的正是"已经在途"的请求，
+    /// 而在途集合**包含两种**——已经送达 agent、模型正在生成的（早过了响应头那一关），
+    /// 以及**仍在等响应头**的（槽位从 `try_acquire` 取得，一直持有到响应结束，覆盖
+    /// `read_head`）。所以它的合理取值与 [`Options::head_timeout`] 和
+    /// [`Options::request_timeout`] 同量级才有意义：**比 `head_timeout` 短，就会掐断
+    /// 本来还在合法等待响应头的请求**（默认 5s < 15s，正是这条）。
+    ///
+    /// 反方向也不能无限大：连接迟迟不关，agent 侧察觉不到自己被摘除，就变回"自认为在线的
+    /// 僵尸"（心跳照通、连接照开、请求永远路由不到它）。`0` 表示不等、立刻关。
+    pub evict_close_grace: Duration,
     /// 超过该时长未心跳的 agent 视为失联。
     pub agent_stale_after: Duration,
     /// 客户端"完全停滞"多久就放弃：请求体读不动 / 响应体客户端不消费。
@@ -112,6 +124,12 @@ impl Options {
     pub const DEFAULT_TUNNEL_OP_TIMEOUT: Duration = Duration::from_secs(10);
     /// 等待上游响应头默认值。
     pub const DEFAULT_HEAD_TIMEOUT: Duration = Duration::from_secs(15);
+    /// 摘除后等待在途请求收尾的宽限默认值。
+    ///
+    /// **保持历史值 5s 不动**：把它调到与 `head_timeout` 同量级（或改成对关闭阶段感知）
+    /// 是一次**策略决策**，不是重构——那件事必须单独定、单独测，不能顺手夹带在"把常量
+    /// 变成旋钮"这一步里。这一步只让这个值变得可达（可配置、可回滚）。
+    pub const DEFAULT_EVICT_CLOSE_GRACE: Duration = Duration::from_secs(5);
     /// agent 失联判定默认值。
     pub const DEFAULT_AGENT_STALE_AFTER: Duration = Duration::from_secs(15);
     /// 客户端停滞阈值默认值。
@@ -150,6 +168,7 @@ impl Default for Options {
             request_timeout: Self::DEFAULT_REQUEST_TIMEOUT,
             tunnel_op_timeout: Self::DEFAULT_TUNNEL_OP_TIMEOUT,
             head_timeout: Self::DEFAULT_HEAD_TIMEOUT,
+            evict_close_grace: Self::DEFAULT_EVICT_CLOSE_GRACE,
             agent_stale_after: Self::DEFAULT_AGENT_STALE_AFTER,
             client_stall: Self::DEFAULT_CLIENT_STALL,
             rate_limit_per_min: 0,
