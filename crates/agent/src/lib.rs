@@ -155,6 +155,29 @@ async fn run(cfg: AgentConfig, client_config: rustls::ClientConfig) {
     }
 }
 
+/// 连上游时的"连上"超时。**不是**总超时——总超时会腰斩合法的长 SSE 流（记录 R10 的坑）。
+const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 上游 HTTP 客户端。三个默认值必须显式改掉（记录 P2-4）：
+///
+/// - **不跟随重定向**：`reqwest` 默认跟随最多 10 跳，而上游就是本地固定端点，重定向没有任何
+///   正当用途。跟随的后果不只是"多跳一次"：307/308 会把**方法连同 prompt 一起重发**到
+///   `Location` 指定的地址（内网服务、云元数据 `169.254.169.254`），并把那边的**响应**
+///   回给调用方——等于把一次 SSRF 和一条数据出境路径交给本地 LLM、或交给能改写它响应的人。
+/// - **不读环境代理**：edge 机器上存在 `HTTP_PROXY`/`ALL_PROXY` 时，prompt 会静默经该代理。
+///   今天 `Cargo.toml` 里 `reqwest` 关了默认特性、`system-proxy` 未启用，所以**已经**不读；
+///   显式写出来是为了别人日后打开默认特性时不悄悄多一条出境路径。⚠️ 这一条**没有**行为测试
+///   钉着（特性没开时它无从观测），属"显式声明"而非"已验证"。
+/// - **连接有超时**：上游不监听时不要无限等。响应阶段的兜底在网关侧（`head_timeout` 与
+///   逐帧空闲超时 → 发 `Cancel`），所以这里只限"连上"这一跳，不设总超时。
+fn upstream_client() -> anyhow::Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
+        .build()?)
+}
+
 async fn connect_once(
     cfg: &AgentConfig,
     client_config: rustls::ClientConfig,
@@ -206,7 +229,7 @@ async fn connect_once(
         cfg.heartbeat_interval,
     ));
 
-    let http = reqwest::Client::new();
+    let http = upstream_client()?;
     // ④ accept 循环用 acceptor（单消费者，独占）
     //
     // 和心跳**并跑**，而不是各跑各的：心跳是网关判定"这个 agent 还活着"的唯一依据
@@ -848,7 +871,8 @@ mod tests {
         .expect("应当是 Some(stream)");
         let task = tokio::spawn(handle_stream(
             agent_stream,
-            reqwest::Client::new(),
+            // 与生产同一条构造路径：测试不该复制一份"没加固的客户端"（那正是 P2-4 的形状）
+            upstream_client().unwrap(),
             upstream_url,
             false,
         ));
@@ -1066,5 +1090,116 @@ mod tests {
             request_log: true,
         };
         assert!(Agent::start(cfg).is_err(), "invalid key should fail start");
+    }
+
+    /// 一发就走的假 HTTP 服务器：接连接 → 读掉请求（至少读到请求头结束）→ 回**给定的原始
+    /// 响应字节** → 关连接。返回 `(地址, 收到的请求文本)`——测试用它回答"agent 到底连了谁、
+    /// 送了什么"。
+    async fn one_shot_http(
+        response: String,
+    ) -> (std::net::SocketAddr, tokio::sync::mpsc::Receiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake upstream");
+        let addr = listener.local_addr().expect("addr");
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                // 请求体可能还没到齐，但本测试只关心"连没连、头里有什么"，读一小段就够
+                let mut buf = vec![0u8; 8192];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                // 为了让 307/308 的请求体能被看到，再给一小段时间补读
+                if head.starts_with("POST") {
+                    let n = tokio::time::timeout(Duration::from_millis(200), sock.read(&mut buf))
+                        .await
+                        .ok()
+                        .and_then(|r| r.ok())
+                        .unwrap_or(0);
+                    let mut all = head;
+                    all.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    let _ = tx.send(all).await;
+                } else {
+                    let _ = tx.send(head).await;
+                }
+                let _ = sock.write_all(response.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        (addr, rx)
+    }
+
+    /// 规格（记录 P2-4）：**上游的重定向不许被跟随**。
+    ///
+    /// 跟随的代价不是"多一跳"：307/308 会把方法与 **prompt 原样重发**到 `Location` 指定的地址
+    /// （内网服务、`169.254.169.254` 云元数据），并把那边的响应回给调用方。判据有两条，缺一不可：
+    /// ① 客户端拿到的是上游自己回的 307（而不是被跟随后的 200）；
+    /// ② "第二个服务器"**一次连接都没有**——这才是"prompt 没被送出去"。
+    #[tokio::test]
+    async fn the_upstream_client_does_not_follow_redirects() {
+        let (victim, mut victim_rx) =
+            one_shot_http("HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\nexfiltr".to_string()).await;
+        let (attacker, _attacker_rx) = one_shot_http(format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{victim}/steal\r\nContent-Length: 0\r\n\r\n"
+        ))
+        .await;
+
+        let client = upstream_client().unwrap();
+        let resp = client
+            .post(format!("http://{attacker}/v1/chat/completions"))
+            .body(r#"{"model":"m","messages":[{"role":"user","content":"TOPSECRET"}]}"#)
+            .send()
+            .await
+            .expect("上游能连上，请求本身必须成功");
+
+        assert_eq!(
+            resp.status().as_u16(),
+            307,
+            "不跟随重定向：把上游自己的 3xx 原样返回，而不是替它去访问 Location"
+        );
+
+        // ② 关键判据：prompt 绝不得到达 Location 指向的地址
+        if let Ok(Some(request)) =
+            tokio::time::timeout(Duration::from_millis(500), victim_rx.recv()).await
+        {
+            panic!("agent 跟随了重定向：prompt 被送到 {victim}，请求内容：{request}");
+        }
+    }
+
+    /// 规格（记录 P2-4 的另一半）：上游客户端**不读环境代理**。
+    ///
+    /// ⚠️ 今天这条测试**通过的原因**是 `reqwest` 在本仓库关了默认特性、`system-proxy` 未启用
+    /// （`cargo tree -p reqwest -f "{f}"` 可复核），而不是因为 `.no_proxy()` 真的被验证了——
+    /// 特性没开时环境代理根本不会被读，观测不到差别。它的价值是**日后**：谁把 `reqwest` 的
+    /// 默认特性打开、又删掉 `upstream_client()` 里的 `.no_proxy()`，这条测试就会红。
+    #[tokio::test]
+    async fn the_upstream_client_ignores_environment_proxies() {
+        let (proxy, mut proxy_rx) =
+            one_shot_http("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n".to_string())
+                .await;
+        let (upstream, _upstream_rx) =
+            one_shot_http("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_string()).await;
+
+        let saved = std::env::var("HTTP_PROXY").ok();
+        std::env::set_var("HTTP_PROXY", format!("http://{proxy}"));
+        let client = upstream_client().unwrap();
+        let sent = client
+            .post(format!("http://{upstream}/v1/chat/completions"))
+            .body(r#"{"model":"m","messages":[{"role":"user","content":"TOPSECRET"}]}"#)
+            .send()
+            .await;
+        match &saved {
+            Some(v) => std::env::set_var("HTTP_PROXY", v),
+            None => std::env::remove_var("HTTP_PROXY"),
+        }
+
+        let resp = sent.expect("必须直连上游成功（经代理会被拒）");
+        assert_eq!(resp.status().as_u16(), 200);
+        assert!(
+            proxy_rx.try_recv().is_err(),
+            "prompt 不该出现在环境变量指定的代理上"
+        );
     }
 }
