@@ -471,10 +471,11 @@
 - [ ] **A3 类型化错误收尾**（OPTIMIZATION.md 已改标 ⚠️ 部分）：`Agent::start`
       （`agent/src/lib.rs:40`）与 `tls::https_server_config`（`gateway/src/tls.rs:51-54`）仍返回 anyhow；
       `config_err`、`AgentError::Forward`、`GatewayError::Sqlite` 是从未被构造的死变体。
-- [ ] **Makefile `deny` 目标 ≠ hook/CI**：目标只跑 `cargo deny check licenses`，而 pre-commit hook
-      与 CI 跑完整 `cargo deny check`（广告语已改，行为未变）。二选一：把目标改成完整检查，
-      或明确 `make check` 不含完整 cargo-deny。
-- [ ] **工具链没真的锁版本 → 本地与 CI 的 lint 会漂移**（`OPTIMIZATION.md` 的 E2 已从 ✅ 改标 ⚠️ 名义）：
+- [x] **Makefile `deny` 目标 ≠ hook/CI（2026-09-22 完成）**：目标现在就是完整的
+      `cargo deny check`（advisories/bans/licenses/sources 全跑，与 hook/CI 同一条命令），
+      注释也改成"完整检查"而不是"由 hook 与 CI 执行"；`make check` 的说明补上"CI 还会跑
+      `cargo deny`"（它本身不含，见 `deny` 目标）。
+- [x] **工具链没真的锁版本 → 本地与 CI 的 lint 会漂移**（`OPTIMIZATION.md` 的 E2 已从 ✅ 改标 ⚠️ 名义）：
       `rust-toolchain.toml` 是 `channel = "stable"`（**浮动 channel，不是钉版本**），
       `.github/workflows/ci.yml:18-21` 用 `dtolnay/rust-toolchain@stable`——**不读那个文件**，
       装的是 CI 当刻的最新 stable（步骤名却叫 `Install Rust (rust-toolchain.toml)`），
@@ -484,6 +485,21 @@
       + 在 `[workspace.package]` 补 `rust-version` 声明 MSRV；升级工具链变成一次显式提交。
       根因不清掉，后面每轮 CI 都可能冒出新的 nightly/stable 新 lint（例如 `Atomic::fetch_update`
       弃用就是靠本地 nightly 才提前发现的，见本文件「坏味道 / 清理」里那条）。
+      - **已修（2026-09-22）**：① `rust-toolchain.toml` 钉到 **1.97.1**（具体补丁版本，不再浮动）；
+      ② **CI 不再写死 `@stable`**：新增一步从 `rust-toolchain.toml` 读出 channel 再交给
+      `dtolnay/rust-toolchain`，步骤名也改成带真实版本——`rust-toolchain.toml` 成为**唯一来源**；
+      ③ `Dockerfile` 对齐到 `FROM rust:1.97.1-bookworm` + `ARG RUST_TOOLCHAIN=1.97.1`（镜像里预装的
+      就是它，构建不碰网络；原来钉 1.95、文件写 stable 的组合会让 rustup 去下载整套工具链而挂住），
+      并修掉那段自相矛盾的注释（原文说"rust:1.95 现在是 trixie"，而标签是 `-bookworm`）；
+      ④ `Cargo.toml` 补 `rust-version = "1.97"`（MSRV，只到 minor）并在四个成员里继承——它回答的是
+      "最低能编译什么"，与"用什么编译"是两个问题，所以只比前缀；
+      ⑤ 新增 `scripts/check-toolchain.sh`：逐处比对这四处（channel 必须是 x.y.z、Dockerfile 的
+      FROM/ARG、MSRV 前缀），CI 与 `make check` 都跑。**故意改错即红**（实测把 FROM 改回 1.95 后
+      脚本以非零退出并指名 Dockerfile）。
+      - 过程记录（供后人参考）：钉版本要求本机**真的装有**该工具链，否则仓库里每条 `cargo` 都会去下载；
+      本次用 `rustup toolchain install 1.97.1 --profile minimal -c rustfmt,clippy` 装好（顺带被 rustup
+      自己升级到 1.29.1），本地/CI/镜像三处现在都是 1.97.1（同一 commit `8bab26f4f`，验证基座不变）。
+
 - [ ] **Heartbeat 载荷空洞**：`Frame::Heartbeat { inflight }` 恒为 0（`agent/src/lib.rs:136-140`），
       网关只打 debug 日志（`quic.rs:76-84`）。它是"容量感知路由"的前置数据：要么实现上报，
       要么删掉该字段（现在是死载荷，容易误导）。

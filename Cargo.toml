@@ -6,6 +6,10 @@ members = ["crates/proto", "crates/gateway", "crates/agent", "crates/mock-llm"]
 version = "0.1.1"
 edition = "2021"
 license = "MIT"
+# 最低支持的编译器（MSRV）。**刻意声明我们真正验证过的版本**（见 `rust-toolchain.toml`
+# 的 channel 与 `scripts/check-toolchain.sh`）：与其猜一个更低的数字，不如让更老的工具链
+# 直接给出清晰报错，而不是一堆难解的类型错误。各成员用 `rust-version.workspace = true` 继承。
+rust-version = "1.97"
 
 [workspace.dependencies]
 anyhow = "1"

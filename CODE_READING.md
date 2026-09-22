@@ -95,6 +95,7 @@ crates/gateway/tests/e2e/   e2e 场景（common.rs 怎么起全栈；chain.rs �
                             evict_close.rs 摘除宽限）
 crates/proto/benches/       Criterion 微基准（帧编解码；gateway 侧只剩 keystore argon2）
 scripts/bench-k6/           k6 宏观压测模板（SSE 长流 + QPS，含 429 分类断言）
+scripts/check-toolchain.sh  工具链三处一致（rust-toolchain.toml / Dockerfile / MSRV；CI 与 `make check` 跑）
 ```
 
 > 验证：`make check`（fmt + clippy + test + web build）全绿。

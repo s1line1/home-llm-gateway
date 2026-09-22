@@ -1,4 +1,14 @@
+# 工具链：**钉到具体版本**，不用浮动的 `stable`。
+#
+# 为什么必须钉（记录 P3-14 / 项目扫描"工具链三重漂移"）：本地、CI、Docker 三个环境各用一套
+# "当刻的 stable"，`clippy` 的新 lint 于是在某一个版本上才报——实测过"本地全绿 → CI 红"
+# （`clippy::result_large_err`）。钉版本之后三处一致，升级是一次**显式、可 review** 的改动。
+#
+# 三处必须一致（`scripts/check-toolchain.sh` 会校验，CI 与 `make check` 都跑）：
+#   1) 本文件的 `channel`（唯一来源；CI 直接读它，不再写死 `@stable`）；
+#   2) `Dockerfile` 的 `FROM rust:<version>-bookworm` 与 `ARG RUST_TOOLCHAIN` 默认值；
+#   3) `Cargo.toml` 的 `rust-version`（MSRV，只写 major.minor）。
 [toolchain]
-channel = "stable"
+channel = "1.97.1"
 components = ["rustfmt", "clippy"]
 profile = "minimal"

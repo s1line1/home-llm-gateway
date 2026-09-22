@@ -31,25 +31,25 @@
 # 镜像内含 gateway / agent / mock-llm 三个二进制。
 # 也可以直接用仓库根的 `docker-compose.yml`（网关 + 可选 agent）。
 
-# 构建基底**必须与运行阶段的发行版对齐**：`rust:1.95` 现在是 Debian 13（trixie，glibc 2.41），
-# 而运行阶段是 `debian:bookworm-slim`（Debian 12，glibc 2.36）。在 trixie 上链接出来的
-# gateway / agent 在 bookworm 里根本起不来：
+# 构建基底**必须与运行阶段的发行版对齐**：运行阶段是 `debian:bookworm-slim`（Debian 12，
+# glibc 2.36），所以构建基底也用 `-bookworm` 变体。若换成 Debian 13（trixie，glibc 2.41）的基底，
+# 链出来的 gateway / agent 在 bookworm 里根本起不来：
 #   /usr/local/bin/gateway: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.38' not found
 # 症状很隐蔽：**镜像能构建成功**，`mock-llm --version` 也正常（它依赖少），只有 gateway/agent
-# 一启动就死。用 `-bookworm` 变体把两边对齐，顺带让产物二进制也能直接在 Debian 12 宿主机上跑。
-# （另一条路是把运行阶段换成 `debian:trixie-slim`，但那样产物就要求 glibc ≥ 2.38。）
-FROM rust:1.95-bookworm AS builder
+# 一启动就死。（另一条路是把运行阶段换成 `debian:trixie-slim`，但那样产物就要求 glibc ≥ 2.38。）
+#
+# 版本**必须与仓库 `rust-toolchain.toml` 的 channel 一致**（`scripts/check-toolchain.sh` 会校验）：
+# 镜像里预装的就是这个版本的工具链，于是构建完全不碰网络。曾经这里钉 1.95、而仓库文件写
+# `channel = "stable"`：rustup 找不到 "stable" 就去 static.rust-lang.org 下整套工具链
+# （约 130 MB）——实测这一步在网络层面**挂住不返回**（日志停在 `downloading 5 components`：
+# 7 分钟零字节、CPU 0.1%、磁盘零增长），这才是"镜像构建跑不完"的根本原因。
+FROM rust:1.97.1-bookworm AS builder
 
-# 工具链：**必须显式指定**，否则构建会挂死在这里。
-# 仓库的 `rust-toolchain.toml` 写的是 `channel = "stable"`，而本镜像里装的是
-# `1.95.0-x86_64-unknown-linux-gnu`。rustup 找不到 "stable" 就去 static.rust-lang.org 下整套
-# 工具链（rustc/rust-std/cargo/clippy/rustfmt，约 130 MB）——实测这一步在网络层面**挂住不返回**
-# （日志停在 `downloading 5 components`：7 分钟零字节、CPU 0.1%、磁盘零增长）。这才是"镜像构建
-# 跑不完"的根本原因，跟 2 核编译快慢无关。
-# `RUSTUP_TOOLCHAIN` 优先级高于 rust-toolchain.toml，指到镜像里已有的工具链后构建不碰网络。
-# 想改用当前 stable（与 CI 一致）：--build-arg RUST_TOOLCHAIN=stable
-# —— 那时需要能访问 rustup 源，或另外配 RUSTUP_DIST_SERVER 国内镜像。
-ARG RUST_TOOLCHAIN=1.95.0
+# 工具链显式钉死：`RUSTUP_TOOLCHAIN` 优先级高于 rust-toolchain.toml，指到镜像里已有的那一套，
+# 即使以后仓库文件的 channel 与镜像不同，构建也不会因为去下载工具链而挂住。
+# 想临时试别的版本：--build-arg RUST_TOOLCHAIN=stable（那时需要能访问 rustup 源，
+# 或另外配 RUSTUP_DIST_SERVER 国内镜像）。
+ARG RUST_TOOLCHAIN=1.97.1
 ENV RUSTUP_TOOLCHAIN=$RUST_TOOLCHAIN
 
 # crates 镜像源。**关键是这个镜像要自己提供包体**：

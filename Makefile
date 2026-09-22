@@ -56,10 +56,13 @@ fmt: ## 检查代码格式（cargo fmt --check）
 clippy: ## clippy 检查（-D warnings，与 CI 同等门槛）
 	cargo clippy --workspace --all-targets -- -D warnings
 
+toolchain-check: ## 工具链三处一致（rust-toolchain.toml / Dockerfile / Cargo.toml 的 MSRV）
+	./scripts/check-toolchain.sh
+
 deny: ##（advisories/bans/licenses/sources 全跑，与 pre-commit hook / CI 同一条命令）
 	cargo deny check
 
-check: fmt clippy nextest web-build ## 一键全量验证（格式 + clippy + 测试 + 前端构建；CI 还会跑 `cargo deny`，见 `deny` 目标）
+check: fmt clippy nextest web-build toolchain-check ## 一键全量验证（格式 + clippy + 测试 + 前端构建 + 工具链钉版本一致性；CI 还会跑 `cargo deny`，见 `deny` 目标）
 
 test: ## 运行全部 Rust 测试（cargo 原生 runner，含 e2e；串行靠测试里的 #[serial]）
 	cargo test
