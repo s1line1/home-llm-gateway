@@ -10,6 +10,12 @@ use crate::Frame;
 /// 单帧最大字节数（64 MiB）。
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
 
+/// [`FrameReader`] 在"缓冲已空"之后愿意保留的容量（记录 P2-5）。
+///
+/// 取值够装常见帧（一次底层 `read` 是 8KiB，响应块上限是 [`crate::frame::MAX_RESPONSE_CHUNK`]
+/// = 64KiB），又不至于让一次大 body 的峰值容量跟着整条流。
+const BUFFER_RETAINED_CAPACITY: usize = crate::frame::MAX_RESPONSE_CHUNK;
+
 // 长度前缀只有 u32：MAX_FRAME 必须装得下，否则下面 `as u32` 会静默截断。
 const _: () = assert!(MAX_FRAME <= u32::MAX as usize);
 
@@ -156,12 +162,28 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
         if self.buf.len() < total {
             return Ok(None);
         }
-        let payload = self.buf[4..total].to_vec();
+        // 直接从缓冲区解码（记录 P2-5）：以前先 `self.buf[4..total].to_vec()` 复制一份载荷再解，
+        // 大 body 白白多一次整块拷贝。`Frame` 的字段全是拥有的（`Bytes`/`String`/`Vec`），
+        // 解码不借用 `self.buf`（借用检查会拦住），所以可以"先解、后 drain"。
+        let frame = postcard::from_bytes(&self.buf[4..total])
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         self.buf.drain(..total);
         self.want = None;
-        let frame = postcard::from_bytes(&payload)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        self.release_peak_buffer();
         Ok(Some(frame))
+    }
+
+    /// 缓冲已空且容量明显过大时把内存还回去（记录 P2-5）。
+    ///
+    /// `Vec::drain` **不缩容**：读过一次 16MiB 的 `ProxyRequest` 之后，这个 reader 会带着同量级
+    /// 容量活到**整条流结束**（agent 侧每个请求流一个 reader ⇒ 随并发线性叠加）。实测比"同量级"
+    /// 更大——`Vec` 按指数扩容，1MiB 的帧读完后容量是 2MiB（约 2×）。
+    /// 只在"已空且超过 [`BUFFER_RETAINED_CAPACITY`]"时缩，避免每帧都 realloc；留下那一点容量
+    /// 是为了"多帧连续到达"这条常见路径不重新分配。
+    fn release_peak_buffer(&mut self) {
+        if self.buf.is_empty() && self.buf.capacity() > BUFFER_RETAINED_CAPACITY {
+            self.buf.shrink_to(BUFFER_RETAINED_CAPACITY);
+        }
     }
 }
 
@@ -544,6 +566,43 @@ mod tests {
                 _ => panic!("n={n}: plain={plain:?} cancellable={cancellable:?}"),
             }
         }
+    }
+
+    /// 规格（记录 P2-5）：**大帧读完之后，峰值容量必须还回去**。
+    ///
+    /// `Vec::drain` 不缩容，所以修复前一个读过 1MiB 帧的 reader 会带着 ≥1MiB 容量活到整条流
+    /// 结束（agent 侧每个请求流一个 reader ⇒ 随并发线性叠加）。这条直接断言容量，看的正是
+    /// "内存有没有还回去"；第二段再确认缩容没有把"同一批到达的后续帧"弄丢。
+    #[tokio::test]
+    async fn a_large_frame_does_not_leave_its_buffer_capacity_behind() {
+        let big = Frame::ProxyResponseBody {
+            request_id: 1,
+            chunk: vec![7u8; 1024 * 1024].into(),
+        };
+        let small = Frame::ProxyResponseBody {
+            request_id: 2,
+            chunk: Bytes::from_static(b"small"),
+        };
+        // 两帧写在**同一条线上**：第二帧常常和第一帧的尾巴一起到达，正好是"缓冲非空 ⇒ 不缩容"
+        // 的那条路径，必须照样解析正确
+        let mut wire = Vec::new();
+        write_frame(&mut wire, &big).await.unwrap();
+        write_frame(&mut wire, &small).await.unwrap();
+
+        let mut reader = FrameReader::new(wire.as_slice());
+        assert_eq!(reader.next().await.unwrap(), Some(big));
+        assert_eq!(
+            reader.next().await.unwrap(),
+            Some(small),
+            "缩容不得弄丢同一批到达的后续帧"
+        );
+        assert!(reader.buf.is_empty(), "两帧都取走后缓冲应当为空");
+        assert!(
+            reader.buf.capacity() <= BUFFER_RETAINED_CAPACITY,
+            "1MiB 帧读完后容量必须还回去：实际 {} 字节（上限 {BUFFER_RETAINED_CAPACITY}）",
+            reader.buf.capacity()
+        );
+        assert!(reader.next().await.unwrap().is_none());
     }
 
     #[tokio::test]

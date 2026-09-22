@@ -84,19 +84,98 @@ impl Drop for AbortOnDrop {
     }
 }
 
-async fn run(cfg: AgentConfig, client_config: rustls::ClientConfig) {
-    let mut delay = Duration::from_millis(500);
-    loop {
-        match connect_once(&cfg, client_config.clone()).await {
-            Ok(()) => {
-                info!("disconnected from cloud, reconnecting");
-                delay = Duration::from_millis(500);
-            }
-            Err(e) => warn!("agent error: {e}; retrying in {delay:?}"),
-        }
-        tokio::time::sleep(delay).await;
-        delay = std::cmp::min(delay.saturating_mul(2), Duration::from_secs(30));
+/// 重连退避基准（第一次重连等这么久）。
+const BACKOFF_BASE: Duration = Duration::from_millis(500);
+/// 标称上限。DESIGN §6.1 原设计是"抖动 + 上限 60s"，这里刻意取 30s：网关滚动重启后
+/// agent 回归更快；握手风暴的余地由 `connect_once` 里的 30s 握手限时给（那段注释解释了
+/// 为什么不能更短）。
+const BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// 会话活过这么久才算"健康"，断开时才把退避重置回基准。
+///
+/// 阈值存在的唯一理由是记录 P2-1 那个根因：`connect_once` 返回 `Ok(())` 有**两种**语义——
+/// "健康跑了很久后断开" 与 "刚注册就被踢"（如同名 `agent_id` 互踢、网关注册后立刻关连接）。
+/// 旧代码把两者都当成前者、退避一律重置回 500ms，于是每 ~500ms 互踢一次、永不收敛
+/// （实测：3 秒内 5 次连接、6 个 `/v1/slow` 全 502，而两侧进程与 `/admin/agents` 都正常）。
+/// 现在**只看会话活了多久**，与 Ok/Err 无关。
+const BACKOFF_RESET_AFTER: Duration = Duration::from_secs(60);
+/// 抖动幅度（百分比）：多台 agent 同时断线（网关重启）时不要把重连挤在同一毫秒。
+const BACKOFF_JITTER_PERCENT: u64 = 20;
+
+/// 下一轮的标称退避：会话活得够久才重置，否则翻倍（封顶 [`BACKOFF_MAX`]）。
+fn next_backoff(current: Duration, session_alive: Duration) -> Duration {
+    if session_alive >= BACKOFF_RESET_AFTER {
+        BACKOFF_BASE
+    } else {
+        std::cmp::min(current.saturating_mul(2), BACKOFF_MAX)
     }
+}
+
+/// 给标称退避加 ±[`BACKOFF_JITTER_PERCENT`]% 抖动，并**仍然封顶** [`BACKOFF_MAX`]
+/// （顶上因此是单边缩小：一撮 agent 落在 `[24s, 30s]` 而不是同一个 30s）。
+///
+/// `entropy` 由调用方给：生产用时钟纳秒，测试直接喂值——策略是纯函数，才钉得住。
+fn jittered(backoff: Duration, entropy: u64) -> Duration {
+    let span = BACKOFF_JITTER_PERCENT * 2;
+    let percent = 100 - BACKOFF_JITTER_PERCENT + (entropy % (span + 1));
+    let micros = backoff.as_micros() * u128::from(percent) / 100;
+    std::cmp::min(Duration::from_micros(micros as u64), BACKOFF_MAX)
+}
+
+/// 抖动的熵：不引入 `rand` 依赖（只为一个 ±20% 的抖动不值当），用时钟纳秒 + 秒数混合。
+fn jitter_entropy() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::from(d.subsec_nanos()) ^ d.as_secs())
+        .unwrap_or(0)
+}
+
+async fn run(cfg: AgentConfig, client_config: rustls::ClientConfig) {
+    let mut backoff = BACKOFF_BASE;
+    loop {
+        let started = std::time::Instant::now();
+        let outcome = connect_once(&cfg, client_config.clone()).await;
+        let session_alive = started.elapsed();
+        // 先算出真正要等多久再打日志：日志里的值必须就是实际睡的值（排查时据此对齐
+        // 两侧时间线），而且抖动过的值才看得出"多台机器错开了"。
+        let wait = jittered(backoff, jitter_entropy());
+        match outcome {
+            Ok(()) => info!(
+                session_alive_secs = session_alive.as_secs(),
+                wait_ms = wait.as_millis(),
+                "disconnected from cloud, reconnecting"
+            ),
+            Err(e) => warn!(
+                session_alive_secs = session_alive.as_secs(),
+                wait_ms = wait.as_millis(),
+                "agent error: {e}; retrying"
+            ),
+        }
+        tokio::time::sleep(wait).await;
+        backoff = next_backoff(backoff, session_alive);
+    }
+}
+
+/// 连上游时的"连上"超时。**不是**总超时——总超时会腰斩合法的长 SSE 流（记录 R10 的坑）。
+const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 上游 HTTP 客户端。三个默认值必须显式改掉（记录 P2-4）：
+///
+/// - **不跟随重定向**：`reqwest` 默认跟随最多 10 跳，而上游就是本地固定端点，重定向没有任何
+///   正当用途。跟随的后果不只是"多跳一次"：307/308 会把**方法连同 prompt 一起重发**到
+///   `Location` 指定的地址（内网服务、云元数据 `169.254.169.254`），并把那边的**响应**
+///   回给调用方——等于把一次 SSRF 和一条数据出境路径交给本地 LLM、或交给能改写它响应的人。
+/// - **不读环境代理**：edge 机器上存在 `HTTP_PROXY`/`ALL_PROXY` 时，prompt 会静默经该代理。
+///   今天 `Cargo.toml` 里 `reqwest` 关了默认特性、`system-proxy` 未启用，所以**已经**不读；
+///   显式写出来是为了别人日后打开默认特性时不悄悄多一条出境路径。⚠️ 这一条**没有**行为测试
+///   钉着（特性没开时它无从观测），属"显式声明"而非"已验证"。
+/// - **连接有超时**：上游不监听时不要无限等。响应阶段的兜底在网关侧（`head_timeout` 与
+///   逐帧空闲超时 → 发 `Cancel`），所以这里只限"连上"这一跳，不设总超时。
+fn upstream_client() -> anyhow::Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
+        .build()?)
 }
 
 async fn connect_once(
@@ -150,7 +229,7 @@ async fn connect_once(
         cfg.heartbeat_interval,
     ));
 
-    let http = reqwest::Client::new();
+    let http = upstream_client()?;
     // ④ accept 循环用 acceptor（单消费者，独占）
     //
     // 和心跳**并跑**，而不是各跑各的：心跳是网关判定"这个 agent 还活着"的唯一依据
@@ -293,6 +372,116 @@ async fn heartbeat_once(
 mod tests {
     use super::*;
     use proto::ALPN;
+
+    /// 规格（记录 P2-1）：**"连上就被踢"不许把退避重置回 500ms**。
+    ///
+    /// 这是同名 `agent_id` 互踢"每 ~500ms 一次、永不收敛"的根因：`connect_once` 返回
+    /// `Ok(())` 有两种语义，旧代码把"刚注册就被踢"也当成"健康跑了很久后断开"。
+    /// 判据：会话只活了毫秒级时，退避必须**继续增长/保持在上限**，绝不能回到基准。
+    #[test]
+    fn a_short_lived_session_does_not_reset_the_backoff() {
+        let short = Duration::from_millis(5);
+        assert_eq!(
+            next_backoff(BACKOFF_BASE, short),
+            BACKOFF_BASE * 2,
+            "短命会话必须继续退避"
+        );
+        assert_eq!(
+            next_backoff(Duration::from_secs(2), short),
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            next_backoff(BACKOFF_MAX, short),
+            BACKOFF_MAX,
+            "已经到顶就保持在顶，而不是被打回基准（这正是互踢风暴的形状）"
+        );
+    }
+
+    /// 规格：会话活得够久 = 真的健康过，断开时才把退避重置回基准。
+    #[test]
+    fn a_long_lived_session_resets_the_backoff() {
+        assert_eq!(next_backoff(BACKOFF_MAX, BACKOFF_RESET_AFTER), BACKOFF_BASE);
+        assert_eq!(
+            next_backoff(Duration::from_secs(4), BACKOFF_RESET_AFTER * 10),
+            BACKOFF_BASE
+        );
+        // 边界：差一毫秒不算健康
+        assert_eq!(
+            next_backoff(BACKOFF_MAX, BACKOFF_RESET_AFTER - Duration::from_millis(1)),
+            BACKOFF_MAX
+        );
+    }
+
+    /// 规格：连续失败/短命会话下退避**单调增长到上限并停在那儿**（旧代码在每条
+    /// `Ok(())` 上都重置，所以永远停在 500ms）。
+    #[test]
+    fn the_backoff_grows_to_the_cap_and_stays_there() {
+        let mut backoff = BACKOFF_BASE;
+        let mut seen = vec![backoff];
+        for _ in 0..12 {
+            backoff = next_backoff(backoff, Duration::from_millis(1));
+            seen.push(backoff);
+        }
+        assert_eq!(
+            seen,
+            vec![
+                Duration::from_millis(500),
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                Duration::from_secs(8),
+                Duration::from_secs(16),
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+            ],
+            "退避序列必须是 500ms 起翻倍、封顶 30s"
+        );
+    }
+
+    /// 规格：抖动必须在 ±20% 之内、**两端都能取到**（否则就是"加了抖动"的自述），
+    /// 且封顶之后不许超过上限。
+    #[test]
+    fn jitter_stays_within_bounds_reaches_both_ends_and_respects_the_cap() {
+        let base = Duration::from_secs(1);
+        let values: Vec<Duration> = (0..=40).map(|e| jittered(base, e)).collect();
+        for v in &values {
+            assert!(
+                *v >= Duration::from_millis(800) && *v <= Duration::from_millis(1200),
+                "抖动越界：{v:?}（基准 {base:?}）"
+            );
+        }
+        assert!(
+            values.iter().any(|v| *v < base),
+            "必须能取到向下的一侧：{values:?}"
+        );
+        assert!(
+            values.iter().any(|v| *v > base),
+            "必须能取到向上的一侧：{values:?}"
+        );
+        // 熵只影响结果、不该把结果挤成常量（"抖了但都一样"等于没抖）
+        let distinct: std::collections::BTreeSet<u128> =
+            values.iter().map(|v| v.as_micros()).collect();
+        assert!(distinct.len() >= 5, "抖动值太集中：{distinct:?}");
+
+        // 顶上单边缩小：仍然封顶，不会超过标称上限
+        for e in 0..=40 {
+            let capped = jittered(BACKOFF_MAX, e);
+            assert!(
+                capped <= BACKOFF_MAX,
+                "抖动后不得超过标称上限（e={e}）：{capped:?}"
+            );
+            assert!(
+                capped >= BACKOFF_MAX * 4 / 5,
+                "顶上也不该掉太多：{capped:?}"
+            );
+        }
+    }
+
     use rcgen::{
         BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
         KeyUsagePurpose, SanType,
@@ -682,7 +871,8 @@ mod tests {
         .expect("应当是 Some(stream)");
         let task = tokio::spawn(handle_stream(
             agent_stream,
-            reqwest::Client::new(),
+            // 与生产同一条构造路径：测试不该复制一份"没加固的客户端"（那正是 P2-4 的形状）
+            upstream_client().unwrap(),
             upstream_url,
             false,
         ));
@@ -900,5 +1090,116 @@ mod tests {
             request_log: true,
         };
         assert!(Agent::start(cfg).is_err(), "invalid key should fail start");
+    }
+
+    /// 一发就走的假 HTTP 服务器：接连接 → 读掉请求（至少读到请求头结束）→ 回**给定的原始
+    /// 响应字节** → 关连接。返回 `(地址, 收到的请求文本)`——测试用它回答"agent 到底连了谁、
+    /// 送了什么"。
+    async fn one_shot_http(
+        response: String,
+    ) -> (std::net::SocketAddr, tokio::sync::mpsc::Receiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake upstream");
+        let addr = listener.local_addr().expect("addr");
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                // 请求体可能还没到齐，但本测试只关心"连没连、头里有什么"，读一小段就够
+                let mut buf = vec![0u8; 8192];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                // 为了让 307/308 的请求体能被看到，再给一小段时间补读
+                if head.starts_with("POST") {
+                    let n = tokio::time::timeout(Duration::from_millis(200), sock.read(&mut buf))
+                        .await
+                        .ok()
+                        .and_then(|r| r.ok())
+                        .unwrap_or(0);
+                    let mut all = head;
+                    all.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    let _ = tx.send(all).await;
+                } else {
+                    let _ = tx.send(head).await;
+                }
+                let _ = sock.write_all(response.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        (addr, rx)
+    }
+
+    /// 规格（记录 P2-4）：**上游的重定向不许被跟随**。
+    ///
+    /// 跟随的代价不是"多一跳"：307/308 会把方法与 **prompt 原样重发**到 `Location` 指定的地址
+    /// （内网服务、`169.254.169.254` 云元数据），并把那边的响应回给调用方。判据有两条，缺一不可：
+    /// ① 客户端拿到的是上游自己回的 307（而不是被跟随后的 200）；
+    /// ② "第二个服务器"**一次连接都没有**——这才是"prompt 没被送出去"。
+    #[tokio::test]
+    async fn the_upstream_client_does_not_follow_redirects() {
+        let (victim, mut victim_rx) =
+            one_shot_http("HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\nexfiltr".to_string()).await;
+        let (attacker, _attacker_rx) = one_shot_http(format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{victim}/steal\r\nContent-Length: 0\r\n\r\n"
+        ))
+        .await;
+
+        let client = upstream_client().unwrap();
+        let resp = client
+            .post(format!("http://{attacker}/v1/chat/completions"))
+            .body(r#"{"model":"m","messages":[{"role":"user","content":"TOPSECRET"}]}"#)
+            .send()
+            .await
+            .expect("上游能连上，请求本身必须成功");
+
+        assert_eq!(
+            resp.status().as_u16(),
+            307,
+            "不跟随重定向：把上游自己的 3xx 原样返回，而不是替它去访问 Location"
+        );
+
+        // ② 关键判据：prompt 绝不得到达 Location 指向的地址
+        if let Ok(Some(request)) =
+            tokio::time::timeout(Duration::from_millis(500), victim_rx.recv()).await
+        {
+            panic!("agent 跟随了重定向：prompt 被送到 {victim}，请求内容：{request}");
+        }
+    }
+
+    /// 规格（记录 P2-4 的另一半）：上游客户端**不读环境代理**。
+    ///
+    /// ⚠️ 今天这条测试**通过的原因**是 `reqwest` 在本仓库关了默认特性、`system-proxy` 未启用
+    /// （`cargo tree -p reqwest -f "{f}"` 可复核），而不是因为 `.no_proxy()` 真的被验证了——
+    /// 特性没开时环境代理根本不会被读，观测不到差别。它的价值是**日后**：谁把 `reqwest` 的
+    /// 默认特性打开、又删掉 `upstream_client()` 里的 `.no_proxy()`，这条测试就会红。
+    #[tokio::test]
+    async fn the_upstream_client_ignores_environment_proxies() {
+        let (proxy, mut proxy_rx) =
+            one_shot_http("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n".to_string())
+                .await;
+        let (upstream, _upstream_rx) =
+            one_shot_http("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_string()).await;
+
+        let saved = std::env::var("HTTP_PROXY").ok();
+        std::env::set_var("HTTP_PROXY", format!("http://{proxy}"));
+        let client = upstream_client().unwrap();
+        let sent = client
+            .post(format!("http://{upstream}/v1/chat/completions"))
+            .body(r#"{"model":"m","messages":[{"role":"user","content":"TOPSECRET"}]}"#)
+            .send()
+            .await;
+        match &saved {
+            Some(v) => std::env::set_var("HTTP_PROXY", v),
+            None => std::env::remove_var("HTTP_PROXY"),
+        }
+
+        let resp = sent.expect("必须直连上游成功（经代理会被拒）");
+        assert_eq!(resp.status().as_u16(), 200);
+        assert!(
+            proxy_rx.try_recv().is_err(),
+            "prompt 不该出现在环境变量指定的代理上"
+        );
     }
 }

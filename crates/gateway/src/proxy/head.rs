@@ -20,13 +20,33 @@ use super::routing::RouteFailure;
 use super::tunnel::tunnel_cancel;
 
 /// 读到响应头，或读到"在给头之前就结束/出错"的信号。
+#[derive(Debug)]
 enum HeadOutcome {
     Head(StatusCode, Vec<(String, String)>),
     Error(u16, String),
 }
 
-/// 读响应头帧（或错误帧），跳过其余帧。
-async fn read_head(recv: &mut s2n_quic::stream::ReceiveStream) -> anyhow::Result<HeadOutcome> {
+/// 读响应头帧（或错误帧）。
+///
+/// **头之前的响应体：按既有契约忽略，但不再无声**（记录 P3-15 的复核结果）。
+///
+/// 原本这里所有别的帧都走 `Some(_) => {}`——一个"头之前先发了一块 body"的 agent 会让那一块
+/// **无声消失**：客户端拿到 200、内容却少了一段，日志里一句话都没有。
+///
+/// ⚠️ 但把它改成 502 协议错误是**改契约**，不是修 bug：`tests/e2e/https.rs` 的
+/// `e2e_proxy_protocol_edge_cases` 场景 2 明确钉住"head 前的 body 应被忽略 → 200 + hello"，
+/// 那是项目作者写下的**容忍**决定（代理对帧序更宽容）。所以这里保留忽略，只把"无声"去掉；
+/// 要不要收紧成协议错误属于产品决定，见 P3-15 的登记。
+///
+/// 其余帧（心跳等）同样容忍：跳过并记一行**只有帧名**的日志。为什么不打 `{frame:?}`——
+/// `Debug` 会连 `Bytes` 载荷一起打，一个坏 agent 发来的大帧就是一行巨大日志（见
+/// [`Frame::kind`]）。兼容性也要求容忍：新旧版本两端可能多出对方不认识的帧。
+///
+/// 泛型只为可测：生产传 `s2n_quic::stream::ReceiveStream`，测试传一段线上字节。
+async fn read_head<R>(recv: &mut R, request_id: u64) -> anyhow::Result<HeadOutcome>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
     loop {
         match read_frame(recv).await? {
             Some(Frame::ProxyResponseHead {
@@ -45,7 +65,22 @@ async fn read_head(recv: &mut s2n_quic::stream::ReceiveStream) -> anyhow::Result
             Some(Frame::ProxyResponseEnd { .. }) => {
                 return Ok(HeadOutcome::Error(502, "empty upstream response".into()));
             }
-            Some(_) => {}
+            Some(Frame::ProxyResponseBody { chunk, .. }) => {
+                // 忽略是契约；但"这一块再也补不回来"至少要留在日志里
+                warn!(
+                    request_id,
+                    len = chunk.len(),
+                    "ignoring a response body received before the response head \
+                     (the chunk cannot be put back in order)"
+                );
+            }
+            Some(other) => {
+                warn!(
+                    request_id,
+                    frame = other.kind(),
+                    "ignoring an unexpected frame while waiting for the response head"
+                );
+            }
             None => {
                 return Ok(HeadOutcome::Error(
                     502,
@@ -70,7 +105,7 @@ pub(super) async fn await_head(
     entry: &Entry,
     request_id: u64,
 ) -> Result<(StatusCode, Vec<(String, String)>), RouteFailure> {
-    let head = tokio::time::timeout(state.head_timeout, read_head(recv)).await;
+    let head = tokio::time::timeout(state.head_timeout, read_head(recv, request_id)).await;
     match head {
         Ok(Ok(HeadOutcome::Head(s, h))) => {
             // 对端真的回了响应头 = 这条隧道是活的 → 清掉连续超时计数。
@@ -143,6 +178,158 @@ pub(super) async fn await_head(
                 status: StatusCode::GATEWAY_TIMEOUT,
                 message: "upstream timed out".to_string(),
             })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 把若干帧拼成一段线上字节（与真实隧道同格式，走生产代码的 `write_frame`）。
+    async fn wire(frames: &[Frame]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for frame in frames {
+            proto::io::write_frame(&mut buf, frame).await.unwrap();
+        }
+        buf
+    }
+
+    fn head_200() -> Frame {
+        Frame::ProxyResponseHead {
+            request_id: 1,
+            status: 200,
+            headers: vec![("content-type".into(), "text/plain".into())],
+        }
+    }
+
+    /// 规格（记录 P3-15 的复核结论）：头之前的响应体**仍然被忽略**——这是**已钉住的契约**，
+    /// 不是待修的 bug。
+    ///
+    /// `tests/e2e/https.rs::e2e_proxy_protocol_edge_cases` 场景 2 就是这条：先 Body("ignored")
+    /// 再 Head(200) 再 Body("hello") + End ⇒ 客户端拿到 200 + `"hello"`。所以"改成 502 协议
+    /// 错误"属于**改契约**，得先有人拍板；本测试把现状钉在这里，免得它被顺手改掉。
+    ///
+    /// 本次真正修掉的是**无声**这一半：那一块内容补不回来，至少要在日志里出现（代码里的
+    /// `warn!`）。日志本身不在这里断言——仓库没有 tracing 捕获依赖，不为一条日志新增依赖。
+    #[tokio::test]
+    async fn a_body_before_the_head_is_still_ignored_per_the_pinned_contract() {
+        let bytes = wire(&[
+            Frame::ProxyResponseBody {
+                request_id: 1,
+                chunk: b"ignored\n".to_vec().into(),
+            },
+            head_200(),
+            Frame::ProxyResponseBody {
+                request_id: 1,
+                chunk: b"hello\n".to_vec().into(),
+            },
+        ])
+        .await;
+        let mut reader = bytes.as_slice();
+
+        match read_head(&mut reader, 7).await.unwrap() {
+            HeadOutcome::Head(status, headers) => {
+                assert_eq!(status, 200, "头本身照旧决定响应");
+                assert_eq!(headers.len(), 1);
+            }
+            other => panic!("头之前的 body 按契约应被忽略，实际：{other:?}"),
+        }
+
+        // 被忽略的那一块确实**读掉了**（不是留在流里再被当成别的帧）：下一帧应当就是"头之后"
+        // 的那块 hello——这条同时说明"忽略"的代价（数据真的没了），别把它当成无损操作。
+        let next = proto::io::read_frame(&mut reader).await.unwrap();
+        match next {
+            Some(Frame::ProxyResponseBody { chunk, .. }) => {
+                assert_eq!(&chunk[..], b"hello\n", "被忽略的那一块不会补回来");
+            }
+            other => panic!("头之后应当是第二块，实际：{other:?}"),
+        }
+    }
+
+    /// 对照：**头之后的**响应体不归本函数管（它由 `forward_body` 转发），本函数在拿到头时
+    /// 就必须返回，不能顺手把后面的块也读掉——否则那些字节就丢了。
+    #[tokio::test]
+    async fn a_body_after_the_head_is_left_in_the_stream() {
+        let bytes = wire(&[
+            head_200(),
+            Frame::ProxyResponseBody {
+                request_id: 1,
+                chunk: b"first\n".to_vec().into(),
+            },
+        ])
+        .await;
+        let mut reader = bytes.as_slice();
+
+        match read_head(&mut reader, 7).await.unwrap() {
+            HeadOutcome::Head(status, headers) => {
+                assert_eq!(status, 200);
+                assert_eq!(headers.len(), 1);
+            }
+            other => panic!("第一个帧就是响应头，应当直接返回，实际：{other:?}"),
+        }
+
+        // 剩下的字节必须仍在流里：`read_frame` 一次只消费一帧（对比 `FrameReader` 会预读）
+        let next = proto::io::read_frame(&mut reader).await.unwrap();
+        assert!(
+            matches!(next, Some(Frame::ProxyResponseBody { .. })),
+            "响应头之后的块必须留在流里，实际：{next:?}"
+        );
+    }
+
+    /// 规格：不认识的帧**容忍**（新旧版本两端可能多出对方不认识的帧），但必须记日志；
+    /// 日志只带帧名，不带载荷。
+    #[tokio::test]
+    async fn an_unexpected_frame_is_skipped_and_the_head_is_still_found() {
+        let bytes = wire(&[
+            Frame::Heartbeat {
+                agent_id: "a".into(),
+                inflight: 0,
+            },
+            head_200(),
+        ])
+        .await;
+
+        match read_head(&mut bytes.as_slice(), 7).await.unwrap() {
+            HeadOutcome::Head(status, _) => assert_eq!(status, 200),
+            other => panic!("心跳应当被跳过、继续等响应头，实际：{other:?}"),
+        }
+    }
+
+    /// 对照：头之前就结束 / 对端报错，两条既有出口不许被这次改动碰坏。
+    #[tokio::test]
+    async fn closed_stream_and_error_frames_keep_their_own_outcomes() {
+        // 一字节都没有 = 干净关闭
+        match read_head(&mut (&[][..]), 7).await.unwrap() {
+            HeadOutcome::Error(502, message) => {
+                assert!(message.contains("closed before responding"), "{message}")
+            }
+            other => panic!("空流应当是 502，实际：{other:?}"),
+        }
+
+        // 上游显式报错：原样透出 code/message
+        let bytes = wire(&[Frame::Error {
+            request_id: Some(1),
+            code: 429,
+            message: "slow down".into(),
+        }])
+        .await;
+        match read_head(&mut bytes.as_slice(), 7).await.unwrap() {
+            HeadOutcome::Error(429, message) => assert_eq!(message, "slow down"),
+            other => panic!("错误帧应当原样透出，实际：{other:?}"),
+        }
+
+        // 头都没给就结束：502 "empty upstream response"
+        let bytes = wire(&[Frame::ProxyResponseEnd {
+            request_id: 1,
+            ok: true,
+        }])
+        .await;
+        match read_head(&mut bytes.as_slice(), 7).await.unwrap() {
+            HeadOutcome::Error(502, message) => {
+                assert!(message.contains("empty upstream response"), "{message}")
+            }
+            other => panic!("先结束应当是 502，实际：{other:?}"),
         }
     }
 }

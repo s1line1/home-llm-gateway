@@ -178,10 +178,15 @@
 **技术栈**：`s2n-quic` + `reqwest` + `tokio` + `clap` + `tracing` + `serde`
 
 职责：
-1. **拨号与保活**：启动即连接云端，指数退避重连（0.5s → 1s → … → **上限 30s**）；每 N 秒（`heartbeat_secs`，默认 5s）发 `Heartbeat`。
-   **与本节原设计的差异**：无抖动（jitter）、上限是 30s 而非 60s。缺抖动会让多台 agent 的重连同步化，见 TODO 审查登记「重连退避无抖动、上限 30s」。
+1. **拨号与保活**：启动即连接云端，指数退避重连（0.5s → 1s → … → **上限 30s**），每次退避带
+   **±20% 抖动**；退避只在**会话活过 60s** 后才重置回 0.5s（"连上就被踢"必须继续退避，否则同名
+   `agent_id` 互踢会退化成每 ~500ms 一轮的风暴，见 `docs/PROJECT_SCAN.md` 的 P2-1）；每 N 秒
+   （`heartbeat_secs`，默认 5s）发 `Heartbeat`。
+   **与本节原设计的差异**：上限是 30s 而非 60s（刻意：网关滚动重启后 agent 回归更快，握手
+   风暴的余地由 30s 握手限时给——见 `agent/src/lib.rs` 里 `connect_once` 的注释）。
 2. **mTLS**：持有云端 CA 签发的客户端证书。
 3. **请求处理**：收到 `ProxyRequest` → 映射为对本地 LLM 的 HTTP 请求（如 `http://127.0.0.1:11434/v1/chat/completions`）→ 流式回传；收到 `Cancel` → 取消上游请求（reqwest 的 `AbortHandle`）。
+   上游客户端**不跟随重定向、不读环境代理、只给"连上"设超时**（`agent/src/lib.rs` 的 `upstream_client()`）：跟随 307/308 会把 prompt 原样重发到 `Location` 指向的任何地址（内网、云元数据）并把响应回给调用方；不设总超时是因为它会腰斩合法长 SSE 流（见 §6.1 与 `docs/PROJECT_SCAN.md` 的 P2-4）。
 4. **本地 LLM 管理（可选但推荐）**：进程守护——启动、健康检查（`/v1/models`）、崩溃自动重启。
 5. **本地直连模式（可选）**：同网段时客户端也可直连 agent（跳过云端），agent 兼开一个小型 HTTP 入口。
 

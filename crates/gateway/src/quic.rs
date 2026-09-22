@@ -136,7 +136,8 @@ async fn handle_conn_inner(
                         let _ = send.finish();
                     }
                     Some(other) => {
-                        warn!("unexpected frame on control stream: {other:?}");
+                        // 只打帧名：`{other:?}` 会把 `Bytes` 载荷整块写进日志（见 `Frame::kind`）
+                        warn!(frame = other.kind(), "unexpected frame on control stream");
                         let _ = send.finish();
                     }
                     None => {
