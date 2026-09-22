@@ -592,8 +592,18 @@
       那侧已经分清了（`io.rs:108-115`，测试 `frame_reader_truncated_frame_errors`），差的只是老路径。
 - [ ] **R6 "流即会话"可断言**：首帧必须是 `ProxyRequest`、后续帧 `request_id` 必须一致
       ——现在既无断言也无日志，不一致只会表现成"上游好像没在收流"。
-- [ ] **R8 原子占位改 CAS**：`Admission::try_enter` 仍是 `fetch_add` 后回滚
-      （`crates/gateway/src/metrics.rs:83-92`），并发下存在"双双误拒"窗口。
+- [x] **R8 原子占位改 CAS（2026-09-22 完成）**：`Admission::try_enter` 原先是 `fetch_add` +
+  超限回滚（`crates/gateway/src/metrics.rs`），回滚前那一瞬间计数**比真实持票数多 1**（幽灵占位）；
+  若持票者恰在这一刻释放，紧随其后的请求会读到 `prev >= limit` 而被拒——**闸门明明是空的**
+  （"双双误拒"：客户端拿到本不该有的 429）。现在改成 **CAS 循环**：只在确实要到票时才加计数，
+  因此 `active_count()` **恒等于**已发出的票数（顺带消掉 `hlmg_active_requests` 的瞬时尖峰，
+  而排空判据 `drain()` 读的正是它）。`limit == 0`（不限）路径保持占位 + 记账不变。
+  证据：`metrics::tests::try_enter_never_inflates_the_counter_above_the_limit`（8 线程 barrier
+  对齐抢同一个槽位 + 一个**采样线程**盯计数上界，50 轮）与
+  `try_enter_accounts_exactly_and_treats_zero_as_unlimited`（放行/拒绝/释放 + `0` 不限的记账）。
+  **退回旧实现即红**：实测 5 次里红 4 次（失败信息形如"采样到 active=2 > limit=1：存在幽灵占位"）。
+  另：`PROJECT_SCAN` 里"`try_enter` 的 `fetch_add` + 回滚是**正确**的、别去改它"那句已更正——
+  "不超发"确实成立，但"不误拒"不成立，两者是不同性质。
 - [ ] **R9 背压按字节有界**：回写客户端的通道仍是 `mpsc::channel(32)`，**按条数**有界
       （`crates/gateway/src/proxy/mod.rs:566`）——大帧场景下"32 条"不等于"字节有界"。
       相关的"响应体内存缓冲上限"见上文 P1。

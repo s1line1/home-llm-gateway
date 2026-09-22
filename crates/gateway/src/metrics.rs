@@ -115,22 +115,44 @@ impl Metrics {
             .store(u64::from(accepting), Ordering::Relaxed);
     }
 
-    /// 原子占位（HTTP 全局并发 admission）：`fetch_add` 用**旧值**判定是否超限——
-    /// 两个并发请求各自拿到唯一旧值，恰好允许 limit 个进入，无 check-then-act 竞态。
-    /// 超限 → 回退占位并返回 None（调用方返回 429）；
+    /// 原子占位（HTTP 全局并发 admission）：**CAS 循环**，超限直接返回 `None`（调用方 429）；
     /// 通过 → 返回 [`Admission`] 票据，**槽位由票据的 Drop 释放**（见其文档）。
+    ///
+    /// 为什么是 CAS 而不是 `fetch_add` + 超限回滚（记录 R8）：后者在"加了但还没回滚"的那一瞬间
+    /// 让计数**比真实持票数多 1**（幽灵占位）。若恰好有持票者在这一刻释放，紧接着到达的请求会
+    /// 读到 `prev >= limit` 而被拒——**闸门其实是空的**（"双双误拒"，客户端拿到本不该有的 429）。
+    /// CAS 只在"确实要到票"时才加计数，因此
+    /// `active_count()` **恒等于**已发出的票数（顺带让 `hlmg_active_requests` 不再有瞬时尖峰，
+    /// 排空判据 `drain()` 读的也是它）。
+    ///
+    /// `limit == 0` = 不限：直接占位（仍然计数，票据照常负责 `request_count` 与时长记账）。
     pub fn try_enter(&self, limit: u32) -> Option<Admission> {
-        let prev = self.inner.active.fetch_add(1, Ordering::Relaxed);
-        if limit > 0 && prev >= limit as u64 {
-            self.inner.active.fetch_sub(1, Ordering::Relaxed);
-            None
+        if limit > 0 {
+            let limit = u64::from(limit);
+            let mut current = self.inner.active.load(Ordering::Relaxed);
+            loop {
+                if current >= limit {
+                    return None;
+                }
+                match self.inner.active.compare_exchange_weak(
+                    current,
+                    current + 1,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    // 别的线程改了计数：用观测到的新值重试（不重试就真的会漏放行）
+                    Err(observed) => current = observed,
+                }
+            }
         } else {
-            self.inner.request_count.fetch_add(1, Ordering::Relaxed);
-            Some(Admission {
-                metrics: self.clone(),
-                start: Instant::now(),
-            })
+            self.inner.active.fetch_add(1, Ordering::Relaxed);
         }
+        self.inner.request_count.fetch_add(1, Ordering::Relaxed);
+        Some(Admission {
+            metrics: self.clone(),
+            start: Instant::now(),
+        })
     }
 
     /// 记录被 admission 拒绝的请求（不计 active/耗时，但计入请求数与状态码分布）。
@@ -546,6 +568,90 @@ mod tests {
             text.contains("hlmg_requests_total{status=\"204\"} 1"),
             "中毒后新记的状态码也要出现：\n{text}"
         );
+    }
+
+    /// 规格（记录 R8）：**占位不得制造"幽灵占位"**——`active_count()` 永远不超过已发出的票数。
+    ///
+    /// 旧实现（`fetch_add` 后超限回滚）在回滚前那一瞬间把计数抬高 1；若持票者恰在那一刻释放，
+    /// 紧接着到达的请求会读到 `prev >= limit` 而被拒，而闸门其实是空的。这条用一个**采样线程**
+    /// 盯住计数上界：M 个线程在 barrier 上对齐、同时抢同一个槽位，采样到 `active > limit` 即红。
+    #[test]
+    fn try_enter_never_inflates_the_counter_above_the_limit() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Barrier,
+        };
+
+        for round in 0..50 {
+            let metrics = Metrics::default();
+            let threads = 8usize;
+            let barrier = Arc::new(Barrier::new(threads + 1));
+            let stop = Arc::new(AtomicBool::new(false));
+
+            let sampler = {
+                let (m, b, stop) = (metrics.clone(), barrier.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    b.wait();
+                    let mut worst = 0u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        worst = worst.max(m.active_count());
+                    }
+                    worst
+                })
+            };
+            let workers: Vec<_> = (0..threads)
+                .map(|_| {
+                    let (m, b) = (metrics.clone(), barrier.clone());
+                    std::thread::spawn(move || {
+                        b.wait();
+                        // 抢到就立刻放：制造"持票者释放"与"别人正在占位"重叠的窗口
+                        if let Some(ticket) = m.try_enter(1) {
+                            drop(ticket);
+                        }
+                    })
+                })
+                .collect();
+            for w in workers {
+                w.join().unwrap();
+            }
+            stop.store(true, Ordering::Relaxed);
+            let worst = sampler.join().unwrap();
+            assert!(
+                worst <= 1,
+                "第 {round} 轮采样到 active={worst} > limit=1：存在幽灵占位 ⇒ 会误拒（R8）"
+            );
+        }
+    }
+
+    /// 规格（R8 的另一半）：**占位/释放的记账必须精确**，`0` 仍然是"不限"。
+    #[test]
+    fn try_enter_accounts_exactly_and_treats_zero_as_unlimited() {
+        let m = Metrics::default();
+        let a = m.try_enter(2).expect("第 1 个应当放行");
+        let b = m.try_enter(2).expect("第 2 个应当放行");
+        assert!(m.try_enter(2).is_none(), "第 3 个必须被拒");
+        assert_eq!(
+            m.active_count(),
+            2,
+            "被拒的那次不得留下任何计数（否则会连锁误拒）"
+        );
+
+        drop(a);
+        assert_eq!(m.active_count(), 1);
+        let c = m.try_enter(2).expect("释放一个之后必须能再进");
+        assert_eq!(m.active_count(), 2);
+        drop((b, c));
+        assert_eq!(m.active_count(), 0);
+
+        // `0` = 不限：一直放行，但仍然计数
+        let m2 = Metrics::default();
+        let t1 = m2.try_enter(0).expect("limit=0 无条件放行");
+        let t2 = m2.try_enter(0).expect("limit=0 无条件放行");
+        assert_eq!(m2.active_count(), 2);
+        drop(t1);
+        assert_eq!(m2.active_count(), 1);
+        drop(t2);
+        assert_eq!(m2.active_count(), 0);
     }
 
     /// 规格（P2-11）：**连接任务的 panic 必须把 `hlmg_quic_connections` 降回去**。

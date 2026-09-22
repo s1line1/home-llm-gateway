@@ -42,7 +42,8 @@ pub(super) async fn admission_middleware(
         .unwrap_or("-")
         .to_string();
     let method = req.method().clone();
-    // HTTP 全局在途上限（0 = 不限）：try_enter 原子占位（旧值判定，无竞态），
+    // HTTP 全局在途上限（0 = 不限）：try_enter **CAS 占位**（记录 R8：不再用
+    // `fetch_add` + 超限回滚，那会在回滚前留下"幽灵占位"、连锁误拒闸门其实为空的请求），
     // 超限返回 None → 立即 429，防多 key 总和压垮单实例。
     // 票据的释放完全由 Drop 负责，分两段：① 移交 body 之前（含客户端中断导致 future
     // 被 drop）→ 就地 Drop 归还；② 移交 body 之后 → 随 body 结束/丢弃归还。
