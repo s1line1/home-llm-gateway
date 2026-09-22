@@ -224,6 +224,21 @@ pub struct TestCerts {
 }
 
 impl TestCerts {
+    /// 新生成一套测试证书（CA + 服务端 DER/PEM + 客户端）。要**先看配置再决定是否启动**的
+    /// 用例（例如断言零值旋钮在启动前失败）需要它。
+    pub fn generate() -> Self {
+        let (ca_pem, srv_pem, srv_key_pem, cli_pem, cli_key_pem) = gen_certs_pem();
+        Self {
+            ca: parse_certs_pem(&ca_pem),
+            client_cert: parse_certs_pem(&cli_pem),
+            client_key: parse_key_pem(&cli_key_pem),
+            server_cert_der: parse_certs_pem(&srv_pem),
+            server_key_der: parse_key_pem(&srv_key_pem),
+            server_cert_pem: srv_pem.into_bytes(),
+            server_key_pem: srv_key_pem.into_bytes(),
+        }
+    }
+
     /// 起一个 agent 接到 `gw`，上游是 `upstream` 上的 mock-llm。
     pub fn agent(
         &self,
@@ -285,32 +300,22 @@ pub async fn start_gateway(tune: impl FnOnce(&mut Options)) -> TestGateway {
     start_gateway_with(move |o, _certs| tune(o)).await
 }
 
-/// 同 [`start_gateway`]，但 `tune` 还能拿到证书材料——HTTPS 入口的 PEM 只有生成之后才知道。
-pub async fn start_gateway_with(tune: impl FnOnce(&mut Options, &TestCerts)) -> TestGateway {
-    let (ca_pem, srv_pem, srv_key_pem, cli_pem, cli_key_pem) = gen_certs_pem();
-    let certs = TestCerts {
-        ca: parse_certs_pem(&ca_pem),
-        client_cert: parse_certs_pem(&cli_pem),
-        client_key: parse_key_pem(&cli_key_pem),
-        server_cert_der: parse_certs_pem(&srv_pem),
-        server_key_der: parse_key_pem(&srv_key_pem),
-        server_cert_pem: srv_pem.into_bytes(),
-        server_key_pem: srv_key_pem.into_bytes(),
-    };
-
-    let (keys_path, key) = seed_keys_db();
-    let mut opts = Options {
-        keys_file: Some(keys_path.clone()),
+/// e2e 的旋钮基线（与库默认不同：超时压到秒级，否则一条注定失败的用例要挂十几秒）。
+pub fn e2e_options(keys_file: Option<PathBuf>) -> Options {
+    Options {
+        keys_file,
         request_timeout: Duration::from_secs(10),
         tunnel_op_timeout: Duration::from_secs(2),
         head_timeout: Duration::from_secs(5),
         agent_stale_after: Duration::from_secs(10),
         client_stall: Duration::from_secs(60),
         ..Options::default()
-    };
-    tune(&mut opts, &certs);
+    }
+}
 
-    let gw = Gateway::start(GatewayConfig {
+/// 用给定旋钮组装一份 [`GatewayConfig`]（不启动）——要断言"启动**之前**就失败"的用例需要它。
+pub fn gateway_config(certs: &TestCerts, opts: Options) -> GatewayConfig {
+    GatewayConfig {
         tunnel: TunnelTls::from_der(
             certs.ca.clone(),
             certs.server_cert_der.clone(),
@@ -318,9 +323,18 @@ pub async fn start_gateway_with(tune: impl FnOnce(&mut Options, &TestCerts)) -> 
         )
         .expect("e2e certs are non-empty"),
         opts,
-    })
-    .await
-    .unwrap();
+    }
+}
+
+/// 同 [`start_gateway`]，但 `tune` 还能拿到证书材料——HTTPS 入口的 PEM 只有生成之后才知道。
+pub async fn start_gateway_with(tune: impl FnOnce(&mut Options, &TestCerts)) -> TestGateway {
+    let certs = TestCerts::generate();
+
+    let (keys_path, key) = seed_keys_db();
+    let mut opts = e2e_options(Some(keys_path.clone()));
+    tune(&mut opts, &certs);
+
+    let gw = Gateway::start(gateway_config(&certs, opts)).await.unwrap();
 
     let base = format!("http://{}", gw.http_addr);
     TestGateway {

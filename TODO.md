@@ -4,6 +4,13 @@
 > 状态：P0 主体已实施（2026-09）；其余按优先级推进，`[x]` 表示已完成，未勾选项为待办。
 > 文末「2026-09 全项目代码审查（两轴）」登记了最近一次全量审查发现的代码问题与文档漂移。
 
+> **阶段目标（2026-09-22，人工指示）：这一阶段主要还技术债、解决 bug。新功能一律先不做。**
+> 含义：**不新增能力/接口/表结构/依赖/配置旋钮**——包括多租户、配额与超限拒绝、按 model 归因、
+> 用量 reset/告警、Redis 外置、协议换 protobuf、管理面板扩展、多实例无状态化等（下方带 ⛔ 的条目）。
+> **仍在做**：已登记**缺陷**的修复（正确性 / 并发与资源生命周期 / 安全 / 可观测性与文档漂移）、
+> 测试补齐、以及不改变对外行为的重构。判断标准：这一条的目的是"**让已有行为更正确/更可观测**"
+> （做）还是"**让网关多一个本事**"（不做）。新功能条目只做登记，不排期、不开工。
+
 ## P0 — 工具接入（DSH / Codex / Claude Code 直连）
 
 背景：cloud-gateway 需作为 DeepSeek Harness、Codex CLI、Claude Code 等工具的 LLM 后端。
@@ -227,7 +234,7 @@
       5. 测试：单测（usage_meter.rs 提取/SSE 行/无 usage 估算 ×6、keystore 累加+持久化+
          吊销保留 ×2）；e2e `e2e_usage_metering`（打 2 次请求 → /admin/usage 与
          mock 返回的 usage 一致、/admin/keys 内嵌一致、吊销后记录仍可查）
-- [ ] **计量与治理延伸（待定：暂未决定是否实施）**：usage 计量完成后的候选方向，
+- [ ] **⛔ 计量与治理延伸（新功能——按顶部范围约定先不做，仅登记）**：usage 计量完成后的候选方向，
       按价值排序与口径待定（含"放哪"的架构判断——现阶段放 gateway 合适，多实例/
       多租户时随 11.4 无状态化外置 Redis）：
       1. **per-key quota**：总量 token 配额 → 超限 429；实现收敛为可替换模块
@@ -335,7 +342,8 @@
 
 ## P2 — 协议级去重（提案已写，未实现）
 
-- [ ] **`request_uid` + agent 侧去重表**，让"响应头超时"也能安全重试。设计见
+- [ ] **⛔ `request_uid` + agent 侧去重表**（新功能 + **帧协议不兼容变更**——按顶部范围约定先不做），
+      让"响应头超时"也能安全重试。设计见
       [`EXACTLY_ONCE.md`](EXACTLY_ONCE.md)：现有重试只覆盖建立阶段（开流/写帧失败，
       那时帧未完整送达，重放安全）；504 不重试是因为请求可能已在模型侧执行。
       要点：全局唯一 uid（UUIDv7 或 instance+counter）、agent 侧 `InFlight/Done` 表、
@@ -355,7 +363,7 @@
       如未来工具链支持行级排除再重新评估。
 - [ ] **/admin/* 暴露面收敛**：安全组只放行管理网段（README 已提示，可补部署脚本/检查项）
 
-## P3 — 协议层改造（postcard → protobuf）
+## P3 — 协议层改造（postcard → protobuf）⛔ 新功能/大改造——按顶部范围约定先不做
 
 > 前置判断：**只有动机是"跨语言互操作 / 生态标准化"才值得做**；postcard 在性能和简单性上仍更优
 > （小帧更快更小，64KiB body 序列化 ~2 GiB/s 已是 memcpy 级）。若仅为协议演进，
@@ -563,6 +571,8 @@
       且每次分配两个 `Vec`。可考虑攒批合并写，但需要两个端点同时改帧协议 → 属协议变更，先不动。
 
 ## 重建蓝图 §6 未修项
+
+> ⛔ 本节含多租户 / Redis 外置 / 无状态化等**新功能**路线图条目：按顶部范围约定先不做，只登记。
 
 > 来源：`REBUILD.md` §6 的 12 条验收断言。它那列"反面案例"钉在 `745e8e8`，其中一部分
 > 此后已经修掉；**本节只登记仍未修的**，避免同一件事在两处各维护一份。行号对应 `6609a8c`。
@@ -825,6 +835,7 @@
       - 顺带关闭记录里的缺口「`Cancel` → 上游确实被取消**缺上游侧断言**」（`mock-llm` 新增
         `/stats`，见本节上一条）。
 
+
 - [x] **I. quic 每连接清理上 Drop guard（2026-09-22 完成）**（`PROJECT_SCAN` P2-11 / 评估 H10）
       - 缺陷：`accept_loop` 的每连接任务里是"先 `agent_connected()`、末尾 `agent_disconnected()`"，
         `handle_conn` 里则把注册表条目摘除写成末尾一句 `remove_if_same`。**panic 展开时末尾语句不
@@ -843,6 +854,30 @@
         `registry::tests::registration_guard_removes_the_entry_on_drop_and_on_panic`、
         `registration_guard_removes_only_the_last_registration`（同名重复注册只摘最后一次；
         stable_id 不匹配时不许误删别人的条目）。**把两个 Drop 体改空即红**——实测两条断言同时失败。
+
+
+- [x] **J. 配置零值校验（2026-09-22 完成）**（`PROJECT_SCAN` P2-8）
+      - 缺陷：`head_timeout_secs: 0` 能让网关**起来了就开始全量 503**：每个请求 504，且
+        `head_alive_window = 4 × 0 = 0` 让"连续 3 次没等到响应头"立刻成立 ⇒ 所有 agent 被摘光。
+        `tunnel_op_secs: 0` / `timeout_secs: 0` / `agent_stale_secs: 0` / `client_stall_secs: 0`
+        同类；agent 侧 `heartbeat_secs: 0` → 每次等待立刻超时 → 强制重连风暴。配置文件里那个 `0`
+        看起来毫无异常，此前只有一句 warn（或什么都没有）。
+      - 已做：新增 `Options::validate()`，由 `Gateway::start` **在碰任何资源之前**调用（比 TLS
+        材料解析还早）→ `GatewayError::Config`；报错**同时点名 YAML 键与结构体字段**并写清后果
+        （`timeout_secs` ↔ `request_timeout` 名字不同，配置作者与库调用方各看各的）。agent 侧
+        `heartbeat_secs: 0` 在 `agent::config::from_file` 直接 `bail!`。
+      - **刻意不拒**已文档化的零语义（拒了就是改对外契约）：`head_silent_grace`、`evict_close_grace`、
+        `verified_cache_max`、`rate_limit_per_min`、`max_concurrent_requests`、`max_entry_connections`、
+        `max_open_tunnel_streams`、`shutdown_grace`、`shutdown_flush_timeout`；`verified_cache_max`
+        过大只 WARN（按每条约 100 字节，10 万条 ≈ 10MB）。
+      - 证据：`options::tests::zero_valued_timeouts_are_rejected_by_name`（5 个键逐个断言报错点名）、
+        `documented_zero_semantics_are_not_rejected`（9 个合法零值 + 默认配置都必须通过）、
+        `agent::config::tests::zero_heartbeat_is_rejected`、e2e
+        `lifecycle::e2e_zero_valued_config_fails_fast_before_binding_anything`。**去掉那个
+        `validate()` 调用即红**——实测该 e2e 立刻失败（网关照常起来了）。
+      - 顺带：**P2-7 经复核确认为"空操作"**（rusqlite 0.40.2 的 `open` 已设
+        `sqlite3_busy_timeout(db, 5000)`，见 vendored `inner_connection.rs:118`），scan 的批次清单
+        已标注，不再排期。
 
 - [x] **D. registry 评估 §7 步骤 6 的可选清理（2026-09-21 处置完毕：两项落地、两项裁定不做）**
       - ✅ **`pick()` 抽成纯函数**（`registry::pick`）：次序（新鲜 → 排除 → 模型 → 精确优先 →

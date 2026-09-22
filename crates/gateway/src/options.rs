@@ -194,6 +194,77 @@ impl Options {
             self.max_open_tunnel_streams
         }
     }
+
+    /// 启动前的旋钮校验：**这几个 `0` 不是"关闭"，而是"立刻超时"**，其中两个足以把网关打成
+    /// 全量 503/504。返回 `Err` 时 [`crate::Gateway::start`] 会在**碰任何资源之前**失败。
+    ///
+    /// 为什么必须 fail-fast（评估记录 P2-8）：这些值以前只被 serde 原样带过，`0` 一路传到
+    /// `timeout(ZERO, ..)` 与 `head_timeout_is_fatal(0)`。现象是"每个请求 504 / 所有 agent 在
+    /// 3 次无响应头后被摘光 ⇒ 全量 503"，而配置文件里那个 `0` 看起来毫无异常——让运维从现象
+    /// 倒推回一个数字，代价远高于启动时报错。错误文案**同时给 YAML 键与结构体字段**：前者是
+    /// 配置作者写的，后者是库调用方写的（例如 `timeout_secs` ↔ `request_timeout` 名字并不相同）。
+    ///
+    /// **刻意不校验**（`0` 是已文档化的合法语义，拒绝它们等于改变对外契约）：
+    /// `head_silent_grace`（关掉"对端还活着"那一层）、`evict_close_grace`（不等就关）、
+    /// `verified_cache_max`（关缓存）、`rate_limit_per_min` / `max_concurrent_requests` /
+    /// `max_entry_connections`（不限）、`max_open_tunnel_streams`（用默认值，
+    /// 见 [`Options::stream_ceiling`]）、`shutdown_grace` / `shutdown_flush_timeout`（不等待）。
+    pub fn validate(&self) -> Result<(), String> {
+        // (值, YAML 键, 结构体字段, 0 的后果)
+        let must_be_non_zero = [
+            (
+                self.request_timeout,
+                "timeout_secs",
+                "request_timeout",
+                "响应阶段是逐帧空闲超时，0 会让每个响应立刻被当作空闲而中断",
+            ),
+            (
+                self.tunnel_op_timeout,
+                "tunnel_op_secs",
+                "tunnel_op_timeout",
+                "开流 / 写请求帧 / 取消帧全部立刻超时，每个请求都会 502",
+            ),
+            (
+                self.head_timeout,
+                "head_timeout_secs",
+                "head_timeout",
+                "每个请求都会 504；且 head_alive_window = 4 × 0 = 0，使「连续 3 次没等到响应头」\
+                 立刻成立，所有 agent 会被摘光 ⇒ 全量 503",
+            ),
+            (
+                self.agent_stale_after,
+                "agent_stale_secs",
+                "agent_stale_after",
+                "agent 刚注册就被判失联，注册表永远没有可路由的候选 ⇒ 全量 503",
+            ),
+            (
+                self.client_stall,
+                "client_stall_secs",
+                "client_stall",
+                "请求体读取 / 响应体发送 / 写 socket 全部立刻判停滞，正常请求也会被放弃",
+            ),
+        ];
+        for (value, yaml_key, field, consequence) in must_be_non_zero {
+            if value.is_zero() {
+                return Err(format!(
+                    "config: {yaml_key} ({field}) must be at least 1 second, but is 0: {consequence}"
+                ));
+            }
+        }
+
+        // 上界**只提示不拒绝**：`verified_cache_max` 按每条约 100 字节算（见 `storage::verified`），
+        // 10^8 就是 GB 级内存。运维可能是故意配大，但没有理由不吵一声。
+        const VERIFIED_CACHE_WARN_ABOVE: usize = 100_000;
+        if self.verified_cache_max > VERIFIED_CACHE_WARN_ABOVE {
+            tracing::warn!(
+                verified_cache_max = self.verified_cache_max,
+                warn_above = VERIFIED_CACHE_WARN_ABOVE,
+                "verified_cache_max is large: each cached identity costs on the order of 100 bytes, \
+                 so this reserves tens of megabytes or more (see README's concurrency/memory section)"
+            );
+        }
+        Ok(())
+    }
 }
 
 impl Default for Options {
@@ -241,6 +312,61 @@ mod tests {
             Options::DEFAULT_EVICT_CLOSE_GRACE,
             Options::DEFAULT_HEAD_TIMEOUT
         );
+    }
+
+    /// 规格（P2-8）：**"零值会立刻超时"的旋钮必须在启动前被拒**，且报错要点名 YAML 键。
+    ///
+    /// 修复前这些 `0` 一路传到 `timeout(ZERO, ..)`：`head_timeout_secs: 0` 会让每个请求 504，
+    /// 同时把 `head_alive_window` 归零 ⇒ 连续 3 次没等到响应头就摘除**所有** agent ⇒ 全量 503，
+    /// 而配置文件里那个 `0` 看起来完全正常。
+    #[test]
+    fn zero_valued_timeouts_are_rejected_by_name() {
+        type SetZero = fn(&mut Options);
+        let cases: [(&str, SetZero); 5] = [
+            ("timeout_secs", |o| o.request_timeout = Duration::ZERO),
+            ("tunnel_op_secs", |o| o.tunnel_op_timeout = Duration::ZERO),
+            ("head_timeout_secs", |o| o.head_timeout = Duration::ZERO),
+            ("agent_stale_secs", |o| o.agent_stale_after = Duration::ZERO),
+            ("client_stall_secs", |o| o.client_stall = Duration::ZERO),
+        ];
+        for (yaml_key, mutate) in cases {
+            let mut opts = Options::default();
+            mutate(&mut opts);
+            let err = opts
+                .validate()
+                .expect_err(&format!("{yaml_key}=0 必须被拒（否则启动后从现象倒推）"));
+            assert!(
+                err.contains(yaml_key),
+                "报错必须点名 YAML 键 {yaml_key}，实际：{err}"
+            );
+        }
+    }
+
+    /// 规格（P2-8 的另一半）：**文档化的合法零值一个都不能被误拒**。
+    ///
+    /// 这条与上一条同样重要：把"0 = 不限/关闭/用默认"当成错误拒绝，等于改掉对外契约
+    /// （配置作者会突然起不来）。合法的零值全部列在这里，任何一处收紧都会让本测试红。
+    #[test]
+    fn documented_zero_semantics_are_not_rejected() {
+        let opts = Options {
+            verified_cache_max: 0,                  // 关缓存
+            head_silent_grace: Duration::ZERO,      // 关掉"对端还活着"那一层
+            evict_close_grace: Duration::ZERO,      // 不等，立刻关
+            rate_limit_per_min: 0,                  // 不限流
+            max_concurrent_requests: 0,             // 不限并发
+            max_entry_connections: 0,               // 不限连接数
+            max_open_tunnel_streams: 0,             // 用默认值（stream_ceiling 归一）
+            shutdown_grace: Duration::ZERO,         // 不排空
+            shutdown_flush_timeout: Duration::ZERO, // 不等落库
+            ..Options::default()
+        };
+        assert!(
+            opts.validate().is_ok(),
+            "文档化的 0 语义（不限/关闭/用默认）不得被拒：{:?}",
+            opts.validate()
+        );
+        // 默认配置当然也要通过
+        Options::default().validate().expect("默认配置必须合法");
     }
 
     /// 契约：**「对端还活着」的静默宽限必须长于"忙/死"窗口**，否则第二层判据形同虚设

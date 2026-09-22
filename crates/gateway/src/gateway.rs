@@ -78,11 +78,16 @@ impl Gateway {
     /// ② `nofile::install()` 产出凭证；③ `listen::Sockets::bind` 同时要求这两样
     /// （已校验的 TLS + 已抬额度的凭证），所以"先绑端口再校验"与"没抬额度就绑"都写不出来。
     ///
-    /// 错误：`Config`（HTTPS 材料构建不出 / 流额度非法）、`Tls`、`Verifier`、
-    /// `Io`（端口占用）、`QuicStart`。**已知的刻意放宽**（保持原有设计）：NOFILE 抬不动
+    /// 错误：`Config`（旋钮零值非法——见 [`Options::validate`] / HTTPS 材料构建不出）、`Tls`、
+    /// `Verifier`、`Io`（端口占用）、`QuicStart`。**已知的刻意放宽**（保持原有设计）：NOFILE 抬不动
     /// 只 WARN、`ui_dir` 不可用只降级成占位页，两者都不阻止启动。
     pub async fn start(cfg: GatewayConfig) -> Result<Self, GatewayError> {
         let GatewayConfig { tunnel, opts } = cfg;
+
+        // ⓪ 旋钮校验（记录 P2-8）：零值不是"关闭"而是"立刻超时"，其中 `head_timeout`/`agent_stale`
+        //    的零值会让网关起来就开始全量 503。放在最前面——比 TLS 材料还早，因为这是配置作者的
+        //    笔误，越早指出越省事。
+        opts.validate().map_err(GatewayError::Config)?;
 
         // ① 纯校验 + 派生：TLS 材料有问题必须**在碰任何资源之前**失败（fail fast）。
         //    否则进程会"启动成功"却从未监听公网端口——systemd 显示 active(running)、

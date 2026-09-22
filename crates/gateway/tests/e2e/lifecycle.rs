@@ -3,6 +3,43 @@
 
 use super::common::*;
 
+/// 规格（P2-8）：**零值旋钮必须在启动时失败，而不是让网关"起来了但全量 503"**。
+///
+/// `head_timeout_secs: 0` 是最毒的一个：每个请求 504，同时 `head_alive_window = 4 × 0 = 0`
+/// 让"连续 3 次没等到响应头"立刻成立 ⇒ 所有 agent 被摘光 ⇒ 之后每个请求 503。配置文件里
+/// 那个 `0` 看起来完全正常，所以必须在**碰任何资源之前**报错，且报错要点名 YAML 键。
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn e2e_zero_valued_config_fails_fast_before_binding_anything() {
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    let certs = TestCerts::generate();
+    let opts = Options {
+        head_timeout: Duration::ZERO,
+        ..e2e_options(None)
+    };
+    let msg = match Gateway::start(gateway_config(&certs, opts)).await {
+        Ok(gw) => {
+            gw.shutdown().await;
+            panic!("head_timeout=0 必须让启动失败（否则网关起来就开始全量 503）");
+        }
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        msg.contains("head_timeout_secs"),
+        "报错要点名 YAML 键（配置作者写的是这个）：{msg}"
+    );
+
+    // 同一份配置把值改回非零就能起来：证明拒绝的是那一个值，不是配置本身
+    let opts = Options {
+        head_timeout: Duration::from_secs(5),
+        ..e2e_options(None)
+    };
+    let gw = Gateway::start(gateway_config(&certs, opts))
+        .await
+        .expect("非零 head_timeout 必须能启动");
+    gw.shutdown().await;
+}
+
 /// 规格：**`Gateway` 被 drop 而未调 `shutdown()` 时，监听口必须释放**。
 ///
 /// 修好前：`tasks` 里的 `JoinHandle` 只是被 drop（tokio 语义是 **detach**，不是 abort），
