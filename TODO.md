@@ -610,3 +610,50 @@
 **已修、不要再照 §6 做一遍的**：R7 票据绑响应 body（钉点时即正确）、R10 的
 `open_bi`/写帧/agent 侧握手三项超时、R11 的 `agent_id` 进日志与 agent 拒绝按 `reason` 分源、
 §5.1 的 `hlmg_agents` 语义（已拆出 `hlmg_agents_healthy`）。
+
+## 2026-09-21 结转：本轮评估（gateway / registry / storage）的收尾项
+
+> 三份评估的 §7 迁移计划都已执行到"可单独发布"的程度（storage `6f5cc74`…`9719d26`、
+> registry `d0f1d39`…`710a5a8`），**本节只登记仍未做的**，省得下次再从评估正文里翻。
+> 评估正文在 `docs/*-assessment*.md`，**那份是 gitignore 的本地取证记录**（不入库）：
+> 过程与并集裁决看那里，可执行清单看本节。
+
+- [ ] **A. 锁中毒兜底还差两处：`metrics.rs` 与 `registry.rs`**（`PROJECT_SCAN` P2-12 的剩余 / registry 评估 M2）
+      - 现状：storage 三个文件已全部改完——生产侧 26 处加锁统一走 `lock_or_recover` /
+        `read_or_recover` / `write_or_recover`（定义与语义论证见 `storage/mod.rs` 顶部）；
+        `metrics.rs`（`grep -c '\.lock()'` = 14 处）与 `registry.rs`（RwLock 读写共 15 处）仍是
+        `.unwrap()`。
+      - 后果：`status_counts` / `tunnel_retries` / `head_timeouts` … 任一中毒 ⇒ `/metrics` 直接 500
+        （正是排障时最需要它的时刻）；registry 的表锁中毒 ⇒ 注册/选路/准入永久失败。
+      - 做法：把三个助手从 `storage/mod.rs` 提到 crate 级（例如 `src/sync.rs`）供 `metrics`/`registry`
+        共用，再逐处替换。锁里都是内存映射（计数/表），unwind 不会让它们变成非法状态。
+      - 验收：新增"毒化后仍可用"的测试（`/metrics` 渲染不 panic；registry 仍能注册并选路）；
+        与 storage 的 `a_poisoned_*` 三条同风格。
+
+- [ ] **B. 公网入口：TLS 握手与请求头读取没有超时，也没有连接数上限**（`PROJECT_SCAN` P1-1 / 评估 H8）
+      - 位置：`http/entry.rs` 的 `acceptor.accept(stream).await`（无超时）与
+        `http1::Builder::new()`（未设 `header_read_timeout`）；只有**写**方向包了 `WriteStall`。
+      - 为什么现在记它：2026-09-21 查那次 e2e `TIMEOUT [180s]` 时逐段量过——**这是整条请求链上
+        唯一"客户端会等、服务端没有任何上界"的步骤**，其余每一步都有 `head_timeout` /
+        `request_timeout`（逐帧空闲）/ `shutdown_grace` 兜住。半开连接又不经准入闸门
+        （闸门在"解析出请求"之后才生效），只受 NOFILE（启动时抬到 16384）约束。
+      - 做法：握手与请求头读取各加 `tokio::time::timeout`（旋钮可复用 `client_stall`，量级不要
+        低于 `head_timeout`，否则会把"慢但合法"的首字节场景误杀），并给入口总连接数设上限。
+      - 验收：连上不发 ClientHello、以及发一半请求头的连接必须在超时后被断开（确定性测试），
+        同时 `https::e2e_https_public_entry` 等正常路径不受影响。
+
+- [ ] **C. 其余 40+ 条 e2e 仍没有逐步超时**（`PROJECT_SCAN` P2-17 的剩余）
+      - 现状：`tests/e2e/common.rs` 已有 `STEP_TIMEOUT`(30s) + `bounded(step, fut)`，
+        但只给 `https::e2e_https_public_entry` 的每一步套上了（那次真实 TIMEOUT 的现场）。
+      - 注意：`stalls.rs` / `write_backpressure.rs` 那几类是**故意**让客户端卡住的用例，必须豁免
+        ——所以不能无脑加 `Client::builder().timeout(..)`，要逐条判断"这一步本该完成吗"。
+      - 价值：卡住会变成**带步骤名**的失败，而不是 nextest 的 180s TIMEOUT、
+        或 `make test`（`cargo test`，e2e 是 `#[serial]`）下整个套件无限期挂起。
+
+- [ ] **D. registry 评估 §7 步骤 6 的可选清理**（每项可单独取舍，都不改变行为）
+      - `pick()` 纯函数抽取（规则已被 `try_acquire_excluding` 的测试钉住）；
+      - 删 `Registry::try_acquire`（`registry.rs:686`，生产零调用，只有它自己的一条测试在用）。
+        ⚠️ `Registry::is_empty`（`:638`）**不能单独删**：`len()` 还在，clippy 的
+        `len_without_is_empty`（warn 级）会报——已用实验确认，要收就 `len()`/`is_empty()` 一起收；
+      - `stable_id` 索引（C4）：消掉摘除路径上的全表扫描；
+      - 可选的 `tunnel_health` 拆分：`Entry` 已不透明，此时拆才不是"搬迁同一份状态"。
