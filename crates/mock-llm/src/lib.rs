@@ -1,7 +1,14 @@
 //! mock-llm：模拟 OpenAI 兼容接口的假 LLM，用于在无真实模型时打通全链路。
 //! 支持实例名，多 agent 场景下可用不同实例名区分上游来源。
 
-use std::{convert::Infallible, sync::Arc, time::Duration};
+use std::{
+    convert::Infallible,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use async_stream::stream;
 use axum::{
@@ -19,19 +26,25 @@ use axum::{
 
 /// 持续产出 `chunks` 块、每块 `kb` KB（块间 `delay_ms` 毫秒，默认 0）。
 /// 上游会一直产到被取消为止——这正是"客户端不读时会不会永久占住槽位"要考的场景。
-async fn flood(Query(p): Query<std::collections::HashMap<String, String>>) -> Response {
+async fn flood(
+    State(st): State<AppState>,
+    Query(p): Query<std::collections::HashMap<String, String>>,
+) -> Response {
     let num = |k: &str, d: u64| p.get(k).and_then(|v| v.parse().ok()).unwrap_or(d);
     let chunks = num("chunks", 100_000) as usize;
     let kb = (num("kb", 64) as usize).clamp(1, 1024);
     let delay = Duration::from_millis(num("delay_ms", 0));
     let payload = Bytes::from(vec![b'F'; kb * 1024]);
+    let guard = CancelGuard::new(st.cancelled.clone());
     let s = stream! {
+        let mut guard = guard;
         for _ in 0..chunks {
             if !delay.is_zero() {
                 tokio::time::sleep(delay).await;
             }
             yield Ok::<_, Infallible>(payload.clone());
         }
+        guard.completed = true;
     };
     Response::builder()
         .header(
@@ -42,9 +55,42 @@ async fn flood(Query(p): Query<std::collections::HashMap<String, String>>) -> Re
         .unwrap()
 }
 
+/// 上游视角的"请求被取消"计数守卫。
+///
+/// 为什么需要它：`TODO.md:414-422` 登记了"`Cancel` → 上游确实被取消"缺**上游侧**断言——
+/// 网关的日志能说它发了 Cancel，agent 的代码看起来也会丢上游请求，但"上游真的停了"只能由
+/// 上游自己证明。放进响应体流里：流正常跑完置 `completed`；客户端（agent）中途断开/取消时
+/// axum 丢掉 body → 生成器连同局部变量一起被 drop → Drop 里 +1。
+///
+/// 用法上的坑：`completed` 必须在 `stream!` 块**内部**的最后一行置位，不能放在块外——
+/// 块外的代码在流被 drop 时根本不会执行，那就变成"永远算取消"。
+struct CancelGuard {
+    counter: Arc<AtomicU64>,
+    completed: bool,
+}
+
+impl CancelGuard {
+    fn new(counter: Arc<AtomicU64>) -> Self {
+        Self {
+            counter,
+            completed: false,
+        }
+    }
+}
+
+impl Drop for CancelGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     name: Arc<str>,
+    /// 被中途丢弃的响应体数（= 上游观察到的取消次数），见 [`CancelGuard`]。
+    cancelled: Arc<AtomicU64>,
 }
 
 pub fn router(name: &str) -> Router {
@@ -60,9 +106,20 @@ pub fn router(name: &str) -> Router {
         // 并释放准入槽位（`?chunks=&kb=&delay_ms=`）。用一次性的固定大小响应测不出这件事：
         // 数据可以先塞进 socket 缓冲与通道，通道并不会一直满着。
         .route("/v1/flood", post(flood))
+        // 观测面：`cancelled` = 上游看到的"中途取消"次数（供 e2e 断言"Cancel 真的到了上游"）
+        .route("/stats", get(stats))
         .with_state(AppState {
             name: Arc::from(name),
+            cancelled: Arc::new(AtomicU64::new(0)),
         })
+}
+
+/// 上游自述的观测数据：目前只有"被中途取消的响应体数"。
+async fn stats(State(st): State<AppState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "name": st.name.as_ref(),
+        "cancelled": st.cancelled.load(Ordering::Relaxed),
+    }))
 }
 
 async fn models(State(st): State<AppState>) -> Json<serde_json::Value> {
@@ -204,4 +261,40 @@ async fn slow_body(State(st): State<AppState>) -> Response {
         .header(CACHE_CONTROL, HeaderValue::from_static("no-cache"))
         .body(Body::from_stream(s))
         .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    /// 规格：守卫只为**被中途丢弃**的流计数。
+    ///
+    /// 这个方向必须钉住，否则"上游观察到取消"这件事就没有意义了——如果 `completed` 忘了置位，
+    /// 每个正常读完的 `/v1/flood` 也会被算成取消，那条 e2e 断言就变成永远为真。
+    #[test]
+    fn cancel_guard_counts_only_streams_that_were_dropped_early() {
+        let counter = Arc::new(AtomicU64::new(0));
+
+        // 正常跑完：在 `stream!` 块内部把 completed 置位（块外的代码在 drop 时不会执行）
+        {
+            let mut guard = CancelGuard::new(counter.clone());
+            guard.completed = true;
+        }
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            0,
+            "正常结束的流不该算成取消"
+        );
+
+        // 中途丢弃
+        {
+            let _guard = CancelGuard::new(counter.clone());
+        }
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            1,
+            "被丢弃的流必须算成一次取消"
+        );
+    }
 }

@@ -665,7 +665,7 @@ mod tests {
                 method: "DELETE".into(),
                 path: "/v1/../api/delete".into(),
                 headers: vec![],
-                body: br#"{"model":"m"}"#.to_vec(),
+                body: bytes::Bytes::from_static(br#"{"model":"m"}"#),
             },
         )
         .await

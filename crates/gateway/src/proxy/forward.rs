@@ -23,7 +23,8 @@ use crate::state::ShutdownPhase;
 use super::tunnel::tunnel_cancel;
 use super::usage::UsageCollector;
 
-/// 往客户端方向送一块的结果。三种情况处置完全不同，必须分开。
+/// 往客户端方向送一块的结果。几种情况处置完全不同，必须分开。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SendOutcome {
     /// 客户端取走了。
     Delivered,
@@ -35,7 +36,20 @@ pub(super) enum SendOutcome {
     /// 的另一半原因：通道容量 32，客户端一停，发送端就在这里永久 park，
     /// 而准入票据（`Admission`）随 response body 一起挂在同一个任务上。
     Stalled,
+    /// 网关进入 `Terminating`，发送被主动叫停（见 [`send_to_client_or_shutdown`]）。
+    ///
+    /// 与 [`SendOutcome::Stalled`] 分开：那一档要记 `client_stalls`（客户端有问题），
+    /// 这一档是**我们自己在关停**，不是客户端的锅；数据也不再重要（响应体接下来会被
+    /// 明确标成"不完整"）。
+    ShuttingDown,
 }
+
+/// 关停时"不完整"事件的写入上限。
+///
+/// 比 `client_stall`（默认 60s）小得多：**正常读取**的客户端微秒级就收下了，这个上限存在的
+/// 意义只是别让"不读的客户端"把关停拖住——那时任务会一直持有 agent 槽位与 QUIC 流，
+/// `Gateway::shutdown` 早返回了（并集报告 H5）。
+const SHUTDOWN_EVENT_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// 响应转发结束的方式。**八个出口各自的处置不同**，以前它们只是散落的 `return`——
 /// 日志能看出差别，返回值看不出来。显式化之后：调用方拿到一个可匹配的结论，
@@ -79,6 +93,33 @@ pub(super) async fn send_to_client(
         Ok(Ok(())) => SendOutcome::Delivered,
         Ok(Err(_)) => SendOutcome::ClientGone,
         Err(_) => SendOutcome::Stalled,
+    }
+}
+
+/// [`send_to_client`] + **盯着 `Terminating`**：任务被卡在"客户端不读"上时也要能被叫停。
+///
+/// 为什么需要它（并集报告 H5）：`forward_body` 只在**循环顶部**看 `shutdown_terminating`，
+/// 而它可以 park 在 `tx.send` 上直到 `client_stall`（默认 60s）。`Gateway::shutdown` 的收尾
+/// 窗口只有 1s，于是它返回时这个游离任务还持有 agent 槽位（`SlotGuard`）与 QUIC 流。
+///
+/// `Draining` **不**叫停：那个阶段只停 accept，在途响应必须继续正常跑完（见 [`ShutdownPhase`]
+/// 的文档）——所以这是**重试发送**而不是丢数据；只有 `Terminating`（或发送端消失）才放弃。
+async fn send_to_client_or_shutdown(
+    tx: &mpsc::Sender<Result<Bytes, String>>,
+    item: Result<Bytes, String>,
+    stall: Duration,
+    shutdown: &mut watch::Receiver<ShutdownPhase>,
+) -> SendOutcome {
+    loop {
+        tokio::select! {
+            outcome = send_to_client(tx, item.clone(), stall) => return outcome,
+            res = shutdown.changed() => {
+                if res.is_err() || shutdown_terminating(shutdown) {
+                    return SendOutcome::ShuttingDown;
+                }
+                // `Draining`：继续尝试发这一块，一块都不能丢。
+            }
+        }
     }
 }
 
@@ -139,12 +180,16 @@ pub(super) async fn forward_body(
                 match send_to_client(
                     &tx,
                     Ok(Bytes::from_static(SHUTDOWN_SSE_EVENT)),
-                    client_stall,
+                    // 关停路径专用上限：正常读取的客户端微秒级就收下，不读的不能拖住关停（H5）
+                    client_stall.min(SHUTDOWN_EVENT_WRITE_TIMEOUT),
                 )
                 .await
                 {
                     SendOutcome::Delivered => {}
-                    SendOutcome::ClientGone => {
+                    // 这一档走的是**不带 shutdown 的** `send_to_client`，所以它不会返回
+                    // `ShuttingDown`；与 `ClientGone` 合并只是让 match 穷尽，处置相同
+                    // （接收端没了 → 发不出去，照常取消上游）。
+                    SendOutcome::ShuttingDown | SendOutcome::ClientGone => {
                         warn!(
                             request_id,
                             "client gone while announcing shutdown; cancelling upstream"
@@ -185,8 +230,21 @@ pub(super) async fn forward_body(
         };
         match frame {
             Ok(Ok(Some(Frame::ProxyResponseBody { chunk, .. }))) => {
-                match send_to_client(&tx, Ok(Bytes::from(chunk.clone())), client_stall).await {
+                match send_to_client_or_shutdown(
+                    &tx,
+                    Ok(chunk.clone()),
+                    client_stall,
+                    &mut shutdown,
+                )
+                .await
+                {
                     SendOutcome::Delivered => {}
+                    SendOutcome::ShuttingDown => {
+                        // 网关要求收尾：这一块不再送（响应体接下来会被明确标成"不完整"），
+                        // 但上游已经产出了它 → 照记用量，然后回到循环顶走收尾分支。
+                        usage.observe(&chunk);
+                        continue;
+                    }
                     SendOutcome::ClientGone => {
                         // 客户端已断开 → 取消上游；仍结算已转发部分
                         warn!(request_id, "client disconnected, cancelling upstream");
@@ -223,10 +281,11 @@ pub(super) async fn forward_body(
                 return ForwardEnd::UpstreamEnd;
             }
             Ok(Ok(Some(Frame::Error { code, message, .. }))) => {
-                let _ = send_to_client(
+                let _ = send_to_client_or_shutdown(
                     &tx,
                     Err(format!("upstream error {code}: {message}")),
                     client_stall,
+                    &mut shutdown,
                 )
                 .await;
                 let _ = send.finish();
@@ -235,31 +294,141 @@ pub(super) async fn forward_body(
             }
             Ok(Ok(Some(_))) => {}
             Ok(Ok(None)) => {
-                let _ = send_to_client(
+                let _ = send_to_client_or_shutdown(
                     &tx,
                     Err("upstream closed the stream early".into()),
                     client_stall,
+                    &mut shutdown,
                 )
                 .await;
                 usage.finish();
                 return ForwardEnd::UpstreamClosed;
             }
             Ok(Err(e)) => {
-                let _ = send_to_client(&tx, Err(format!("tunnel read failed: {e}")), client_stall)
-                    .await;
+                let _ = send_to_client_or_shutdown(
+                    &tx,
+                    Err(format!("tunnel read failed: {e}")),
+                    client_stall,
+                    &mut shutdown,
+                )
+                .await;
                 usage.finish();
                 return ForwardEnd::TunnelError;
             }
             Err(_) => {
                 // 空闲超时 → 取消上游；结算已转发部分
                 warn!(request_id, "upstream idle timeout, cancelling");
-                let _ =
-                    send_to_client(&tx, Err("upstream idle timeout".into()), client_stall).await;
+                let _ = send_to_client_or_shutdown(
+                    &tx,
+                    Err("upstream idle timeout".into()),
+                    client_stall,
+                    &mut shutdown,
+                )
+                .await;
                 tunnel_cancel(send, request_id, op_timeout).await;
                 let _ = send.finish();
                 usage.finish();
                 return ForwardEnd::IdleTimeout;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use super::*;
+
+    /// 规格（并集报告 H5）：**`Terminating` 必须叫停卡在"客户端不读"上的发送**。
+    ///
+    /// 修复前这里会 park 到 `stall`（测试里给 60s）——`Gateway::shutdown` 的收尾窗口只有 1s，
+    /// 于是它返回时这个游离任务还持有 agent 槽位与 QUIC 流。
+    ///
+    /// 同时钉住**`Draining` 不许叫停**：那个阶段只停 accept，在途响应必须继续跑完，
+    /// 在这里丢掉一块就是数据丢失。
+    #[tokio::test]
+    async fn terminating_interrupts_a_stalled_send_but_draining_does_not() {
+        // 容量 1 且占满 → 下一次 send 一定 park
+        let (tx, rx) = mpsc::channel::<Result<Bytes, String>>(1);
+        tx.send(Ok(Bytes::from_static(b"filler"))).await.unwrap();
+        let (phase_tx, mut phase_rx) = watch::channel(ShutdownPhase::Running);
+
+        let started = Instant::now();
+        let task = tokio::spawn(async move {
+            send_to_client_or_shutdown(
+                &tx,
+                Ok(Bytes::from_static(b"blocked")),
+                Duration::from_secs(60),
+                &mut phase_rx,
+            )
+            .await
+        });
+
+        // 先让它卡住，再发 `Draining`：不许结束、也不许丢块
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        phase_tx.send(ShutdownPhase::Draining).unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !task.is_finished(),
+            "`Draining` 只停 accept，不该打断在途响应的发送（丢了就是数据丢失）"
+        );
+
+        // 再发 `Terminating`：必须立刻结束，而不是等满 60s 的停滞上限
+        phase_tx.send(ShutdownPhase::Terminating).unwrap();
+        let outcome = tokio::time::timeout(Duration::from_millis(500), task)
+            .await
+            .expect("`Terminating` 必须叫停停滞的发送（H5：否则关停后任务还活着）")
+            .expect("任务不该 panic");
+        assert!(
+            matches!(outcome, SendOutcome::ShuttingDown),
+            "应当是主动叫停（ShuttingDown），实际 {outcome:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "必须是立刻叫停，而不是等满停滞上限；实测 {:?}",
+            started.elapsed()
+        );
+        drop(rx);
+
+        // 阶段发送端被 drop（`Gateway` 已析构）也算"该收尾了"：`changed()` 报 Err。
+        // 注意接收端要留着——否则 `send` 立刻返回 `ClientGone`，测的就不是这条路径了。
+        let (tx2, _rx2) = mpsc::channel::<Result<Bytes, String>>(1);
+        tx2.send(Ok(Bytes::from_static(b"filler"))).await.unwrap();
+        let (phase_tx2, mut phase_rx2) = watch::channel(ShutdownPhase::Running);
+        drop(phase_tx2);
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(500),
+            send_to_client_or_shutdown(
+                &tx2,
+                Ok(Bytes::from_static(b"blocked")),
+                Duration::from_secs(60),
+                &mut phase_rx2,
+            ),
+        )
+        .await
+        .expect("发送端消失也必须叫停");
+        assert!(matches!(outcome, SendOutcome::ShuttingDown));
+    }
+
+    /// 规格：没有关停信号时，停滞判定维持原样（`Stalled`，由调用方记 `client_stalls`）。
+    #[tokio::test]
+    async fn a_stalled_send_still_reports_stalled_without_a_shutdown() {
+        let (tx, rx) = mpsc::channel::<Result<Bytes, String>>(1);
+        tx.send(Ok(Bytes::from_static(b"filler"))).await.unwrap();
+        let (_phase_tx, mut phase_rx) = watch::channel(ShutdownPhase::Running);
+
+        let outcome = send_to_client_or_shutdown(
+            &tx,
+            Ok(Bytes::from_static(b"blocked")),
+            Duration::from_millis(50),
+            &mut phase_rx,
+        )
+        .await;
+        assert!(
+            matches!(outcome, SendOutcome::Stalled),
+            "没有关停时应按停滞处置，实际 {outcome:?}"
+        );
+        drop(rx);
     }
 }

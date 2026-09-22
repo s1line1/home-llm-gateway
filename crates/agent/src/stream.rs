@@ -221,7 +221,7 @@ async fn forward(
     request_id: u64,
     mut rb: RequestBuilder,
     headers: Vec<(String, String)>,
-    body: Vec<u8>,
+    body: bytes::Bytes,
     _request_log: bool,
     cancel: &CancellationToken,
 ) -> anyhow::Result<()> {
@@ -286,14 +286,7 @@ async fn forward(
             },
             _ = cancel.cancelled() => return send_cancelled(&mut send, request_id).await,
         };
-        write_frame(
-            &mut send,
-            &Frame::ProxyResponseBody {
-                request_id,
-                chunk: chunk.to_vec(),
-            },
-        )
-        .await?;
+        write_frame(&mut send, &Frame::ProxyResponseBody { request_id, chunk }).await?;
     }
 
     // ⑤ 结束帧 + 半关闭写方向

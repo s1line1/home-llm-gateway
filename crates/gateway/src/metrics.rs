@@ -98,6 +98,18 @@ impl Metrics {
         self.inner.quic_accepting.load(Ordering::Relaxed)
     }
 
+    /// 测试专用：直接置位「隧道入口接受中」（生产只走 [`Metrics::mark_accepting`] 的 Drop 守卫）。
+    ///
+    /// 存在的理由：`/healthz` 现在拿这个 gauge 当存活判据，而测试里的裸 `AppState`
+    /// （`http::test_util::test_state`）没有真 QUIC 入口——不置位的话**所有**走 `/healthz`
+    /// 的用例都会看到 503。
+    #[cfg(test)]
+    pub fn set_quic_accepting_for_test(&self, accepting: bool) {
+        self.inner
+            .quic_accepting
+            .store(u64::from(accepting), Ordering::Relaxed);
+    }
+
     /// 原子占位（HTTP 全局并发 admission）：`fetch_add` 用**旧值**判定是否超限——
     /// 两个并发请求各自拿到唯一旧值，恰好允许 limit 个进入，无 check-then-act 竞态。
     /// 超限 → 回退占位并返回 None（调用方返回 429）；

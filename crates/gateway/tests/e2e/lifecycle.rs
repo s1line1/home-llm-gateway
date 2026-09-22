@@ -70,6 +70,80 @@ async fn e2e_healthy_agent_count_separates_registered_from_routable() {
     gw.shutdown().await;
 }
 
+/// 规格（R12）：`/healthz` 的 body 与**程序化 API 同源**，且 `start()` 返回后立刻就是 200。
+///
+/// 三个方向：
+/// ① `start()` 返回 ⇒ 隧道入口接受中 ⇒ **立刻**探活必须 200（不需要重试窗口——
+///    `Gateway::start` 为此等了 gauge，见 `quic::await_accepting`）；
+/// ② 注册后**从不心跳**的裸 agent：`registered` 必须跟着涨、`healthy` 随后归零，
+///    两者分别与 `Gateway::agent_count()` / `healthy_agent_count()` 逐字一致
+///    （否则探针会把人带偏——"注册表里有、但全部不可路由"是排查 503 的关键区分）；
+/// ③ 状态码与 body 的 `status` 永远一致。
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn e2e_healthz_reports_the_same_agent_counts_as_the_api() {
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    let TestGateway {
+        gw, certs, base, ..
+    } = start_gateway(|o| {
+        o.agent_stale_after = Duration::from_millis(200);
+    })
+    .await;
+    // ① 启动返回后**立刻**读：入口必须已经接受中（`start` 等过 gauge，不等就会有调度窗口）
+    assert!(
+        gw.tunnel_accepting(),
+        "start() 返回时隧道入口必须已经接受中"
+    );
+
+    let client = test_client();
+    // 探针也必须是 200（同一判据的另一面）
+    let resp = bounded(
+        "GET /healthz right after start",
+        client.get(format!("{base}/healthz")).send(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "start() 返回时隧道入口必须已经接受中，否则探针会在启动窗口里误报 degraded"
+    );
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["status"], "ok");
+    assert_eq!(v["tunnel_entry"], "accepting");
+    assert_eq!(v["agents"]["registered"], 0, "还没有 agent：{v}");
+
+    // ② 注册一个从不心跳的裸 agent
+    spawn_raw_agent(&gw, &certs, "no-heartbeat", 4).await;
+
+    let resp = client.get(format!("{base}/healthz")).send().await.unwrap();
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        v["agents"]["registered"],
+        gw.agent_count(),
+        "registered 必须与 Gateway::agent_count() 同源：{v}"
+    );
+    assert_eq!(
+        v["agents"]["healthy"],
+        gw.healthy_agent_count(),
+        "healthy 必须与 Gateway::healthy_agent_count() 同源：{v}"
+    );
+
+    // 心跳过期：条目还在（连接没关），但已不可路由——body 必须能区分这两者
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let resp = client.get(format!("{base}/healthz")).send().await.unwrap();
+    assert_eq!(resp.status(), 200, "agent 不健康不等于网关不存活");
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["agents"]["registered"], 1, "条目仍在：{v}");
+    assert_eq!(v["agents"]["healthy"], 0, "心跳过期 ⇒ 不可路由：{v}");
+    assert!(
+        v["agents"]["oldest_last_seen_secs_ago"].is_number(),
+        "最久心跳年龄应当是数字（注册表非空）：{v}"
+    );
+
+    gw.shutdown().await;
+}
+
 /// 规格：**`is_serving()` 能回答"入口还活着吗"**。
 ///
 /// 今天没有别的接口能回答它：`JoinHandle` 存着但从不 poll，`hlmg_quic_accepting` 只覆盖
@@ -83,6 +157,132 @@ async fn e2e_is_serving_reports_a_running_gateway() {
     let TestGateway { gw, .. } = start_gateway(|_| {}).await;
     assert!(gw.is_serving(), "刚启动、三个主任务都在跑时应为 true");
     gw.shutdown().await;
+}
+
+/// 规格（并集报告 H5）：**关停必须把在途转发任务叫停**，而不是等它自己的停滞上限。
+///
+/// 场景：客户端读完响应头就**不再读**（通道很快被灌满 → 转发任务 park 在 `send_to_client`），
+/// 此时调 `Gateway::shutdown()`。修复前任务只在**循环顶部**看 `Terminating`，而它正卡在一个
+/// 最长 `client_stall`（这里刻意设成 30s）的发送上：`shutdown` 1 秒收尾窗口后返回，任务仍持有
+/// agent 槽位与 QUIC 流，Cancel 也要等到 30s 才发出去。
+///
+/// 判据放在**上游侧**（mock-llm 的 `/stats` 里"被中途取消的响应体数"）：网关日志说"发了 Cancel"
+/// 只是自述，**上游真的停了**才算数。`TODO.md:414-422` 登记的那条缺口就此补上。
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn e2e_shutdown_cancels_a_client_stalled_stream_without_waiting_for_the_stall() {
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    // 停滞上限刻意很大（30s）：若关停路径要等它，这条测试会超时；宽限压到 200ms，
+    // 让 shutdown 很快走到 Terminating。
+    let big_stall = Duration::from_secs(30);
+    let (gw, agent, base, key, mock_addr) = start_stack_with_mock(4, |o| {
+        o.client_stall = big_stall;
+        o.shutdown_grace = Duration::from_millis(200);
+        o.max_concurrent_requests = 1;
+    })
+    .await;
+
+    // 对照（让后面的 `cancelled > 0` 有意义）：一条**读完**的 flood 请求不该被算成取消。
+    // 少了这一步，即使计数器把"正常结束"也记进去，下面的断言也会假绿。
+    let full = reqwest::Client::new()
+        .post(format!("{base}/v1/flood?chunks=3&kb=1&delay_ms=0"))
+        .header("Authorization", format!("Bearer {key}"))
+        .json(&serde_json::json!({ "model": "mock-llm" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(full.status().as_u16(), 200);
+    let whole = full.bytes().await.unwrap();
+    assert!(
+        whole.len() >= 3 * 1024,
+        "应当读完整个 flood 响应：{}",
+        whole.len()
+    );
+    let stats: serde_json::Value = reqwest::get(format!("http://{mock_addr}/stats"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        stats["cancelled"].as_u64(),
+        Some(0),
+        "正常读完的流不该被上游算成取消：{stats}"
+    );
+
+    // 裸 TCP：打持续产出的上游，读到响应头之后不再读 socket
+    let mut sock = tokio::net::TcpStream::connect(gw.http_addr).await.unwrap();
+    let body = serde_json::json!({ "model": "mock-llm" }).to_string();
+    let head = format!(
+        "POST /v1/flood?chunks=1000000&kb=64&delay_ms=1 HTTP/1.1\r\n\
+         Host: localhost\r\n\
+         Authorization: Bearer {key}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\r\n",
+        body.len()
+    );
+    tokio::io::AsyncWriteExt::write_all(&mut sock, head.as_bytes())
+        .await
+        .unwrap();
+    tokio::io::AsyncWriteExt::write_all(&mut sock, body.as_bytes())
+        .await
+        .unwrap();
+
+    let mut seen = Vec::new();
+    let mut buf = vec![0u8; 8192];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(
+            remaining,
+            tokio::io::AsyncReadExt::read(&mut sock, &mut buf),
+        )
+        .await
+        {
+            Ok(Ok(0)) | Err(_) => break,
+            Ok(Ok(n)) => seen.extend_from_slice(&buf[..n]),
+            Ok(Err(_)) => break,
+        }
+    }
+    assert!(
+        String::from_utf8_lossy(&seen).contains("200"),
+        "前置条件：应当先正常拿到 /v1/flood 的响应头，实际：{:?}",
+        String::from_utf8_lossy(&seen[..seen.len().min(200)])
+    );
+    // 从这里开始不读；给它一点时间把通道与 socket 缓冲灌满，让转发任务真的 park 住
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let started = std::time::Instant::now();
+    gw.shutdown().await;
+    let shutdown_took = started.elapsed();
+    assert!(
+        shutdown_took < Duration::from_secs(5),
+        "shutdown 不该等 30s 的停滞上限（实测 {shutdown_took:?}）"
+    );
+
+    // 上游必须在**很短**的时间内看到这次取消（修复前要等满 30s 的停滞上限）
+    let stats_url = format!("http://{mock_addr}/stats");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut cancelled = 0;
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(resp) = reqwest::get(&stats_url).await {
+            if let Ok(v) = resp.json::<serde_json::Value>().await {
+                cancelled = v["cancelled"].as_u64().unwrap_or(0);
+                if cancelled > 0 {
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        cancelled > 0,
+        "关停后上游必须在数秒内看到取消（`/stats.cancelled`）；为 0 说明转发任务还卡在停滞发送上，\
+         没把 Cancel 发出去（H5）"
+    );
+
+    drop(sock);
+    agent.shutdown().await;
 }
 
 /// 规格：**关闭先排空在途请求，再 abort**（片 A：停 accept → 排空 → abort）。

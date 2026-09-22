@@ -165,7 +165,8 @@ curl -X DELETE http://127.0.0.1:8443/admin/keys/<id> -H "Authorization: Bearer <
 **本机自检**：
 
 ```bash
-curl -k https://127.0.0.1:8443/healthz            # → ok
+curl -k https://127.0.0.1:8443/healthz            # → {"status":"ok","tunnel_entry":"accepting","agents":{...}}
+                                                  #   隧道入口停摆时是 503 + status=degraded（处置：重启网关）
 curl -k https://127.0.0.1:8443/v1/models           # → 401（还没 agent，但说明认证生效）
 ```
 

@@ -415,14 +415,17 @@
       `max_concurrent_requests: 1` 下后续请求不得 429）+ `io_stall` 单测，均已红检。
       **仍未做**：响应体**内存缓冲上限**（DESIGN §11.2 与本项原本合并做的那半）——
       现在通道是 32 块的有界队列，但 hyper 侧仍会缓冲到 socket 缓冲被写满为止。
-- [ ] **Cancel→上游缺上游侧断言**（原与本项相邻，仍缺）：`mock-llm` 没有"请求被取消"的
-      可观测信号（新加的 `/v1/flood` 提供了持续产出的上游，但还没暴露"被中途丢弃"的计数）。
+- [x] **Cancel→上游缺上游侧断言（2026-09-22 完成）**：`mock-llm` 现在有 `GET /stats`，里面的
+      `cancelled` = **被中途丢弃的响应体数**（`CancelGuard` 的 Drop 计数：流正常跑完置
+      `completed`，被 axum 丢掉 body 时 +1）。上游侧可观测 ⇒ H5 的 e2e 判据落在这里
+      （`lifecycle::e2e_shutdown_cancels_a_client_stalled_stream_without_waiting_for_the_stall`：
+      先读完整条 flood 断言 `cancelled == 0` 作对照，再制造"客户端停读 + 关停"断言 >0）。
 - [ ] **公网入口 accept 出错即永久停服**：`gateway/src/lib.rs:175` 的 `listener.accept().await?`
       用 `?` 结束整个循环，外层只有一句 `warn!("https server stopped")`。对比 QUIC 侧专门做了
       `hlmg_quic_accepting` + `error!` 告警（`quic.rs:29-36`），HTTP 入口（唯一公网入口）反而没有
       等价信号——瞬时错误（EMFILE 等）就能让网关"进程活着但不监听"。修法：accept 错误重试 + 计数指标。
-- [ ] **Cancel→上游缺上游侧断言**：`mock-llm` 没有"请求被取消"的可观测信号，`chain.rs:205-217`
-      只断言断开后 `/v1/models` 仍可用；README 承诺的"客户端断开 → 不白算 token"因此只有间接覆盖。
+- [x] **Cancel→上游缺上游侧断言（2026-09-22 完成）**：见上一条——`mock-llm` 的 `GET /stats`
+      暴露 `cancelled`（被中途丢弃的响应体数），不再只有"断开后 `/v1/models` 仍可用"这种间接覆盖。
       修法：mock-llm 暴露取消计数（或日志端点），e2e 断言断开后上游请求确实被中断。
 
 ### P2 — 契约 / 一致性
@@ -588,10 +591,36 @@
       （`DESIGN.md` §5 自认）。SSE 长流不能被总时限误杀，动之前要先把语义想清楚。
 - [ ] **R11 延迟分位数**：`hlmg_request_duration_ms` 只有 sum，没有直方图
       （`crates/gateway/src/metrics.rs:316`）——"p99 变差"从求和值里看不出来。
-- [ ] **R12 healthz 深度检查**：`/healthz` 恒返 `"ok"`（`crates/gateway/src/http/api.rs`），
-      探针答不出"隧道入口还活着吗 / 还有几个 agent 注册 / 持久化可写吗"。
-      （闸门豁免这一半已修：`/healthz` 用 `limit = 0` 绕过准入，单测
-      `observability::tests::healthz_is_exempt_from_the_admission_gate` 锁住。）
+- [x] **R12 healthz 深度检查（2026-09-22 完成）**：`/healthz` 现在是真探针——
+      **200 ⇔ 隧道入口仍在接受新 agent**（`hlmg_quic_accepting`），否则 `503` + `status:"degraded"`
+      + `detail`（处置：重启网关）；body 改成 JSON，同时报 `agents.registered` /
+      `agents.healthy` / `agents.oldest_last_seen_secs_ago`（与 `Registry::status` 同源，
+      也用上了这个此前只进失败日志的接口）。
+      - 为什么**只有**隧道入口进状态码：它是唯一一个"探针还答得上、但实例已经没用"的故障
+        （QUIC 端点停摆后进程/systemd/HTTP 入口/`/metrics` 全正常，而此后每个 `/v1` 都 503）。
+        HTTP 入口自己不查——它一停探针本身不可达，失败即是信号。
+      - 为什么 agent 数**只在 body**：没有 agent ≠ 进程不健康；塞进状态码会让"刚启动、还没注册"
+        触发摘除/重启循环，而重启并不能让 agent 出现。
+      - 配套不变量：`Gateway::start` 现在等 `quic::await_accepting`（5s 上界，超时只告警），
+        于是「`start()` 返回 ⇒ 隧道入口接受中」成立，探针不会在启动窗口里误报 degraded；
+        新增 `Gateway::tunnel_accepting()` 作为它的程序化读数。**实测**：把那次等待去掉后
+        e2e `lifecycle::e2e_healthz_reports_the_same_agent_counts_as_the_api` 3 次里红 2 次
+        （真竞态），加上即确定绿。
+      - 证据：单测两条（degraded 时必须 503 + detail；接受中时 200 + 三个 agent 字段且空注册表
+        时 `oldest_last_seen_secs_ago` 为 `null`）+ `quic::tests::await_accepting_waits_for_the_mark_and_gives_up_on_timeout`
+        （延迟 60ms 标记时必须**等**它，且超时要返回 false 而不是卡住启动）+ e2e
+        `lifecycle::e2e_healthz_reports_the_same_agent_counts_as_the_api`（真 agent 注册后
+        body 计数与 `agent_count()`/`healthy_agent_count()` 逐字一致；心跳过期后 registered 仍 1、
+        healthy 变 0 而状态码仍 200）。
+      - **明确不在本条**：落库可写性——唯一可靠判据是"真写一次"，而 SQLite 尚无 `busy_timeout`
+        （P2-7），探针写入可能撞 `SQLITE_BUSY` 把健康实例判死；要做得先落 P2-7。用量 flusher
+        任务是否还活着也不在探针里（它死了只影响落库，把"落库坏了"变成 503 会引入重启，而重启
+        修不了磁盘）。
+      - ⚠️ 对外契约变更：`/healthz` 的 body 从纯文本 `ok` 变成 JSON（状态码语义只多不少——
+        原先恒 200，现在只在隧道入口停摆时 503）。只按状态码判的 `curl -sf` / Docker
+        `HEALTHCHECK` / `scripts/bench-*` 不受影响；`README.md` 的《可观测性》与 `DEPLOY.md`
+        已同步。（闸门豁免那一半早已修：`limit = 0` 绕过准入，
+        `observability::tests::healthz_is_exempt_from_the_admission_gate` 锁住。）
 - [x] **R12 drain 式关闭（已实施）**：`Gateway::shutdown`（`crates/gateway/src/gateway.rs`）
       现在是**有界四阶段关闭**：
       ① **停 accept**：广播 `ShutdownPhase::Draining`，公网入口的 accept 循环返回并 drop
@@ -734,6 +763,67 @@
         要立刻退出，不能等满一个退避周期"。
       - 明确不在本条：`/healthz` 的深度（评估 R12）——它查不了自己的 HTTP 入口（入口一死探针本身
         就不可达），但 QUIC 入口停摆时确实看不到；`is_serving()` 也仍无生产消费者。
+
+
+- [x] **G. 请求体路径：一次解析 + 帧里用 `Bytes`（2026-09-22 完成）**（评估 H6）
+      - 缺陷（评估原文："16MiB 请求体在 async worker 上解析/拷贝 3–4 次"）：**两遍**全量 JSON
+        解析（`extract_model` 一遍 + `estimate_prompt_tokens` 又一遍）、`body.to_vec()` 进帧、
+        以及 postcard 序列化。**实测（release，16MiB 合法 chat body）改写了对成本的判断**：
+        | 环节 | 改动前 | 改动后 |
+        |---|---|---|
+        | JSON 解析 | 3.6ms × **2 遍** | 3.6ms × 1（且 >256KiB 时走阻塞池，**不占 worker**） |
+        | body 进帧 | 0.37ms 拷贝 | 移动（≈0；`Bytes` 引用计数） |
+        | postcard 序列化 | **20.0ms** | **1.6ms** |
+        即最大的一笔不是内存也不是解析，而是 **postcard 把 `Vec<u8>` 当"元素序列"逐字节过一遍
+        序列化器**（12×）。评估里"瞬时数百 MB"那句只在 body 的**结构项**极多时成立（DOM 与结构
+        数量成正比）；纯字符串内容时 DOM 与 body 同量级——这条已在并集报告里更正为实测口径。
+      - 已做：① `Frame::{ProxyRequest::body, ProxyResponseBody::chunk}` 改 `bytes::Bytes`
+        （postcard 因此走 `serialize_bytes` 一次写整块），**线上格式逐字节不变**——由
+        `proto::io::tests::bytes_body_encodes_identically_to_a_plain_vec` 与"变体顺序一致"的镜像
+        枚举钉住（新网关 + 旧 agent 的滚动升级仍然互通）；顺带消掉响应侧每 chunk 的一次拷贝
+        （SSE 长流上按 chunk 累积）。② `usage_meter::request_facts` 一次解析同时给出 `model` 与
+        prompt 字符数（`estimate_tokens_from_chars`），不再拼 16MiB 字符串再数。
+        ③ 大 body（≥256KiB）的解析走 `spawn_blocking`，小 body 原地解析（避免每次请求多一次
+        线程池往返）；阻塞池任务 panic 报 500 而不是把锅推给客户端的 400。
+      - 证据：`proto` 的线上格式逐字节比对（空/单字节/跨 0x80/1KiB 四种边界 + 反向解码）；
+        `usage_meter::tests::request_facts_parses_once_and_keeps_the_estimation_semantics`
+        （估算口径逐条：content 字符串、分片数组只取 `text`、数字 content 跳过、无 messages → 0
+        字符 → 下限 1、缺/空/非字符串 model 与非法 JSON → Err）；`proxy::tests::
+        routing_takes_the_top_level_model_string_only`（路由判据不变）；`proxy::tests::
+        request_facts_for_offloads_large_bodies_and_keeps_the_same_result`（阈值两侧同结果 + 非法
+        JSON 必须报 400 而不是 500）；e2e 54 条全绿（真 QUIC 隧道两端现在传的就是 `Bytes` 帧）。
+      - 明确不在本条：`extract_model` 那条"所有 `/v1/*` 都要求 body 带 `model`"的**策略**问题
+        （卡住非 chat 端点）原样保留（`PROJECT_SCAN` 已登记，改它要按路径/方法白名单）；
+        帧体进 postcard 的那次拷贝现在只剩 1.6ms/16MiB，且 streaming 帧写要动线格式处理，
+        不值得再切一刀。
+
+
+- [x] **H. 关停语义：在途转发任务不再活过 `shutdown` 返回（2026-09-22 完成）**（评估 H5）
+      - 缺陷：`forward_body` 只在**循环顶部**查 `shutdown_terminating`，而它可以 park 在
+        `tx.send` 上（客户端不读 → 通道满）直到 `client_stall`（默认 60s）。`Gateway::shutdown`
+        的收尾窗口只有 1s ⇒ 它返回时那个游离任务还持有 agent 槽位（`SlotGuard`）与 QUIC 流，
+        Cancel 也要 60s 后才发给上游（= 上游白算 token 一分钟）。
+      - 已做：① 新增 `send_to_client_or_shutdown`——发送与 `Terminating` 赛跑，被卡住时立刻返回
+        `SendOutcome::ShuttingDown`，转发循环因此马上走收尾分支（发"不完整"事件 + Cancel + 结算）。
+        **`Draining` 刻意不叫停**（那个阶段只停 accept，在途响应必须跑完，丢一块就是数据丢失），
+        所以那条分支是**重试发送**。② 关停时"不完整"事件的写入上限用新的
+        `SHUTDOWN_EVENT_WRITE_TIMEOUT`（250ms）而不是 `client_stall`：正常读取的客户端微秒级就
+        收下，不读的不能把关停拖住。③ 终止性的错误帧也走可叫停版本。④ 收尾窗口到点仍有在途时
+        **WARN**（并说清那是 HTTP 连接任务在等客户端，不是转发任务泄漏）。
+      - **刻意不做**：不在关停末尾 abort 这些转发任务——`usage.finish()` 的结算排在落库之前，
+        abort 会丢掉它们尚未结算的用量。也**不**保证 `hlmg_active_requests` 归零：那张票据由
+        响应 body（HTTP 连接任务）持有，客户端停读时要到 `client_stall` 才归还，与转发任务是否
+        退出无关（这条已写进 `shutdown` 的文档，免得后人误判）。
+      - 证据：`proxy::forward::tests::terminating_interrupts_a_stalled_send_but_draining_does_not`
+        （容量 1 的通道灌满 → `Draining` 不许结束、`Terminating` 必须 500ms 内结束；另含"阶段
+        发送端被 drop 也算收尾"）+ `a_stalled_send_still_reports_stalled_without_a_shutdown`
+        （没有关停信号时停滞判定不变，仍记 `hlmg_client_stalls_total`）+ e2e
+        `lifecycle::e2e_shutdown_cancels_a_client_stalled_stream_without_waiting_for_the_stall`
+        （**上游侧**判据：`client_stall` 设成 30s、宽限 200ms，客户端读完响应头就停读，随后
+        `shutdown()`；断言 5s 内 mock-llm 的 `/stats.cancelled` > 0。**退回旧的裸
+        `send_to_client` 即红**——实测等满 5s 仍为 0）。
+      - 顺带关闭记录里的缺口「`Cancel` → 上游确实被取消**缺上游侧断言**」（`mock-llm` 新增
+        `/stats`，见本节上一条）。
 
 - [x] **D. registry 评估 §7 步骤 6 的可选清理（2026-09-21 处置完毕：两项落地、两项裁定不做）**
       - ✅ **`pick()` 抽成纯函数**（`registry::pick`）：次序（新鲜 → 排除 → 模型 → 精确优先 →

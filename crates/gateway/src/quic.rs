@@ -1,5 +1,7 @@
 //! QUIC 服务端：接受 edge-agent 连接，处理 Register / Heartbeat 控制流。
 
+use std::time::Duration;
+
 use proto::{io::read_frame, Frame};
 use s2n_quic::Connection;
 use tracing::{debug, error, info, warn};
@@ -10,6 +12,22 @@ use crate::registry::Registry;
 /// `stream_ceiling` = 每条连接允许的在途隧道流数（见 `Options::max_open_tunnel_streams`）。
 /// 它只用于**注册时的一致性告警**：agent 声明的 `max_concurrency` 超过这个额度时，网关侧
 /// 会先撞流额度而不是先撞容量闸——表现是"开流排队超时"，排查起来比容量不足隐蔽得多。
+/// 等隧道入口把自己标成「接受中」；返回是否在 `timeout` 内标上。
+///
+/// `Gateway::start` 用它把 **「`start()` 返回 ⇒ 隧道入口接受中」** 变成一个不变量：
+/// `/healthz` 的存活判据就是这个 gauge，不等的话刚起来的实例可能被探针误报成 degraded
+/// （`accept_loop` 的第一条语句就是 `mark_accepting`，所以正常路径上只等一次调度）。
+///
+/// 轮询而不是 `yield_now()`：标记按理说在第一次 poll 就完成，但**万一**没有，yield 循环会
+/// 在 deadline 之前烧满一个核；5ms 的睡眠最多醒来 200 次。
+pub async fn await_accepting(metrics: &Metrics, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while metrics.quic_accepting() == 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    metrics.quic_accepting() == 1
+}
+
 pub async fn accept_loop(
     mut server: s2n_quic::Server,
     registry: Registry,
@@ -232,4 +250,35 @@ mod tests {
     //      Gateway 与测试各持一份句柄）；
     //   ② 或者用自定义 io provider（绑定后立即报错）构造 accept() == None 的场景。
     // 在此之前，「入口停摆必须留下痕迹」这条规格只剩 abort 路径有测试覆盖。
+
+    /// 规格：`Gateway::start` 的不变量——**返回时隧道入口必须已经「接受中」**。
+    ///
+    /// 两个方向都要：没人标记时到点返回 `false`（不能把启动卡死）；有人稍后标记时必须**等它**
+    /// （这里让标记延迟 60ms，断言确实等了 ≥50ms——否则"碰巧第一次读就是 1"也能通过）。
+    #[tokio::test]
+    async fn await_accepting_waits_for_the_mark_and_gives_up_on_timeout() {
+        let metrics = Metrics::default();
+        assert!(
+            !await_accepting(&metrics, Duration::from_millis(20)).await,
+            "没人标记时应当到点返回 false，而不是卡住 start()"
+        );
+
+        let delayed = metrics.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            let _guard = delayed.mark_accepting();
+            std::future::pending::<()>().await; // 守卫要一直活着
+        });
+
+        let started = tokio::time::Instant::now();
+        assert!(
+            await_accepting(&metrics, Duration::from_secs(5)).await,
+            "标记出现后应当返回 true"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(50),
+            "必须在**等**标记，实测只花了 {:?}",
+            started.elapsed()
+        );
+    }
 }

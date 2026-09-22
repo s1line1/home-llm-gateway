@@ -77,37 +77,69 @@ pub fn extract_usage(chunk: &[u8]) -> Option<ExtractedUsage> {
 /// 估算 token 数：文本字符数 / 4（OpenAI 的粗粒度近似；中文按字符计，
 /// 仍会低估——仅作无 usage 时的降级，标记 estimated 供审计区分）。
 pub fn estimate_tokens(text: &str) -> u64 {
-    (text.chars().count() as u64).div_ceil(4)
+    estimate_tokens_from_chars(text.chars().count() as u64)
 }
 
-/// 估算请求侧 prompt：从请求体抽 messages 文本（content 拼接）后估算。
-/// 无法解析（如非 chat 端点 / 非法 JSON）→ 按整个 body 文本估算。
-pub fn estimate_prompt_tokens(body: &[u8]) -> u64 {
-    let text = match serde_json::from_slice::<serde_json::Value>(body) {
-        Ok(value) => {
-            let mut out = String::new();
-            if let Some(msgs) = value.get("messages").and_then(|v| v.as_array()) {
-                for m in msgs {
-                    if let Some(c) = m.get("content") {
-                        match c {
-                            serde_json::Value::String(s) => out.push_str(s),
-                            serde_json::Value::Array(parts) => {
-                                for p in parts {
-                                    if let Some(t) = p.get("text").and_then(|v| v.as_str()) {
-                                        out.push_str(t);
-                                    }
-                                }
+/// 同 [`estimate_tokens`]，但输入已经是字符数。
+///
+/// 拆出来是为了 H6：请求侧的文本**不再拼成一个 `String` 再数**（16MiB 的 messages 拼一遍
+/// 就是一次 16MiB 拷贝），直接累加各段的字符数——字符数在拼接下可加，结果逐字相同。
+pub fn estimate_tokens_from_chars(chars: u64) -> u64 {
+    chars.div_ceil(4)
+}
+
+/// [`request_facts`] 的失败：body 不是合法 JSON，或缺少非空字符串 `model`。
+///
+/// 两种情况对调用方是同一件事（400 + 同一句文案），所以只有一个变体；但**不用 `()`**——
+/// workspace 开着 `clippy::result_unit_err`，而且具名类型让"为什么解析失败"在签名上看得见。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotRoutable;
+
+/// 请求侧解析结果：路由要的 `model` + 无 `usage` 时估算 prompt 的字符数。
+pub struct RequestFacts {
+    /// 顶层 `model`（OpenAI 兼容语义，必填非空）。
+    pub model: String,
+    /// `messages[].content` 的字符数（口径见 [`request_facts`]）。
+    pub prompt_chars: u64,
+}
+
+/// **一次** JSON 遍历同时得到 [`RequestFacts::model`] 与 [`RequestFacts::prompt_chars`]；
+/// 非法 JSON / 缺 `model` / `model` 不是非空字符串 → `Err(())`（调用方回 400）。
+///
+/// （H6）以前是**两遍**全量解析：`proxy::extract_model` 一遍，`estimate_prompt_tokens` 又一遍。
+/// 16MiB 合法 body 实测每遍 ~77ms，两遍都压在 async worker 上。现在只有一遍，且不再拼串。
+///
+/// 估算口径与拆分前逐字一致：只数 `messages[].content`（字符串本身；数组则取各元素的 `text`），
+/// 字符数 / 4 向上取整、下限 1（下限由调用方 `max(1)` 施加，与 `resolve_delta` 的 completion
+/// 估算同一写法）。非 chat 端点（没有 `messages`）得到 0 字符 → 估算 1，与拆分前相同。
+pub fn request_facts(body: &[u8]) -> Result<RequestFacts, NotRoutable> {
+    let value: serde_json::Value = serde_json::from_slice(body).map_err(|_| NotRoutable)?;
+    let model = match value.get("model") {
+        Some(serde_json::Value::String(s)) if !s.is_empty() => s.clone(),
+        _ => return Err(NotRoutable),
+    };
+    let mut chars = 0u64;
+    if let Some(msgs) = value.get("messages").and_then(|v| v.as_array()) {
+        for m in msgs {
+            if let Some(c) = m.get("content") {
+                match c {
+                    serde_json::Value::String(s) => chars += s.chars().count() as u64,
+                    serde_json::Value::Array(parts) => {
+                        for p in parts {
+                            if let Some(t) = p.get("text").and_then(|v| v.as_str()) {
+                                chars += t.chars().count() as u64;
                             }
-                            _ => {}
                         }
                     }
+                    _ => {}
                 }
             }
-            out
         }
-        Err(_) => String::from_utf8_lossy(body).into_owned(),
-    };
-    estimate_tokens(&text).max(1)
+    }
+    Ok(RequestFacts {
+        model,
+        prompt_chars: chars,
+    })
 }
 
 #[cfg(test)]
@@ -150,12 +182,38 @@ mod tests {
         assert!(extract_usage(body2).is_none());
     }
 
+    /// 规格（H6）：**一次**解析同时给出 model 与 prompt 字符数，口径与拆分前逐字一致。
+    ///
+    /// 拆分前是 `extract_model` 一遍 + `estimate_prompt_tokens` 一遍（两遍全量解析）；这条把
+    /// "同一份 body 只解析一次"变成规格，同时钉住估算口径（含 content 数组里的 `text`、
+    /// 非字符串 content 跳过、没有 messages → 0 字符 → 下限 1）。
     #[test]
-    fn estimate_prompt_from_messages() {
+    fn request_facts_parses_once_and_keeps_the_estimation_semantics() {
         let body = br#"{"model":"m","messages":[{"role":"user","content":"12345678"},{"role":"assistant","content":"abcd"}]}"#;
-        // 12 字符 → 12/4 = 3
-        assert_eq!(estimate_prompt_tokens(body), 3);
-        // 非法 JSON → 按 body 文本估算（>0）
-        assert!(estimate_prompt_tokens(b"not json") >= 1);
+        let f = request_facts(body).expect("合法 body");
+        assert_eq!(f.model, "m");
+        assert_eq!(f.prompt_chars, 12, "8 + 4 字符");
+        assert_eq!(estimate_tokens_from_chars(f.prompt_chars).max(1), 3, "12/4");
+
+        // content 是"分片数组"：只取各分片的 text（与拆分前的 `p.get("text")` 一致）
+        let parts = br#"{"model":"m","messages":[{"content":[{"type":"text","text":"abcdefgh"},{"type":"image_url","image_url":{"url":"x"}}]},{"content":123}]}"#;
+        let f = request_facts(parts).expect("合法 body");
+        assert_eq!(f.prompt_chars, 8, "只数 text 分片；数字 content 跳过");
+
+        // 非 chat 端点（没有 messages）→ 0 字符 → 调用方 max(1)
+        let f = request_facts(br#"{"model":"m","input":"hello"}"#).expect("合法 body");
+        assert_eq!(f.prompt_chars, 0);
+        assert_eq!(estimate_tokens_from_chars(f.prompt_chars).max(1), 1);
+
+        // 缺 / 空 / 非字符串 model → Err（调用方 400），与拆分前的 extract_model 一致
+        assert!(request_facts(br#"{"messages":[]}"#).is_err(), "缺 model");
+        assert!(request_facts(br#"{"model":""}"#).is_err(), "空 model");
+        assert!(
+            request_facts(br#"{"model":123}"#).is_err(),
+            "非字符串 model"
+        );
+        assert!(request_facts(b"not json").is_err(), "非法 JSON");
+        // 顶层不是对象也一样（拆分前 `value.get("model")` 拿不到 → Err）
+        assert!(request_facts(br#"[1,2,3]"#).is_err());
     }
 }

@@ -32,17 +32,17 @@ fn frame_fixtures() -> Vec<Frame> {
                     "Bearer sk-0123456789abcdef0123456789abcdef".into(),
                 ),
             ],
-            body: vec![b'a'; 1024],
+            body: vec![b'a'; 1024].into(),
         },
         // SSE 流块（4KiB）
         Frame::ProxyResponseBody {
             request_id: 42,
-            chunk: vec![b'd'; 4096],
+            chunk: vec![b'd'; 4096].into(),
         },
         // 最大常见块（64KiB）
         Frame::ProxyResponseBody {
             request_id: 7,
-            chunk: vec![b'x'; 64 * 1024],
+            chunk: vec![b'x'; 64 * 1024].into(),
         },
     ]
 }

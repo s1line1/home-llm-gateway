@@ -342,6 +342,16 @@ pub async fn start_stack(
     max_concurrency: u32,
     tune: impl FnOnce(&mut Options),
 ) -> (Gateway, Agent, String, String) {
+    let (gw, agent, base, key, _mock_addr) = start_stack_with_mock(max_concurrency, tune).await;
+    (gw, agent, base, key)
+}
+
+/// 同 [`start_stack`]，但把 mock-llm 的地址也交出来——要断言**上游侧**行为（例如
+/// `/stats` 里"被中途取消的响应体数"）的用例需要直接访问上游。
+pub async fn start_stack_with_mock(
+    max_concurrency: u32,
+    tune: impl FnOnce(&mut Options),
+) -> (Gateway, Agent, String, String, SocketAddr) {
     let t = start_gateway(tune).await;
     let mock_addr = start_mock_llm("mock-llm").await;
     let agent = t.certs.agent(
@@ -354,7 +364,7 @@ pub async fn start_stack(
     );
     wait_for_agents(&t.gw, 1, Duration::from_secs(10)).await;
     let TestGateway { gw, key, base, .. } = t;
-    (gw, agent, base, key)
+    (gw, agent, base, key, mock_addr)
 }
 
 /// 起一个**裸 QUIC agent**：注册成功后什么都不做——**不读请求流、不回帧、也不发心跳**。
