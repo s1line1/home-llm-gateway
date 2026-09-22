@@ -24,6 +24,7 @@ pub mod registry;
 mod request_id;
 pub mod state;
 pub mod storage;
+mod sync;
 pub mod tls;
 pub mod ui;
 pub mod usage_flush;

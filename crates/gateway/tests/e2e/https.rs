@@ -157,7 +157,7 @@ async fn e2e_quic_control_stream_edge_frames() {
     .await
     .unwrap();
     rs.finish().unwrap();
-    let _ = read_frame(&mut rr).await;
+    let _ = bounded("read the register reply", read_frame(&mut rr)).await;
     assert_eq!(gw.agent_count(), 1);
 
     // 控制流上发非预期帧（Cancel）→ 服务端走 "unexpected frame" 分支，连接不受影响
@@ -167,7 +167,11 @@ async fn e2e_quic_control_stream_edge_frames() {
         .await
         .unwrap();
     send.finish().unwrap();
-    let _ = read_frame(&mut recv).await;
+    let _ = bounded(
+        "read until the unexpected-frame stream ends",
+        read_frame(&mut recv),
+    )
+    .await;
 
     // 立即结束的空流 → 服务端走干净 EOF 分支
     let stream = conn.open_bidirectional_stream().await.unwrap();
@@ -187,7 +191,11 @@ async fn e2e_quic_control_stream_edge_frames() {
     .await
     .unwrap();
     send3.finish().unwrap();
-    let _ = read_frame(&mut recv3).await;
+    let _ = bounded(
+        "read until the ghost-heartbeat stream ends",
+        read_frame(&mut recv3),
+    )
+    .await;
 
     // 畸形帧（非法长度前缀）→ 控制循环读帧出错 → handle_conn 报错并摘除 reg-1
     let stream = conn.open_bidirectional_stream().await.unwrap();
@@ -220,7 +228,7 @@ async fn e2e_quic_control_stream_edge_frames() {
     .await
     .unwrap();
     rs2.finish().unwrap();
-    let _ = read_frame(&mut rr2).await;
+    let _ = bounded("read the second register reply", read_frame(&mut rr2)).await;
     assert_eq!(gw.agent_count(), 1);
     conn2.close(0u32.into());
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -313,7 +321,7 @@ async fn e2e_proxy_protocol_edge_cases() {
     .await
     .unwrap();
     rs.finish().unwrap();
-    let _ = read_frame(&mut rr).await;
+    let _ = bounded("read the raw agent's register reply", read_frame(&mut rr)).await;
 
     // 应答循环：按场景序号对每个代理流给出不同的（异常）响应
     let client_task = tokio::spawn(async move {
@@ -526,6 +534,9 @@ async fn e2e_proxy_protocol_edge_cases() {
         }
     });
 
+    // **刻意用裸 client**（不走 `test_client()`）：下面好几个断言要的是"响应体读到
+    // 一半出错/提前结束"（`r.bytes().await.is_err()`）。若给整条请求加总超时，它们会
+    // 变成"超时才出错"——断言照样通过，但验的已经不是帧协议边界那一件事了。
     let client = reqwest::Client::new();
     let url = |p: &str| format!("http://{}{}", gw.http_addr, p);
     // 注意：/v1/models 已被网关聚合接管（不走代理），帧协议边界场景必须走

@@ -89,6 +89,11 @@ evict_close_grace_secs: 15
 # 客户端已僵住"时白烧 token。
 client_stall_secs: 60
 
+# 公网入口并发连接数上限（0 = 不限，回到"只受 NOFILE 约束"）。
+# 满额时**暂停 accept**：新连接留在内核 backlog 里排队，等有连接结束再进——
+# 所以它是资源上限（防半开连接吃光 fd），不是限流闸；要限流请调 max_concurrent_requests。
+max_entry_connections: 1024
+
 # 关闭序列：① 停 accept（不再接新请求）② 等在途请求收尾 ③ 强制落库 ④ abort 任务。
 # 本值 = ②的等待上限（秒）：到期仍有在途就记 WARN 并切断（长 SSE 会被截断）。
 shutdown_grace_secs: 15

@@ -610,3 +610,62 @@
 **已修、不要再照 §6 做一遍的**：R7 票据绑响应 body（钉点时即正确）、R10 的
 `open_bi`/写帧/agent 侧握手三项超时、R11 的 `agent_id` 进日志与 agent 拒绝按 `reason` 分源、
 §5.1 的 `hlmg_agents` 语义（已拆出 `hlmg_agents_healthy`）。
+
+## 2026-09-21 结转：本轮评估（gateway / registry / storage）的收尾项
+
+> 三份评估的 §7 迁移计划都已执行到"可单独发布"的程度（storage `6f5cc74`…`9719d26`、
+> registry `d0f1d39`…`710a5a8`），**本节只登记仍未做的**，省得下次再从评估正文里翻。
+> 评估正文在 `docs/*-assessment*.md`，**那份是 gitignore 的本地取证记录**（不入库）：
+> 过程与并集裁决看那里，可执行清单看本节。
+
+- [x] **A. 锁中毒兜底（全 crate 完成，2026-09-21）**（`PROJECT_SCAN` P2-12 / registry 评估 M2）
+      - 已做：三个助手提到 crate 级 `crates/gateway/src/sync.rs`（`lock_or_recover` /
+        `read_or_recover` / `write_or_recover`，模块头写明"唯一允许的加锁方式"），
+        调用点全部替换——storage 26 处、`metrics.rs` **14** 处、`registry.rs` 生产代码
+        **12** 处（另有 3 处测试内的读取保持原样）。
+      - 测试：`storage` 三条（毒化 runtime / db / entries+inflight）+ `metrics` 一条
+        （毒化后 `/metrics` 仍渲染出中毒前后的计数）+ `registry` 一条（毒化后仍能注册并
+        选路），共 5 条 `a_poisoned_*`，都在修复前**先红**（panic 就发生在被毒化的
+        `.unwrap()` 那一行）。
+      - 后果（备忘）：`status_counts` 等中毒 ⇒ `/metrics` 永久 500（排障时最需要它）；
+        registry 表中毒 ⇒ 注册/选路/准入永久失败；`runtime` 中毒 ⇒ 每个 `/v1/*` 都 500。
+      - M2 的另一半（"写锁内含外部调用与 `tokio::spawn`"）**此前已修**：`register` 与
+        `evict` 的写锁范围只够 map 与原子量，关闭动作与 `defer_close` 调度留在锁外，
+        代码里有纪律注释（`registry.rs` 的 `register`/`evict`）。
+
+- [x] **B. 公网入口：握手/请求头超时 + 连接数上限（2026-09-21 完成）**（`PROJECT_SCAN` P1-1 / 评估 H8）
+      - 已做：① `http1::Builder::new().timer(TokioTimer::new()).header_read_timeout(client_stall)`
+        —— hyper 默认那个 30s 请求头超时此前**静默失效**（`Time::Empty` 分支只打一条 warn），
+        现在既生效又可配；② TLS 握手 `tokio::time::timeout(client_stall, acceptor.accept(..))`，
+        超时记 WARN 并断开；③ 新旋钮 `max_entry_connections`（默认 1024，0 = 不限）：
+        **先取额度再 accept**，满额时暂停 accept、新连接留在内核 backlog 排队。
+      - 为什么这三处特殊：它们是整条请求链上**唯一"客户端会等、服务端没有上界"**的步骤，
+        而且不进准入闸门（闸门在解析出请求之后才生效）→ 只吃 fd 与任务，此前只受 NOFILE 约束。
+      - 证据：`tests/e2e/entry_limits.rs` 三条（半开握手 / 半个请求头 / 额度满时排队），都**先红**。
+      - 明确不在本条：`listener.accept()` 拿到 `Err`（EMFILE）仍会结束整个 accept 循环 —— 那是
+        P2-10（第 2 批），**仍未修**；本条只是让它不再能被半开连接触发。
+
+- [x] **C. 其余 e2e 的等待全部上界（2026-09-21 完成）**（`PROJECT_SCAN` P2-17 的剩余）
+      - 已做：`common.rs` 新增 `test_client()` / `test_client_within()`——**整条请求（含读响应体）**
+        的总超时为 `STEP_TIMEOUT`(30s)；**34 处** `reqwest::Client::new()` 换成它（admin 5、
+        agents 11、chain 9、https 1、head_timeout 3、lifecycle 2、evict_close 1、metrics 1、
+        entry_limits 1）；另 6 处非 HTTP 的"本该完成"等待用 `bounded(step, ..)` 包住
+        （5 处原始 QUIC 帧读：注册回应/控制流 EOF/ghost 心跳；1 处跨任务 `rx.recv()`）。
+      - **刻意保持裸 client 的三类**（要的就是"卡住"）：`stalls.rs`（请求体/响应体停滞）、
+        `write_backpressure.rs`（写背压）、`https::e2e_proxy_protocol_edge_cases`（多个断言
+        期待"body 读到一半出错"，加总超时会变成"超时才出错"——断言仍通过但验的不是同一件事）。
+      - 本来就有界、无需再包：`Gateway::shutdown`（排空+落库+收尾 ≈26s 上界）、
+        `Agent::shutdown`（`abort()`）、`wait_for_agents`（自带 10s deadline）、
+        raw agent 应答循环里的 `read_frame`（事件循环，靠连接关闭结束，不是"步骤"）。
+      - 哨兵：`a_bare_client_waits_forever_while_a_bounded_one_gives_up` **在测试里同时证明**
+        "裸 client 对黑洞连接不会自己放弃"（缺陷本身）与"带窗口的 client 会自己放弃"（契约）。
+      - 注意：这些 client 与 `bounded` 共用同一个 `STEP_TIMEOUT`，所以窗口若调整（见 B 之后的
+        讨论），全部一起变。
+
+- [ ] **D. registry 评估 §7 步骤 6 的可选清理**（每项可单独取舍，都不改变行为）
+      - `pick()` 纯函数抽取（规则已被 `try_acquire_excluding` 的测试钉住）；
+      - 删 `Registry::try_acquire`（`registry.rs:686`，生产零调用，只有它自己的一条测试在用）。
+        ⚠️ `Registry::is_empty`（`:638`）**不能单独删**：`len()` 还在，clippy 的
+        `len_without_is_empty`（warn 级）会报——已用实验确认，要收就 `len()`/`is_empty()` 一起收；
+      - `stable_id` 索引（C4）：消掉摘除路径上的全表扫描；
+      - 可选的 `tunnel_health` 拆分：`Entry` 已不透明，此时拆才不是"搬迁同一份状态"。

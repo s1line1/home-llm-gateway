@@ -9,6 +9,8 @@ use std::{
     time::Instant,
 };
 
+use crate::sync::lock_or_recover;
+
 #[derive(Clone, Default)]
 pub struct Metrics {
     inner: Arc<MetricsInner>,
@@ -104,66 +106,42 @@ impl Metrics {
     /// 记录被 admission 拒绝的请求（不计 active/耗时，但计入请求数与状态码分布）。
     /// 记录一次"无可路由 agent"的拒绝及其原因（原因常量见 `proxy` 的调用点）。
     pub fn record_agent_rejection(&self, reason: &'static str) {
-        *self
-            .inner
-            .agent_rejections
-            .lock()
-            .unwrap()
+        *lock_or_recover(&self.inner.agent_rejections)
             .entry(reason)
             .or_insert(0) += 1;
     }
 
     /// 记录一次"因隧道建立失败而换 agent 重试"及其结果。
     pub fn record_tunnel_retry(&self, outcome: &'static str) {
-        *self
-            .inner
-            .tunnel_retries
-            .lock()
-            .unwrap()
+        *lock_or_recover(&self.inner.tunnel_retries)
             .entry(outcome)
             .or_insert(0) += 1;
     }
 
     /// 记录一次响应头超时（`kind`：`slow` = 还在回响应头，`silent` = 窗口内没有任何响应头）。
     pub fn record_head_timeout(&self, kind: &'static str) {
-        *self
-            .inner
-            .head_timeouts
-            .lock()
-            .unwrap()
+        *lock_or_recover(&self.inner.head_timeouts)
             .entry(kind)
             .or_insert(0) += 1;
     }
 
     /// 记录一次"客户端停滞 → 放弃"（`phase`：`request-body` / `response-body`）。
     pub fn record_client_stall(&self, phase: &'static str) {
-        *self
-            .inner
-            .client_stalls
-            .lock()
-            .unwrap()
+        *lock_or_recover(&self.inner.client_stalls)
             .entry(phase)
             .or_insert(0) += 1;
     }
 
     /// 记录一次开流超时（`kind`：`busy` = 背压排队，`dead` = 坏连接）。
     pub fn record_tunnel_open_timeout(&self, kind: &'static str) {
-        *self
-            .inner
-            .tunnel_open_timeouts
-            .lock()
-            .unwrap()
+        *lock_or_recover(&self.inner.tunnel_open_timeouts)
             .entry(kind)
             .or_insert(0) += 1;
     }
 
     /// 记录一次写请求帧失败（`kind`：`backpressure` = 写超时，`broken` = 写直接失败）。
     pub fn record_tunnel_write_failure(&self, kind: &'static str) {
-        *self
-            .inner
-            .tunnel_write_failures
-            .lock()
-            .unwrap()
+        *lock_or_recover(&self.inner.tunnel_write_failures)
             .entry(kind)
             .or_insert(0) += 1;
     }
@@ -175,11 +153,7 @@ impl Metrics {
 
     /// 记录请求结果状态码（在途槽位的释放不在此处，由 [`Admission`] 负责）。
     pub fn record_status(&self, status: u16) {
-        *self
-            .inner
-            .status_counts
-            .lock()
-            .unwrap()
+        *lock_or_recover(&self.inner.status_counts)
             .entry(status)
             .or_insert(0) += 1;
     }
@@ -228,7 +202,7 @@ impl Metrics {
         let mut out = String::with_capacity(512);
         out.push_str("# HELP hlmg_requests_total Total gateway requests by HTTP status.\n");
         out.push_str("# TYPE hlmg_requests_total counter\n");
-        let counts = inner.status_counts.lock().unwrap();
+        let counts = lock_or_recover(&inner.status_counts);
         let mut keys: Vec<u16> = counts.keys().copied().collect();
         keys.sort_unstable();
         for code in keys {
@@ -252,7 +226,7 @@ impl Metrics {
         out.push_str("# TYPE hlmg_agents_healthy gauge\n");
         out.push_str(&format!("hlmg_agents_healthy {agents_healthy}\n"));
         {
-            let retries = inner.tunnel_retries.lock().unwrap();
+            let retries = lock_or_recover(&inner.tunnel_retries);
             if !retries.is_empty() {
                 out.push_str("# HELP hlmg_tunnel_retries_total Requests retried on another agent after a tunnel setup failure, by outcome.\n");
                 out.push_str("# TYPE hlmg_tunnel_retries_total counter\n");
@@ -267,7 +241,7 @@ impl Metrics {
             }
         }
         {
-            let rej = inner.agent_rejections.lock().unwrap();
+            let rej = lock_or_recover(&inner.agent_rejections);
             if !rej.is_empty() {
                 out.push_str("# HELP hlmg_agent_rejections_total Requests rejected because no routable agent was available, by reason.\n");
                 out.push_str("# TYPE hlmg_agent_rejections_total counter\n");
@@ -282,7 +256,7 @@ impl Metrics {
             }
         }
         {
-            let cs = inner.client_stalls.lock().unwrap();
+            let cs = lock_or_recover(&inner.client_stalls);
             if !cs.is_empty() {
                 out.push_str("# HELP hlmg_client_stalls_total Requests abandoned because the client stopped making progress, by direction. Kept slots do not leak: each one is released when the request ends.\n");
                 out.push_str("# TYPE hlmg_client_stalls_total counter\n");
@@ -297,7 +271,7 @@ impl Metrics {
             }
         }
         {
-            let ht = inner.head_timeouts.lock().unwrap();
+            let ht = lock_or_recover(&inner.head_timeouts);
             if !ht.is_empty() {
                 out.push_str("# HELP hlmg_upstream_head_timeouts_total Response heads that exceeded head_timeout_secs; class=slow means the agent had answered recently and is merely blocked (504, not evicted), class=silent means nothing came back within the window (counts toward eviction).\n");
                 out.push_str("# TYPE hlmg_upstream_head_timeouts_total counter\n");
@@ -312,7 +286,7 @@ impl Metrics {
             }
         }
         {
-            let to = inner.tunnel_open_timeouts.lock().unwrap();
+            let to = lock_or_recover(&inner.tunnel_open_timeouts);
             if !to.is_empty() {
                 out.push_str("# HELP hlmg_tunnel_open_timeouts_total Tunnel stream opens that exceeded tunnel_op_secs; class=busy means the agent was at capacity (backpressure, not evicted), class=dead means the connection was treated as broken and evicted.\n");
                 out.push_str("# TYPE hlmg_tunnel_open_timeouts_total counter\n");
@@ -327,7 +301,7 @@ impl Metrics {
             }
         }
         {
-            let wf = inner.tunnel_write_failures.lock().unwrap();
+            let wf = lock_or_recover(&inner.tunnel_write_failures);
             if !wf.is_empty() {
                 out.push_str("# HELP hlmg_tunnel_write_failures_total Request frames that could not be written to the tunnel; class=backpressure means the write timed out (connection-level backpressure, not evicted), class=broken means the write returned an error (connection treated as broken and evicted).\n");
                 out.push_str("# TYPE hlmg_tunnel_write_failures_total counter\n");
@@ -432,5 +406,40 @@ pub struct AcceptingGuard(Metrics);
 impl Drop for AcceptingGuard {
     fn drop(&mut self) {
         self.0.inner.quic_accepting.store(0, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Metrics;
+
+    /// 规格（评估 §7 步骤 6 的结转项 A / `PROJECT_SCAN` P2-12）：**计数锁中毒后
+    /// `/metrics` 不能跟着挂**。
+    ///
+    /// 这些映射只被"加一"与"渲染"访问，守卫内 panic 不会写坏它们；而 `.lock().unwrap()`
+    /// 会把一次 panic 放大成"`/metrics` 永久 500"——恰恰是排障时最需要它的时刻。
+    #[test]
+    fn a_poisoned_counter_lock_does_not_take_metrics_down() {
+        let m = Metrics::default();
+        m.record_status(200);
+
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = m.inner.status_counts.lock().unwrap();
+            panic!("poison status_counts");
+        }));
+        assert!(poisoned.is_err(), "前提：panic 发生了");
+        assert!(m.inner.status_counts.is_poisoned(), "前提：锁中毒了");
+
+        // 写路径与渲染路径都必须照常
+        m.record_status(204);
+        let text = m.render(0, 0, 0, 0);
+        assert!(
+            text.contains("hlmg_requests_total{status=\"200\"} 1"),
+            "渲染必须带上中毒前的计数：\n{text}"
+        );
+        assert!(
+            text.contains("hlmg_requests_total{status=\"204\"} 1"),
+            "中毒后新记的状态码也要出现：\n{text}"
+        );
     }
 }

@@ -135,6 +135,29 @@ pub async fn bounded_within<F: std::future::Future>(
     }
 }
 
+/// 测试用 reqwest client：**整条请求（含读响应体）的总超时**为 [`STEP_TIMEOUT`]。
+///
+/// "这一步本该完成"的用例一律用它——一个裸 `Client::new()` 会一直等下去（见哨兵
+/// `a_bare_client_waits_forever_while_a_bounded_one_gives_up`），而 e2e 是 `#[serial]`：
+/// 一处卡住 = `cargo test` 下整个套件无限期挂起、nextest 下只有一句 TIMEOUT。
+///
+/// **三类必须继续用裸 client**（它们要的就是"卡住"）：
+/// - `stalls.rs`（请求体/响应体停滞）、`write_backpressure.rs`（写背压）：
+///   断言的前提就是客户端不被服务；
+/// - `https.rs::e2e_proxy_protocol_edge_cases`：好几个断言期待"body 读到一半出错"，
+///   加了总超时会让它们变成"超时才出错"，断言虽仍通过但验的不是同一件事。
+pub fn test_client() -> reqwest::Client {
+    test_client_within(STEP_TIMEOUT)
+}
+
+/// 同 [`test_client`]，窗口可指定（哨兵测试要毫秒级窗口）。
+pub fn test_client_within(limit: Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(limit)
+        .build()
+        .expect("reqwest client")
+}
+
 pub async fn start_mock_llm(name: &str) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -392,7 +415,7 @@ pub async fn spawn_raw_agent(
 
 #[cfg(test)]
 mod step_guard_tests {
-    use super::{bounded_within, STEP_TIMEOUT};
+    use super::{bounded_within, test_client_within, STEP_TIMEOUT};
     use std::time::Duration;
 
     /// 守卫**不能吞掉结果**：正常完成的步骤原样返回。
@@ -464,5 +487,43 @@ mod step_guard_tests {
         )
         .await
         .unwrap();
+    }
+
+    /// 规格（`PROJECT_SCAN` P2-17 的剩余部分）：**裸 client 会一直等下去，
+    /// 带总超时的 client 会自己放弃**。
+    ///
+    /// 前半句是这个缺陷本身（e2e 里绝大多数请求以前就是裸 client），后半句是
+    /// [`test_client`] 的契约。窗口取毫秒级，所以这条哨兵本身是毫秒级的。
+    #[tokio::test]
+    async fn a_bare_client_waits_forever_while_a_bounded_one_gives_up() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // 黑洞：accept 之后既不读也不写，永远不回响应
+        tokio::spawn(async move {
+            let _held = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let url = format!("http://{addr}/healthz");
+
+        // ① 裸 client：500ms 的外层窗口内不会返回（这就是缺陷）
+        let bare = reqwest::Client::new();
+        let hung = tokio::time::timeout(Duration::from_millis(500), bare.get(&url).send()).await;
+        assert!(
+            hung.is_err(),
+            "前提：裸 client 对黑洞连接不会自己放弃（否则这条哨兵没测到东西）"
+        );
+
+        // ② 带窗口的 client：在窗口量级返回错误，而不是陪着一起卡住
+        let t0 = std::time::Instant::now();
+        let gave_up = test_client_within(Duration::from_millis(200))
+            .get(&url)
+            .send()
+            .await;
+        assert!(gave_up.is_err(), "总超时到点必须报错");
+        assert!(
+            t0.elapsed() < Duration::from_millis(400),
+            "应在超时量级返回，实际 {:?}",
+            t0.elapsed()
+        );
     }
 }

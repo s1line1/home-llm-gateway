@@ -30,7 +30,8 @@ use rusqlite::Connection;
 use serde::Serialize;
 
 // `now_secs` 只用于 `last_used_at`，与凭据表里的 `created_at` 同源（都在 `super::hash`）。
-use super::{hash::now_secs, lock_or_recover, read_or_recover, write_or_recover};
+use super::hash::now_secs;
+use crate::sync::{lock_or_recover, read_or_recover, write_or_recover};
 
 /// 每 key 的用量明细（/admin/usage 序列化用）。
 #[derive(Debug, Clone, Serialize)]

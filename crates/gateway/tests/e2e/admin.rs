@@ -8,7 +8,7 @@ async fn e2e_admin_api_keys() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     let (gw, agent, base, key) =
         start_stack(4, |o| o.admin_token = Some("admin-token".into())).await;
-    let client = reqwest::Client::new();
+    let client = test_client();
 
     // 无 admin token → 401；普通 API key 也不行
     let resp = client
@@ -119,7 +119,7 @@ async fn e2e_usage_metering() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     let (gw, agent, base, key) =
         start_stack(4, |o| o.admin_token = Some("admin-token".into())).await;
-    let client = reqwest::Client::new();
+    let client = test_client();
 
     // 非流式 chat ×2（mock 每次返回 usage prompt 1 / completion 1）
     for _ in 0..2 {
@@ -238,7 +238,7 @@ async fn e2e_openai_error_semantics() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     let (gw, agent, base, key) =
         start_stack(4, |o| o.admin_token = Some("admin-token".into())).await;
-    let client = reqwest::Client::new();
+    let client = test_client();
 
     // 401：无 key → authentication_error
     let resp = client
@@ -281,7 +281,7 @@ async fn e2e_openai_error_semantics() {
 
     // 429：限流（每 key 1 次/分钟）→ rate_limit_error + Retry-After
     let (gw2, agent2, base2, key2) = start_stack(4, |o| o.rate_limit_per_min = 1).await;
-    let client2 = reqwest::Client::new();
+    let client2 = test_client();
     let req = || {
         client2
             .get(format!("{base2}/v1/models"))
@@ -358,7 +358,7 @@ async fn e2e_usage_write_does_not_stall_the_response() {
     });
     locked_rx.recv().expect("锁已取得");
 
-    let client = reqwest::Client::new();
+    let client = test_client();
     let base = format!("http://{}", gw.http_addr);
     let started = std::time::Instant::now();
     let resp = client

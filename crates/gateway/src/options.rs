@@ -106,6 +106,21 @@ pub struct Options {
     pub rate_limit_per_min: u32,
     /// HTTP 全局在途请求上限（0 = 不限）。
     pub max_concurrent_requests: u32,
+    /// 公网入口的**并发连接数**上限（0 = 不限）。
+    ///
+    /// 为什么需要：准入闸门（`max_concurrent_requests`）在**解析出请求之后**才生效，
+    /// 所以半开连接——连上不发 ClientHello、或发了半个请求头——既不受它约束，也原本
+    /// 没有任何超时，只受 NOFILE 约束（启动时抬到 16384）。这类连接只占 fd 与任务，
+    /// 进程、QUIC、`/healthz` 全都正常，是最安静的一种资源耗尽。
+    ///
+    /// 满额时的行为是**暂停 accept**（新连接留在内核 backlog 里排队），而不是先收进来
+    /// 再拒绝：突发流量只会变慢，不会变成 5xx，fd 也不会被吃光。所以它不适合当限流闸用
+    /// （那是 `max_concurrent_requests` 的活）。
+    ///
+    /// 1024 的依据：README 的 NOFILE 一节实测过"768 个并发客户端 → fd 峰值 785"，
+    /// 1024 在那条水位之上留了余量；而一条 SSE 长流只占一条连接，正常负载远低于此。
+    /// 需要更多就调大，或设 0 表示不限（回到"只受 NOFILE 约束"的旧行为）。
+    pub max_entry_connections: usize,
     /// 每条 agent 连接上允许同时在途的隧道流数（QUIC 双向流额度）。
     ///
     /// s2n-quic 的 `initial_max_streams_bidi` 默认 **100**，实际可用额度取
@@ -158,6 +173,8 @@ impl Options {
     pub const DEFAULT_AGENT_STALE_AFTER: Duration = Duration::from_secs(15);
     /// 客户端停滞阈值默认值。
     pub const DEFAULT_CLIENT_STALL: Duration = Duration::from_secs(60);
+    /// 公网入口并发连接数默认上限。见 [`Options::max_entry_connections`]。
+    pub const DEFAULT_MAX_ENTRY_CONNECTIONS: usize = 1024;
     /// 每连接隧道流额度默认值（依据见 `config::default_max_open_tunnel_streams`）。
     pub const DEFAULT_MAX_OPEN_TUNNEL_STREAMS: u32 = 1024;
     /// 关闭时强制落库的等待上限默认值。见 [`Options::shutdown_flush_timeout`]。
@@ -198,6 +215,7 @@ impl Default for Options {
             client_stall: Self::DEFAULT_CLIENT_STALL,
             rate_limit_per_min: 0,
             max_concurrent_requests: 0,
+            max_entry_connections: Self::DEFAULT_MAX_ENTRY_CONNECTIONS,
             max_open_tunnel_streams: Self::DEFAULT_MAX_OPEN_TUNNEL_STREAMS,
             shutdown_flush_timeout: Self::DEFAULT_SHUTDOWN_FLUSH_TIMEOUT,
             shutdown_grace: Self::DEFAULT_SHUTDOWN_GRACE,

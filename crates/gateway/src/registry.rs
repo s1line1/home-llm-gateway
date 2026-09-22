@@ -12,6 +12,8 @@ use std::{
 use serde::Serialize;
 use tracing::{info, warn};
 
+use crate::sync::{read_or_recover, write_or_recover};
+
 /// 连接身份发号器：给每条注册进来的连接发一个**进程内唯一且永不复用**的编号。
 ///
 /// 为什么不用 `Handle::id()`：那是 s2n-quic 的**端点内部**连接序号，源码注释写的是
@@ -342,7 +344,7 @@ impl Registry {
         // 写锁下只碰 map（与 `evict` 同一条纪律）：被顶替的那条连接的关闭动作留到锁外，
         // 免得把传输调用夹在守卫里。
         let superseded = {
-            let mut inner = self.inner.write().unwrap();
+            let mut inner = write_or_recover(&self.inner);
             let superseded = match inner.get(&agent_id) {
                 Some(old) if old.stable_id != stable_id => {
                     warn!(agent = %agent_id, "duplicate agent connection, closing old one");
@@ -387,7 +389,7 @@ impl Registry {
     /// 每来一帧心跳（agent 侧每 5s 一帧，多 agent 时叠加）就把**所有正在选路的读锁**挡在门外。
     /// 换成原子毫秒后，这个热点不再与路由争锁。
     pub fn heartbeat(&self, agent_id: &str) {
-        if let Some(e) = self.inner.read().unwrap().get(agent_id) {
+        if let Some(e) = read_or_recover(&self.inner).get(agent_id) {
             let now = now_millis();
             e.last_seen_millis.store(now, Ordering::Relaxed);
             // 同时也是"对端说过话"的证据：响应头静默判据的第二层靠它（见 `Entry::peer_alive`）。
@@ -397,7 +399,7 @@ impl Registry {
 
     /// 仅当条目仍对应给定连接（stable_id）时才移除，防止误删新连接的同名条目。
     pub fn remove_if_same(&self, agent_id: &str, stable_id: usize) {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = write_or_recover(&self.inner);
         if let Some(e) = inner.get(agent_id) {
             if e.stable_id == stable_id {
                 inner.remove(agent_id);
@@ -429,7 +431,7 @@ impl Registry {
     /// （云端实测 `hlmg_agents 1`），扫 4 个元素远比它旁边那次 HTTP 往返便宜。真要动它，
     /// 先拿 profiling 说话（评估 §2 C4 的结论也是"别在没数据时动"）。
     pub fn note_tunnel_op_ok(&self, stable_id: usize) {
-        let inner = self.inner.read().unwrap();
+        let inner = read_or_recover(&self.inner);
         if let Some(e) = inner.values().find(|e| e.stable_id == stable_id) {
             e.open_timeouts.store(0, Ordering::Relaxed);
             e.head_timeouts.store(0, Ordering::Relaxed);
@@ -517,7 +519,7 @@ impl Registry {
         // unwind 中释放 → 锁**永久中毒**，之后每一次 register/heartbeat/选路都跟着 panic
         // （评估 §5 H3）。这条纪律对 `register` 同样适用。
         let (agent_id, entry, n, inflight) = {
-            let mut inner = self.inner.write().unwrap();
+            let mut inner = write_or_recover(&self.inner);
             let hit = inner
                 .iter()
                 .find(|(_, e)| e.stable_id == stable_id)
@@ -587,7 +589,7 @@ impl Registry {
     }
 
     pub fn len(&self) -> usize {
-        self.inner.read().unwrap().len()
+        read_or_recover(&self.inner).len()
     }
 
     /// 注册表里 **心跳未过期** 的 agent 数（= 真正能被路由的候选数）。
@@ -597,7 +599,7 @@ impl Registry {
     /// 但它**不参与路由**。排查"所有请求 503"时必须能区分这两者——否则会误判为
     /// "agent 掉了"，实际是"注册表里有、但全部不健康"。
     pub fn healthy_count(&self, stale_after: Duration) -> usize {
-        let inner = self.inner.read().unwrap();
+        let inner = read_or_recover(&self.inner);
         let now = now_millis();
         inner
             .values()
@@ -607,7 +609,7 @@ impl Registry {
 
     /// 挑不出候选时的诊断快照（只用于失败路径的日志/指标，不进热路径）。
     pub fn status(&self, stale_after: Duration) -> RegistryStatus {
-        let inner = self.inner.read().unwrap();
+        let inner = read_or_recover(&self.inner);
         let now = now_millis();
         let mut healthy = 0usize;
         let mut oldest: Option<Duration> = None;
@@ -636,12 +638,12 @@ impl Registry {
     /// `struct Registry has a public len method, but no is_empty method`，而 CI 跑的是
     /// `clippy -- -D warnings`）。它是与 [`Self::len`] 配对存在的方法，不是死代码。
     pub fn is_empty(&self) -> bool {
-        self.inner.read().unwrap().is_empty()
+        read_or_recover(&self.inner).is_empty()
     }
 
     /// 返回全部已注册 agent 的明细快照（按 agent_id 排序）。
     pub fn snapshot(&self) -> Vec<AgentInfo> {
-        let inner = self.inner.read().unwrap();
+        let inner = read_or_recover(&self.inner);
         let now = now_millis();
         let mut out: Vec<AgentInfo> = inner
             .iter()
@@ -661,7 +663,7 @@ impl Registry {
     /// 聚合所有**健康** agent 显式声明的模型（去重、排序）。
     /// `["*"]` 不贡献条目（全匹配，但具体能跑什么只有上游知道）。
     pub fn healthy_models(&self, stale_after: Duration) -> Vec<String> {
-        let inner = self.inner.read().unwrap();
+        let inner = read_or_recover(&self.inner);
         let now = now_millis();
         let mut out: Vec<String> = inner
             .values()
@@ -700,7 +702,7 @@ impl Registry {
         model: &str,
         exclude: &[usize],
     ) -> Result<(Entry, SlotGuard), AcquireError> {
-        let inner = self.inner.read().unwrap();
+        let inner = read_or_recover(&self.inner);
         let now = now_millis();
         let mut candidates: Vec<&Entry> = inner
             .values()
@@ -892,6 +894,29 @@ mod tests {
             .unwrap();
         let (handle, _acceptor) = conn.split();
         handle
+    }
+
+    /// 规格（评估 §7 步骤 6 的结转项 A / registry 评估 M2）：**表锁中毒后注册与选路
+    /// 不能全挂**。
+    ///
+    /// 表只是内存映射，守卫内 panic 不会写坏它；而 `.read().unwrap()` 会把一次 panic
+    /// 放大成"之后每个请求都无法选路"——进程活着、指标还在跑，但全站 503。
+    #[tokio::test]
+    async fn a_poisoned_registry_lock_does_not_take_routing_down() {
+        let reg = Registry::default();
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = reg.inner.write().unwrap();
+            panic!("poison the registry table");
+        }));
+        assert!(poisoned.is_err(), "前提：panic 发生了");
+        assert!(reg.inner.is_poisoned(), "前提：锁中毒了");
+
+        let conn = test_connection().await;
+        reg.register("home-1".into(), vec!["m".into()], 2, conn);
+        assert_eq!(reg.len(), 1, "中毒后仍应能注册");
+        let (_entry, _slot) = reg
+            .try_acquire(Duration::from_secs(10), "m")
+            .expect("中毒后仍应能选路");
     }
 
     #[tokio::test]

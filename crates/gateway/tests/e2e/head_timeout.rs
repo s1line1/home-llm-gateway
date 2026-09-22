@@ -28,7 +28,7 @@ async fn e2e_slow_head_does_not_evict_an_agent_that_is_still_answering() {
         o.client_stall = Duration::from_secs(5);
     })
     .await;
-    let client = reqwest::Client::new();
+    let client = test_client();
     let normal = || {
         client
             .post(format!("{base}/v1/chat/completions"))
@@ -105,7 +105,7 @@ async fn e2e_silent_agent_is_still_evicted_after_the_window() {
         o.client_stall = Duration::from_secs(5);
     })
     .await;
-    let client = reqwest::Client::new();
+    let client = test_client();
     let connections_before = metric_gauge(&base, "hlmg_agent_connections_total").await;
 
     // 一个个慢请求打过去（每个都超过 head_timeout），中间**不做**任何成功请求，
@@ -190,7 +190,7 @@ async fn e2e_uniformly_slow_traffic_does_not_evict_a_heartbeating_agent() {
         o.head_silent_grace = Duration::from_secs(5);
     })
     .await;
-    let client = reqwest::Client::new();
+    let client = test_client();
 
     // 先建立一个"最近成功过响应头"的事实（同时也让判据不走"从未回过"那条快路径）。
     let ok = client
