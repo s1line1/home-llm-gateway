@@ -879,6 +879,28 @@
         `sqlite3_busy_timeout(db, 5000)`，见 vendored `inner_connection.rs:118`），scan 的批次清单
         已标注，不再排期。
 
+
+- [x] **K. H8 复核：写帧超时不会导致双执行（2026-09-22 完成，结论=推翻）**（评估 H8）
+      - 原担忧：`write_frame` 是非原子 `write_all`，若"整帧已送达而超时先到"，换 agent 重放就会
+        **双执行**；另外旧流可能残留半帧、挂到连接关闭。
+      - 复核结论：**不可达**，四条独立的腿（每条都可在仓库里指出来）：
+        ① 超时的 `write_all` 被 drop ⇒ 对端只拿到**严格前缀**
+        （`proto::io::tests::a_timed_out_write_leaves_only_a_strict_prefix_of_the_frame`，
+        用"前 N 字节照收、之后永远 Pending"的 writer 钉住）；
+        ② 重试必然**换新流**：`routing::open_and_send` 每轮重新 `try_acquire_excluding` +
+        `open_tunnel`，剩余字节绝不补写到旧流；
+        ③ 丢弃旧 `SendStream` 会调 `finish()`（s2n-quic `send.rs` 的 `finish` 文档明写
+        "This method will be called when the stream is dropped"）⇒ 对端在帧中途收到 FIN
+        ⇒ `FrameReader` 报 `early eof` ⇒ **既不执行也不挂住**；
+        ④ `tokio::time::timeout` **先轮询内层 future**（`timeout.rs:217`）⇒ 写完成不可能被误判超时。
+      - 实测：e2e `write_backpressure::e2e_a_write_that_times_out_mid_frame_never_reaches_the_agent_as_a_request`
+        ——8MiB 帧、`tunnel_op_timeout=300ms`、对端只读 64 字节就停（客户端拿到
+        `502 tunnel write timed out`，`hlmg_tunnel_write_failures_total{class="backpressure"}≥1`），
+        放行后对端报告 `EofMidFrame("early eof", saw_eof=true)`：**只拿到前缀 + 干净的 FIN**，
+        从未解出完整 `ProxyRequest`。README 的《能重试什么》那一行按实测补齐了这两条依据。
+      - 过程小坑（写进测试注释）：对端"先读的那 64 字节"必须留在手里再接后续——丢掉就字节流错位，
+        `FrameReader` 会把垃圾当长度前缀（实测报 `frame too large`），断言会因错误的原因变绿。
+
 - [x] **D. registry 评估 §7 步骤 6 的可选清理（2026-09-21 处置完毕：两项落地、两项裁定不做）**
       - ✅ **`pick()` 抽成纯函数**（`registry::pick`）：次序（新鲜 → 排除 → 模型 → 精确优先 →
         负载轻 → 心跳新）与两个错误变体（`NoAgent` / `NoModel`）都在一处；新增

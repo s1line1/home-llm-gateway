@@ -132,3 +132,232 @@ async fn e2e_write_timeout_does_not_evict_the_agent() {
 
     gw.shutdown().await;
 }
+
+/// "读到一半就停"的裸 agent 最终**解出了什么**——H8 的判据只能由对端自己给。
+#[derive(Debug)]
+pub enum HalfReadOutcome {
+    /// 解出了一个**完整**的 `ProxyRequest`：写到一半被放弃的帧仍然被执行了（双执行——H8 的红）。
+    CompleteRequestFrame,
+    /// 帧中途 EOF：网关放弃那条流时 `SendStream` 的 Drop 会 `finish()`，对端 `read_exact`
+    /// 拿到 `UnexpectedEof` ⇒ 请求永远不会被处理。
+    ///
+    /// 第二项：对端是**读到流结束**（`read` 返回 0）还是"3 秒静默"——`true` 才证明网关
+    /// 关掉了那条被放弃的流，而不是把它挂在那里（H8 原记录的另一种担忧）。
+    EofMidFrame(String, bool),
+    /// 恢复读取后一个字节都没再来（既没帧也没 EOF）。
+    NothingMore,
+    /// 读取出错。
+    ReadError(String),
+}
+
+/// 起一个**读到一半就停**的裸 QUIC agent：注册成功后接受第一条请求流、只读一小段就停住
+/// （让网关的 `write_frame` 撑爆流控窗口而超时），随后由调用方发信号让它**恢复读取**，
+/// 并把"最终解出了什么"报告回来。
+///
+/// 为什么必须有这个 peer（评估记录 H8）：`write_frame` 是一次非原子的 `write_all`，写超时
+/// 只意味着"没写完"，而"没写完的帧会不会仍然被执行"只能由对端回答。
+async fn spawn_half_reading_agent(
+    gw: &Gateway,
+    certs: &TestCerts,
+    agent_id: &str,
+    first_read: usize,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<HalfReadOutcome>,
+) {
+    use tokio::io::AsyncReadExt;
+
+    let client = s2n_quic::Client::builder()
+        .with_tls(s2n_quic::provider::tls::rustls::Client::from(
+            std::sync::Arc::new(
+                agent::tls::rustls_client_tls(
+                    &certs.ca,
+                    certs.client_cert.clone(),
+                    certs.client_key.clone_key(),
+                )
+                .unwrap(),
+            ),
+        ))
+        .unwrap()
+        .with_io("0.0.0.0:0")
+        .unwrap()
+        .start()
+        .unwrap();
+    let conn = client
+        .connect(s2n_quic::client::Connect::new(gw.quic_addr).with_server_name("localhost"))
+        .await
+        .unwrap();
+    let (mut handle, mut acceptor) = conn.split();
+
+    // 注册（与 `spawn_raw_agent` 同一套；注册流由 agent 自己开）
+    let stream = handle.open_bidirectional_stream().await.unwrap();
+    let (mut reg_recv, mut reg_send) = stream.split();
+    write_frame(
+        &mut reg_send,
+        &Frame::Register {
+            agent_id: agent_id.into(),
+            models: vec!["mock-llm".into()],
+            max_concurrency: 4,
+            version: "test".into(),
+        },
+    )
+    .await
+    .unwrap();
+    reg_send.finish().unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut reg_recv)).await;
+    wait_for_agents(gw, 1, Duration::from_secs(5)).await;
+
+    let (go_tx, go_rx) = tokio::sync::oneshot::channel();
+    let (out_tx, out_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        // `conn` 已被 `split()` 消耗，保活靠它分出来的 handle/acceptor
+        let _keep_alive = (client, handle, reg_recv);
+        let Ok(Some(stream)) = acceptor.accept_bidirectional_stream().await else {
+            let _ = out_tx.send(HalfReadOutcome::ReadError("no request stream".into()));
+            return;
+        };
+        let (mut recv, _send) = stream.split();
+
+        // ① 只读第一小段就停住：之后的字节留在流控窗口里，网关的写会 park 到超时。
+        //    ⚠️ 这一小段必须留在手里：帧是从**第一个字节**开始按长度前缀解析的，
+        //    恢复读取时把它丢掉就会错位，`FrameReader` 会把垃圾当长度（实测报 "frame too large"）。
+        let mut first = vec![0u8; first_read];
+        let mut acc: Vec<u8> = Vec::new();
+        if let Ok(Ok(n)) = tokio::time::timeout(Duration::from_secs(5), recv.read(&mut first)).await
+        {
+            acc.extend_from_slice(&first[..n]);
+        }
+
+        // ② 等调用方放行（此时网关已经超时、重试并放弃过这条流）
+        let _ = go_rx.await;
+
+        // ③ 把之后收到的一切都接在后面（EOF / 出错 / 静默 3s 为止）
+        let mut read_error: Option<String> = None;
+        let mut saw_eof = false;
+        loop {
+            let mut buf = vec![0u8; 64 * 1024];
+            match tokio::time::timeout(Duration::from_secs(3), recv.read(&mut buf)).await {
+                Ok(Ok(0)) => {
+                    saw_eof = true;
+                    break;
+                }
+                Err(_) => break, // 静默：没等到 EOF
+                Ok(Ok(n)) => acc.extend_from_slice(&buf[..n]),
+                Ok(Err(e)) => {
+                    read_error = Some(e.to_string());
+                    break;
+                }
+            }
+        }
+
+        // ④ 用**生产代码的读取器**解释这堆字节：能解出完整 ProxyRequest 才是双执行。
+        let outcome = match proto::io::FrameReader::new(&acc[..]).next().await {
+            Ok(Some(Frame::ProxyRequest { .. })) => HalfReadOutcome::CompleteRequestFrame,
+            Ok(Some(other)) => {
+                HalfReadOutcome::EofMidFrame(format!("解出的是别的帧：{other:?}"), saw_eof)
+            }
+            Ok(None) => match read_error {
+                Some(e) => HalfReadOutcome::ReadError(e),
+                None => HalfReadOutcome::NothingMore,
+            },
+            Err(e) => HalfReadOutcome::EofMidFrame(e.to_string(), saw_eof),
+        };
+        let _ = out_tx.send(outcome);
+    });
+
+    (go_tx, out_rx)
+}
+
+/// 规格（评估记录 H8 的验证）：**写到一半被超时放弃的帧，不可能在对端变成一次执行**。
+///
+/// H8 的担忧是"整帧已送达而超时先到 ⇒ 换 agent 重放 ⇒ 双执行"。用一个**读到一半就停**的
+/// peer 直接验证：网关的写超时之后（`hlmg_tunnel_write_failures_total{class="backpressure"}`），
+/// 让对端恢复读取，用生产代码的 `FrameReader` 解释它收到的字节——它只能拿到真帧的一个前缀
+/// （机制见 `proto::io::tests::a_timed_out_write_leaves_only_a_strict_prefix_of_the_frame`），
+/// 因此**永远解不出完整的 `ProxyRequest`**。
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn e2e_a_write_that_times_out_mid_frame_never_reaches_the_agent_as_a_request() {
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    let TestGateway {
+        gw,
+        certs,
+        key,
+        base,
+        ..
+    } = start_gateway(|o| {
+        o.tunnel_op_timeout = Duration::from_millis(300);
+        o.head_timeout = Duration::from_secs(3);
+        o.request_timeout = Duration::from_secs(10);
+        o.client_stall = Duration::from_secs(60);
+    })
+    .await;
+
+    // 只读 64 字节就停：剩下的 8 MiB 帧必然撑爆流控窗口
+    let (go, outcome) = spawn_half_reading_agent(&gw, &certs, "half-reader", 64).await;
+
+    let big = "x".repeat(8 * 1024 * 1024);
+    let resp = tokio::time::timeout(
+        Duration::from_secs(10),
+        reqwest::Client::new()
+            .post(format!("{base}/v1/chat/completions"))
+            .header("Authorization", format!("Bearer {key}"))
+            .json(&serde_json::json!({
+                "model": "mock-llm",
+                "messages": [{ "role": "user", "content": big }],
+            }))
+            .send(),
+    )
+    .await
+    .expect("请求必须在隧道超时量级内结束")
+    .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_GATEWAY,
+        "前提：这次失败必须来自**写帧超时**（不是等响应头）"
+    );
+    let body = resp.text().await.unwrap_or_default();
+    assert!(
+        body.contains("tunnel write timed out"),
+        "前提：失败原因应当是写超时，实际：{body}"
+    );
+    let backpressure = metric_gauge(
+        &base,
+        "hlmg_tunnel_write_failures_total{class=\"backpressure\"}",
+    )
+    .await;
+    assert!(backpressure >= 1, "前提：写超时必须被记成背压");
+
+    // 让对端恢复读取，看它到底能解出什么
+    go.send(()).unwrap();
+    let outcome = tokio::time::timeout(Duration::from_secs(10), outcome)
+        .await
+        .expect("对端应当在几秒内报告结论")
+        .unwrap();
+    match &outcome {
+        // 期望形态：对端只拿到真帧的前缀，读到流结束时 `read_exact` 报"帧中途 EOF"。
+        HalfReadOutcome::EofMidFrame(e, saw_eof) => {
+            assert!(
+                e.contains("early eof"),
+                "半帧必须表现为「帧中途 EOF」；报别的错说明对端字节流错位或损坏，值得查：{e}"
+            );
+            assert!(
+                *saw_eof,
+                "对端必须是**读到流结束**才停在半帧的——那说明网关关掉了被放弃的流；\
+                 若是「静默 3 秒」则说明它还挂着（H8 原记录的另一种担忧）"
+            );
+        }
+        // 这两种同样是"没执行"（流被 reset、或对端恢复读取后什么都没再来）
+        HalfReadOutcome::ReadError(e) => {
+            eprintln!("H8: 对端读到流错误（也算没执行）：{e}")
+        }
+        HalfReadOutcome::NothingMore => eprintln!("H8: 对端恢复读取后没有新字节（也算没执行）"),
+        // 这一档才是 H8 的红：写到一半被放弃的帧仍然被执行了
+        HalfReadOutcome::CompleteRequestFrame => {
+            panic!("写到一半被放弃的帧在对端变成了**完整请求**——那就是双执行（H8）")
+        }
+    }
+    eprintln!("H8: 卡在中途的 peer 最终看到：{outcome:?}");
+
+    gw.shutdown().await;
+}

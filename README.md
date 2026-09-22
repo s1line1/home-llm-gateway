@@ -312,7 +312,7 @@ max_concurrency: 4
 | 失败点 | 是否重试 | 依据 |
 |---|---|---|
 | 打开隧道流失败 | **重试**（换另一个 agent） | 还没写过任何字节，请求帧必然**未送达** |
-| 写请求帧失败 | **重试**（换另一个 agent） | `write_frame` 是一整块 `write_all`，只有**全部字节被接受**才返回；超时 ⇒ 帧不完整 ⇒ agent 读不到完整帧（`FrameReader` 先读满长度前缀+载荷）⇒ 它不会调用上游 |
+| 写请求帧失败 | **重试**（换另一个 agent） | `write_frame` 是一整块 `write_all`，只有**全部字节被接受**才返回；超时 ⇒ 帧不完整 ⇒ agent 读不到完整帧（`FrameReader` 先读满长度前缀+载荷）⇒ 它不会调用上游。2026-09-22 用"读到一半就停"的 peer 实测确认（`tests/e2e/write_backpressure.rs`）：对端只拿到真帧的**严格前缀**，随后收到网关 `SendStream` Drop 时的 `finish()`（= FIN）⇒ `FrameReader` 报 `early eof`，那条流上的请求**永远不会被执行**，也不会挂在连接上。另一半同样成立：`tokio::time::timeout` **先轮询内层 future**，所以"整帧已送达但超时先到"这种情况根本不会被判成失败（`tokio::time::timeout` 的 `Timeout::poll` 第一句就是 `me.value.poll(cx)`） |
 | **等响应头超时** | **不重试** | 请求帧已完整送达，**模型可能已经在执行**；重试会重复计费、重复生成（`temperature > 0` 时结果还不一样）。宁可报错，也不做不安全的静默重放 |
 | 响应体中途断流/超时 | 不重试 | 已经产出字节，无法重放 |
 
