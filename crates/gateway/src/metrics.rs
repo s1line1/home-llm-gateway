@@ -28,6 +28,13 @@ struct MetricsInner {
     total_duration_ms: AtomicU64,
     /// 累计请求数（含 /metrics 之外的所有请求）。
     request_count: AtomicU64,
+    /// **写出状态码之前**就被丢弃的请求数（客户端断开 / 连接被掐 / future 被 drop）。
+    ///
+    /// 为什么必须单独记：`request_count` 在准入成功时就 +1，而状态码是在处理返回之后才记的；
+    /// 中断路径上后者永远不执行 → 仓库自用的"僵尸槽位"判据 `request_count − Σ状态码`
+    /// 会**每个中断漂移 +1**，把真泄漏淹没。减掉这一项之后恒等式才重新可判
+    /// （见 `render` 里 `hlmg_requests_aborted_total` 的 HELP 与 `README.md` 的排障一节）。
+    aborted: AtomicU64,
     /// 当前在线 QUIC 连接数（隧道层 gauge）。
     quic_connections: AtomicU64,
     /// 累计 agent 连接次数（重连计数，counter）。
@@ -156,6 +163,23 @@ impl Metrics {
         *lock_or_recover(&self.inner.status_counts)
             .entry(status)
             .or_insert(0) += 1;
+    }
+
+    /// 记一次「请求在写出状态码之前被丢弃」。由 `metrics_middleware` 的 RAII 守卫调用
+    /// （见 `http/observability.rs`）：取消没有"出口"可写，只有 Drop 能覆盖。
+    pub fn record_aborted(&self) {
+        self.inner.aborted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 三项供测试核对恒等式 `request_count − Σ状态码 − aborted == 0`（真泄漏才会让它 >0）。
+    #[cfg(test)]
+    pub fn identity_terms(&self) -> (u64, u64, u64) {
+        let status_total: u64 = lock_or_recover(&self.inner.status_counts).values().sum();
+        (
+            self.inner.request_count.load(Ordering::Relaxed),
+            status_total,
+            self.inner.aborted.load(Ordering::Relaxed),
+        )
     }
 
     pub fn add_bytes_out(&self, n: usize) {
@@ -332,6 +356,16 @@ impl Metrics {
         out.push_str(&format!(
             "hlmg_request_count {}\n",
             inner.request_count.load(Ordering::Relaxed)
+        ));
+        // HELP/TYPE 必须**紧贴**在各自样本之前（Prometheus 文本格式按"家族"解析），
+        // 所以这一条整块放在 request_count 之后，而不是插进它的 HELP 与 TYPE 之间。
+        out.push_str(
+            "# HELP hlmg_requests_aborted_total Requests dropped before a status was written (client aborted or the connection was cut).\n",
+        );
+        out.push_str("# TYPE hlmg_requests_aborted_total counter\n");
+        out.push_str(&format!(
+            "hlmg_requests_aborted_total {}\n",
+            inner.aborted.load(Ordering::Relaxed)
         ));
         out.push_str(
             "# HELP hlmg_key_verify_hits_total Cached key verifications served without argon2.\n",

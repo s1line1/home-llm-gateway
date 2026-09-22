@@ -404,6 +404,11 @@ s2n-quic 的 `initial_max_streams_bidi` 默认只有 **100**（`InitialMaxStream
 当前 `max_concurrent_requests: 5000` 时无害，但按本文件的内存口径生产该是 ~32 量级，
 8 个就是 25%，且**只能重启恢复**。
 
+> ⚠️ 判据要**减掉中断**：`僵尸槽位 = hlmg_request_count − Σ状态码 − hlmg_requests_aborted_total`。
+> 客户端中途断开时 hyper 会 drop 掉 handler 的 future——准入数已经 +1 而状态码永远写不出来，
+> 不减这一项的话每中断一次差值就漂移 +1，真泄漏会被淹没（2026-09-22 修：中断单独计数，
+> 由 `metrics_middleware` 的 RAII 守卫补记）。上面那次历史事故里没有中断参与，所以当时直接对得上。
+
 判定的是**停滞**而不是**总时长**：该方向只要还有字节在动就持续续期，所以慢而持续的大 body
 上传、弱网下逐块到达的 SSE 都不会被误杀。五个方向共用同一个 `client_stall_secs`。
 回归测试：`tests/e2e/stalls.rs`（请求体停滞、响应体停滞各一条；判据是 `max_concurrent_requests: 1`

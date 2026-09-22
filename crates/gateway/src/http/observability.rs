@@ -42,6 +42,42 @@ use crate::state::AppState;
 ///   - status >= 500 → error（真实失败：tunnel/upstream/内部错误）
 ///
 /// 需要临时恢复全量访问日志：`RUST_LOG=info,gateway::access=debug`
+/// 请求在**写出状态码之前**被丢弃（客户端断开 / 连接被掐）时补记一次 `aborted`。
+///
+/// 为什么必须用 RAII：取消（hyper 把这个 future drop 掉）**没有"出口"可以写代码**，
+/// 只有 Drop 能覆盖。`recorded()` 由正常路径在记完状态码之后调用，于是守卫只在
+/// "没记成状态"时补记——两者恰好互补，不会重复记。
+///
+/// 补记它的理由：`request_count` 在准入成功时就 +1，而状态码是处理返回之后才记的；
+/// 没有这一项时，仓库自用的"僵尸槽位"判据 `request_count − Σ状态码` 会每中断一次漂移 +1，
+/// 把真泄漏淹没（见 `Metrics::record_aborted` 与 `README` 的排障一节）。
+struct AbortGuard<'a> {
+    metrics: &'a crate::metrics::Metrics,
+    recorded: bool,
+}
+
+impl<'a> AbortGuard<'a> {
+    fn new(metrics: &'a crate::metrics::Metrics) -> Self {
+        Self {
+            metrics,
+            recorded: false,
+        }
+    }
+
+    /// 正常路径已经记过状态码 → 守卫不再补记。
+    fn recorded(&mut self) {
+        self.recorded = true;
+    }
+}
+
+impl Drop for AbortGuard<'_> {
+    fn drop(&mut self) {
+        if !self.recorded {
+            self.metrics.record_aborted();
+        }
+    }
+}
+
 pub(super) async fn metrics_middleware(
     State(state): State<AppState>,
     mut req: Request,
@@ -105,9 +141,13 @@ pub(super) async fn metrics_middleware(
         return resp;
     };
     let start = admission.started_at();
+    // 从这里到"记完状态码"之间被 drop = 客户端中途断开：`record_status` 不会执行，
+    // 但准入计数已经 +1。守卫把这一类单独记成 `aborted`（取消没有出口，只有 Drop 能覆盖）。
+    let mut outcome = AbortGuard::new(&state.metrics);
     let mut resp = next.run(req).await;
     let status = resp.status().as_u16();
     state.metrics.record_status(status);
+    outcome.recorded();
     if let Ok(v) = axum::http::HeaderValue::from_str(&echo_id) {
         resp.headers_mut().insert("x-request-id", v);
     }
@@ -480,6 +520,57 @@ mod tests {
     ///
     /// 回归背景：释放原先只挂在中间件尾部（`next.run(req).await` 之后），而 hyper 会在
     /// 连接断开时直接 drop 在途 future → 尾部永不执行 → 槽位永久占住，此后**所有**请求
+    /// 规格（并集评估 §5 H4 / §7 步骤 3）：**中断不该让"僵尸槽位"判据漂移**。
+    ///
+    /// 仓库自用的判据是 `request_count − Σ状态码 = 僵尸槽位`（README 的排障一节）。但中断
+    /// 路径上 `try_enter` 已经把 `request_count` +1，而 `record_status` 因为 future 被 drop
+    /// 永远不执行 → **每中断一次差值就 +1**，真泄漏会被淹没。现在中断单独记 `aborted`，
+    /// 恒等式变成 `request_count − Σ状态码 − aborted == 0`。
+    #[tokio::test]
+    async fn an_aborted_request_is_counted_so_the_zombie_identity_holds() {
+        let mut state = test_state(None);
+        state.admin_token = Some("admin".into());
+        state.max_concurrent_requests = 1;
+        let router = app(state.clone());
+
+        // 5ms 放弃 vs `/admin/keys` 里的真 argon2（10–30ms，本模块不装 CheapArgon2）：
+        // 窗口足够宽，20 次里应当次次落在窗口内（与既有 abort 测试同一姿态）。
+        for _ in 0..20 {
+            let req = axum::extract::Request::builder()
+                .method("POST")
+                .uri("/admin/keys")
+                .header(axum::http::header::AUTHORIZATION, "Bearer admin")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(r#"{"name":"probe"}"#))
+                .unwrap();
+            let _ =
+                tokio::time::timeout(Duration::from_millis(5), router.clone().oneshot(req)).await;
+        }
+        // 再走一条正常请求：正常路径**不该**被记成 aborted
+        let resp = router
+            .oneshot(
+                axum::extract::Request::builder()
+                    .uri("/healthz")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let (admitted, status_total, aborted) = state.metrics.identity_terms();
+        assert!(
+            aborted >= 1,
+            "至少应有一次中断被记为 aborted（窗口 5ms vs argon2 10–30ms），实际 {aborted}"
+        );
+        assert_eq!(
+            admitted as i64 - status_total as i64 - aborted as i64,
+            0,
+            "恒等式破了：准入 {admitted} − Σ状态码 {status_total} − aborted {aborted} ≠ 0 \
+             —— 说明有请求既没写出状态码、也没被记成中断（真泄漏），或者被重复记账"
+        );
+    }
+
     /// （含 /healthz）被打成 429，只能重启网关。
     #[tokio::test]
     async fn aborted_request_does_not_leak_concurrency_slot() {
