@@ -623,6 +623,10 @@
         `read_or_recover` / `write_or_recover`，模块头写明"唯一允许的加锁方式"），
         调用点全部替换——storage 26 处、`metrics.rs` **14** 处、`registry.rs` 生产代码
         **12** 处（另有 3 处测试内的读取保持原样）。
+        **补（2026-09-22）**：当时"全 crate 完成"说早了——`ratelimit.rs:38` 与 `ui.rs:66,75`
+        仍漏在外面（`crates/gateway/src/` 并集评估的三份独立样本一致命中）。现已改走
+        `lock_or_recover` 并各配一条中毒测试；机器化核验确认生产代码里已无裸加锁。
+        这条纪律**没有强制点**（无 lint 拦新的裸锁），只能靠复核。
       - 测试：`storage` 三条（毒化 runtime / db / entries+inflight）+ `metrics` 一条
         （毒化后 `/metrics` 仍渲染出中毒前后的计数）+ `registry` 一条（毒化后仍能注册并
         选路），共 5 条 `a_poisoned_*`，都在修复前**先红**（panic 就发生在被毒化的
@@ -661,6 +665,75 @@
         "裸 client 对黑洞连接不会自己放弃"（缺陷本身）与"带窗口的 client 会自己放弃"（契约）。
       - 注意：这些 client 与 `bounded` 共用同一个 `STEP_TIMEOUT`，所以窗口若调整（见 B 之后的
         讨论），全部一起变。
+
+- [x] **D. 限流桶：键改 `key_id` + 吊销回收 + 空闲清扫（2026-09-22 完成）**
+      （`PROJECT_SCAN` P2-19 / 评估 H3 的另一半；锁那半见上一条 A）
+      - 已做：① **桶键从明文 token 改成 `key_id`**（`auth.rs` 里 `try_acquire(&key.key_id)`），
+        `AuthenticatedKey` 随之不再持有明文 token（顺带删掉 `verify_api_key` 里那次
+        `token.clone()`）。keystore 那边是"只存 sha256 索引 + argon2 哈希、明文不落盘"，
+        而桶表是**长生命周期的内存状态**——拿明文作键等于把每个用过的 key 常驻到进程退出
+        （`/proc/<pid>/mem`、core dump、panic 报告都带着它），还随轮换/吊销无上限增长。
+        ② `RateLimiter::evict(key)`：`admin::delete_key` 吊销成功后立即回收该桶。
+        ③ 空闲清扫 `Buckets::sweep`：**只丢"已回满 + 空闲 ≥ `IDLE_BUCKET_TTL`(10 分钟)"的桶**，
+        每 `SWEEP_PERIOD`(60 秒) 至多一次全表 `retain`（取令牌保持 O(1)）。
+      - 两个容易写错的点（都写了注释）：判据里必须**先把令牌按 `elapsed` 补到 `now` 再比**——
+        补充是按需算的，只看存下来的 `tokens` 会让空闲桶永远停在"上次用完的样子"，
+        一个都回收不掉；而**没回满的桶不能丢**——丢了等于白送配额。
+      - 证据（先红）：`auth::tests::the_rate_limiter_keys_buckets_by_key_id_not_by_the_plaintext_token`
+        修复前直接观察到桶键就是 `sk-…`；`admin::tests::deleting_a_key_also_drops_its_rate_limit_bucket`
+        把那三行接线摘掉即红（`bucket_count` 1 ≠ 0）。另有 4 条：补速率（抽干→空闲 250ms→放行）、
+        双 key 隔离、吊销回收、清扫只丢满桶——前两条是**特性钉**，改前改后都绿，防顺手改坏。
+      - 明确不在本条：多实例各算各的（`DESIGN.md:240` 的登记项）、租户级总配额、Redis 外置配额。
+
+- [x] **E. 路径穿越 P1-2：两道守卫都到位（2026-09-22 完成）**（`PROJECT_SCAN` P1-2）
+      - **网关侧（§7 步骤 1，`439e78a`）**：`DELETE /v1/../api/delete` 这类路径原本会**原样**
+        进隧道（catch-all 不做点段归一），agent 拼 URL 时被 WHATWG 归一成 `/api/delete`，
+        持 key 者于是能驱动上游任意端点（Ollama 的 `/api/delete` 直接删模型）。现在在
+        **认证之后、读 body 之前**判：不安全 → `400` + WARN（不读那 16MiB body、也不泄露
+        "路径合法与否"给未认证探测）。判据是**保守拒绝**而非"归一后转发"——归一拦不住
+        `%2e`/`%2f` 这类**由上游解码**的形态。
+      - **agent 侧（本次）**：判据搬到 `proto::path::safe_upstream_path`，**网关与 agent 共享
+        同一份实现**（与 `proto::headers` 的逐跳/凭据两张表同一模式）。agent 在拼上游 URL 前
+        再判一次；不合法就回 `code: 400` 的 `Error` 帧（网关把帧里的 code 直接当客户端状态码
+        → 客户端看到的就是 400）。
+      - 为什么必须共享而不是各写一份：这是**同一条判据的两道防线**，两份实现会漂移，而漂移的
+        方向恰好会是"后面那道更松"（第一道在远端，第二道才在放上游请求的本机）——纵深防御会
+        静默失效。agent 侧那道还覆盖"新 agent 配旧网关"的混版本场景。
+      - 两个刻意的边界：① agent **只判路径、不判 query**（先把 `?` 之后切开）——网关同样只判
+        `uri.path()`，整串一起判会让 agent 比网关更严，把 `?x=/../` 这类合法请求 400 掉；
+        ② 拒绝用 `Error` 帧而不是直接断流，否则客户端只会拿到一条没有因果的 502。
+      - 证据：`proto::path::tests::safe_upstream_path_allows_only_verbatim_forwardable_paths`
+        （从网关搬来，逐条不变）+ agent 5 条单测：越权路径不得拼出 URL（**摘掉守卫即红**）、
+        合法 target 逐字转发、query 不参与判据、拒绝 = 400 Error 帧（内存 writer 解帧断言）、
+        "裸拼接真的会被 WHATWG 归一"的前提钉；外加**接线级**一条
+        `agent::tests::a_traversal_path_never_reaches_the_upstream_and_returns_400`——复用 agent
+        已有的 QUIC 夹具（真连一条 s2n-quic 连接）让"假网关"写 PoC 进双向流、真跑
+        `handle_stream`，断言 ① 回包是 400 Error 帧 ② **上游 listener 一次连接都没有**；
+        把接线摘掉即红（5s 超时）。网关侧回归网是 e2e
+        `chain::e2e_dot_segment_path_is_rejected_instead_of_forwarded`（**先红**：修复前实测
+        转发过、上游归一后回 404）。
+
+- [x] **F. 公网入口：`accept()` 出错不再永久停服（2026-09-22 完成）**（`PROJECT_SCAN` P2-10 / 评估 H2）
+      - 缺陷：两条 accept 循环（HTTPS 与明文）都是 `listener.accept().await?`，**一次**暂时性错误
+        （`EMFILE` 最常见，`nofile.rs` 记录线上实测 296 次）就结束整个公网入口：进程活着、
+        systemd active、日志一行 warn，端口再也不接受连接。QUIC 侧有 `hlmg_quic_accepting` +
+        `error!`，唯一公网入口反而没有等价信号。
+      - 已做：① 两条近乎逐字重复的循环合并成**一个** `serve_entry`（差异只剩 `Option<TlsAcceptor>`）
+        ——策略只有一处，改一处不会再漏另一边；② 失败**退避重试、绝不退出**：`accept_backoff`
+        从 50ms 起翻倍、封顶 1s，退避期间也能被关闭信号打断；**没有退避的重试是忙等热循环**
+        （CPU 满载 + 日志刷屏），比"安静地停摆"更难排查；③ 新计数 `hlmg_http_accept_errors_total`；
+        ④ 失败的 accept 先把连接额度还回去，免得退避期间白占名额。
+      - 取证到的一段历史：那 296 次 `EMFILE` 发生在**明文入口还在用 `axum::serve`** 的时期（它记
+        日志后继续接受连接，所以网关没停摆）；`55c56f1`（2026-09-18，为写超时把明文入口也换成
+        自研循环）之后这点容错丢了；HTTPS 入口从 `73365b0` 起就是 `accepted?`。README 的 FD 一节
+        已把这段写进去。
+      - 证据：`http::entry::tests` 三条。关键那条用**注入的假 accept 源**（真实 `EMFILE` 要耗尽整个
+        进程的 fd，会污染同进程其它测试）先失败两次再给一个真连接，断言 ① 第三次连接被正常服务
+        ② 计数为 2 ③ **退避真的睡过**（≥100ms，专门防"重试但没退避"）；把它退回旧行为（Err 分支
+        直接返回）即红——实测 0.02s 就失败（端口不再接受连接）。另一条钉住"退避期间收到关闭信号
+        要立刻退出，不能等满一个退避周期"。
+      - 明确不在本条：`/healthz` 的深度（评估 R12）——它查不了自己的 HTTP 入口（入口一死探针本身
+        就不可达），但 QUIC 入口停摆时确实看不到；`is_serving()` 也仍无生产消费者。
 
 - [x] **D. registry 评估 §7 步骤 6 的可选清理（2026-09-21 处置完毕：两项落地、两项裁定不做）**
       - ✅ **`pick()` 抽成纯函数**（`registry::pick`）：次序（新鲜 → 排除 → 模型 → 精确优先 →

@@ -1,6 +1,7 @@
 //! 代理转发：认证 → 限流 → 编码为隧道帧转发（从 `http` 模块拆出，保持路由层精简）。
 
 mod forward;
+mod head;
 mod routing;
 mod tunnel;
 mod usage;
@@ -11,7 +12,7 @@ use axum::{
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
     response::Response,
 };
-use proto::{io::read_frame, Frame};
+use proto::Frame;
 
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -21,7 +22,6 @@ use crate::body::{read_body_with_stall, BodyRead, MAX_REQUEST_BODY};
 use crate::openai::error_response;
 use crate::{auth::authenticate, state::AppState};
 use forward::forward_body;
-use tunnel::tunnel_cancel;
 
 /// 从请求 body 提取路由所需模型：顶层 `model` 字段（OpenAI 兼容语义，必填）。
 /// 缺失 / 非字符串 / 空串 → Err（调用方返回 400）。
@@ -31,42 +31,6 @@ fn extract_model(body: &[u8]) -> Result<String, ()> {
         Some(serde_json::Value::String(s)) if !s.is_empty() => Ok(s.clone()),
         _ => Err(()),
     }
-}
-
-/// 入站路径是否可以**原样转发给上游**；不安全 → `None`（调用方回 400）。
-///
-/// 为什么必须自己判：`uri.path()` 是**原样**的（HTTP/1.1 与 h2 都不做点段归一），而 agent
-/// 把它拼到上游 base 之后才交给 URL 解析器——WHATWG 归一的那一刻，`/v1/../api/delete`
-/// 就变成 `/api/delete`。**持 key 者因此能驱动上游任意端点**（Ollama 的 `/api/delete`
-/// 直接删模型），`PROJECT_SCAN` P1-2 记录了这一条；修复前 e2e 实测网关确实把该路径转发
-/// 了出去（上游回 404，因为归一后是它不认识的 `/api/delete`）。
-///
-/// 判据是**保守拒绝**，而不是"归一后转发"：归一等于替客户端改写语义，而且拦不住
-/// `%2e%2e` / `%2f` 这类**由上游解码**的形态（URL 归一不解码百分号编码，上游却可能解码）。
-/// 拒绝：不以 `/v1/` 开头、任一段为空 / `.` / `..`、路径含 `\`（WHATWG 在 http 下把 `\`
-/// 当 `/`）或 `%2e`/`%2f`/`%5c`（大小写不敏感）。
-///
-/// 只判**路径**、不判 query：点段放不进 query，而 query 里合法地出现 `%2e` 是可能的。
-fn safe_upstream_path(path: &str) -> Option<&str> {
-    if !path.starts_with("/v1/") {
-        return None;
-    }
-    let lower = path.to_ascii_lowercase();
-    if lower.contains('\\')
-        || lower.contains("%2e")
-        || lower.contains("%2f")
-        || lower.contains("%5c")
-    {
-        return None;
-    }
-    if path
-        .split('/')
-        .skip(1)
-        .any(|seg| seg.is_empty() || seg == "." || seg == "..")
-    {
-        return None;
-    }
-    Some(path)
 }
 
 pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
@@ -88,8 +52,13 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
 
     // 路径守卫：**认证之后、读 body 之前**。放在这里有两个理由：① 未认证的探测拿不到
     // 路径校验的信息（先 401）；② 越权路径不必先让我们读进 16MiB 的 body。
-    // 详见 [`safe_upstream_path`] 与 `PROJECT_SCAN` P1-2。
-    let Some(guarded_path) = safe_upstream_path(uri.path()) else {
+    //
+    // 判据本身在 `proto::path::safe_upstream_path`——**与 agent 侧共享同一份实现**：同一条
+    // 规则的两道防线（这里拒一次、agent 拼上游 URL 前再拒一次），两份实现会漂移，而漂移的
+    // 方向恰好会是"后面那道更松"，纵深防御就静默失效了。网关这一步管的是**越权请求的
+    // 状态码**（客户端拿 400），agent 那一步管的是**隧道另一端不再受信时的兜底**。
+    // 详见 `PROJECT_SCAN` P1-2。
+    let Some(guarded_path) = proto::path::safe_upstream_path(uri.path()) else {
         warn!(
             request_id,
             path = %uri.path(),
@@ -157,81 +126,13 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
 
     debug!(request_id, "proxying request to agent");
 
-    // 读取响应头（用 head_timeout，不是 request_timeout）。
-    //
-    // 以前这里用 `state.timeout`（默认 120s）：agent 一旦卡住（注册着但什么都不回），
-    // 每个请求都要把连接、并发槽位和缓冲区占满两分钟；客户端早就超时断开，而网关还停在
-    // 读上，连"客户端已断开"都发现不了（实测 40 并发 → 620MB 内存被钉住、日志停更）。
-    // 也不能用 `tunnel_op_timeout`（2s）：上游"思考"是合法的，本地模型 1–3s 很常见。
-    let head = tokio::time::timeout(state.head_timeout, read_head(&mut recv)).await;
-    let (status, mut out_headers) = match head {
-        Ok(Ok(HeadOutcome::Head(s, h))) => {
-            // 对端真的回了响应头 = 这条隧道是活的 → 清掉连续超时计数。
-            // （开流成功不能作为判据：agent 卡死时流照样能开，只是永远不回帧。）
-            state.registry.note_tunnel_op_ok(entry.stable_id());
-            (s, h)
-        }
-        Ok(Ok(HeadOutcome::Error(code, message))) => {
-            let _ = send.finish();
-            return error_response(
-                StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY),
-                message,
-            );
-        }
-        Ok(Err(e)) => {
-            let _ = send.finish();
-            return error_response(StatusCode::BAD_GATEWAY, format!("tunnel read failed: {e}"));
-        }
-        Err(_) => {
-            // 响应头超时：请求已经发出去了、对端却什么都没回。**两种情况必须分开**：
-            //
-            //   慢：这条隧道最近还在正常回响应头（`head_alive_window` 内），说明它只是被链路/
-            //       上游堵住了 → 只回 504、**不计连续超时、不摘除**。把"慢"当"死"的代价实测过：
-            //       出口带宽饱和时一个响应头都收不到，连续计数必然爬到阈值 → 摘除健康 agent →
-            //       重连期间注册表为空 → **全量 503**（一次压测 1 026 次 head timeout、
-            //       `registry-empty` +3 753）。局部超载不该变成全站不可用。
-            //   死：窗口内一次都没回过 → 没有任何"只是慢"的理由，走原来的连续 3 次摘除。
-            //
-            // 这条判据由注册表给出（判定与记账、摘除在同一处），本模块只把它映射成
-            // 指标标签与日志文案——那些是外部契约，留在原处。
-            //
-            // 判据有**两层**（第二层见评估 §5 H2）：窗口内有过成功响应头 → 只是慢；
-            // 窗口过了但**对端还在说话**（心跳新鲜）且静默没超过 `head_silent_grace` → 仍算慢。
-            // 第二层不可省：`last_head_ok` 的唯一刷新点就是成功响应头，所以当**所有**请求都慢过
-            // `head_timeout` 时没有任何一次成功能刷新它，只按第一层就会误摘活着的 agent。
-            let disposition = state.registry.report_head_timeout(
-                &entry,
-                crate::registry::HeadSilence {
-                    window: state.head_alive_window,
-                    peer_alive_window: state.agent_stale_after,
-                    stuck_after: state.head_silent_grace,
-                },
-                state.evict_close_grace,
-            );
-            let last_head_ago_secs = entry.last_head_ago().map_or(0, |d| d.as_secs());
-            if matches!(disposition, crate::registry::Disposition::Fatal) {
-                state.metrics.record_head_timeout("silent");
-                warn!(
-                    request_id,
-                    agent = %entry.agent_id(),
-                    last_head_ago_secs,
-                    window_secs = state.head_alive_window.as_secs(),
-                    "upstream head timeout and the agent has been silent; evicting agent"
-                );
-            } else {
-                state.metrics.record_head_timeout("slow");
-                warn!(
-                    request_id,
-                    agent = %entry.agent_id(),
-                    last_head_ago_secs,
-                    "upstream head timeout while the agent is still answering; not evicting"
-                );
-            }
-            tunnel_cancel(&mut send, request_id, state.tunnel_op_timeout).await;
-            let _ = send.finish();
-            return error_response(StatusCode::GATEWAY_TIMEOUT, "upstream timed out");
-        }
-    };
+    // 读取响应头：超时窗口、慢/死判据的渲染、Cancel 与 finish 全在 `head` 模块里
+    // （一处改动理由 = 上游响应头契约），这里只把失败渲染成响应。
+    let (status, mut out_headers) =
+        match head::await_head(&state, &mut recv, &mut send, &entry, request_id).await {
+            Ok(v) => v,
+            Err(failure) => return error_response(failure.status, failure.message),
+        };
     out_headers.retain(|(k, _)| !proto::headers::is_hop_by_hop(k.as_str()));
 
     // 流式回写响应体：后台任务把响应帧转进通道，HTTP 客户端从通道逐块读取。
@@ -245,7 +146,7 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
     let metrics = state.metrics.clone();
     let key_store = state.key_store.clone();
     // 关闭阶段的接收端：`Terminating` 时这条流要带一个明确事件收尾（见 `forward.rs`）。
-    let shutdown = state.shutdown.subscribe();
+    let shutdown = state.subscribe_shutdown();
     // 请求 body 的 prompt 估算（仅在无 usage 时使用）
     let prompt_est = crate::usage_meter::estimate_prompt_tokens(&body);
     // SSE 响应是流式（usage 在每个 chunk 尾部，逐块预过滤）；非 SSE 为整包 JSON
@@ -286,42 +187,6 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
     match builder.body(Body::from_stream(ReceiverStream::new(rx))) {
         Ok(resp) => resp,
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-    }
-}
-
-enum HeadOutcome {
-    Head(StatusCode, Vec<(String, String)>),
-    Error(u16, String),
-}
-
-/// 读取响应头帧（或错误帧）。
-async fn read_head(recv: &mut s2n_quic::stream::ReceiveStream) -> anyhow::Result<HeadOutcome> {
-    loop {
-        match read_frame(recv).await? {
-            Some(Frame::ProxyResponseHead {
-                status: s,
-                headers: h,
-                ..
-            }) => {
-                return Ok(HeadOutcome::Head(
-                    StatusCode::from_u16(s).unwrap_or(StatusCode::BAD_GATEWAY),
-                    h,
-                ));
-            }
-            Some(Frame::Error { code, message, .. }) => {
-                return Ok(HeadOutcome::Error(code, message));
-            }
-            Some(Frame::ProxyResponseEnd { .. }) => {
-                return Ok(HeadOutcome::Error(502, "empty upstream response".into()));
-            }
-            Some(_) => {}
-            None => {
-                return Ok(HeadOutcome::Error(
-                    502,
-                    "upstream closed before responding".into(),
-                ));
-            }
-        }
     }
 }
 
@@ -428,39 +293,5 @@ mod tests {
         assert!(extract_model(br#"{"model":""}"#).is_err());
         // 非法 JSON → Err
         assert!(extract_model(b"not json").is_err());
-    }
-
-    /// 规格（`PROJECT_SCAN` P1-2）：只有"原样转发不会越权"的路径才放行。
-    ///
-    /// 拒绝面比"含 `..`"宽：`%2e`/`%2f`/`%5c` 由上游解码才成点段/分隔符，`\` 在 WHATWG
-    /// 的 http 下本身就被当成 `/`——这几种都能构造出同一类越权，所以一起拒。
-    #[test]
-    fn safe_upstream_path_allows_only_verbatim_forwardable_paths() {
-        for ok in [
-            "/v1/chat/completions",
-            "/v1/models",
-            "/v1/embeddings",
-            "/v1/a/b-c_d.e",
-            "/v1/..hidden", // 以点开头但不是点段
-        ] {
-            assert_eq!(safe_upstream_path(ok), Some(ok), "{ok} 应当放行");
-        }
-        for bad in [
-            "/v1/../api/delete", // e2e 里实测被转发过的 PoC
-            "/v1/../../etc/passwd",
-            "/v1/./models",
-            "/v1//models",
-            "/v1/",
-            "/v1",          // 不在 `/v1/` 之下（前缀判定）
-            "/api/delete",  // 越出 `/v1/`
-            "/v2/chat",     // 邻近前缀不算
-            "/v1/%2e%2e/x", // 上游解码后是 `..`
-            "/v1/%2E%2E/x", // 大小写
-            "/v1/%2fapi",   // 上游解码后是分隔符
-            "/v1/a%5Cb",    // 编码的反斜杠
-            "/v1/a\\..\\b", // WHATWG 在 http 下把 `\` 当 `/`
-        ] {
-            assert!(safe_upstream_path(bad).is_none(), "{bad} 必须被拒");
-        }
     }
 }

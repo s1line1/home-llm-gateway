@@ -5,6 +5,7 @@ use tracing::info;
 
 use crate::state::AppState;
 
+mod admission;
 mod api;
 mod entry;
 mod observability;
@@ -12,9 +13,10 @@ mod observability;
 mod test_util;
 mod ui;
 
+use admission::admission_middleware;
 use api::{healthz, metrics_route, models_route};
 pub(crate) use entry::spawn_entry;
-use observability::metrics_middleware;
+use observability::request_id_middleware;
 use ui::{ui_fallback, ui_missing};
 
 pub fn app(state: AppState) -> Router {
@@ -67,9 +69,15 @@ pub fn app(state: AppState) -> Router {
         // 上限常量与 `body::read_body_with_stall` 手动读 body 时用的**是同一个**（那边要自己判，因为
         // 改成手动逐块读之后提取器层的限制不再生效）。
         .layer(DefaultBodyLimit::max(crate::body::MAX_REQUEST_BODY))
+        // 层序**不能反**：准入（里）→ id/日志/状态码（外）。被闸门拒掉的 429 必须经过外层
+        // 才能带上回显的 `x-request-id`，而状态码记账只在最外层发生一次（见两个模块头）。
         .layer(middleware::from_fn_with_state(
             state.clone(),
-            metrics_middleware,
+            admission_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            request_id_middleware,
         ))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)

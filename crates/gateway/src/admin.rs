@@ -147,6 +147,9 @@ pub async fn create_key(
 
 /// 吊销 key。
 pub async fn delete_key(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    // 桶键就是 key id（`ratelimit.rs`）：吊销成功后要把桶一并丢掉，否则一个再也不会被
+    // 取用的桶要留到空闲清扫为止（P2-19）。
+    let bucket_key = id.clone();
     let store = state.key_store.clone();
     let removed = match tokio::task::spawn_blocking(move || store.delete(&id)).await {
         Ok(Ok(r)) => r,
@@ -166,6 +169,9 @@ pub async fn delete_key(State(state): State<AppState>, Path(id): Path<String>) -
         }
     };
     if removed {
+        if let Some(rl) = &state.rate_limiter {
+            rl.evict(&bucket_key);
+        }
         StatusCode::NO_CONTENT.into_response()
     } else {
         crate::openai::error_response(StatusCode::NOT_FOUND, "key not found")
@@ -205,6 +211,41 @@ mod tests {
             .await
             .unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// 规格（P2-19）：吊销成功要把该 key 的**限流桶一并回收**——桶键就是 key id，吊销后
+    /// 这个桶再也不会被取用，不丢就要留到 `ratelimit.rs` 的空闲清扫（10 分钟）为止。
+    #[tokio::test]
+    async fn deleting_a_key_also_drops_its_rate_limit_bucket() {
+        let opts = Options {
+            admin_token: Some("admin-token".into()),
+            rate_limit_per_min: 60,
+            head_timeout: Duration::from_secs(5),
+            ..Options::default()
+        };
+        let state = AppState::new(
+            Registry::default(),
+            KeyStore::new(None),
+            Metrics::default(),
+            &opts,
+        );
+        let created = state
+            .key_store
+            .create("p2-19".into())
+            .expect("建 key 应当成功");
+        let id = created.record.id().to_string();
+        // 克隆一份句柄：桶表在 `Arc` 里，`delete_key` 会把 `state` 整个吃掉。
+        let rl = state
+            .rate_limiter
+            .clone()
+            .expect("前提：60/min 应当建出限流器");
+        assert!(rl.try_acquire(&id), "前提：先让这个 key 建出一个桶");
+        assert_eq!(rl.bucket_count(), 1);
+
+        let resp = delete_key(State(state), Path(id)).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT, "吊销应当成功");
+
+        assert_eq!(rl.bucket_count(), 0, "吊销后应立即可回收桶，不等空闲清扫");
     }
 
     #[tokio::test]

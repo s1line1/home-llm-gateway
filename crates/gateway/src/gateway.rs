@@ -142,7 +142,9 @@ impl Gateway {
         let app_state =
             state::AppState::new(registry.clone(), key_store.clone(), metrics.clone(), &opts);
         // 关闭阶段的发送端留在 `Gateway`；接收端给 accept 循环，在途响应各自 `subscribe()`。
-        let shutdown = app_state.shutdown.clone();
+        // 发送端只有这里拿得到（`shutdown_sender` 是 pub(crate)）：推进关闭阶段的能力
+        // 属于进程生命周期，不随 `AppState` 外流（评估 §2 S3）。
+        let shutdown = app_state.shutdown_sender();
         let app = http::app(app_state);
 
         // ⑤ 起任务。入列顺序有意义：用量 flusher 必须在 serve 任务之前就位（它按周期
@@ -156,6 +158,7 @@ impl Gateway {
                 opts.client_stall,
                 opts.max_entry_connections,
                 shutdown.subscribe(),
+                metrics.clone(),
             ),
             tokio::spawn(quic::accept_loop(
                 sockets.server,

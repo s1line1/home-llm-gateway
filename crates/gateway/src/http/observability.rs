@@ -1,4 +1,9 @@
-//! 请求路径的中间件：`x-request-id`、全局并发闸门、访问日志，以及**准入票据的移交**。
+//! 请求路径的中间件：`x-request-id`、访问日志、状态码与中断记账。
+//!
+//! 全局准入闸门（豁免表 / 429 / 票据移交）**不在这里**——它是资源正确性策略，已搬到
+//! `http/admission.rs`（并集评估 §2 S1）。本模块与它是**外层/里层**关系：拒掉的 429 要
+//! 经过这里才能带上回显的 `x-request-id`，状态码也只在这里记一次（闸门那边只补
+//! `request_count`）。链序见 `http::app`。
 //!
 //! 三条策略在这里，但它们不是并列的——第 3 条是前两条能成立的前提：
 //!
@@ -27,7 +32,7 @@ use axum::{
     middleware::Next,
     response::Response,
 };
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 use crate::state::AppState;
 
@@ -42,7 +47,43 @@ use crate::state::AppState;
 ///   - status >= 500 → error（真实失败：tunnel/upstream/内部错误）
 ///
 /// 需要临时恢复全量访问日志：`RUST_LOG=info,gateway::access=debug`
-pub(super) async fn metrics_middleware(
+/// 请求在**写出状态码之前**被丢弃（客户端断开 / 连接被掐）时补记一次 `aborted`。
+///
+/// 为什么必须用 RAII：取消（hyper 把这个 future drop 掉）**没有"出口"可以写代码**，
+/// 只有 Drop 能覆盖。`recorded()` 由正常路径在记完状态码之后调用，于是守卫只在
+/// "没记成状态"时补记——两者恰好互补，不会重复记。
+///
+/// 补记它的理由：`request_count` 在准入成功时就 +1，而状态码是处理返回之后才记的；
+/// 没有这一项时，仓库自用的"僵尸槽位"判据 `request_count − Σ状态码` 会每中断一次漂移 +1，
+/// 把真泄漏淹没（见 `Metrics::record_aborted` 与 `README` 的排障一节）。
+struct AbortGuard<'a> {
+    metrics: &'a crate::metrics::Metrics,
+    recorded: bool,
+}
+
+impl<'a> AbortGuard<'a> {
+    fn new(metrics: &'a crate::metrics::Metrics) -> Self {
+        Self {
+            metrics,
+            recorded: false,
+        }
+    }
+
+    /// 正常路径已经记过状态码 → 守卫不再补记。
+    fn recorded(&mut self) {
+        self.recorded = true;
+    }
+}
+
+impl Drop for AbortGuard<'_> {
+    fn drop(&mut self) {
+        if !self.recorded {
+            self.metrics.record_aborted();
+        }
+    }
+}
+
+pub(super) async fn request_id_middleware(
     State(state): State<AppState>,
     mut req: Request,
     next: Next,
@@ -71,43 +112,16 @@ pub(super) async fn metrics_middleware(
     let client_request_id = client_request_id.unwrap_or_else(|| "-".to_string());
     let method = req.method().clone();
     let path = req.uri().path().to_string();
-    // HTTP 全局在途上限（0 = 不限）：try_enter 原子占位（旧值判定，无竞态），
-    // 超限返回 None → 立即 429，防多 key 总和压垮单实例。
-    // 票据的释放完全由 Drop 负责，分两段：① 移交 body 之前（含客户端中断导致 future
-    // 被 drop）→ 就地 Drop 归还；② 移交 body 之后 → 随 body 结束/丢弃归还。
-    //
-    // /healthz **豁免**（REBUILD §5.3 / R12）：闸门打满时探针若被 429，LB 会摘除实例、
-    // systemd 会重启循环——把上游的"慢"放大成整机"全挂"。用 `0 = 不限` 表达豁免，
-    // 于是 id、访问日志、在途与耗时记账与其它路径完全一致，区别只有"能不能被拒"。
-    let limit = if path == "/healthz" {
-        0
-    } else {
-        state.max_concurrent_requests
-    };
-    let Some(admission) = state.metrics.try_enter(limit) else {
-        state.metrics.record_rejected(429);
-        let mut resp = crate::openai::error_response(
-            axum::http::StatusCode::TOO_MANY_REQUESTS,
-            "too many concurrent requests, retry later",
-        );
-        if let Ok(v) = axum::http::HeaderValue::from_str(&echo_id) {
-            resp.headers_mut().insert("x-request-id", v);
-        }
-        warn!(
-            request_id = %request_id,
-            client_request_id = %client_request_id,
-            method = %method,
-            path = %path,
-            active = state.metrics.active_count(),
-            limit,
-            "concurrent request limit reached, rejecting 429"
-        );
-        return resp;
-    };
-    let start = admission.started_at();
+    // TTFB 从本中间件入口算起（含里层闸门的判定），与"请求到达网关"的语义一致。
+    let start = std::time::Instant::now();
+    // 从这里到"记完状态码"之间被 drop = 客户端中途断开：`record_status` 不会执行，
+    // 但准入计数已经 +1。守卫把这一类单独记成 `aborted`（取消没有出口，只有 Drop 能覆盖）。
+    // 被闸门拒掉的那一支也会走到这里（里层返回 429），于是同样会被记上状态码、守卫解除。
+    let mut outcome = AbortGuard::new(&state.metrics);
     let mut resp = next.run(req).await;
     let status = resp.status().as_u16();
     state.metrics.record_status(status);
+    outcome.recorded();
     if let Ok(v) = axum::http::HeaderValue::from_str(&echo_id) {
         resp.headers_mut().insert("x-request-id", v);
     }
@@ -147,15 +161,7 @@ pub(super) async fn metrics_middleware(
         ),
     }
 
-    // 把准入票据**移交**给 response body：槽位与耗时记账持有到 body 流结束、或中途
-    // 被丢弃（客户端断开）为止。这样闸门才真正覆盖"整个请求"——LLM 的 SSE 长流恰恰
-    // 是最需要被计入的场景；若在此处直接释放，闸门只能覆盖到首字节。
-    let (parts, body) = resp.into_parts();
-    let body = http_body_util::BodyExt::map_frame(body, move |frame| {
-        let _held = &admission; // 仅为把票据生命周期绑定到 body 上，不改动任何帧
-        frame
-    });
-    Response::from_parts(parts, axum::body::Body::new(body))
+    resp
 }
 
 #[cfg(test)]
@@ -240,7 +246,7 @@ mod tests {
             )
             .layer(axum::middleware::from_fn_with_state(
                 state.clone(),
-                super::metrics_middleware,
+                super::request_id_middleware,
             ))
             .with_state(state);
 
@@ -299,6 +305,9 @@ mod tests {
         let held = metrics
             .try_enter(0)
             .expect("limit=0 admits unconditionally");
+        // 记账断言用**增量**：闸门那次 429 应当恰好 +1 请求、+1 状态码、+0 中断
+        // （里层补 request_count、外层记状态码，各一半；两边都记就会变成 -1）。
+        let before = metrics.identity_terms();
         // 用 /v1/models 而不是 /healthz：探针已豁免闸门（见下一条用例）
         let resp = router
             .clone()
@@ -319,6 +328,12 @@ mod tests {
             resp.headers().get(axum::http::header::RETRY_AFTER),
             Some(&axum::http::HeaderValue::from_static("60")),
             "429 carries Retry-After"
+        );
+        let after = metrics.identity_terms();
+        assert_eq!(
+            (after.0 - before.0, after.1 - before.1, after.2 - before.2),
+            (1, 1, 0),
+            "闸门 429 必须恰好记一次请求与一次状态码、且不算中断（准入数, Σ状态码, aborted）"
         );
         drop(held); // 票据 Drop → 释放槽位
 
@@ -480,6 +495,57 @@ mod tests {
     ///
     /// 回归背景：释放原先只挂在中间件尾部（`next.run(req).await` 之后），而 hyper 会在
     /// 连接断开时直接 drop 在途 future → 尾部永不执行 → 槽位永久占住，此后**所有**请求
+    /// 规格（并集评估 §5 H4 / §7 步骤 3）：**中断不该让"僵尸槽位"判据漂移**。
+    ///
+    /// 仓库自用的判据是 `request_count − Σ状态码 = 僵尸槽位`（README 的排障一节）。但中断
+    /// 路径上 `try_enter` 已经把 `request_count` +1，而 `record_status` 因为 future 被 drop
+    /// 永远不执行 → **每中断一次差值就 +1**，真泄漏会被淹没。现在中断单独记 `aborted`，
+    /// 恒等式变成 `request_count − Σ状态码 − aborted == 0`。
+    #[tokio::test]
+    async fn an_aborted_request_is_counted_so_the_zombie_identity_holds() {
+        let mut state = test_state(None);
+        state.admin_token = Some("admin".into());
+        state.max_concurrent_requests = 1;
+        let router = app(state.clone());
+
+        // 5ms 放弃 vs `/admin/keys` 里的真 argon2（10–30ms，本模块不装 CheapArgon2）：
+        // 窗口足够宽，20 次里应当次次落在窗口内（与既有 abort 测试同一姿态）。
+        for _ in 0..20 {
+            let req = axum::extract::Request::builder()
+                .method("POST")
+                .uri("/admin/keys")
+                .header(axum::http::header::AUTHORIZATION, "Bearer admin")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(r#"{"name":"probe"}"#))
+                .unwrap();
+            let _ =
+                tokio::time::timeout(Duration::from_millis(5), router.clone().oneshot(req)).await;
+        }
+        // 再走一条正常请求：正常路径**不该**被记成 aborted
+        let resp = router
+            .oneshot(
+                axum::extract::Request::builder()
+                    .uri("/healthz")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let (admitted, status_total, aborted) = state.metrics.identity_terms();
+        assert!(
+            aborted >= 1,
+            "至少应有一次中断被记为 aborted（窗口 5ms vs argon2 10–30ms），实际 {aborted}"
+        );
+        assert_eq!(
+            admitted as i64 - status_total as i64 - aborted as i64,
+            0,
+            "恒等式破了：准入 {admitted} − Σ状态码 {status_total} − aborted {aborted} ≠ 0 \
+             —— 说明有请求既没写出状态码、也没被记成中断（真泄漏），或者被重复记账"
+        );
+    }
+
     /// （含 /healthz）被打成 429，只能重启网关。
     #[tokio::test]
     async fn aborted_request_does_not_leak_concurrency_slot() {

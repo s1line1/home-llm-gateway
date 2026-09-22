@@ -28,6 +28,19 @@ struct MetricsInner {
     total_duration_ms: AtomicU64,
     /// 累计请求数（含 /metrics 之外的所有请求）。
     request_count: AtomicU64,
+    /// **写出状态码之前**就被丢弃的请求数（客户端断开 / 连接被掐 / future 被 drop）。
+    ///
+    /// 为什么必须单独记：`request_count` 在准入成功时就 +1，而状态码是在处理返回之后才记的；
+    /// 中断路径上后者永远不执行 → 仓库自用的"僵尸槽位"判据 `request_count − Σ状态码`
+    /// 会**每个中断漂移 +1**，把真泄漏淹没。减掉这一项之后恒等式才重新可判
+    /// （见 `render` 里 `hlmg_requests_aborted_total` 的 HELP 与 `README.md` 的排障一节）。
+    aborted: AtomicU64,
+    /// 公网入口 `accept()` 失败的次数（含 `EMFILE`/`ECONNABORTED`/`EINTR` 等暂时性错误）。
+    ///
+    /// 修复之前这类错误会让整个入口**永久停摆**（`accepted?` 结束循环），而进程、systemd
+    /// 与其它入口全都正常；现在它会退避重试，这个计数就是"入口正在挣扎"的唯一信号——
+    /// 持续增长说明 fd 长期不够用（`nofile.rs` 抬额度、`max_entry_connections` 或上游泄漏）。
+    http_accept_errors: AtomicU64,
     /// 当前在线 QUIC 连接数（隧道层 gauge）。
     quic_connections: AtomicU64,
     /// 累计 agent 连接次数（重连计数，counter）。
@@ -146,9 +159,13 @@ impl Metrics {
             .or_insert(0) += 1;
     }
 
-    pub fn record_rejected(&self, status: u16) {
+    /// 记一次「被全局闸门拒掉」。**只补 `request_count`**：`try_enter` 失败时没有自增。
+    ///
+    /// 状态码**不在这里记**——闸门住在 id 中间件里层，被拒的 429 会经过外层，由外层统一
+    /// `record_status`。两边各记一半，`request_count − Σ状态码 − aborted` 才平衡
+    /// （在这里也记一次就会重复计数，恒等式反而变成 -1）。
+    pub fn record_rejected(&self) {
         self.inner.request_count.fetch_add(1, Ordering::Relaxed);
-        self.record_status(status);
     }
 
     /// 记录请求结果状态码（在途槽位的释放不在此处，由 [`Admission`] 负责）。
@@ -156,6 +173,35 @@ impl Metrics {
         *lock_or_recover(&self.inner.status_counts)
             .entry(status)
             .or_insert(0) += 1;
+    }
+
+    /// 记一次「请求在写出状态码之前被丢弃」。由 `metrics_middleware` 的 RAII 守卫调用
+    /// （见 `http/observability.rs`）：取消没有"出口"可写，只有 Drop 能覆盖。
+    pub fn record_aborted(&self) {
+        self.inner.aborted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 记一次公网入口 `accept()` 失败（调用方已经退避重试，入口会继续监听）。
+    pub fn record_accept_error(&self) {
+        self.inner
+            .http_accept_errors
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 公网入口 `accept()` 累计失败次数。
+    pub fn http_accept_errors(&self) -> u64 {
+        self.inner.http_accept_errors.load(Ordering::Relaxed)
+    }
+
+    /// 三项供测试核对恒等式 `request_count − Σ状态码 − aborted == 0`（真泄漏才会让它 >0）。
+    #[cfg(test)]
+    pub fn identity_terms(&self) -> (u64, u64, u64) {
+        let status_total: u64 = lock_or_recover(&self.inner.status_counts).values().sum();
+        (
+            self.inner.request_count.load(Ordering::Relaxed),
+            status_total,
+            self.inner.aborted.load(Ordering::Relaxed),
+        )
     }
 
     pub fn add_bytes_out(&self, n: usize) {
@@ -333,6 +379,16 @@ impl Metrics {
             "hlmg_request_count {}\n",
             inner.request_count.load(Ordering::Relaxed)
         ));
+        // HELP/TYPE 必须**紧贴**在各自样本之前（Prometheus 文本格式按"家族"解析），
+        // 所以这一条整块放在 request_count 之后，而不是插进它的 HELP 与 TYPE 之间。
+        out.push_str(
+            "# HELP hlmg_requests_aborted_total Requests dropped before a status was written (client aborted or the connection was cut).\n",
+        );
+        out.push_str("# TYPE hlmg_requests_aborted_total counter\n");
+        out.push_str(&format!(
+            "hlmg_requests_aborted_total {}\n",
+            inner.aborted.load(Ordering::Relaxed)
+        ));
         out.push_str(
             "# HELP hlmg_key_verify_hits_total Cached key verifications served without argon2.\n",
         );
@@ -356,6 +412,14 @@ impl Metrics {
         out.push_str(&format!(
             "hlmg_quic_accepting {}\n",
             inner.quic_accepting.load(Ordering::Relaxed)
+        ));
+        out.push_str(
+            "# HELP hlmg_http_accept_errors_total Public entry accept() failures (EMFILE, ECONNABORTED, ...); the entry keeps listening and retries with backoff.\n",
+        );
+        out.push_str("# TYPE hlmg_http_accept_errors_total counter\n");
+        out.push_str(&format!(
+            "hlmg_http_accept_errors_total {}\n",
+            inner.http_accept_errors.load(Ordering::Relaxed)
         ));
         out.push_str(
             "# HELP hlmg_agent_connections_total Cumulative agent connections (reconnects).\n",
@@ -440,6 +504,36 @@ mod tests {
         assert!(
             text.contains("hlmg_requests_total{status=\"204\"} 1"),
             "中毒后新记的状态码也要出现：\n{text}"
+        );
+    }
+
+    /// 规格：渲染出的每个 `# HELP` 后面必须**紧跟同名的 `# TYPE`**。
+    ///
+    /// 这不是格式洁癖：Prometheus 的文本解析按"家族"分组，HELP 与 TYPE 之间插进另一个家族的
+    /// 样本会让解析失败（整轮抓取报废）。本仓库真踩过这个坑——加 `hlmg_requests_aborted_total`
+    /// 时把 HELP 插到了 `hlmg_request_count` 的 HELP 与 TYPE 之间。这条把它变成机器判据，
+    /// 顺带保证新指标（`hlmg_http_accept_errors_total`）确实被渲染出来。
+    #[test]
+    fn every_help_line_is_immediately_followed_by_its_own_type_line() {
+        let text = Metrics::default().render(0, 0, 0, 0);
+        let lines: Vec<&str> = text.lines().collect();
+        let mut checked = 0;
+        for (i, line) in lines.iter().enumerate() {
+            let Some(name) = line.strip_prefix("# HELP ") else {
+                continue;
+            };
+            let name = name.split_whitespace().next().expect("HELP 必须带指标名");
+            let next = lines.get(i + 1).unwrap_or(&"");
+            assert!(
+                next.starts_with(&format!("# TYPE {name} ")),
+                "`{name}` 的 HELP 后面必须紧跟同名的 TYPE（家族不能交错），实际下一行是 `{next}`"
+            );
+            checked += 1;
+        }
+        assert!(checked > 10, "应当检查到足够多的家族（实际 {checked}）");
+        assert!(
+            text.contains("# TYPE hlmg_http_accept_errors_total counter"),
+            "新指标必须被渲染：\n{text}"
         );
     }
 }

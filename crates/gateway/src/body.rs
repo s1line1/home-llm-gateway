@@ -32,7 +32,8 @@ pub(crate) enum BodyRead {
 /// 为什么不能用 `Bytes` 提取器：它会一直等到 body 读完，**没有任何超时**。客户端只要发完
 /// headers（声明一个大 `Content-Length`）就不再发 body，这个请求就会永久占住准入票据
 /// （`Admission`）——实测云端沉淀了 8 个这样的僵尸槽位（`hlmg_active_requests` 恒为 8、
-/// `request_count − Σ状态码 = 8`），而且只增不减，配了 `max_concurrent_requests` 的网关
+/// `request_count − Σ状态码 − aborted = 8`，其中 `aborted` 见 `hlmg_requests_aborted_total`：
+/// 当时没有中断参与，所以那一项是 0），而且只增不减，配了 `max_concurrent_requests` 的网关
 /// 会被慢慢吃光闸门（生产口径约 32，8 个 = 25%），只能重启恢复。
 ///
 /// 语义是**停滞**而不是**总时长**：每收到一块就重新计时，所以"慢但一直在传"的大 body

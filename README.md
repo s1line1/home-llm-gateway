@@ -404,6 +404,11 @@ s2n-quic 的 `initial_max_streams_bidi` 默认只有 **100**（`InitialMaxStream
 当前 `max_concurrent_requests: 5000` 时无害，但按本文件的内存口径生产该是 ~32 量级，
 8 个就是 25%，且**只能重启恢复**。
 
+> ⚠️ 判据要**减掉中断**：`僵尸槽位 = hlmg_request_count − Σ状态码 − hlmg_requests_aborted_total`。
+> 客户端中途断开时 hyper 会 drop 掉 handler 的 future——准入数已经 +1 而状态码永远写不出来，
+> 不减这一项的话每中断一次差值就漂移 +1，真泄漏会被淹没（2026-09-22 修：中断单独计数，
+> 由 `metrics_middleware` 的 RAII 守卫补记）。上面那次历史事故里没有中断参与，所以当时直接对得上。
+
 判定的是**停滞**而不是**总时长**：该方向只要还有字节在动就持续续期，所以慢而持续的大 body
 上传、弱网下逐块到达的 SSE 都不会被误杀。五个方向共用同一个 `client_stall_secs`。
 回归测试：`tests/e2e/stalls.rs`（请求体停滞、响应体停滞各一条；判据是 `max_concurrent_requests: 1`
@@ -752,6 +757,7 @@ QPS 压到一两个数量级以下。上面这些数字只在"把模型换快"�
 - **`GET /metrics`**：Prometheus 文本格式指标（按状态码计数、在途请求、在线 agent 数、转发字节、累计耗时），可直接被 Prometheus/Grafana 抓取
   - 浏览器直接访问（`Accept: text/html`）时返回 Dashboard 页面而非文本，便于点进指标页；Prometheus 抓取（`Accept: */*`）不受影响
   - `hlmg_quic_accepting`：隧道入口是否仍在接受新 agent（1/0）。UDP 驱动失效时入口会停止接受新连接，而进程与 HTTP 入口照常运行——**建议对该指标为 0 告警**（这是唯一能发现该故障的信号）
+  - `hlmg_http_accept_errors_total`：公网入口 `accept()` 失败的累计次数（`EMFILE`/`ECONNABORTED` 一类**暂时性**错误）。入口现在**退避重试、不会退出**（退避 50ms 起翻倍、封顶 1s），所以这个数**持续增长**才是信号：说明 fd 长期不够用（先看下面《文件描述符上限》一节），而不是"入口挂了"。⚠️ 修复之前，**一次**这样的错误就会让入口永久停摆（进程、systemd、`/healthz` 全都正常，端口却不再接受连接）
   - **`hlmg_agents` 与 `hlmg_agents_healthy`**：前者是**注册条目数**（含心跳已过期、连接还没关的），
     后者是**心跳未过期、真正可路由**的数量。排查"所有请求 503"时只有后者能说明问题——
     `hlmg_agents=2` 而 `hlmg_agents_healthy=0` 意味着"有人注册，但全部不健康"，与"没人注册"完全不同
@@ -792,6 +798,12 @@ systemd 单元：`deploy/gateway.service`（云服务器）、`deploy/agent.serv
 **现象**：并发一高，客户端开始零星 `connection reset by peer`，而网关 `/healthz` 正常、
 CPU/内存都不高；网关日志里是 `accept error: Too many open files (os error 24)`。
 实测（2026-09-17，云端 2 vCPU）日志里这种错误有 296 次，全部落在压测窗口内。
+
+> 注：那 296 次错误发生在**明文入口还在用 `axum::serve`** 的时期——它记一行日志后继续接受连接，
+> 所以网关没有真的停摆。2026-09-18 `55c56f1`（为写超时把明文入口也换成自研循环）之后那点容错丢了，
+> HTTPS 入口则从最初就是 `listener.accept().await?`：**一次** `EMFILE` 就会结束整个 accept 循环
+> （进程活着、systemd active、日志一行 warn，端口再不通）。现在两条入口合并成同一个循环并带退避重试，
+> 见 `hlmg_http_accept_errors_total` 与 `crates/gateway/src/http/entry.rs`。
 
 **成因**：进程的 `RLIMIT_NOFILE` 有 soft（运行时实际强制执行，用满即 `EMFILE`）与 hard
 （soft 允许抬到的天花板）两个值。`gateway.service` 没设 `LimitNOFILE`，于是吃 systemd 的

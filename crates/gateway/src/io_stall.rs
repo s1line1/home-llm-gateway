@@ -4,7 +4,8 @@
 //! （socket 缓冲写满后 hyper 就永久阻塞在 `poll_write` 上），这条连接会一直挂着，而
 //! **准入票据（`Admission`）是绑在 response body 上的**——body 不被丢弃，票据就不释放。
 //! 实测（2026-09-18 云端）就是这样沉淀出 8 个永不归还的槽位：`hlmg_active_requests`
-//! 恒定 8、`hlmg_request_count − Σ状态码 = 8`，配了 `max_concurrent_requests` 的网关被
+//! 恒定 8、`hlmg_request_count − Σ状态码 − hlmg_requests_aborted_total = 8`（当时无中断，
+//! 第三项为 0），配了 `max_concurrent_requests` 的网关被
 //! 只增不减地吃掉闸门，只能重启恢复。
 //!
 //! 应用层的"响应体停滞超时"（`proxy::send_to_client`）**修不掉这一半**：它只能让
