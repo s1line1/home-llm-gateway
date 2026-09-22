@@ -245,7 +245,7 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
     let metrics = state.metrics.clone();
     let key_store = state.key_store.clone();
     // 关闭阶段的接收端：`Terminating` 时这条流要带一个明确事件收尾（见 `forward.rs`）。
-    let shutdown = state.shutdown.subscribe();
+    let shutdown = state.subscribe_shutdown();
     // 请求 body 的 prompt 估算（仅在无 usage 时使用）
     let prompt_est = crate::usage_meter::estimate_prompt_tokens(&body);
     // SSE 响应是流式（usage 在每个 chunk 尾部，逐块预过滤）；非 SSE 为整包 JSON

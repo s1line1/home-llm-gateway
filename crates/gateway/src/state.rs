@@ -88,8 +88,13 @@ pub struct AppState {
     /// 由启动时 [`resolve_ui`] 判定后写入，占位页会把它显示出来——否则用户只看到白屏/通用文案。
     pub ui_problem: Option<String>,
     /// 关闭阶段的广播端。见 [`ShutdownPhase`]：`Gateway::shutdown` 发，accept 循环与
-    /// 在途响应任务收（各自 `subscribe()` 一个接收端）。
-    pub shutdown: watch::Sender<ShutdownPhase>,
+    /// 在途响应任务收。
+    ///
+    /// **刻意私有**（评估 §2 S3）：推进阶段是**进程生命周期**的能力，只有 `Gateway` 该有。
+    /// 外部拿到一个 `AppState` 只能 [`AppState::shutdown_phase`] 查询、
+    /// [`AppState::subscribe_shutdown`] 订阅——`pub` 的 `watch::Sender` 等于把"停服"
+    /// 交给每一个持有者。发送端克隆走 `pub(crate) fn shutdown_sender`。
+    shutdown: watch::Sender<ShutdownPhase>,
 }
 
 impl AppState {
@@ -131,5 +136,63 @@ impl AppState {
                 tx
             },
         }
+    }
+
+    /// 当前关闭阶段（只读）。给"探针要不要报不健康"这类判断用。
+    pub fn shutdown_phase(&self) -> ShutdownPhase {
+        *self.shutdown.borrow()
+    }
+
+    /// 订阅关闭阶段的变化：每个在途响应各持一个接收端（`Gateway` 用 `Draining` 停 accept、
+    /// 用 `Terminating` 给在途 SSE 一个明确的收尾事件）。
+    pub fn subscribe_shutdown(&self) -> watch::Receiver<ShutdownPhase> {
+        self.shutdown.subscribe()
+    }
+
+    /// 关闭通道的发送端克隆：**只给进程生命周期（`Gateway`）**。
+    ///
+    /// `pub(crate)` 而不是 `pub`：拿不到发送端就推不动阶段，这正是收窄后的契约
+    /// （见字段文档与评估 §2 S3）。
+    pub(crate) fn shutdown_sender(&self) -> watch::Sender<ShutdownPhase> {
+        self.shutdown.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state() -> AppState {
+        AppState::new(
+            Registry::default(),
+            KeyStore::new(None),
+            Metrics::default(),
+            &Options::default(),
+        )
+    }
+
+    /// 规格（并集评估 §2 S3）：关闭阶段**可查、可订阅**，但推进阶段的能力只属于
+    /// 进程生命周期——`shutdown` 字段私有、发送端克隆是 `pub(crate)`。
+    ///
+    /// 这条测试钉的是"新接口的行为"：查询反映当前阶段，订阅端能收到后续变化。
+    /// "外部拿不到发送端"由编译器保证（把 `shutdown` 改回 `pub` 或把
+    /// `shutdown_sender` 提成 `pub` 不在任何测试里会被拦住，所以字段文档里写了理由）。
+    #[test]
+    fn shutdown_phase_is_queryable_and_subscribable() {
+        let state = state();
+        assert_eq!(state.shutdown_phase(), ShutdownPhase::Running);
+
+        let mut rx = state.subscribe_shutdown();
+        // 发送端只有 crate 内（`Gateway` 的角色）拿得到；测试用它模拟一次推进。
+        let tx = state.shutdown_sender();
+        let _ = tx.send(ShutdownPhase::Draining);
+        assert_eq!(state.shutdown_phase(), ShutdownPhase::Draining);
+        assert_eq!(*rx.borrow_and_update(), ShutdownPhase::Draining);
+
+        // 订阅者是**独立**接收端：第二个订阅者只看到自己订阅之后的变化
+        let mut rx2 = state.subscribe_shutdown();
+        let _ = tx.send(ShutdownPhase::Terminating);
+        assert_eq!(*rx.borrow_and_update(), ShutdownPhase::Terminating);
+        assert_eq!(*rx2.borrow_and_update(), ShutdownPhase::Terminating);
     }
 }
