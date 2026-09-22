@@ -488,3 +488,207 @@ async fn e2e_shutdown_announces_incomplete_sse_instead_of_cutting() {
     shutdown.await.unwrap();
     agent.shutdown().await;
 }
+
+/// 裸 agent：注册 → 接受请求流 → 回"头 + 第一块" → **只写第二帧的前 2 字节**并通知调用方
+/// → 等调用方放行 → 写完后半帧 → 结束。
+///
+/// 三个信号：① 半个帧头已写出（且已给足送达时间）；② 放行写剩下的一半；③ 整帧写完。
+async fn spawn_split_frame_agent(
+    gw: &Gateway,
+    certs: &TestCerts,
+    agent_id: &str,
+) -> (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+) {
+    use tokio::io::AsyncWriteExt;
+
+    let client = s2n_quic::Client::builder()
+        .with_tls(s2n_quic::provider::tls::rustls::Client::from(
+            std::sync::Arc::new(
+                agent::tls::rustls_client_tls(
+                    &certs.ca,
+                    certs.client_cert.clone(),
+                    certs.client_key.clone_key(),
+                )
+                .unwrap(),
+            ),
+        ))
+        .unwrap()
+        .with_io("0.0.0.0:0")
+        .unwrap()
+        .start()
+        .unwrap();
+    let conn = client
+        .connect(s2n_quic::client::Connect::new(gw.quic_addr).with_server_name("localhost"))
+        .await
+        .unwrap();
+    let (mut handle, mut acceptor) = conn.split();
+
+    // 注册流由 agent 自己开（与 `spawn_raw_agent` 同一套）
+    let stream = handle.open_bidirectional_stream().await.unwrap();
+    let (mut reg_recv, mut reg_send) = stream.split();
+    write_frame(
+        &mut reg_send,
+        &Frame::Register {
+            agent_id: agent_id.into(),
+            models: vec!["mock-llm".into()],
+            max_concurrency: 4,
+            version: "test".into(),
+        },
+    )
+    .await
+    .unwrap();
+    reg_send.finish().unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut reg_recv)).await;
+    wait_for_agents(gw, 1, Duration::from_secs(5)).await;
+
+    let (half_tx, half_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        // `conn` 已被 `split()` 消耗，保活靠它分出来的 handle/acceptor
+        let _keep_alive = (client, handle, reg_recv);
+        let Ok(Some(stream)) = acceptor.accept_bidirectional_stream().await else {
+            return;
+        };
+        let (mut recv, mut send) = stream.split();
+
+        let mut reader = proto::io::FrameReader::new(&mut recv);
+        let Ok(Some(Frame::ProxyRequest { request_id, .. })) = reader.next().await else {
+            return;
+        };
+
+        write_frame(
+            &mut send,
+            &Frame::ProxyResponseHead {
+                request_id,
+                status: 200,
+                headers: vec![("content-type".into(), "text/plain".into())],
+            },
+        )
+        .await
+        .unwrap();
+        write_frame(
+            &mut send,
+            &Frame::ProxyResponseBody {
+                request_id,
+                chunk: b"first\n".to_vec().into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // 第二块**整帧的线上字节**，刻意从中间切开：前 2 字节单独写出（不足一个长度前缀）。
+        let mut wire = Vec::new();
+        write_frame(
+            &mut wire,
+            &Frame::ProxyResponseBody {
+                request_id,
+                chunk: b"second\n".to_vec().into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(wire.len() > 2, "前提：这一帧必须长于一个前缀");
+        send.write_all(&wire[..2]).await.unwrap();
+        send.flush().await.unwrap();
+        let _ = half_tx.send(());
+        let _ = resume_rx.await;
+        send.write_all(&wire[2..]).await.unwrap();
+
+        write_frame(
+            &mut send,
+            &Frame::ProxyResponseEnd {
+                request_id,
+                ok: true,
+            },
+        )
+        .await
+        .unwrap();
+        let _ = send.finish();
+        let _ = done_tx.send(());
+    });
+
+    (half_rx, resume_tx, done_rx)
+}
+
+/// 规格（记录 P3-26）：**关停的阶段变化不许吃掉已经读了一半的帧**。
+///
+/// `forward_body` 的读帧 `select!` 里有三个分支，其中 `shutdown.changed()` 是 `continue`
+/// ——也就是**复用同一条流**。用不可取消的 `read_frame`（内部 `read_exact`）时，阶段变化恰好
+/// 落在帧中途会让被 drop 的 future 带走已读字节，下一轮按错误偏移解析长度前缀：帧错位，
+/// 客户端拿到的是读取错误而不是后半块。`docs/refactor-assessment.md:243` 早就写明"今天安全
+/// 只因为读侧只有一个任务，有人加第三分支就会静默丢半帧"——`c62df2b` 加的正是这个分支。
+///
+/// 判据：`Draining` 期间写出的后半帧必须**完整拼回**，且响应体里不许出现读取错误。
+/// 时序上刻意让"半个帧头"先落地并停留半秒，再触发关停——那半秒里网关必然已读走那 2 字节。
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn e2e_a_frame_split_by_a_shutdown_phase_change_is_not_misparsed() {
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    let TestGateway {
+        gw,
+        certs,
+        key,
+        base,
+        ..
+    } = start_gateway(|o| {
+        // Draining 必须活到"后半帧写进来"之后：宽限给够，别让它直接滑到 Terminating
+        o.shutdown_grace = Duration::from_millis(1500);
+        o.head_timeout = Duration::from_secs(5);
+        o.request_timeout = Duration::from_secs(15);
+        o.client_stall = Duration::from_secs(30);
+    })
+    .await;
+
+    let (half_written, resume, agent_done) =
+        spawn_split_frame_agent(&gw, &certs, "split-frame").await;
+
+    let client = reqwest::Client::new();
+    let request = client
+        .post(format!("{base}/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {key}"))
+        .json(&serde_json::json!({
+            "model": "mock-llm",
+            "messages": [{ "role": "user", "content": "hi" }],
+        }))
+        .send();
+    let response = tokio::spawn(request);
+
+    // ① 等"半个帧头"落地，再留半秒让它被网关读走（此时网关正 park 在 read 上）
+    half_written.await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // ② 关停（Draining：在途响应必须继续跑完），等阶段变化真的送达转发任务
+    let shutdown = tokio::spawn(async move { gw.shutdown().await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // ③ 放行后半帧
+    resume.send(()).unwrap();
+
+    let resp = response.await.unwrap().unwrap();
+    assert_eq!(resp.status(), 200, "响应头在关停前就已经发出去了");
+    // 帧错位后网关只能中止响应体，客户端读到的是**破损的分块编码**而不是一句错误文案
+    // （实测退回 `read_frame` 时报 "unexpected EOF during chunk size line"）。
+    let body = match resp.text().await {
+        Ok(body) => body,
+        Err(e) => panic!("响应体读到一半断了——帧错位后网关中止了响应体（P3-26 的红）：{e}"),
+    };
+    assert!(
+        body.contains("first"),
+        "前提：关停前那一块应当已送达，实际：{body:?}"
+    );
+    assert!(
+        !body.contains("tunnel read failed") && !body.contains("frame too large"),
+        "半个帧头被吃掉后按错误偏移解析（帧错位）；响应体：{body:?}"
+    );
+    assert!(
+        body.contains("second"),
+        "`Draining` 期间写出的后半帧必须被完整拼回（P3-26 的红）：{body:?}"
+    );
+
+    agent_done.await.unwrap();
+    shutdown.await.unwrap();
+}
