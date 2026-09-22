@@ -158,6 +158,7 @@ impl Gateway {
                 opts.client_stall,
                 opts.max_entry_connections,
                 shutdown.subscribe(),
+                metrics.clone(),
             ),
             tokio::spawn(quic::accept_loop(
                 sockets.server,
