@@ -8,7 +8,7 @@
 
 use axum::{
     extract::State,
-    http::HeaderMap,
+    http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
     Json,
 };
@@ -16,8 +16,47 @@ use serde_json::json;
 
 use crate::state::AppState;
 
-pub(super) async fn healthz() -> &'static str {
-    "ok"
+/// 存活探针：状态码回答**唯一一个"探针还答得上、但实例已经没用"**的问题——
+/// 隧道入口是否还在接受新 agent（`hlmg_quic_accepting`）。
+///
+/// 200 ⇔ 隧道入口接受中；否则 503 + `status: "degraded"`。为什么是这个判据、为什么不是别的：
+/// - **它必须进状态码**：QUIC 端点停摆后进程、systemd、HTTP 入口、`/metrics` 全都正常，
+///   而此后每个 `/v1` 都会 503（没有 agent 能接入）——`quic.rs` 那条 `error!` 说的正是
+///   "需要重启网关"，让 LB / 编排器重启它是唯一有效的处置，而它们只看状态码。
+/// - **HTTP 入口自己不查**：它一停，探针本身就不可达（`TcpListener` 随任务结束被 drop），
+///   探针失败即是信号；在这里"自检"只会得到永远不会为假的判断。
+/// - **agent 数不进状态码**（只在 body 里报）：没有 agent ≠ 进程不健康。把它塞进来会让
+///   "刚启动、还没等到 agent 注册"变成探针失败 → LB 摘除 / 容器重启循环，而重启并不能让
+///   agent 出现。要按 readiness 摘流的部署自己读 body 的 `agents.healthy`。
+/// - **落库可写性也不进**（`TODO.md` R12 的结转项）：唯一可靠的判据是"真写一次"，而 SQLite
+///   目前没有 `busy_timeout`（P2-7），探针的写入可能撞 `SQLITE_BUSY` 把健康实例判死。
+///
+/// body 是 JSON（早期是纯文本 `ok`）；**状态码与 body 的 `status` 永远一致**，
+/// `agents.oldest_last_seen_secs_ago` 用来区分"没人注册"与"有人但全过期"（`null` = 注册表为空）。
+pub(super) async fn healthz(State(state): State<AppState>) -> Response {
+    let accepting = state.metrics.quic_accepting() == 1;
+    let status = state.registry.status(state.agent_stale_after);
+
+    let mut body = json!({
+        "status": if accepting { "ok" } else { "degraded" },
+        "tunnel_entry": if accepting { "accepting" } else { "stopped" },
+        "agents": {
+            "registered": status.registered,
+            "healthy": status.healthy,
+            "oldest_last_seen_secs_ago": status.oldest_last_seen_ago.map(|d| d.as_secs()),
+        },
+    });
+    if !accepting {
+        body["detail"] =
+            json!("the tunnel entry stopped accepting new agents; restart the gateway");
+    }
+
+    let code = if accepting {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (code, Json(body)).into_response()
 }
 
 /// OpenAI 兼容 `/v1/models`：聚合所有**健康** agent 显式声明的模型并集
@@ -107,5 +146,56 @@ mod tests {
         let text = body_str(resp).await;
         assert!(text.contains("# TYPE hlmg_requests_total counter"));
         assert!(text.contains("hlmg_agents"));
+    }
+
+    /// 规格（R12）：**隧道入口停摆时必须 503**——这是唯一一个"探针还答得上、但实例已经没用"
+    /// 的故障（QUIC 端点停了以后进程、systemd、HTTP 入口、`/metrics` 全都正常，而此后每个
+    /// `/v1` 都会 503）。修复前这里恒返 `200 "ok"`。
+    #[tokio::test]
+    async fn healthz_is_degraded_while_the_tunnel_entry_is_not_accepting() {
+        let state = test_state(None);
+        // 测试态默认置成"接受中"（见 test_util），这里显式制造"入口停摆"
+        state.metrics.set_quic_accepting_for_test(false);
+
+        let resp = healthz(State(state)).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "隧道入口没在接受新 agent 时必须是 503"
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&body_str(resp).await).expect("body 是 JSON");
+        assert_eq!(v["status"], "degraded");
+        assert_eq!(v["tunnel_entry"], "stopped");
+        assert!(
+            v["detail"].as_str().is_some_and(|d| d.contains("restart")),
+            "degraded 时说清处置方式（重启）：{v}"
+        );
+    }
+
+    /// 规格（R12）：入口接受中时 200，并且 body 能回答"隧道入口状态 + 注册/健康 agent 数"。
+    ///
+    /// **agent 数刻意不进状态码**（只在这里报）：没有 agent ≠ 进程不健康，把它塞进状态码会让
+    /// "刚启动、还没注册"变成探针失败 → 摘除/重启循环。真正的计数由 e2e
+    /// `lifecycle::e2e_healthz_reports_the_same_agent_counts_as_the_api` 用真 agent 交叉验证。
+    #[tokio::test]
+    async fn healthz_reports_ok_and_the_agent_fields_while_accepting() {
+        let state = test_state(None);
+        // 守卫要活到断言结束：Drop 会把 gauge 置回 0
+        let _accepting = state.metrics.mark_accepting();
+
+        let resp = healthz(State(state)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: serde_json::Value =
+            serde_json::from_str(&body_str(resp).await).expect("body 是 JSON");
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["tunnel_entry"], "accepting");
+        assert_eq!(v["agents"]["registered"], 0);
+        assert_eq!(v["agents"]["healthy"], 0);
+        assert!(
+            v["agents"]["oldest_last_seen_secs_ago"].is_null(),
+            "注册表为空时最久心跳年龄是 null（不是 0）：{v}"
+        );
+        assert!(v["detail"].is_null(), "正常时不该有 detail：{v}");
     }
 }

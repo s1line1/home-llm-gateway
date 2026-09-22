@@ -168,6 +168,16 @@ impl Gateway {
             )),
         ];
 
+        // 「`start()` 返回 ⇒ 隧道入口接受中」：把这条不变量在这里做出来，而不是让探针在启动
+        // 窗口里误报 degraded（判据见 `quic::await_accepting`）。等不到只告警、不失败启动——
+        // 端口已经绑好，"入口还没标上"是**健康信号**该说的事，不是启动失败。
+        if !quic::await_accepting(&metrics, std::time::Duration::from_secs(5)).await {
+            tracing::warn!(
+                "the tunnel entry has not marked itself as accepting yet; /healthz will report \
+                 degraded until it does"
+            );
+        }
+
         Ok(Self {
             http_addr: sockets.http_addr,
             quic_addr: sockets.quic_addr,
@@ -209,6 +219,15 @@ impl Gateway {
     /// 注意它**不**覆盖每连接/每请求的派生任务，也不覆盖 `registry` 的摘除宽限任务。
     pub fn is_serving(&self) -> bool {
         self.tasks.iter().all(|t| !t.is_finished())
+    }
+
+    /// 隧道入口是否仍在接受新 agent（`hlmg_quic_accepting` 的程序化形式）。
+    ///
+    /// 与 [`Self::is_serving`] 分工不同：这个回答**具体故障**（UDP 驱动/端点失效，`quic.rs`
+    /// 说"需要重启网关"），`is_serving` 回答"三个主任务是否都还在跑"。`/healthz` 的存活判据
+    /// 就是它；[`Gateway::start`] 保证**返回时为 `true`**（见 `quic::await_accepting`）。
+    pub fn tunnel_accepting(&self) -> bool {
+        self.metrics.quic_accepting() == 1
     }
 
     /// 停网关：**停 accept → 有界排空 → 在途带明确事件收尾 → 有界落库 → abort**。

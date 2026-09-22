@@ -588,10 +588,36 @@
       （`DESIGN.md` §5 自认）。SSE 长流不能被总时限误杀，动之前要先把语义想清楚。
 - [ ] **R11 延迟分位数**：`hlmg_request_duration_ms` 只有 sum，没有直方图
       （`crates/gateway/src/metrics.rs:316`）——"p99 变差"从求和值里看不出来。
-- [ ] **R12 healthz 深度检查**：`/healthz` 恒返 `"ok"`（`crates/gateway/src/http/api.rs`），
-      探针答不出"隧道入口还活着吗 / 还有几个 agent 注册 / 持久化可写吗"。
-      （闸门豁免这一半已修：`/healthz` 用 `limit = 0` 绕过准入，单测
-      `observability::tests::healthz_is_exempt_from_the_admission_gate` 锁住。）
+- [x] **R12 healthz 深度检查（2026-09-22 完成）**：`/healthz` 现在是真探针——
+      **200 ⇔ 隧道入口仍在接受新 agent**（`hlmg_quic_accepting`），否则 `503` + `status:"degraded"`
+      + `detail`（处置：重启网关）；body 改成 JSON，同时报 `agents.registered` /
+      `agents.healthy` / `agents.oldest_last_seen_secs_ago`（与 `Registry::status` 同源，
+      也用上了这个此前只进失败日志的接口）。
+      - 为什么**只有**隧道入口进状态码：它是唯一一个"探针还答得上、但实例已经没用"的故障
+        （QUIC 端点停摆后进程/systemd/HTTP 入口/`/metrics` 全正常，而此后每个 `/v1` 都 503）。
+        HTTP 入口自己不查——它一停探针本身不可达，失败即是信号。
+      - 为什么 agent 数**只在 body**：没有 agent ≠ 进程不健康；塞进状态码会让"刚启动、还没注册"
+        触发摘除/重启循环，而重启并不能让 agent 出现。
+      - 配套不变量：`Gateway::start` 现在等 `quic::await_accepting`（5s 上界，超时只告警），
+        于是「`start()` 返回 ⇒ 隧道入口接受中」成立，探针不会在启动窗口里误报 degraded；
+        新增 `Gateway::tunnel_accepting()` 作为它的程序化读数。**实测**：把那次等待去掉后
+        e2e `lifecycle::e2e_healthz_reports_the_same_agent_counts_as_the_api` 3 次里红 2 次
+        （真竞态），加上即确定绿。
+      - 证据：单测两条（degraded 时必须 503 + detail；接受中时 200 + 三个 agent 字段且空注册表
+        时 `oldest_last_seen_secs_ago` 为 `null`）+ `quic::tests::await_accepting_waits_for_the_mark_and_gives_up_on_timeout`
+        （延迟 60ms 标记时必须**等**它，且超时要返回 false 而不是卡住启动）+ e2e
+        `lifecycle::e2e_healthz_reports_the_same_agent_counts_as_the_api`（真 agent 注册后
+        body 计数与 `agent_count()`/`healthy_agent_count()` 逐字一致；心跳过期后 registered 仍 1、
+        healthy 变 0 而状态码仍 200）。
+      - **明确不在本条**：落库可写性——唯一可靠判据是"真写一次"，而 SQLite 尚无 `busy_timeout`
+        （P2-7），探针写入可能撞 `SQLITE_BUSY` 把健康实例判死；要做得先落 P2-7。用量 flusher
+        任务是否还活着也不在探针里（它死了只影响落库，把"落库坏了"变成 503 会引入重启，而重启
+        修不了磁盘）。
+      - ⚠️ 对外契约变更：`/healthz` 的 body 从纯文本 `ok` 变成 JSON（状态码语义只多不少——
+        原先恒 200，现在只在隧道入口停摆时 503）。只按状态码判的 `curl -sf` / Docker
+        `HEALTHCHECK` / `scripts/bench-*` 不受影响；`README.md` 的《可观测性》与 `DEPLOY.md`
+        已同步。（闸门豁免那一半早已修：`limit = 0` 绕过准入，
+        `observability::tests::healthz_is_exempt_from_the_admission_gate` 锁住。）
 - [x] **R12 drain 式关闭（已实施）**：`Gateway::shutdown`（`crates/gateway/src/gateway.rs`）
       现在是**有界四阶段关闭**：
       ① **停 accept**：广播 `ShutdownPhase::Draining`，公网入口的 accept 循环返回并 drop

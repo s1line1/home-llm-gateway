@@ -22,12 +22,16 @@ pub(super) fn test_state(ui: Option<PathBuf>) -> AppState {
         ui_dir: ui,
         ..Options::default()
     };
-    AppState::new(
+    let state = AppState::new(
         Registry::default(),
         KeyStore::new(None),
         Metrics::default(),
         &opts,
-    )
+    );
+    // 测试态默认「隧道入口接受中」：`/healthz` 拿这个 gauge 当存活判据，而这些用例没有真
+    // QUIC 入口。要测 degraded 语义的用例自己 `set_quic_accepting_for_test(false)`。
+    state.metrics.set_quic_accepting_for_test(true);
+    state
 }
 
 pub(super) fn headers_with_accept(accept: &str) -> HeaderMap {

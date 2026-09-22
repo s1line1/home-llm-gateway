@@ -70,6 +70,80 @@ async fn e2e_healthy_agent_count_separates_registered_from_routable() {
     gw.shutdown().await;
 }
 
+/// 规格（R12）：`/healthz` 的 body 与**程序化 API 同源**，且 `start()` 返回后立刻就是 200。
+///
+/// 三个方向：
+/// ① `start()` 返回 ⇒ 隧道入口接受中 ⇒ **立刻**探活必须 200（不需要重试窗口——
+///    `Gateway::start` 为此等了 gauge，见 `quic::await_accepting`）；
+/// ② 注册后**从不心跳**的裸 agent：`registered` 必须跟着涨、`healthy` 随后归零，
+///    两者分别与 `Gateway::agent_count()` / `healthy_agent_count()` 逐字一致
+///    （否则探针会把人带偏——"注册表里有、但全部不可路由"是排查 503 的关键区分）；
+/// ③ 状态码与 body 的 `status` 永远一致。
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn e2e_healthz_reports_the_same_agent_counts_as_the_api() {
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    let TestGateway {
+        gw, certs, base, ..
+    } = start_gateway(|o| {
+        o.agent_stale_after = Duration::from_millis(200);
+    })
+    .await;
+    // ① 启动返回后**立刻**读：入口必须已经接受中（`start` 等过 gauge，不等就会有调度窗口）
+    assert!(
+        gw.tunnel_accepting(),
+        "start() 返回时隧道入口必须已经接受中"
+    );
+
+    let client = test_client();
+    // 探针也必须是 200（同一判据的另一面）
+    let resp = bounded(
+        "GET /healthz right after start",
+        client.get(format!("{base}/healthz")).send(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "start() 返回时隧道入口必须已经接受中，否则探针会在启动窗口里误报 degraded"
+    );
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["status"], "ok");
+    assert_eq!(v["tunnel_entry"], "accepting");
+    assert_eq!(v["agents"]["registered"], 0, "还没有 agent：{v}");
+
+    // ② 注册一个从不心跳的裸 agent
+    spawn_raw_agent(&gw, &certs, "no-heartbeat", 4).await;
+
+    let resp = client.get(format!("{base}/healthz")).send().await.unwrap();
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        v["agents"]["registered"],
+        gw.agent_count(),
+        "registered 必须与 Gateway::agent_count() 同源：{v}"
+    );
+    assert_eq!(
+        v["agents"]["healthy"],
+        gw.healthy_agent_count(),
+        "healthy 必须与 Gateway::healthy_agent_count() 同源：{v}"
+    );
+
+    // 心跳过期：条目还在（连接没关），但已不可路由——body 必须能区分这两者
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let resp = client.get(format!("{base}/healthz")).send().await.unwrap();
+    assert_eq!(resp.status(), 200, "agent 不健康不等于网关不存活");
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["agents"]["registered"], 1, "条目仍在：{v}");
+    assert_eq!(v["agents"]["healthy"], 0, "心跳过期 ⇒ 不可路由：{v}");
+    assert!(
+        v["agents"]["oldest_last_seen_secs_ago"].is_number(),
+        "最久心跳年龄应当是数字（注册表非空）：{v}"
+    );
+
+    gw.shutdown().await;
+}
+
 /// 规格：**`is_serving()` 能回答"入口还活着吗"**。
 ///
 /// 今天没有别的接口能回答它：`JoinHandle` 存着但从不 poll，`hlmg_quic_accepting` 只覆盖
