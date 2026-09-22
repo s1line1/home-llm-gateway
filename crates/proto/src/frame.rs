@@ -75,6 +75,29 @@ pub enum Frame {
     },
 }
 
+impl Frame {
+    /// 变体名（`"ProxyResponseHead"` 等），**不含任何载荷**。
+    ///
+    /// 专门给"收到了不该出现的帧"这类日志用：`{frame:?}` 会把 `Bytes` 载荷整块打进日志，
+    /// 于是一个坏 agent 发来的 16 MiB `ProxyRequest` 就变成一行 16 MiB 的日志
+    /// （`quic.rs` 的控制流、`head.rs` 的等头循环都有这条路径）。日志要的是"是什么帧"，
+    /// 不是"帧里有什么"。
+    ///
+    /// 穷尽匹配：新增变体时编译器会在这里报错，不会漏掉一个没名字的帧。
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Frame::Register { .. } => "Register",
+            Frame::Heartbeat { .. } => "Heartbeat",
+            Frame::ProxyRequest { .. } => "ProxyRequest",
+            Frame::ProxyResponseHead { .. } => "ProxyResponseHead",
+            Frame::ProxyResponseBody { .. } => "ProxyResponseBody",
+            Frame::ProxyResponseEnd { .. } => "ProxyResponseEnd",
+            Frame::Cancel { .. } => "Cancel",
+            Frame::Error { .. } => "Error",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,5 +145,67 @@ mod tests {
     fn an_empty_chunk_yields_no_piece() {
         let mut empty = Bytes::new();
         assert!(take_chunk_piece(&mut empty).is_none());
+    }
+
+    /// 规格：[`Frame::kind`] 是"收到了不该出现的帧"的唯一日志来源，所以每个变体都要有名字
+    /// 且**互不相同**——名字混在一起，日志就分不出是哪种帧。
+    ///
+    /// 穷尽性由编译器保证（`kind` 里是穷尽匹配）；这里补的是"名字本身"这一层。
+    #[test]
+    fn every_frame_variant_has_its_own_kind_name() {
+        let all = [
+            Frame::Register {
+                agent_id: "a".into(),
+                models: vec!["m".into()],
+                max_concurrency: 1,
+                version: "v".into(),
+            },
+            Frame::Heartbeat {
+                agent_id: "a".into(),
+                inflight: 0,
+            },
+            Frame::ProxyRequest {
+                request_id: 1,
+                method: "POST".into(),
+                path: "/v1/chat/completions".into(),
+                headers: Vec::new(),
+                body: Bytes::new(),
+            },
+            Frame::ProxyResponseHead {
+                request_id: 1,
+                status: 200,
+                headers: Vec::new(),
+            },
+            Frame::ProxyResponseBody {
+                request_id: 1,
+                chunk: Bytes::new(),
+            },
+            Frame::ProxyResponseEnd {
+                request_id: 1,
+                ok: true,
+            },
+            Frame::Cancel { request_id: 1 },
+            Frame::Error {
+                request_id: None,
+                code: 500,
+                message: "boom".into(),
+            },
+        ];
+
+        let names: Vec<&str> = all.iter().map(|f| f.kind()).collect();
+        assert!(
+            names
+                .iter()
+                .all(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric())),
+            "帧名要短且可 grep：{names:?}"
+        );
+        let mut unique = names.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            names.len(),
+            "帧名必须互不相同（新增变体别忘了改名）：{names:?}"
+        );
     }
 }
