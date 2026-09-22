@@ -618,17 +618,20 @@
 > 评估正文在 `docs/*-assessment*.md`，**那份是 gitignore 的本地取证记录**（不入库）：
 > 过程与并集裁决看那里，可执行清单看本节。
 
-- [ ] **A. 锁中毒兜底还差两处：`metrics.rs` 与 `registry.rs`**（`PROJECT_SCAN` P2-12 的剩余 / registry 评估 M2）
-      - 现状：storage 三个文件已全部改完——生产侧 26 处加锁统一走 `lock_or_recover` /
-        `read_or_recover` / `write_or_recover`（定义与语义论证见 `storage/mod.rs` 顶部）；
-        `metrics.rs`（`grep -c '\.lock()'` = 14 处）与 `registry.rs`（RwLock 读写共 15 处）仍是
-        `.unwrap()`。
-      - 后果：`status_counts` / `tunnel_retries` / `head_timeouts` … 任一中毒 ⇒ `/metrics` 直接 500
-        （正是排障时最需要它的时刻）；registry 的表锁中毒 ⇒ 注册/选路/准入永久失败。
-      - 做法：把三个助手从 `storage/mod.rs` 提到 crate 级（例如 `src/sync.rs`）供 `metrics`/`registry`
-        共用，再逐处替换。锁里都是内存映射（计数/表），unwind 不会让它们变成非法状态。
-      - 验收：新增"毒化后仍可用"的测试（`/metrics` 渲染不 panic；registry 仍能注册并选路）；
-        与 storage 的 `a_poisoned_*` 三条同风格。
+- [x] **A. 锁中毒兜底（全 crate 完成，2026-09-21）**（`PROJECT_SCAN` P2-12 / registry 评估 M2）
+      - 已做：三个助手提到 crate 级 `crates/gateway/src/sync.rs`（`lock_or_recover` /
+        `read_or_recover` / `write_or_recover`，模块头写明"唯一允许的加锁方式"），
+        调用点全部替换——storage 26 处、`metrics.rs` **14** 处、`registry.rs` 生产代码
+        **12** 处（另有 3 处测试内的读取保持原样）。
+      - 测试：`storage` 三条（毒化 runtime / db / entries+inflight）+ `metrics` 一条
+        （毒化后 `/metrics` 仍渲染出中毒前后的计数）+ `registry` 一条（毒化后仍能注册并
+        选路），共 5 条 `a_poisoned_*`，都在修复前**先红**（panic 就发生在被毒化的
+        `.unwrap()` 那一行）。
+      - 后果（备忘）：`status_counts` 等中毒 ⇒ `/metrics` 永久 500（排障时最需要它）；
+        registry 表中毒 ⇒ 注册/选路/准入永久失败；`runtime` 中毒 ⇒ 每个 `/v1/*` 都 500。
+      - M2 的另一半（"写锁内含外部调用与 `tokio::spawn`"）**此前已修**：`register` 与
+        `evict` 的写锁范围只够 map 与原子量，关闭动作与 `defer_close` 调度留在锁外，
+        代码里有纪律注释（`registry.rs` 的 `register`/`evict`）。
 
 - [ ] **B. 公网入口：TLS 握手与请求头读取没有超时，也没有连接数上限**（`PROJECT_SCAN` P1-1 / 评估 H8）
       - 位置：`http/entry.rs` 的 `acceptor.accept(stream).await`（无超时）与

@@ -38,7 +38,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::{lock_or_recover, KeyRecord};
+use super::KeyRecord;
+use crate::sync::lock_or_recover;
 
 /// 缓存中的一条已验证身份：**整条记录 + 校验时间**。
 ///

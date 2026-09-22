@@ -43,29 +43,7 @@ mod verified;
 pub use usage::{KeyUsageInfo, UsageDelta};
 
 use crate::storage::hash::{generate_id_key, hash_argon2, lookup_of, now_secs, verify_argon2};
-
-/// 加锁并**忽略中毒**：本模块（含 `verified` / `usage`）唯一允许的加锁方式。
-///
-/// 锁里的东西全是内存映射（`HashMap` / `Option<Connection>` / 单飞槽的 `()`），守卫内
-/// panic 不会把它们变成非法状态，继续用是安全的；而 `.unwrap()` 会把**一次** panic
-/// 放大成永久的全站故障（评估 §5 H4）：`runtime` 中毒 ⇒ 之后每个 `/v1/*` 都 500，
-/// `inflight` 中毒 ⇒ 该 key 的单飞槽永久卡死，`db` 中毒 ⇒ 建/吊销全部 500。
-///
-/// 触发链不必是"认证逻辑自己写错"：守卫内任何一次 panic（越界、`unwrap`、断言、
-/// 第三方库）都会让那把锁永久中毒，所以这里是**兜底**，不是给某段代码开脱。
-fn lock_or_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// 同 [`lock_or_recover`]，用于 `RwLock` 的读侧。
-fn read_or_recover<T>(l: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
-    l.read().unwrap_or_else(|e| e.into_inner())
-}
-
-/// 同 [`lock_or_recover`]，用于 `RwLock` 的写侧。
-fn write_or_recover<T>(l: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
-    l.write().unwrap_or_else(|e| e.into_inner())
-}
+use crate::sync::{lock_or_recover, read_or_recover, write_or_recover};
 
 /// 把库文件权限收紧到 `0600`（评估 §7 步骤 6 / P3-7）。
 ///
