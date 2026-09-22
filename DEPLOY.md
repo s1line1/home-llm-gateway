@@ -249,7 +249,7 @@ curl -N -k -H "Authorization: Bearer <你的key>" \
 - [ ] 每台 LLM 机器的 `agent_id` 唯一（见 §6 警告）
 - [ ] 安全组仅放行所需端口（22 限制来源 IP）
 - [ ] `/metrics` 未加认证：安全组中仅对监控网段放行，或后续给 metrics 加鉴权
-- [ ] server.key / client.key / keys.db 权限 `chmod 600`
+- [ ] server.key / client.key 权限 `chmod 600`（`keys.db` 由网关启动时自动收紧为 0600，可用 `stat -c %a keys.db` 复核）
 - [ ] 证书到期前重签轮换（825 天），记录到期时间
 
 ## 10. 升级说明（旧版 keys.db 自动迁移）
@@ -321,6 +321,7 @@ curl -s localhost:8080/metrics | grep -E 'hlmg_key_verify_(hits|misses)_total'
    （mock-llm 同理），否则跑起来的仍然是网关。
 3. **`keys.db` 是 SQLite WAL 模式**：会额外生成 `keys.db-wal` / `keys.db-shm`，所以必须挂
    **目录**（不能只挂那个文件），而且**目录**要可写；SELinux 主机上可能还要加 `:z` / `:Z`。
+   三个文件的权限由网关启动时收紧为 `0600`（`-wal`/`-shm` 跟随主库）。
 
 ### 11.4 端口与安全组
 

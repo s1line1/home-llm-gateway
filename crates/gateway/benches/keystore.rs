@@ -11,7 +11,7 @@ fn bench_keystore(c: &mut Criterion) {
     let store = KeyStore::new(None);
     let created = store.create("bench".into()).unwrap();
     let plaintext = created.plaintext.clone();
-    let _id = created.record.id;
+    let _id = created.record.id();
 
     // 创建 key（哈希 + 落内存索引）：每次新建 store 保持独立测量
     c.bench_function("keystore/create-key", |b| {

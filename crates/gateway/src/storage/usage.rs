@@ -30,7 +30,7 @@ use rusqlite::Connection;
 use serde::Serialize;
 
 // `now_secs` 只用于 `last_used_at`，与凭据表里的 `created_at` 同源（都在 `super::hash`）。
-use super::hash::now_secs;
+use super::{hash::now_secs, lock_or_recover, read_or_recover, write_or_recover};
 
 /// 每 key 的用量明细（/admin/usage 序列化用）。
 #[derive(Debug, Clone, Serialize)]
@@ -93,7 +93,7 @@ impl UsageStore {
     /// 建实例：库可用则从 `key_usage` 载入（失败只告警、按空账本继续，与凭据存储同风格），
     /// 库不可用（`None`）则纯内存记账。
     pub(crate) fn new(db: Arc<Mutex<Option<Connection>>>) -> Self {
-        let usage = match db.lock().unwrap().as_ref() {
+        let usage = match lock_or_recover(&db).as_ref() {
             Some(conn) => match load_usage(conn) {
                 Ok(map) => map,
                 Err(e) => {
@@ -123,7 +123,7 @@ impl UsageStore {
     /// 只做内存累加：纳秒级、无 IO，用于让 `/admin/usage`（读的正是这份内存计数）
     /// 在响应返回时立即一致。
     pub(crate) fn accumulate(&self, key_id: &str, name: &str, delta: &UsageDelta) {
-        let mut usage = self.usage.write().unwrap();
+        let mut usage = write_or_recover(&self.usage);
         let rec = usage.entry(key_id.to_string()).or_default();
         if rec.current.name.is_empty() {
             rec.current.name = name.to_string();
@@ -139,9 +139,7 @@ impl UsageStore {
 
     /// 是否有"内存值尚未落库"的 key（静默期返回 false，调用方可跳过整轮 flush）。
     pub(crate) fn has_pending(&self) -> bool {
-        self.usage
-            .read()
-            .unwrap()
+        read_or_recover(&self.usage)
             .values()
             .any(|r| !r.ever_flushed || r.current != r.flushed)
     }
@@ -161,7 +159,7 @@ impl UsageStore {
     pub(crate) fn flush_once(&self, force: bool) -> usize {
         // 准备阶段只在内存锁内做，不碰 SQLite。
         let batch: Vec<(String, UsageSnapshot)> = {
-            let usage = self.usage.read().unwrap();
+            let usage = read_or_recover(&self.usage);
             usage
                 .iter()
                 .filter(|(_, r)| force || !r.ever_flushed || r.current != r.flushed)
@@ -172,7 +170,7 @@ impl UsageStore {
             return 0;
         }
 
-        let mut conn = self.db.lock().unwrap();
+        let mut conn = lock_or_recover(&self.db);
         let Some(conn) = conn.as_mut() else {
             return 0; // 无持久化（内存模式）：没有库可写
         };
@@ -224,7 +222,7 @@ impl UsageStore {
             return 0;
         }
         // 提交成功后才更新"已落库"标记。
-        let mut usage = self.usage.write().unwrap();
+        let mut usage = write_or_recover(&self.usage);
         for (key_id, snap) in batch {
             if let Some(rec) = usage.get_mut(&key_id) {
                 rec.flushed = snap;
@@ -247,7 +245,7 @@ impl UsageStore {
     /// 构造"库里已有某值"的场景。**阻塞调用**，不要放回请求路径。
     #[cfg(test)]
     pub(crate) fn persist(&self, key_id: &str, name: &str, delta: &UsageDelta) {
-        if let Some(conn) = self.db.lock().unwrap().as_mut() {
+        if let Some(conn) = lock_or_recover(&self.db).as_mut() {
             let r = conn.execute(
                 "INSERT INTO key_usage
                  (key_id, name, prompt_tokens, completion_tokens, requests, estimated_requests, last_used_at)
@@ -277,14 +275,14 @@ impl UsageStore {
 
     /// 单个 key 的用量快照（无记录 → None）。
     pub(crate) fn of(&self, key_id: &str) -> Option<KeyUsageInfo> {
-        let usage = self.usage.read().unwrap();
+        let usage = read_or_recover(&self.usage);
         let rec = usage.get(key_id)?;
         Some(cell_to_info(key_id, &rec.current))
     }
 
     /// 全部 key 的用量快照（按 key_id 排序）。
     pub(crate) fn snapshot(&self) -> Vec<KeyUsageInfo> {
-        let usage = self.usage.read().unwrap();
+        let usage = read_or_recover(&self.usage);
         let mut out: Vec<KeyUsageInfo> = usage
             .iter()
             .map(|(id, rec)| cell_to_info(id, &rec.current))
