@@ -368,6 +368,45 @@ fn pick<'a>(
     Ok(candidates)
 }
 
+/// 已注册条目的摘除守卫：连接任务结束时把条目摘掉——**即使任务 panic**。
+///
+/// 为什么必须用 Drop（评估记录 P2-11）：`quic::handle_conn` 原先在末尾写一句
+/// `if let Some((id, sid)) = &agent_id { registry.remove_if_same(id, *sid) }`。panic 展开时
+/// 那句不执行，条目就**永久**留在注册表里——而这个仓库**没有 stale 清扫器**（心跳过期只是
+/// 不再可路由），于是 `hlmg_agents` 虚高、`/admin/agents` 里出现幽灵条目，直到重启。
+///
+/// 用法：`let mut reg = Registration::new(&registry);` … 注册成功后 `reg.note(id, stable_id)`；
+/// 守卫随 `handle_conn` 的栈帧一起 drop。`Option` 为空（从没注册成功）时摘除是 no-op。
+pub struct Registration<'a> {
+    registry: &'a Registry,
+    agent: Option<(String, usize)>,
+}
+
+impl<'a> Registration<'a> {
+    pub fn new(registry: &'a Registry) -> Self {
+        Self {
+            registry,
+            agent: None,
+        }
+    }
+
+    /// 记下"这条连接注册成了哪个 agent / stable_id"。
+    ///
+    /// 重复注册同名 agent 时**覆盖**：只有最后一次的 `stable_id` 才匹配当前条目，
+    /// 用旧的 stable_id 摘除是 no-op（`remove_if_same` 会比对）。
+    pub fn note(&mut self, agent_id: String, stable_id: usize) {
+        self.agent = Some((agent_id, stable_id));
+    }
+}
+
+impl Drop for Registration<'_> {
+    fn drop(&mut self) {
+        if let Some((agent_id, stable_id)) = &self.agent {
+            self.registry.remove_if_same(agent_id, *stable_id);
+        }
+    }
+}
+
 impl Registry {
     /// 注册 agent；若同名 agent 已有其他连接，关闭旧连接。
     ///
@@ -1020,6 +1059,69 @@ mod tests {
             ),
             Err(AcquireError::NoModel)
         ));
+    }
+
+    /// 规格（P2-11）：注册条目随 [`Registration`] 的 Drop 摘除——**panic 展开也要摘**。
+    ///
+    /// 为什么重要：`quic::handle_conn` 原来在末尾写一句 `remove_if_same`，panic 时那句不执行，
+    /// 条目就永久留在注册表里（本仓库没有 stale 清扫器），表现为 `hlmg_agents` 虚高 +
+    /// `/admin/agents` 幽灵条目。
+    #[tokio::test]
+    async fn registration_guard_removes_the_entry_on_drop_and_on_panic() {
+        let reg = Registry::default();
+
+        // 正常路径：守卫出作用域即摘除
+        {
+            let mut registration = Registration::new(&reg);
+            let stable_id = reg.register(
+                "home-1".into(),
+                vec!["m".into()],
+                2,
+                test_connection().await,
+            );
+            registration.note("home-1".into(), stable_id);
+            assert_eq!(reg.len(), 1);
+        }
+        assert_eq!(reg.len(), 0, "守卫 drop 必须摘掉条目");
+
+        // panic 路径：展开过程中也要摘
+        let conn = test_connection().await;
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut registration = Registration::new(&reg);
+            let stable_id = reg.register("home-2".into(), vec!["m".into()], 2, conn.clone());
+            registration.note("home-2".into(), stable_id);
+            assert_eq!(reg.len(), 1);
+            panic!("connection task blew up");
+        }));
+        assert!(panicked.is_err(), "前提：panic 发生了");
+        assert_eq!(
+            reg.len(),
+            0,
+            "panic 展开也必须摘掉条目（否则是永远删不掉的幽灵 agent）"
+        );
+    }
+
+    /// 规格：`note` 被后来的注册**覆盖**——同名重复注册时，只有最后一次的 `stable_id`
+    /// 匹配条目，用旧的 stable_id 摘除是 no-op（`remove_if_same` 会比对）。
+    #[tokio::test]
+    async fn registration_guard_removes_only_the_last_registration() {
+        let reg = Registry::default();
+        let mut registration = Registration::new(&reg);
+        let first = reg.register("x".into(), vec!["m".into()], 2, test_connection().await);
+        registration.note("x".into(), first);
+        let second = reg.register("x".into(), vec!["m".into()], 2, test_connection().await);
+        registration.note("x".into(), second);
+        assert_eq!(reg.len(), 1);
+
+        drop(registration);
+        assert_eq!(reg.len(), 0, "最后一次注册的条目必须被摘掉");
+
+        // 反向：只记着旧 stable_id 时，摘除不许误删新条目
+        let mut stale = Registration::new(&reg);
+        let fresh = reg.register("y".into(), vec!["m".into()], 2, test_connection().await);
+        stale.note("y".into(), fresh.wrapping_sub(1)); // 一个不存在的 stable_id
+        drop(stale);
+        assert_eq!(reg.len(), 1, "stable_id 不匹配时不得摘除别人的条目");
     }
 
     #[tokio::test]

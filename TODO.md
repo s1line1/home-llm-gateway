@@ -825,6 +825,25 @@
       - 顺带关闭记录里的缺口「`Cancel` → 上游确实被取消**缺上游侧断言**」（`mock-llm` 新增
         `/stats`，见本节上一条）。
 
+- [x] **I. quic 每连接清理上 Drop guard（2026-09-22 完成）**（`PROJECT_SCAN` P2-11 / 评估 H10）
+      - 缺陷：`accept_loop` 的每连接任务里是"先 `agent_connected()`、末尾 `agent_disconnected()`"，
+        `handle_conn` 里则把注册表条目摘除写成末尾一句 `remove_if_same`。**panic 展开时末尾语句不
+        执行** ⇒ `hlmg_quic_connections` 永久虚高、条目永久留在注册表（本仓库**没有 stale 清扫器**，
+        心跳过期只是不再可路由），表现为 `hlmg_agents` 虚高 + `/admin/agents` 里的幽灵条目，
+        只能重启。仓库其它资源（`AcceptingGuard`/`Admission`/`SlotGuard`）早就是 RAII，这是最后一处例外。
+        另外 `agent_disconnected` 是裸 `fetch_sub`：在 0 上回绕会把 gauge 变成 `u64::MAX`。
+      - 已做：① `Metrics::mark_agent_connected()` 返回 `AgentConnectionGuard`（Drop 减一），
+        **删掉**旧的 `agent_connected`/`agent_disconnected` 两个公开方法——只留一条配对路径；
+        递减改成饱和 `fetch_update`（第二道保险）。② 新增 `registry::Registration`
+        （`new/note` + Drop 时 `remove_if_same`），`quic::handle_conn` 用它取代末尾语句。
+        两条 Drop 路径覆盖**正常返回 / `?` 提前返回 / panic 展开**。
+      - 证据：`metrics::tests::the_connection_gauge_is_released_even_when_the_task_panics`
+        （在 `catch_unwind` 里持有守卫后 panic，断言 gauge 归零、counter 不回退）、
+        `the_connection_gauge_never_wraps_around`；
+        `registry::tests::registration_guard_removes_the_entry_on_drop_and_on_panic`、
+        `registration_guard_removes_only_the_last_registration`（同名重复注册只摘最后一次；
+        stable_id 不匹配时不许误删别人的条目）。**把两个 Drop 体改空即红**——实测两条断言同时失败。
+
 - [x] **D. registry 评估 §7 步骤 6 的可选清理（2026-09-21 处置完毕：两项落地、两项裁定不做）**
       - ✅ **`pick()` 抽成纯函数**（`registry::pick`）：次序（新鲜 → 排除 → 模型 → 精确优先 →
         负载轻 → 心跳新）与两个错误变体（`NoAgent` / `NoModel`）都在一处；新增

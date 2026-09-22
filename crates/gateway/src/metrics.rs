@@ -93,6 +93,11 @@ impl Metrics {
         AcceptingGuard(self.clone())
     }
 
+    /// 当前在线 agent 连接数（`hlmg_quic_connections` 同一份读数）。
+    pub fn quic_connections(&self) -> u64 {
+        self.inner.quic_connections.load(Ordering::Relaxed)
+    }
+
     /// 隧道入口是否仍在接受新连接（1/0）。
     pub fn quic_accepting(&self) -> u64 {
         self.inner.quic_accepting.load(Ordering::Relaxed)
@@ -231,16 +236,26 @@ impl Metrics {
     }
 
     /// agent 连接建立：累计 +1、当前在线 +1。
-    pub fn agent_connected(&self) {
+    pub fn mark_agent_connected(&self) -> AgentConnectionGuard {
         self.inner
             .agent_connections_total
             .fetch_add(1, Ordering::Relaxed);
         self.inner.quic_connections.fetch_add(1, Ordering::Relaxed);
+        AgentConnectionGuard(self.clone())
     }
 
-    /// agent 连接断开：当前在线 -1。
-    pub fn agent_disconnected(&self) {
-        self.inner.quic_connections.fetch_sub(1, Ordering::Relaxed);
+    /// agent 连接断开：当前在线 -1。**只由 [`AgentConnectionGuard`] 调用**。
+    ///
+    /// 饱和减而不是裸 `fetch_sub`：gauge 在 0 上回绕会变成 `u64::MAX`（`hlmg_quic_connections`
+    /// 永远报警）。守卫已经保证每 +1 恰好配一次 -1，这里是第二道保险——一处逻辑错误不该把
+    /// 仪表盘彻底毁掉。
+    fn agent_disconnected(&self) {
+        let _ =
+            self.inner
+                .quic_connections
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                    Some(n.saturating_sub(1))
+                });
     }
 
     /// 渲染为 Prometheus 文本格式。
@@ -485,6 +500,20 @@ impl Drop for AcceptingGuard {
     }
 }
 
+/// 一条 agent 连接的生命周期守卫：见 [`Metrics::mark_agent_connected`]。
+///
+/// **为什么必须用 Drop**（评估记录 P2-11）：以前 `quic.rs` 是在连接任务里"先 +1、末尾 -1"，
+/// 而 `handle_conn` 里任何 panic 都会让末尾那句不执行——`hlmg_quic_connections` 于是**永久虚高**，
+/// 而且注册表条目也再也摘不掉（没有 stale 清扫器）。仓库其它资源（`AcceptingGuard` /
+/// `Admission` / `SlotGuard`）早就是这个模式，这是最后一处例外。
+pub struct AgentConnectionGuard(Metrics);
+
+impl Drop for AgentConnectionGuard {
+    fn drop(&mut self) {
+        self.0.agent_disconnected();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Metrics;
@@ -516,6 +545,46 @@ mod tests {
         assert!(
             text.contains("hlmg_requests_total{status=\"204\"} 1"),
             "中毒后新记的状态码也要出现：\n{text}"
+        );
+    }
+
+    /// 规格（P2-11）：**连接任务的 panic 必须把 `hlmg_quic_connections` 降回去**。
+    ///
+    /// 旧的"先 +1、末尾 -1"写法在这条测试下必然红：panic 展开时末尾那句不执行，gauge 永久虚高，
+    /// 而没有任何东西会去纠正它（注册表条目同样漏掉，见 `registry::Registration`）。
+    #[test]
+    fn the_connection_gauge_is_released_even_when_the_task_panics() {
+        let m = Metrics::default();
+        assert_eq!(m.quic_connections(), 0);
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = m.mark_agent_connected();
+            assert_eq!(m.quic_connections(), 1, "在连时应为 1");
+            panic!("connection task blew up");
+        }));
+        assert!(panicked.is_err(), "前提：panic 发生了");
+        assert_eq!(
+            m.quic_connections(),
+            0,
+            "panic 展开也必须归还 gauge（否则永久虚高，只能重启）"
+        );
+        assert!(
+            m.render(0, 0, 0, 0)
+                .contains("hlmg_agent_connections_total 1"),
+            "累计连接数是 counter，不因 panic 回退"
+        );
+    }
+
+    /// 规格（P2-11）：递减**饱和**——0 上再减不许回绕成 `u64::MAX`。
+    #[test]
+    fn the_connection_gauge_never_wraps_around() {
+        let m = Metrics::default();
+        m.agent_disconnected();
+        m.agent_disconnected();
+        assert_eq!(
+            m.quic_connections(),
+            0,
+            "裸 fetch_sub 会回绕成 u64::MAX，仪表盘彻底不可读"
         );
     }
 
