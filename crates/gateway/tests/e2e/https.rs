@@ -366,7 +366,7 @@ async fn e2e_proxy_protocol_edge_cases() {
                         &mut send,
                         &Frame::ProxyResponseBody {
                             request_id: 1,
-                            chunk: b"ignored".to_vec(),
+                            chunk: axum::body::Bytes::from_static(b"ignored"),
                         },
                     )
                     .await
@@ -385,7 +385,7 @@ async fn e2e_proxy_protocol_edge_cases() {
                         &mut send,
                         &Frame::ProxyResponseBody {
                             request_id: 1,
-                            chunk: b"hello".to_vec(),
+                            chunk: axum::body::Bytes::from_static(b"hello"),
                         },
                     )
                     .await
@@ -513,7 +513,7 @@ async fn e2e_proxy_protocol_edge_cases() {
                         &mut send,
                         &Frame::ProxyResponseBody {
                             request_id: 1,
-                            chunk: b"ok".to_vec(),
+                            chunk: axum::body::Bytes::from_static(b"ok"),
                         },
                     )
                     .await

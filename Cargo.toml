@@ -11,6 +11,9 @@ license = "MIT"
 anyhow = "1"
 async-stream = "0.3"
 axum = "0.8"
+# bytes：帧里的 body/chunk。开 `serde` 是为了让 postcard 走 `serialize_bytes`（一次写整块）
+# 而不是把 `Vec<u8>` 当序列**逐元素**编码——16MiB 上实测差三个数量级（见 proto/src/frame.rs）。
+bytes = { version = "1", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 futures-util = "0.3"
 hyper = { version = "1", features = ["http1", "server"] }

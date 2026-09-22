@@ -150,6 +150,7 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
 mod tests {
     use super::*;
     use crate::Frame;
+    use bytes::Bytes;
 
     #[tokio::test]
     async fn roundtrip_all_frame_types() {
@@ -169,7 +170,7 @@ mod tests {
                 method: "POST".into(),
                 path: "/v1/chat/completions?stream=true".into(),
                 headers: vec![("content-type".into(), "application/json".into())],
-                body: b"{\"model\":\"x\"}".to_vec(),
+                body: Bytes::from_static(b"{\"model\":\"x\"}"),
             },
             Frame::ProxyResponseHead {
                 request_id: 42,
@@ -178,7 +179,7 @@ mod tests {
             },
             Frame::ProxyResponseBody {
                 request_id: 42,
-                chunk: b"data: {...}\n\n".to_vec(),
+                chunk: Bytes::from_static(b"data: {...}\n\n"),
             },
             Frame::ProxyResponseEnd {
                 request_id: 42,
@@ -246,7 +247,7 @@ mod tests {
         // 64KiB body 跨长度前缀正确编解码
         let frame = Frame::ProxyResponseBody {
             request_id: 7,
-            chunk: vec![0xabu8; 64 * 1024],
+            chunk: vec![0xabu8; 64 * 1024].into(),
         };
         let mut buf = Vec::new();
         write_frame(&mut buf, &frame).await.unwrap();
@@ -342,7 +343,7 @@ mod tests {
     async fn frame_reader_survives_cancel_mid_frame() {
         let body = Frame::ProxyResponseBody {
             request_id: 7,
-            chunk: vec![1, 2, 3],
+            chunk: vec![1u8, 2, 3].into(),
         };
         let cancel = Frame::Cancel { request_id: 7 };
         let wire = wire_of(&[body.clone(), cancel.clone()]).await;
@@ -385,7 +386,7 @@ mod tests {
                 method: "POST".into(),
                 path: "/v1/chat/completions?stream=true".into(),
                 headers: vec![("content-type".into(), "application/json".into())],
-                body: b"{\"model\":\"x\"}".to_vec(),
+                body: Bytes::from_static(b"{\"model\":\"x\"}"),
             },
             Frame::ProxyResponseHead {
                 request_id: 42,
@@ -394,7 +395,7 @@ mod tests {
             },
             Frame::ProxyResponseBody {
                 request_id: 42,
-                chunk: b"data: {...}\n\n".to_vec(),
+                chunk: Bytes::from_static(b"data: {...}\n\n"),
             },
             Frame::ProxyResponseEnd {
                 request_id: 42,
@@ -438,7 +439,7 @@ mod tests {
     async fn frame_reader_large_body_spans_multiple_reads() {
         let big = Frame::ProxyResponseBody {
             request_id: 7,
-            chunk: vec![0xab; 64 * 1024], // 远超内部 8KiB 读块
+            chunk: vec![0xab; 64 * 1024].into(), // 远超内部 8KiB 读块
         };
         let next = Frame::ProxyResponseEnd {
             request_id: 7,
@@ -486,5 +487,120 @@ mod tests {
         let mut dribble = FrameReader::new(DribbleReader::new(buf));
         let err = dribble.next().await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// 规格：帧里的 `body`/`chunk` 从 `Vec<u8>` 换成 [`bytes::Bytes`]（H6：让 postcard 走
+    /// `serialize_bytes` 一次写整块）**不改变线上格式**。
+    ///
+    /// 为什么必须钉：隧道两端可以版本不一致（新网关 + 旧 agent，或反过来）。`Bytes` 用
+    /// `serialize_bytes`、`Vec<u8>` 用"元素序列"，是两条不同的 serde 路径；postcard 恰好把两者
+    /// 都编成 `varint 长度 + 原始字节`，这里用一个**变体顺序与字段顺序完全一致**的镜像枚举
+    /// 逐字节比对，把"恰好"变成判据。（镜像里变体顺序也必须一致——postcard 的枚举是"变体序号 +
+    /// 字段"，所以这个测试顺带钉住"变体顺序不能改"。）
+    #[test]
+    fn bytes_body_encodes_identically_to_a_plain_vec() {
+        // 只构造 ProxyRequest/ProxyResponseBody；其余变体存在的意义是**对齐变体序号**
+        // （postcard 的枚举编码 = 变体序号 + 字段），所以这里允许它们"未被构造"。
+        #[derive(serde::Serialize)]
+        #[allow(dead_code)]
+        enum PlainFrame {
+            Register {
+                agent_id: String,
+                models: Vec<String>,
+                max_concurrency: u32,
+                version: String,
+            },
+            Heartbeat {
+                agent_id: String,
+                inflight: u32,
+            },
+            ProxyRequest {
+                request_id: u64,
+                method: String,
+                path: String,
+                headers: Vec<(String, String)>,
+                body: Vec<u8>,
+            },
+            ProxyResponseHead {
+                request_id: u64,
+                status: u16,
+                headers: Vec<(String, String)>,
+            },
+            ProxyResponseBody {
+                request_id: u64,
+                chunk: Vec<u8>,
+            },
+            ProxyResponseEnd {
+                request_id: u64,
+                ok: bool,
+            },
+            Cancel {
+                request_id: u64,
+            },
+            Error {
+                request_id: Option<u64>,
+                code: u16,
+                message: String,
+            },
+        }
+
+        // 边界：空、单字节、跨 0x80、1KiB
+        for body in [
+            Vec::new(),
+            vec![0u8],
+            vec![0x7f, 0x80, 0xff],
+            vec![b'x'; 1024],
+        ] {
+            let headers = vec![("content-type".to_string(), "application/json".into())];
+            let frame = Frame::ProxyRequest {
+                request_id: 7,
+                method: "POST".into(),
+                path: "/v1/chat/completions".into(),
+                headers: headers.clone(),
+                body: Bytes::copy_from_slice(&body),
+            };
+            let plain = PlainFrame::ProxyRequest {
+                request_id: 7,
+                method: "POST".into(),
+                path: "/v1/chat/completions".into(),
+                headers,
+                body: body.clone(),
+            };
+            assert_eq!(
+                postcard::to_allocvec(&frame).expect("encode"),
+                postcard::to_allocvec(&plain).expect("encode"),
+                "body={} 字节时线上格式变了（旧 agent 会解不开）",
+                body.len()
+            );
+
+            let chunk = Frame::ProxyResponseBody {
+                request_id: 9,
+                chunk: Bytes::copy_from_slice(&body),
+            };
+            let plain_chunk = PlainFrame::ProxyResponseBody {
+                request_id: 9,
+                chunk: body.clone(),
+            };
+            assert_eq!(
+                postcard::to_allocvec(&chunk).expect("encode"),
+                postcard::to_allocvec(&plain_chunk).expect("encode"),
+                "chunk={} 字节时线上格式变了",
+                body.len()
+            );
+        }
+
+        // 反向：旧端（`Vec<u8>` 编码）写出的字节，新端必须解成同一个帧
+        let plain_bytes = postcard::to_allocvec(&PlainFrame::ProxyResponseBody {
+            request_id: 3,
+            chunk: b"hello".to_vec(),
+        })
+        .expect("encode");
+        match postcard::from_bytes::<Frame>(&plain_bytes).expect("decode") {
+            Frame::ProxyResponseBody { request_id, chunk } => {
+                assert_eq!(request_id, 3);
+                assert_eq!(&chunk[..], b"hello");
+            }
+            other => panic!("应当解出 ProxyResponseBody，实际 {other:?}"),
+        }
     }
 }

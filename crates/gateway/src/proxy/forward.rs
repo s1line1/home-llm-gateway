@@ -185,7 +185,7 @@ pub(super) async fn forward_body(
         };
         match frame {
             Ok(Ok(Some(Frame::ProxyResponseBody { chunk, .. }))) => {
-                match send_to_client(&tx, Ok(Bytes::from(chunk.clone())), client_stall).await {
+                match send_to_client(&tx, Ok(chunk.clone()), client_stall).await {
                     SendOutcome::Delivered => {}
                     SendOutcome::ClientGone => {
                         // 客户端已断开 → 取消上游；仍结算已转发部分

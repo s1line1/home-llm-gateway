@@ -20,16 +20,39 @@ use tracing::{debug, warn};
 
 use crate::body::{read_body_with_stall, BodyRead, MAX_REQUEST_BODY};
 use crate::openai::error_response;
+use crate::usage_meter;
 use crate::{auth::authenticate, state::AppState};
 use forward::forward_body;
 
-/// 从请求 body 提取路由所需模型：顶层 `model` 字段（OpenAI 兼容语义，必填）。
-/// 缺失 / 非字符串 / 空串 → Err（调用方返回 400）。
-fn extract_model(body: &[u8]) -> Result<String, ()> {
-    let value: serde_json::Value = serde_json::from_slice(body).map_err(|_| ())?;
-    match value.get("model") {
-        Some(serde_json::Value::String(s)) if !s.is_empty() => Ok(s.clone()),
-        _ => Err(()),
+/// 解析请求体的失败原因：`Invalid` 是客户端的问题（400），`Internal` 是网关自己的（500）。
+#[derive(Debug, PartialEq, Eq)]
+enum FactsError {
+    Invalid,
+    Internal,
+}
+
+/// 大 body 的解析挪去阻塞池的最小体积。
+///
+/// `request_facts` 是一次**全量 JSON 解析**：16MiB 实测 ~77ms（debug 构建），压在 async worker
+/// 上会连带卡住同一个线程上的其它请求（H6 说的队头阻塞）。小 body（聊天请求常见几 KB）原地
+/// 解析——每次请求多一次 `spawn_blocking` 的线程池往返还更亏。阈值是**实测权衡**，不是协议值。
+const PARSE_OFFLOAD_MIN_BYTES: usize = 256 * 1024;
+
+/// 取请求侧解析结果：大 body 走阻塞池，小 body 原地解析。
+async fn request_facts_for(
+    body: &axum::body::Bytes,
+) -> Result<usage_meter::RequestFacts, FactsError> {
+    if body.len() < PARSE_OFFLOAD_MIN_BYTES {
+        return usage_meter::request_facts(body).map_err(|_| FactsError::Invalid);
+    }
+    // `Bytes` 克隆是引用计数：把所有权移进阻塞任务**不拷贝** body 内容
+    let owned = body.clone();
+    match tokio::task::spawn_blocking(move || usage_meter::request_facts(&owned)).await {
+        Ok(facts) => facts.map_err(|_| FactsError::Invalid),
+        Err(e) => {
+            tracing::error!("request body parsing task failed: {e}");
+            Err(FactsError::Internal)
+        }
     }
 }
 
@@ -99,13 +122,24 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
                 )
             }
         };
-    // 路由需要模型：按请求 model 挑选能服务它的 agent（见 MODEL_ROUTING.md）
-    let model = match extract_model(&body) {
-        Ok(m) => m,
-        Err(()) => {
+    // 一次解析同时拿到路由要的 model 与 prompt 估算（H6：以前这里解析一遍、
+    // 下面估算又解析一遍）。解析失败/缺 model 的语义与拆分前一致 → 400。
+    let facts = match request_facts_for(&body).await {
+        Ok(f) => f,
+        Err(FactsError::Invalid) => {
             return error_response(StatusCode::BAD_REQUEST, "model is required in request body")
         }
+        // 阻塞池任务 panic/被取消：这是网关自己的故障，别让客户端以为是自己 body 的问题
+        Err(FactsError::Internal) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error while parsing the request body",
+            )
+        }
     };
+    let model = facts.model;
+    // prompt 估算（仅在无 usage 时使用）：来自上面那次解析的字符数，**不再解析一遍**
+    let prompt_est = usage_meter::estimate_tokens_from_chars(facts.prompt_chars).max(1);
     // request_id 在函数最开头就算好了（因为它要出现在"读 body 停滞"这类早期日志里）。
     // 隧道 request_id 与 HTTP 层 x-request-id 同源（crate::request_id）：
     // middleware 注入规范化的 req-{n}，本函数沿用它，响应头/日志/隧道帧三方同一个数字。
@@ -115,7 +149,7 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
         method: method.to_string(),
         path,
         headers: filter_headers(&headers),
-        body: body.to_vec(),
+        body,
     };
 
     let (entry, slot, mut recv, mut send) =
@@ -147,8 +181,6 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
     let key_store = state.key_store.clone();
     // 关闭阶段的接收端：`Terminating` 时这条流要带一个明确事件收尾（见 `forward.rs`）。
     let shutdown = state.subscribe_shutdown();
-    // 请求 body 的 prompt 估算（仅在无 usage 时使用）
-    let prompt_est = crate::usage_meter::estimate_prompt_tokens(&body);
     // SSE 响应是流式（usage 在每个 chunk 尾部，逐块预过滤）；非 SSE 为整包 JSON
     let is_stream = out_headers
         .iter()
@@ -276,22 +308,62 @@ mod tests {
         );
     }
 
-    #[test]
-    fn extract_model_reads_top_level_field() {
-        // 正常：字符串 model
+    /// 规格（H6）：**大 body 走阻塞池、结果与小 body 一致**。
+    ///
+    /// 这条覆盖的是"分支正确"，不是"真的不阻塞"（后者由 `spawn_blocking` 的语义保证，测不了）；
+    /// 它同时钉住阈值两侧都返回同一份 facts——否则大于 256KiB 的请求会静默走另一条路。
+    #[tokio::test]
+    async fn request_facts_for_offloads_large_bodies_and_keeps_the_same_result() {
+        // 造一个刚好跨过阈值、含 messages 的合法 chat body
+        let filler = "x".repeat(PARSE_OFFLOAD_MIN_BYTES);
+        let body = serde_json::to_vec(&serde_json::json!({
+            "model": "qwen2.5",
+            "messages": [{"role": "user", "content": filler}],
+        }))
+        .unwrap();
+        assert!(
+            body.len() >= PARSE_OFFLOAD_MIN_BYTES,
+            "前提：这个 body 必须走阻塞池那条路（实际 {}）",
+            body.len()
+        );
+        let bytes = axum::body::Bytes::from(body);
+        let facts = request_facts_for(&bytes)
+            .await
+            .expect("大 body 也必须解析成功");
+        assert_eq!(facts.model, "qwen2.5");
         assert_eq!(
-            extract_model(br#"{"model":"qwen2.5","messages":[]}"#).unwrap(),
+            facts.prompt_chars, PARSE_OFFLOAD_MIN_BYTES as u64,
+            "字符数必须与小 body 路径一致（同样是 messages[].content 的长度）"
+        );
+
+        // 小 body：原地解析（同一条规格的另一侧）
+        let small = axum::body::Bytes::from_static(br#"{"model":"m","messages":[]}"#);
+        assert_eq!(request_facts_for(&small).await.expect("小 body").model, "m");
+        // 非法 JSON 仍然是"客户端的问题"（400），不是 500
+        let bad = axum::body::Bytes::from(vec![b'x'; PARSE_OFFLOAD_MIN_BYTES]);
+        assert!(
+            matches!(request_facts_for(&bad).await, Err(FactsError::Invalid)),
+            "非法 JSON 必须报 Invalid（400），不能报 Internal（500）"
+        );
+    }
+
+    /// 规格：路由只认**顶层**的 `model` 字符串（等价于拆分前 `extract_model` 的判据）。
+    ///
+    /// 判据本体搬去了 `usage_meter::request_facts`（一次解析同时算 prompt 估算，见 H6），
+    /// 这条从调用方的角度把"哪些 body 会被路由"钉住：嵌套的 `model` 不算、空串不算、
+    /// 非字符串不算、非法 JSON 不算。
+    #[test]
+    fn routing_takes_the_top_level_model_string_only() {
+        let model = |b: &[u8]| crate::usage_meter::request_facts(b).map(|f| f.model);
+        assert_eq!(
+            model(br#"{"model":"qwen2.5","messages":[]}"#).unwrap(),
             "qwen2.5"
         );
-        // model 是嵌套路径中的字段（不应误取）
-        assert!(extract_model(br#"{"messages":[{"role":"user","content":"model?"}]}"#).is_err());
-        // 缺失 model → Err（调用方返回 400）
-        assert!(extract_model(br#"{"messages":[]}"#).is_err());
-        // model 非字符串 → Err
-        assert!(extract_model(br#"{"model":123}"#).is_err());
-        // 空串 → Err
-        assert!(extract_model(br#"{"model":""}"#).is_err());
-        // 非法 JSON → Err
-        assert!(extract_model(b"not json").is_err());
+        // model 只出现在 messages 里（嵌套路径）→ 不算
+        assert!(model(br#"{"messages":[{"role":"user","content":"model?"}]}"#).is_err());
+        assert!(model(br#"{"messages":[]}"#).is_err(), "缺失 model");
+        assert!(model(br#"{"model":123}"#).is_err(), "非字符串 model");
+        assert!(model(br#"{"model":""}"#).is_err(), "空串 model");
+        assert!(model(b"not json").is_err(), "非法 JSON");
     }
 }

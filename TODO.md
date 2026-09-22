@@ -761,6 +761,39 @@
       - 明确不在本条：`/healthz` 的深度（评估 R12）——它查不了自己的 HTTP 入口（入口一死探针本身
         就不可达），但 QUIC 入口停摆时确实看不到；`is_serving()` 也仍无生产消费者。
 
+
+- [x] **G. 请求体路径：一次解析 + 帧里用 `Bytes`（2026-09-22 完成）**（评估 H6）
+      - 缺陷（评估原文："16MiB 请求体在 async worker 上解析/拷贝 3–4 次"）：**两遍**全量 JSON
+        解析（`extract_model` 一遍 + `estimate_prompt_tokens` 又一遍）、`body.to_vec()` 进帧、
+        以及 postcard 序列化。**实测（release，16MiB 合法 chat body）改写了对成本的判断**：
+        | 环节 | 改动前 | 改动后 |
+        |---|---|---|
+        | JSON 解析 | 3.6ms × **2 遍** | 3.6ms × 1（且 >256KiB 时走阻塞池，**不占 worker**） |
+        | body 进帧 | 0.37ms 拷贝 | 移动（≈0；`Bytes` 引用计数） |
+        | postcard 序列化 | **20.0ms** | **1.6ms** |
+        即最大的一笔不是内存也不是解析，而是 **postcard 把 `Vec<u8>` 当"元素序列"逐字节过一遍
+        序列化器**（12×）。评估里"瞬时数百 MB"那句只在 body 的**结构项**极多时成立（DOM 与结构
+        数量成正比）；纯字符串内容时 DOM 与 body 同量级——这条已在并集报告里更正为实测口径。
+      - 已做：① `Frame::{ProxyRequest::body, ProxyResponseBody::chunk}` 改 `bytes::Bytes`
+        （postcard 因此走 `serialize_bytes` 一次写整块），**线上格式逐字节不变**——由
+        `proto::io::tests::bytes_body_encodes_identically_to_a_plain_vec` 与"变体顺序一致"的镜像
+        枚举钉住（新网关 + 旧 agent 的滚动升级仍然互通）；顺带消掉响应侧每 chunk 的一次拷贝
+        （SSE 长流上按 chunk 累积）。② `usage_meter::request_facts` 一次解析同时给出 `model` 与
+        prompt 字符数（`estimate_tokens_from_chars`），不再拼 16MiB 字符串再数。
+        ③ 大 body（≥256KiB）的解析走 `spawn_blocking`，小 body 原地解析（避免每次请求多一次
+        线程池往返）；阻塞池任务 panic 报 500 而不是把锅推给客户端的 400。
+      - 证据：`proto` 的线上格式逐字节比对（空/单字节/跨 0x80/1KiB 四种边界 + 反向解码）；
+        `usage_meter::tests::request_facts_parses_once_and_keeps_the_estimation_semantics`
+        （估算口径逐条：content 字符串、分片数组只取 `text`、数字 content 跳过、无 messages → 0
+        字符 → 下限 1、缺/空/非字符串 model 与非法 JSON → Err）；`proxy::tests::
+        routing_takes_the_top_level_model_string_only`（路由判据不变）；`proxy::tests::
+        request_facts_for_offloads_large_bodies_and_keeps_the_same_result`（阈值两侧同结果 + 非法
+        JSON 必须报 400 而不是 500）；e2e 54 条全绿（真 QUIC 隧道两端现在传的就是 `Bytes` 帧）。
+      - 明确不在本条：`extract_model` 那条"所有 `/v1/*` 都要求 body 带 `model`"的**策略**问题
+        （卡住非 chat 端点）原样保留（`PROJECT_SCAN` 已登记，改它要按路径/方法白名单）；
+        帧体进 postcard 的那次拷贝现在只剩 1.6ms/16MiB，且 streaming 帧写要动线格式处理，
+        不值得再切一刀。
+
 - [x] **D. registry 评估 §7 步骤 6 的可选清理（2026-09-21 处置完毕：两项落地、两项裁定不做）**
       - ✅ **`pick()` 抽成纯函数**（`registry::pick`）：次序（新鲜 → 排除 → 模型 → 精确优先 →
         负载轻 → 心跳新）与两个错误变体（`NoAgent` / `NoModel`）都在一处；新增

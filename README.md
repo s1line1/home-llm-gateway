@@ -468,6 +468,10 @@ s2n-quic 的 `initial_max_streams_bidi` 默认只有 **100**（`InitialMaxStream
 - **`verified_cache_max`（默认 1650）把校验成本从"每请求"降到"每凭据版本"**：已验证身份缓存 + **单飞**（同一 token 的并发请求串行化，只跑一次 argon2）+ **凭据版本核对**（吊销即时生效，不靠 TTL）。峰值随之变成 `同时首用的不同 token 数 × 19MiB`：64 并发从 **1 236.5MB 降到 27.1MB**（上面那张对照表）。设 0 可回到"每请求都校验"的旧行为。
 
   > 生产实测（云端 2 vCPU / 1.6GB，同一 key）：缓存生效后 **21 516 个 200 + 941 个 429** 的负载下，`hlmg_key_verify_hits_total` = 22 426、`misses` = 3（命中率 99.99%），CPU 峰值 15%。
+- **请求体只解析一次、进帧不拷贝**（H6）：路由要的 `model` 与无 `usage` 时的 prompt 估算来自
+  **同一次** JSON 解析（`usage_meter::request_facts`），请求帧的 body 用 `Bytes`（零拷贝移动，
+  postcard 一次写整块而不是逐字节）。release 实测 16MiB 请求：改动前 ≈27.6ms 的 worker CPU
+  （两次解析 + 逐元素序列化 20.0ms），现在 ≈1.6ms，且 ≥256KiB 的解析走阻塞池、不占 worker。
 - **`max_concurrent_requests` 是并发总量闸门，与内存脱钩**。它管的是「所有路径的在途 HTTP 请求总数」（`/metrics` 与 `/healthz` 豁免——探针被 429 会让 LB 摘除实例、把"慢"放大成"全挂"；SSE 长流从开头占到最后一块 body 送完），超限返回 `429 + Retry-After`。缓存关闭时它必须收在 `MemoryMax / 19MiB` 之下，否则那道闸等于没有——**先撞的是 `MemoryMax`（网关被 OOM 杀掉、连接中断），而不是这里优雅地 429**；缓存开启后按业务量给即可：
 
   ```yaml
