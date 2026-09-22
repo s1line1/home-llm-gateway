@@ -203,9 +203,12 @@ sudo vi /etc/home-llm-gateway/agent-config.yml
 
 > ⚠️ **`agent_id` 必须每台机器唯一**：`agent_config.example.yml` 与 `Makefile` 生成的默认值都是
 > `edge-1`，**多台机器直接照抄就会撞车**。同名时网关会关掉旧连接（本意是同一台机器重连接管），
-> agent 把"被踢"当干净断开、把退避重置回 500ms，于是两台机器每 ~500ms 互踢一次、永不收敛——
-> **凡活得比踢连接周期长的请求全部失败（502）**，而两侧进程都健康、`/admin/agents` 恒显示
-> "1 个 agent 在线"，只有 `hlmg_agent_connections_total` 在飞涨。详见 `TODO.md` P1。
+> 两台机器于是轮流接管——**凡活得比接管周期长的请求都可能失败（502）**，而两侧进程都健康、
+> `/admin/agents` 恒显示"1 个 agent 在线"，信号只有 `hlmg_agent_connections_total` 在飞涨。
+> **2026-09-22 起 agent 侧那半边已修**：退避不再被"连上就被踢"重置回 500ms（改看会话存活时长，
+> 短命会话继续指数退避 + ±20% 抖动），所以不再退化成"每 ~500ms 互踢、永不收敛"的风暴；
+> 但网关侧"同名接管"仍是当前语义，**多台机器依然要各用各的 `agent_id`**。详见 `TODO.md` 与
+> `docs/PROJECT_SCAN.md` 的 P2-1。
 
 ```bash
 # deploy/agent.service 只负责 --config 指向配置文件

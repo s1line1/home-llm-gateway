@@ -163,6 +163,10 @@
       `hlmg_agent_connections_total` 在飞涨（它是 counter，不看 rate 注意不到）。
       触发门槛很低：`agent/src/config.rs` 的默认值与 `Makefile` 生成的都是 `edge-1`，示例配置
       是 `home-1`，而 DEPLOY.md 全文没提"多台机器要改 agent_id"。
+      **2026-09-22 进展：agent 侧那半边已修**（退避不再被"连上就被踢"重置为 500ms，见下面
+      "重连退避无抖动"那条），所以即使真的同名，重连也会指数退避而不是每 ~500ms 互踢。
+      **网关侧那半边（同名注册即关旧连接）仍未动**：那是"重连接管 vs 拒绝重名"的产品决定，
+      记录在此不静默——当前语义下两台同名机器仍是"轮流接管"，只是不再抖成风暴。
       **已定修法（跑通过，含红→绿）**：`agent_id` 改为「可读前缀 + 每进程唯一的随机后缀」
       （`edge-1-6d69369d`），在 `agent/src/config.rs` 的 `from_file` 里生成；需加依赖
       `getrandom = "0.3"`（gateway 已在用同版本，Cargo.lock 只多一条依赖边）。
@@ -512,8 +516,18 @@
 - [ ] **Heartbeat 载荷空洞**：`Frame::Heartbeat { inflight }` 恒为 0（`agent/src/lib.rs:136-140`），
       网关只打 debug 日志（`quic.rs:76-84`）。它是"容量感知路由"的前置数据：要么实现上报，
       要么删掉该字段（现在是死载荷，容易误导）。
-- [ ] **重连退避无抖动、上限 30s**（DESIGN §6.1 原设计为抖动 + 上限 60s）：多台 agent 同时断线
-      会同步重连；与同名 `agent_id` 互踢叠加时更糟。修法：加 jitter（±20%）并对齐上限。
+- [x] **重连退避无抖动（2026-09-22 已修）**：`run()` 现在给退避加 **±20% 抖动**
+      （熵取时钟纳秒，不引入 `rand` 依赖），并顺手修掉更靠前的根因——**退避被重置**
+      （`docs/PROJECT_SCAN.md` 的 P2-1）：以前 `connect_once` 只要返回 `Ok(())` 就把退避打回
+      500ms，而"刚注册就被踢"走的也是这一支 ⇒ 同名 `agent_id` 互踢时每 ~500ms 一轮、永不收敛。
+      现在只看**会话活了多久**（≥60s 才重置，否则翻倍、封顶 30s），日志同时打
+      `session_alive_secs` 与 `wait_ms`（就是实际要睡的值）。
+      **上限刻意保持 30s**（DESIGN §6.1 原设计写 60s）：30s 让网关滚动重启后 agent 更快回归，
+      握手风暴的余地由 30s 握手限时给；要对齐成 60s 属产品决定，记录在此不静默。
+      测试：`a_short_lived_session_does_not_reset_the_backoff`（**红**：换回旧口径报
+      `left: 500ms, right: 1s`）、`a_long_lived_session_resets_the_backoff`、
+      `the_backoff_grows_to_the_cap_and_stays_there`、
+      `jitter_stays_within_bounds_reaches_both_ends_and_respects_the_cap`。
 
 ### P3 — 坏味道 / 清理（不成灾，但会持续收利息）
 
