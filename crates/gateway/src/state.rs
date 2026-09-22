@@ -27,7 +27,8 @@ use crate::ui::{resolve_ui, IndexHtml};
 
 /// 关闭阶段。`Running` → `Draining` → `Terminating`，只向一个方向走。
 ///
-/// `Gateway::shutdown` 通过 [`AppState::shutdown`] 这个 `watch` 通道广播它，两类消费者：
+/// `Gateway::shutdown` 通过 `AppState` 里那个私有的 `watch` 通道广播它（推进能力不外流，
+/// 见 [`AppState::subscribe_shutdown`]），两类消费者：
 /// - **accept 循环**（`http/entry.rs`）：`Draining` 起停止接受新连接，但在途请求继续跑；
 /// - **每条在途响应**（`proxy/forward.rs`）：`Terminating` 起带一个明确的"不完整"事件收尾，
 ///   而不是被硬切。
