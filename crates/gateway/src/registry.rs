@@ -736,7 +736,7 @@ impl Registry {
         self.try_acquire_excluding(stale_after, model, &[])
     }
 
-    /// 同 [`Self::try_acquire`]，但**跳过 `exclude` 里列出的连接**（按 `stable_id`）。
+    /// 同 `try_acquire`（测试便利入口，见下），但**跳过 `exclude` 里列出的连接**（按 `stable_id`）。
     ///
     /// 用于"换一个 agent 重试"：刚失败的那条连接不该再被选中（否则重试没有意义）。
     pub fn try_acquire_excluding(

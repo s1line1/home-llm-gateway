@@ -153,9 +153,13 @@ impl Metrics {
             .or_insert(0) += 1;
     }
 
-    pub fn record_rejected(&self, status: u16) {
+    /// 记一次「被全局闸门拒掉」。**只补 `request_count`**：`try_enter` 失败时没有自增。
+    ///
+    /// 状态码**不在这里记**——闸门住在 id 中间件里层，被拒的 429 会经过外层，由外层统一
+    /// `record_status`。两边各记一半，`request_count − Σ状态码 − aborted` 才平衡
+    /// （在这里也记一次就会重复计数，恒等式反而变成 -1）。
+    pub fn record_rejected(&self) {
         self.inner.request_count.fetch_add(1, Ordering::Relaxed);
-        self.record_status(status);
     }
 
     /// 记录请求结果状态码（在途槽位的释放不在此处，由 [`Admission`] 负责）。
