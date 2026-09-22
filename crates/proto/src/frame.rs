@@ -3,6 +3,31 @@
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
+/// 单个 [`Frame::ProxyResponseBody`] 允许携带的最大字节数。
+///
+/// 这是一条**内存边界**，不只是格式约定：网关把这些块交给一条 `mpsc::channel(32)` 再喂给
+/// 客户端，而通道是按**条数**有界的。没有这个上限时"32 条"可能是 32 × `MAX_FRAME`（64MiB），
+/// 一个慢客户端就足以让网关堆下 GB 级内存（记录 R9）。
+///
+/// 两侧的分工：**agent 负责切块**（[`take_chunk_piece`]，`Bytes::split_to` 零拷贝），
+/// **网关负责拒绝**超标的块（纵深防御：坏 agent 或旧版本不该让这个上界失效）。
+pub const MAX_RESPONSE_CHUNK: usize = 64 * 1024;
+
+/// 从 `chunk` 头部切出一片（≤ [`MAX_RESPONSE_CHUNK`]）并把它从 `chunk` 中移除；空块返回 `None`。
+///
+/// 零拷贝：`Bytes::split_to` 只调整引用计数与偏移，不搬字节。已经足够小的块直接整体交出
+/// （常见路径不产生额外分配）。
+pub fn take_chunk_piece(chunk: &mut Bytes) -> Option<Bytes> {
+    if chunk.is_empty() {
+        return None;
+    }
+    Some(if chunk.len() > MAX_RESPONSE_CHUNK {
+        chunk.split_to(MAX_RESPONSE_CHUNK)
+    } else {
+        std::mem::take(chunk)
+    })
+}
+
 /// 隧道帧。所有帧经 postcard 序列化，由 [`crate::io::write_frame`] 加上长度前缀。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Frame {
@@ -48,4 +73,54 @@ pub enum Frame {
         code: u16,
         message: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 规格（记录 R9）：响应块**切到 ≤ `MAX_RESPONSE_CHUNK`**，且切片拼回来与原文**逐字节相同**。
+    ///
+    /// 这条上界是网关侧内存的支点：通道按条数有界（32），所以单块大小决定了"32 条"能占多少内存。
+    #[test]
+    fn response_chunks_are_split_to_the_byte_bound_without_losing_bytes() {
+        for total in [
+            0usize,
+            1,
+            MAX_RESPONSE_CHUNK - 1,
+            MAX_RESPONSE_CHUNK, // 恰好一块：不该白切一片
+            MAX_RESPONSE_CHUNK + 1,
+            MAX_RESPONSE_CHUNK * 3,     // 恰好整数倍
+            MAX_RESPONSE_CHUNK * 3 + 7, // 带零头
+        ] {
+            let original = Bytes::from(vec![b'z'; total]);
+            let mut rest = original.clone();
+            let mut pieces = Vec::new();
+            while let Some(piece) = take_chunk_piece(&mut rest) {
+                assert!(
+                    piece.len() <= MAX_RESPONSE_CHUNK,
+                    "total={total} 时切出了 {} 字节的块（上限 {MAX_RESPONSE_CHUNK}）",
+                    piece.len()
+                );
+                assert!(!piece.is_empty(), "total={total} 时切出了空块");
+                pieces.push(piece);
+            }
+            assert!(rest.is_empty(), "切完之后剩余缓冲必须为空");
+            let expected_pieces = total.div_ceil(MAX_RESPONSE_CHUNK);
+            assert_eq!(
+                pieces.len(),
+                expected_pieces,
+                "total={total} 的块数应当是 {expected_pieces}"
+            );
+            let rejoined: Vec<u8> = pieces.iter().flat_map(|p| p.to_vec()).collect();
+            assert_eq!(rejoined, original.to_vec(), "total={total} 时字节被改动了");
+        }
+    }
+
+    /// 规格：空块没有被切出任何东西（调用方据此结束循环）。
+    #[test]
+    fn an_empty_chunk_yields_no_piece() {
+        let mut empty = Bytes::new();
+        assert!(take_chunk_piece(&mut empty).is_none());
+    }
 }

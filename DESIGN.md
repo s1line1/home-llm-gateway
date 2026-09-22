@@ -249,7 +249,9 @@
 - SQLite 写操作（create/revoke）挪到 `spawn_blocking`，不阻塞 async runtime ✅ 已实施（OPTIMIZATION.md C2；keystore argon2/落库走阻塞线程池）
 - QUIC 流上限调优：s2n-quic 默认 100，高并发流场景上调 ✅ 已实施（网关侧 `max_open_tunnel_streams` 默认 **1024**，见 `gateway.rs` 的 `DEFAULT_MAX_OPEN_TUNNEL_STREAMS`，应用点在 `listen.rs`）
 - 慢上游排队：agent 满时先排队（带超时）而非直接 429
-- SSE 流式转发增加内存缓冲上限，防慢客户端拖垮
+- ~~SSE 流式转发增加内存缓冲上限，防慢客户端拖垮~~ ✅ 已实施（2026-09-22）：单块
+  ≤ `proto::frame::MAX_RESPONSE_CHUNK`（64 KiB，agent 侧切块 + 网关侧拒绝），
+  回写队列 32 块 ⇒ 每请求 ≈ 2 MiB 上界；hyper 自身的 socket 缓冲不在应用层可控范围（记录 R9）
 
 ### 11.3 阶段 2：多租户（大团队核心需求）
 

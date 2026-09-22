@@ -286,7 +286,19 @@ async fn forward(
             },
             _ = cancel.cancelled() => return send_cancelled(&mut send, request_id).await,
         };
-        write_frame(&mut send, &Frame::ProxyResponseBody { request_id, chunk }).await?;
+        // 切块后逐片回传：`MAX_RESPONSE_CHUNK` 是**网关侧的内存边界**（那边通道按条数有界，
+        // 见该常量的文档 / 记录 R9）。`Bytes::split_to` 零拷贝：只动引用计数与偏移。
+        let mut rest = chunk;
+        while let Some(piece) = proto::frame::take_chunk_piece(&mut rest) {
+            write_frame(
+                &mut send,
+                &Frame::ProxyResponseBody {
+                    request_id,
+                    chunk: piece,
+                },
+            )
+            .await?;
+        }
     }
 
     // ⑤ 结束帧 + 半关闭写方向

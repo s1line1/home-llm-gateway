@@ -421,8 +421,10 @@
       语义统一为"**停滞**"而非"总时长"（有字节流动就续期），所以慢客户端不会被误伤；
       三处共用 `client_stall_secs`（默认 60s）。回归测试 `tests/e2e/stalls.rs`（判据：
       `max_concurrent_requests: 1` 下后续请求不得 429）+ `io_stall` 单测，均已红检。
-      **仍未做**：响应体**内存缓冲上限**（DESIGN §11.2 与本项原本合并做的那半）——
-      现在通道是 32 块的有界队列，但 hyper 侧仍会缓冲到 socket 缓冲被写满为止。
+      **字节上界那一半已做（2026-09-22，见 R9）**：单块 ≤ `MAX_RESPONSE_CHUNK`（64 KiB），
+      于是"32 块的有界队列"≈ 2 MiB；agent 侧切块、网关侧拒绝超标块，两端都有测试。
+      **仍未做**：hyper 侧仍会缓冲到 socket 缓冲被写满为止（应用层改不到），以及单个超标帧在
+      `FrameReader` 里已经发生的那一次分配（要封住得改线格式分片）。
 - [x] **Cancel→上游缺上游侧断言（2026-09-22 完成）**：`mock-llm` 现在有 `GET /stats`，里面的
       `cancelled` = **被中途丢弃的响应体数**（`CancelGuard` 的 Drop 计数：流正常跑完置
       `completed`，被 axum 丢掉 body 时 +1）。上游侧可观测 ⇒ H5 的 e2e 判据落在这里
@@ -604,9 +606,26 @@
   **退回旧实现即红**：实测 5 次里红 4 次（失败信息形如"采样到 active=2 > limit=1：存在幽灵占位"）。
   另：`PROJECT_SCAN` 里"`try_enter` 的 `fetch_add` + 回滚是**正确**的、别去改它"那句已更正——
   "不超发"确实成立，但"不误拒"不成立，两者是不同性质。
-- [ ] **R9 背压按字节有界**：回写客户端的通道仍是 `mpsc::channel(32)`，**按条数**有界
-      （`crates/gateway/src/proxy/mod.rs:566`）——大帧场景下"32 条"不等于"字节有界"。
-      相关的"响应体内存缓冲上限"见上文 P1。
+- [x] **R9 背压按字节有界（2026-09-22 完成）**：回写客户端的通道按**条数**有界
+  （`mpsc::channel(32)`），所以**单块大小就是内存上界的乘数**——没有上限时"32 条"可能是
+  32 × `MAX_FRAME`(64MiB)，慢客户端足以让网关堆下 GB 级。
+  - 已做：① 新增 `proto::frame::MAX_RESPONSE_CHUNK`（64 KiB）+ `take_chunk_piece`（`Bytes::split_to`
+    零拷贝切片）；② **agent 侧回传响应体时切块**（正常上游块本来多为 ≤64 KiB，切块是零拷贝，
+    不产生额外内存）；③ **网关侧拒绝**超标的响应块（纵深防御：坏/旧 agent）→ 记 WARN、
+    给客户端一个错误、取消上游并结算，新的 `ForwardEnd::ProtocolViolation`（第九个出口，
+    与 `UpstreamError` 分开：这不是上游内容的问题，是 agent 没按约定切块）。
+  - 得到了什么：一个请求在通道里最多 32 块 × ≤64 KiB ≈ **2 MiB**（外加 hyper 自己手里的一块），
+    这个算式现在写在常量文档里，而不是"看代码推断"。
+  - 证据：`proto::frame::tests::response_chunks_are_split_to_the_byte_bound_without_losing_bytes`
+    （0/1/上限-1/恰好上限/上限+1/整数倍/带零头 七种长度：每片 ≤ 上限、片数正确、拼回来逐字节相同）
+    + `an_empty_chunk_yields_no_piece`；e2e `chain::e2e_large_upstream_chunks_survive_the_byte_bound`
+    （上游 3 × 1 MiB 的块经切块后**完整**到达：这一条是"网关的检查不会误伤合法大块"的保险——
+    少了 agent 的切块，它就会变成 502）；e2e `chain::e2e_an_oversized_response_chunk_is_refused`
+    （故意违规的裸 agent 发 64 KiB+1 的块：违约前的合法块照常到达、超标块**未被转发**；
+    **去掉网关侧判据即红**——实测客户端收到 65550 字节且含 X）。
+  - **仍未做**（与上一条 P1 的"响应体内存缓冲上限"是同一件事的两半，那半原样保留）：hyper 侧
+    仍会缓冲到 socket 缓冲写满为止（应用层改不到）；且**单个**超标帧在 `FrameReader` 里就已经
+    分配（检查只能阻止"多块累积"，不能阻止那一次分配——真要封住得改线格式分片）。
 - [ ] **R10 总时长上限**：`timeout_secs`（120s）是响应体**逐帧空闲**超时，没有整请求总时限
       （`DESIGN.md` §5 自认）。SSE 长流不能被总时限误杀，动之前要先把语义想清楚。
 - [ ] **R11 延迟分位数**：`hlmg_request_duration_ms` 只有 sum，没有直方图
