@@ -16,6 +16,8 @@
 > 重写**（初稿写的是 quinn，2026-09 已迁移，参数名与默认值都不同）。
 >
 > **状态**：蓝图。面向新代码库，不讨论如何修改现有仓库。
+> 例外：表格里标 ✅ 的行是**对照现有实现**的落地情况（"这一点现有项目已经做对/已修"），
+> 便于新代码库直接照搬；它们的日期与出处就在同一格里。
 
 ---
 
@@ -511,11 +513,11 @@ quinn 的名字抄进来**：s2n-quic 全在 `Limits` 上用 `with_*` setter，�
 | **R5** | 解码/方向/`request_id` 错误 → **只 reset 该流**，不摘连接 | 控制面 `?` 直接退出循环 → 整台 edge 被摘除（`quic.rs:63` + `46-48`），且被 e2e 固化为期望 | e2e：发坏帧后该 agent 仍在册、其他请求正常 |
 | **R6** | "流即会话"可断言：首帧必须 `ProxyRequest`，后续帧 `request_id` 一致 | `request_id` 被 `..` 丢弃（`proxy/mod.rs:418/431/444`），无断言无日志 | 不一致时错误可观测 + 该流被 reset |
 | **R7** | 计数一律 RAII 释放，且票据绑到**响应 body** 生命周期 | ✅ 已做对（`metrics.rs` 的 `Admission`、`registry.rs` 的 `SlotGuard`、`http/admission.rs:81` 的 `map_frame`）——**照搬** | e2e：客户端中断 + **上游静默**场景下，槽位须在秒级归零（现有实现会拖到 120 s，见 §4.7） |
-| **R8** | 原子占位用 CAS，无 check-then-act | ✅ 已做对（`registry.rs:170`, `metrics.rs:57`）——**照搬**；HTTP 侧有良性误拒窗口 | 并发 N 请求恰好 limit 通过、零误拒 |
-| **R9** | 背压端到端有界，且**按字节**而非按条数 | 通道 `mpsc(32)` 条数有界、字节无界（`proxy/mod.rs:221`） | 慢客户端压测下进程 RSS 有上界 |
-| **R10** | 超时矩阵完整，区分"空闲"与"总时长"；取消**即时**传播 | 无总时长上限；无 TLS 握手/`open_bi`/写帧/控制流超时；取消可延迟 120 s（`proxy/mod.rs:419`） | 静默上游的取消在秒级释放槽位，而非等 `idle_timeout` |
-| **R11** | 可归因性：日志/指标带 `request_id` + **`agent_id`** + `model`；429 分源；延迟有分位数 | 无 `agent_id`（结构体无此字段）；429 三源合一；只有求和值；`hlmg_agents` 语义错误 | 从 `/metrics` 能区分三种 429；从日志能回答"路由到哪个 edge" |
-| **R12** | 生命周期与运维：drain 式关闭；healthz 豁免闸门；`agent_id` 全局唯一 | SIGTERM 只 abort 2 个监听任务（`lib.rs:157-161`）；healthz 过闸门；默认 `agent_id` 会撞车 | SIGTERM 下在途流收到明确错误事件而非硬切；两进程读同一份配置能共存 |
+| **R8** | 原子占位用 CAS，无 check-then-act | ✅ 已做对——**照搬**：`registry.rs` 的 `try_acquire` 一直是 CAS；HTTP 侧 `metrics.rs::try_enter` 原先的 `fetch_add`+回滚有"幽灵占位 ⇒ 连锁误拒"，**2026-09-22 已改成 CAS 循环** | 并发 N 请求恰好 limit 通过、零误拒（新增 `try_enter_never_inflates_the_counter_above_the_limit`） |
+| **R9** | 背压端到端有界，且**按字节**而非按条数 | ✅ 2026-09-22 已修：`mpsc(32)` 之外新增**单块字节上限** `proto::frame::MAX_RESPONSE_CHUNK`（64 KiB，agent 侧切块 + 网关侧拒绝超标块）⇒ 每请求 ≈ 2 MiB 上界 | 慢客户端压测下进程 RSS 有上界（e2e `chain::e2e_an_oversized_response_chunk_is_refused`） |
+| **R10** | 超时矩阵完整，区分"空闲"与"总时长"；取消**即时**传播 | 部分已修：TLS 握手 / `open_bi` / 写帧 / 控制流超时都已就位（2026-09-18 那轮），关停路径的取消也不再等 `client_stall`（2026-09-22，H5）；**仍缺"整请求总时限"**——`timeout_secs` 只是逐帧空闲超时（`TODO.md` 的 R10 仍开放，动它要先定 SSE 长流语义） | 静默上游的取消在秒级释放槽位（已达成）；总时限待定 |
+| **R11** | 可归因性：日志/指标带 `request_id` + **`agent_id`** + `model`；429 分源；延迟有分位数 | 大部分已做：`agent_id` 进日志、429 按 `reason` 分源、`hlmg_agents` 已拆出 `hlmg_agents_healthy`；**仍缺延迟分位数**（`hlmg_request_duration_ms` 只有 sum，`TODO.md` 的 R11） | 从 `/metrics` 能区分三种 429（已达成）；p99 待直方图 |
+| **R12** | 生命周期与运维：drain 式关闭；healthz 豁免闸门；`agent_id` 全局唯一 | 前两项已做：四阶段 drain 式关闭（在途 SSE 收到明确 `event: error`）、`/healthz` 豁免闸门且 2026-09-22 起还是真探针；**`agent_id` 唯一性只做到"显式告警"**（默认值仍会撞车，见 `DEPLOY.md` 的警告），按蓝图应改成默认唯一 | SIGTERM 下在途流收到明确错误事件（已达成）；两进程共存待唯一化 |
 
 ---
 

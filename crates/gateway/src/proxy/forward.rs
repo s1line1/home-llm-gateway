@@ -14,7 +14,7 @@
 use std::time::Duration;
 
 use axum::body::Bytes;
-use proto::{io::read_frame, Frame};
+use proto::{io::FrameReader, Frame};
 use tokio::sync::{mpsc, watch};
 use tracing::warn;
 
@@ -164,6 +164,13 @@ pub(super) async fn forward_body(
     mut shutdown: watch::Receiver<ShutdownPhase>,
 ) -> ForwardEnd {
     let mut usage = UsageCollector::new(key_store, key_id, key_name, prompt_est, is_stream);
+    // 读帧必须走**可取消安全**的 `FrameReader`（记录 P3-26）：下面那个 `select!` 里
+    // `shutdown.changed()` 分支会 `continue`，也就是**复用同一条流**。用 `read_frame`
+    // （内部 `read_exact`）时，阶段变化恰好落在帧中途会让被 drop 的 future 带走已读字节，
+    // 之后按错误偏移解析长度前缀（帧错位：要么 "frame too large"，要么反序列化错误）——
+    // 而 `Draining` 阶段的承诺正是"在途响应照常跑完"。半读进度落在 reader 自己身上，
+    // 任何 await 点被打断都可安全重入，所以这里不会丢字节。
+    let mut reader = FrameReader::new(recv);
     loop {
         // 同时等"上游来帧"与"客户端走人"。
         //
@@ -214,7 +221,7 @@ pub(super) async fn forward_body(
             return ForwardEnd::GatewayShutdown;
         }
         let frame = tokio::select! {
-            r = tokio::time::timeout(idle_timeout, read_frame(recv)) => r,
+            r = tokio::time::timeout(idle_timeout, reader.next()) => r,
             _ = tx.closed() => {
                 warn!(
                     request_id,

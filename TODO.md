@@ -145,7 +145,9 @@
       `Possible SYN flooding on port 0.0.0.0:9090`（全机 164 天里只出现在网关端口）。
       修法：用 `socket2` 建 socket → `listen(4096)` → `TcpListener::from_std`。
       属**次要因素**（accept 被上面那条 EMFILE 卡住时才会放大），故排在 fd 之后。
-- [ ] **网关日志无轮转、体量失控**：`StandardOutput=append:/var/log/home-llm-gateway/gateway.log`，
+- [ ] **网关日志无轮转、体量失控**（**2026-09-22 补充现状**：`deploy/logrotate.example` 与
+      `docker-compose.yml` 的注释都已给出规则；缺的是"部署步骤里真的装上"——`DEPLOY.md` 只提了一句，
+      没有安装命令/检查项）：`StandardOutput=append:/var/log/home-llm-gateway/gateway.log`，
       每请求至少一行 INFO，实测单日 **652MB**（`tail -c 6000000` 只覆盖约 20 秒，
       排查时按时间 grep 会误以为"日志里什么都没有"）。修法：`logrotate` + 降级为
       `RUST_LOG=info,gateway::access=debug` 之类的分级，或按请求采样。
@@ -193,7 +195,7 @@
       覆盖 systemd stop、Ctrl+C、harness job_kill 场景（对应 OPTIMIZATION.md A1 ✅）。
       网关侧现在是**两阶段有界关闭**（先停 accept 并排空，宽限期后才带明确事件切断），见下方
       R12 drain 式关闭；**agent 侧仍是立即 abort（无排空）**。
-- [ ] **多 CA 信任根 + 动态增删（每 agent 独立 CA，gateway 不停机）**：
+- [ ] **⛔ 多 CA 信任根 + 动态增删（新功能——按顶部范围约定先不做，仅登记）**：
       目标：每个 agent 用独立 CA 签发证书，gateway 维护全部 CA 的信任根集合；
       运行时热添加/移除单个 CA——移除即吊销该 CA 下所有 agent（新连接被拒，
       已建立连接不受影响，其他 agent 零影响）；重启后动态配置不丢。
@@ -214,7 +216,7 @@
          另一 agent 不受影响；② POST 新 CA → 新 agent 热接入；③ 重启后动态 CA 仍生效
       7. 分步：TrustStore+verifier → Admin API → SQLite 持久化 → e2e + 文档
          （README/DEPLOY/DESIGN 安全章节更新：每 agent 独立 CA 的管理模型与吊销语义）
-- [ ] **UDP 被封时的 TCP+TLS fallback**（DESIGN.md §10）：帧协议不变，仅替换 QUIC 传输层
+- [ ] **⛔ UDP 被封时的 TCP+TLS fallback（新功能——按顶部范围约定先不做）**（DESIGN.md §10）：帧协议不变，仅替换 QUIC 传输层
 - [x] **per-API-key token 用量计量（2026-09 实施）**：
       按 API key 统计 token 消耗（prompt/completion/total + 请求数 + 最后使用时间），
       Admin API 可查询、Keys 页展示；吊销 key 后用量记录仍保留（可审计）。
@@ -253,10 +255,10 @@
          当前网关连自家 vLLM（无金钱成本），价值有限，暂缓
       注：模型白名单/请求数配额/到期时间等非 token 维度与 token quota 二选一或组合，
       取决于要防的场景（偷用贵模型 → 白名单；刷请求 → 请求数配额；失控并发 → key 并发上限）
-- [ ] **健康上报驱动的更精细路由**（DESIGN.md §9 M4 待办）：当前按在途请求数最少路由，
+- [ ] **⛔ 健康上报驱动的更精细路由（新功能——按顶部范围约定先不做）**（DESIGN.md §9 M4 待办）：当前按在途请求数最少路由，
       后续可结合 agent 心跳上报的延迟/队列深度
 - [ ] **Grafana 仪表盘模板**（DESIGN.md §9 M4 待办）：消费 `/metrics` 指标
-- [ ] **key 禁用/启用 toggle（B 档，可选）**：`KeyRecord.enabled` 字段已存在但 admin API
+- [ ] **⛔ key 禁用/启用 toggle（新功能 / 新管理接口——按顶部范围约定先不做）**：`KeyRecord.enabled` 字段已存在但 admin API
       只有创建/删除——补 `POST /admin/keys/{id}/disable|enable`（"暂时停用"不吊销），
       10 分钟级改动
 - [x] **HTTP 层总并发 admission（2026-09 实施）**：配置 `max_concurrent_requests`
@@ -265,9 +267,9 @@
       带 Retry-After 与 x-request-id），防多 key 总和压垮单实例。
       测试：lib 单测（占 1 槽后第 2 请求 429 / 0 不限 / 释放后恢复）+ e2e
       `e2e_http_concurrent_request_limit`（limit=1 并发两慢请求 → 200 + 429）
-- [ ] **请求体大小限制可配置（C 档，可选）**：`DefaultBodyLimit::max(16MB)` 硬编码
+- [ ] **⛔ 请求体大小限制可配置（新配置旋钮——按顶部范围约定先不做）**：`DefaultBodyLimit::max(16MB)` 硬编码
       （`http/mod.rs`，上限常量在 `body.rs`）——多模态图像/大上下文请求 413 无法调；config 加字段即可
-- [ ] **首次部署 bootstrap（B 档，可选）**：第一个 API key 目前必须走 admin API
+- [ ] **⛔ 首次部署 bootstrap（新功能——按顶部范围约定先不做）**：第一个 API key 目前必须走 admin API
       （admin_token 配置文件明文）；考虑"首次启动自动建默认 key"或引导提示
 - [ ] **usage 数据保留策略（B 档，可选）**：`key_usage` 无限累积（reset 是待定项）——
       长时间运行表会涨；建议与 reset 一并设计保留窗口/归档
@@ -275,7 +277,7 @@
       （容器化的路径映射、ENTRYPOINT 与 UDP 端口三个坑见 `DEPLOY.md` §11），**仅剩**容器内没有
       管理面板：访问 `/` 只得到"UI 未构建"的提示页。要做就在多阶段构建里加一个 pnpm 阶段把
       `web/dist` 打进去，或在 compose 里挂载 `web/dist` 并把 `ui_dir` 指过去。
-- [ ] **结构化访问日志 JSONL（C 档，可选）**：tracing 文本日志给人看；如需审计
+- [ ] **⛔ 结构化访问日志 JSONL（新输出格式——按顶部范围约定先不做）**：tracing 文本日志给人看；如需审计
       "谁何时调了什么"可加 JSON 行落盘
 - [ ] **keys.db 迁移规模化**：当前自动迁移（`storage/mod.rs::migrate_legacy_keys`）同步执行、
       全量读入内存 + 单一大事务——仅适合小数据量 / 个人 / 小团队（适用边界见 DEPLOY.md §10）。
@@ -370,7 +372,7 @@
 > （小帧更快更小，64KiB body 序列化 ~2 GiB/s 已是 memcpy 级）。若仅为协议演进，
 > postcard 加字段本身也向后兼容（serde 忽略未知字段）。
 
-- [ ] **隧道帧协议 postcard → protobuf**：
+- [ ] **⛔ 隧道帧协议 postcard → protobuf（新功能 / 协议改造——按顶部范围约定先不做）**：
       目标：`Frame` 枚举 8 种帧改用 protobuf 编解码，获得跨语言互操作与显式 .proto schema。
       **设计要点（已定稿）**：
       1. 选型：**prost**（prost + prost-build + protoc，build.rs 编译期生成）；备选 rust-protobuf（免 protoc）
@@ -401,13 +403,18 @@
 
 ### P1 — 正确性 / 健壮性
 
-- [ ] **usage 内存累加竞态（少报用量）**：`gateway/src/storage/mod.rs:318-335` 在 map 无 cell 时
+- [x] **usage 内存累加竞态（少报用量）（2026-09-22 复核：已修）**：现在是
+      `usage.entry(key_id).or_default()` **就地累加**（`storage/usage.rs:128`），不存在"孤儿 cell"
+      导致少报。原记录：`gateway/src/storage/mod.rs:318-335` 在 map 无 cell 时
       新建 `c` 再 `or_insert_with(|| c.clone())`，然后**返回本地 `c`**——若并发请求先插入成功，
       `or_insert_with` 保留的是别人的 cell，本次增量就记进了不在 map 里的孤儿 cell。
       后果：SQLite 的 `key_usage` 正确，但 `/admin/usage`、`/admin/keys` 的内存视图少报，
       **重启后自愈**（启动时从 SQLite 重载，见 `:185-199`）；窗口 = 新建 key 的首批并发请求。
       修法：返回 entry 里的值（`usage.entry(..).or_insert_with(..)` 的返回值）。
-- [ ] **失联 agent 不摘除，却被当成"健康"计数**：`registry.rs:91` 的 `len()` 不做新鲜度过滤，
+- [x] **失联 agent 不摘除，却被当成"健康"计数（2026-09-22 复核：已修）**：已拆出
+      `hlmg_agents_healthy`（`metrics.rs:320-322`）+ `Registry::healthy_count`/`status`，
+      `hlmg_agents` 的 HELP 也写明"含心跳过期者"；`/admin/agents` 仍列全部但带
+      `last_seen_secs_ago`（有意的可观测性设计）。原记录：`registry.rs:91` 的 `len()` 不做新鲜度过滤，
       直接喂给 `/metrics hlmg_agents`（HELP 文案是 "Registered healthy agents"，`metrics.rs:136-138`）
       与 `/admin/agents`（`admin.rs:173`）；只有 `try_acquire`（`registry.rs:145`）过滤了
       `agent_stale_secs`。活跃但沉默的连接会一直多报。修法：`len()`/`snapshot()` 接 `stale_after`，
@@ -462,7 +469,9 @@
       原值，两者不一致时访问日志同时记 `request_id` 与 `client_request_id`。
       **未**采用"帧内改用字符串"：动协议字段类型要改 proto/agent/mock-llm 三处，
       收益只是省掉那条日志映射。
-- [ ] **`extract_model` 卡住非 chat 的 `/v1/*`**：`proxy/mod.rs:28-34` 的 `extract_model`
+- [ ] **`extract_model` 卡住非 chat 的 `/v1/*`**（**指针已校正**：判据 2026-09-22 随 H6 搬进
+      `usage_meter::request_facts`，调用点在 `proxy/mod.rs` 的 handler 开头；**行为未变**——
+      仍无条件要求 body 带非空字符串 `model`**）：
       对 catch-all 路由（`http/mod.rs:27-34` 的 `/v1/{*rest}`，注册了 GET/POST/PUT/DELETE/PATCH）
       **所有方法与路径**都要求 body 是带 `model` 的 JSON（调用点 `proxy/mod.rs:81-86` → 400）→
       `GET /v1/files`、`DELETE /v1/files/{id}`、multipart（`/v1/audio/transcriptions`）现在一律 400，
@@ -508,7 +517,9 @@
 
 ### P3 — 坏味道 / 清理（不成灾，但会持续收利息）
 
-- [ ] **e2e 证书 fixture 重复且已分叉**：`tests/e2e/common.rs` 的 `gen_certs`（`:24-82`）与
+- [x] **e2e 证书 fixture 重复且已分叉（2026-09-22 复核：已修）**：`gen_certs`（`common.rs:27`）
+      现在**委托**给 `gen_certs_pem()`（CA 的 `key_usages` 取并集），两份 fixture 不再各自演化。
+      原记录：`tests/e2e/common.rs` 的 `gen_certs`（`:24-82`）与
       `gen_certs_pem`（`:85-123`）逐行重复，CA 的 `key_usages` 一个 3 项、一个 2 项；全仓另有
       23 处 `CertificateParams::default()` 的 PKI 脚手架（`agent/src/lib.rs:326-366`、
       `gateway/src/tls.rs:75-109`、`gateway/src/main.rs:76-100`、`agent/src/main.rs:75-99`、
@@ -606,11 +617,28 @@
       目标：上限按帧类型分设，分配量对声明值不敏感（计数型分配器断言）。
 - [ ] **R3 读路径合一（取消安全）**：现在有两条读路径——`read_frame`
       （`crates/proto/src/io.rs:43`，`read_exact` 包装、不可取消）与 `FrameReader`
-      （`io.rs:100`，走 `DribbleReader`，`io.rs:287`，可取消）。`read_frame` 仍用在控制面
-      `crates/gateway/src/quic.rs:87`。目标：只留可取消的那条。
-- [ ] **R4 EOF 四格分明**：`read_frame` 读 4 字节前缀时**任何 `UnexpectedEof` 都返回 `Ok(None)`**
-      （`crates/proto/src/io.rs:47-53`）——1–3 字节的头部截断被当成干净关闭。`FrameReader`
-      那侧已经分清了（`io.rs:108-115`，测试 `frame_reader_truncated_frame_errors`），差的只是老路径。
+      （`io.rs:100`，走 `DribbleReader`，`io.rs:287`，可取消）。目标：只留可取消的那条。
+      **2026-09-22 进展（P3-26）**：`forward.rs` 的读帧 `select!` 是唯一的**危险**调用点
+      （`shutdown.changed()` 分支 `continue` ⇒ 复用同一条流；阶段变化落在帧中途时
+      `read_frame` 会把已读字节带走 ⇒ 帧错位），现已换成循环外的 `FrameReader::new(recv)`
+      + `reader.next()`。剩下用 `read_frame` 的地方都**没有"落败后复用同一条流"**这回事：
+      `quic.rs` 控制流（每流只读一帧，读完就 `finish`）、`head.rs`（整段包在
+      `timeout(head_timeout, ..)` 里）、agent 侧注册/心跳回包（结果被忽略）、benches。
+      证据：e2e `lifecycle::e2e_a_frame_split_by_a_shutdown_phase_change_is_not_misparsed`
+      （先红：退回 `read_frame` 后客户端报 `unexpected EOF during chunk size line`）。
+- [x] **R4 EOF 四格分明（2026-09-22 完成）**：`read_frame` 读 4 字节前缀时**任何
+      `UnexpectedEof` 都返回 `Ok(None)`**（`crates/proto/src/io.rs:47-53`）——1–3 字节的头部
+      截断被当成干净关闭；`FrameReader` 那侧早就分清了（`io.rs:108-115`），于是同一条线上的
+      同一段字节有两种解释。后果是把协议违规说成对端的有序收工：`forward` 侧记成
+      `ForwardEnd::UpstreamClosed`（"upstream closed the stream early"）而不是读取错误，
+      `quic` 侧记成"这条流没发注册帧"且**不打日志**，`head` 侧记成"上游没回就关了"。
+      现在前缀改为自己逐段 `read`：**一个字节都没读到**才算干净关闭，1–3 字节即
+      `UnexpectedEof("early eof: truncated frame header")`；`Interrupted` 按惯例重试。
+      证据：`io::tests::a_truncated_length_prefix_is_not_a_clean_close`（0 字节 = `None`；
+      1/2/3 字节与 `DribbleReader` 逐字节慢喂 = `UnexpectedEof`）与
+      `io::tests::both_readers_agree_that_a_half_header_is_truncation_not_eof`
+      （0–3 字节逐格比对两个读取器，判断必须一致）。两条都**先红**：改回 `read_exact` 版本后
+      分别报 `None` 与 `plain=Ok(None) cancellable=Err(UnexpectedEof)`。
 - [ ] **R6 "流即会话"可断言**：首帧必须是 `ProxyRequest`、后续帧 `request_id` 必须一致
       ——现在既无断言也无日志，不一致只会表现成"上游好像没在收流"。
 - [x] **R8 原子占位改 CAS（2026-09-22 完成）**：`Admission::try_enter` 原先是 `fetch_add` +
