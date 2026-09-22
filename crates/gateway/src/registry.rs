@@ -327,6 +327,47 @@ pub enum Disposition {
     Fatal,
 }
 
+/// 选路规则（**纯函数**，评估 §8 的 passB 建议）：从当前条目里挑出**按优先级排好序**的候选。
+///
+/// 次序：新鲜 → 不在 `exclude` 里 → 能服务该模型 → 精确声明优先于 `*` 通配 → 负载轻优先
+/// → 心跳新者优先。两个错误变体各代表"被哪一层滤空"（`NoAgent` = 没人可用/都过期，
+/// `NoModel` = 有人但都不声明这个模型），调用方据此区分 503 文案。
+///
+/// 为什么抽成纯函数：规则以前与"占位 + 返回槽位"的副作用揉在 `try_acquire_excluding` 里，
+/// 只能靠注册表端到端测；现在规则本身可以直接用一组条目断言（见单测
+/// `pick_orders_exact_over_wildcard_then_lightest`）。
+fn pick<'a>(
+    entries: impl Iterator<Item = &'a Entry>,
+    now: u64,
+    stale_after: Duration,
+    model: &str,
+    exclude: &[usize],
+) -> Result<Vec<&'a Entry>, AcquireError> {
+    let mut candidates: Vec<&Entry> = entries
+        .filter(|e| is_fresh(e.last_seen_millis.load(Ordering::Relaxed), now, stale_after))
+        .filter(|e| !exclude.contains(&e.stable_id))
+        .collect();
+    if candidates.is_empty() {
+        return Err(AcquireError::NoAgent);
+    }
+    // 模型过滤：只保留能服务请求模型的 agent（声明含 "*" 或含 model）
+    candidates.retain(|e| e.models.iter().any(|m| m == "*" || m == model));
+    if candidates.is_empty() {
+        return Err(AcquireError::NoModel);
+    }
+    // 排序：精确声明（exact=true）排前 → 负载轻优先 → 心跳新者优先。
+    // bool 排序 false < true，故用 !exact 让精确者排前。
+    candidates.sort_by_key(|e| {
+        let exact = e.models.iter().any(|m| m == model);
+        (
+            !exact,
+            e.inflight.load(Ordering::Relaxed),
+            std::cmp::Reverse(e.last_seen_millis.load(Ordering::Relaxed)),
+        )
+    });
+    Ok(candidates)
+}
+
 impl Registry {
     /// 注册 agent；若同名 agent 已有其他连接，关闭旧连接。
     ///
@@ -684,7 +725,9 @@ impl Registry {
     ///
     /// **生产路径走的是 [`Self::try_acquire_excluding`]**：`routing.rs` 总要把"刚失败的那条
     /// 连接"排除掉（否则重试没有意义），所以本方法在 `crates/gateway/src` 里没有调用者。
-    /// 保留它是因为它是 `Registry` 公开 API 的一部分（库调用方与单测用），实现只有一行转发。
+    /// 它是**单测的便利入口**（24 处调用，省掉一个 `&[]`），因此收进 `#[cfg(test)]`：
+    /// 不进非测试构建，也不占 `Registry` 的公开 API（评估 §7 步骤 6 的"死 API"清理）。
+    #[cfg(test)]
     pub fn try_acquire(
         &self,
         stale_after: Duration,
@@ -703,30 +746,8 @@ impl Registry {
         exclude: &[usize],
     ) -> Result<(Entry, SlotGuard), AcquireError> {
         let inner = read_or_recover(&self.inner);
-        let now = now_millis();
-        let mut candidates: Vec<&Entry> = inner
-            .values()
-            .filter(|e| is_fresh(e.last_seen_millis.load(Ordering::Relaxed), now, stale_after))
-            .filter(|e| !exclude.contains(&e.stable_id))
-            .collect();
-        if candidates.is_empty() {
-            return Err(AcquireError::NoAgent);
-        }
-        // 模型过滤：只保留能服务请求模型的 agent（声明含 "*" 或含 model）
-        candidates.retain(|e| e.models.iter().any(|m| m == "*" || m == model));
-        if candidates.is_empty() {
-            return Err(AcquireError::NoModel);
-        }
-        // 排序：精确声明（exact=true）排前 → 负载轻优先 → 心跳新者优先。
-        // bool 排序 false < true，故用 !exact 让精确者排前。
-        candidates.sort_by_key(|e| {
-            let exact = e.models.iter().any(|m| m == model);
-            (
-                !exact,
-                e.inflight.load(Ordering::Relaxed),
-                std::cmp::Reverse(e.last_seen_millis.load(Ordering::Relaxed)),
-            )
-        });
+        // 规则全在 [`pick`] 里（纯函数）：这里只负责"按序号占位、占不到就换下一个"。
+        let candidates = pick(inner.values(), now_millis(), stale_after, model, exclude)?;
         for candidate in candidates {
             let entry = candidate.clone();
             // `max_concurrency == 0` = 不限：**不做上限判定**，但自增必须照做。
@@ -917,6 +938,88 @@ mod tests {
         let (_entry, _slot) = reg
             .try_acquire(Duration::from_secs(10), "m")
             .expect("中毒后仍应能选路");
+    }
+
+    /// 规格（评估 §8 passB）：选路规则的**次序**——精确声明 > `*` 通配，同级负载轻者优先；
+    /// 排除/过期各自把候选滤空时要给出正确的那一种错误。
+    ///
+    /// 规则现在是纯函数 [`pick`]，所以这条测试直接用条目断言，不必再绕 `try_acquire` 的占位副作用
+    /// （要造的负载直接用条目上的原子量写，测试与 `Entry` 同模块）。
+    #[tokio::test]
+    async fn pick_orders_exact_over_wildcard_then_lightest() {
+        let reg = Registry::default();
+        let stale = Duration::from_secs(10);
+        reg.register("wild".into(), vec!["*".into()], 8, test_connection().await);
+        let exact = reg.register("exact".into(), vec!["m".into()], 8, test_connection().await);
+        let busy = reg.register(
+            "exact-busy".into(),
+            vec!["m".into()],
+            8,
+            test_connection().await,
+        );
+
+        // 直接给"忙"那条写负载：两条精确里它更重，所以应排在 exact 之后
+        let inner = reg.inner.read().unwrap();
+        inner
+            .values()
+            .find(|e| e.stable_id == busy)
+            .unwrap()
+            .inflight
+            .store(2, Ordering::Relaxed);
+
+        let ordered: Vec<&str> = pick(inner.values(), now_millis(), stale, "m", &[])
+            .unwrap()
+            .iter()
+            .map(|e| e.agent_id.as_str())
+            .collect();
+        assert_eq!(
+            ordered,
+            vec!["exact", "exact-busy", "wild"],
+            "精确声明必须排在通配之前，同级负载轻者优先；实际 {ordered:?}"
+        );
+
+        // 排掉两条精确的 → 只剩通配
+        let only_wild = pick(inner.values(), now_millis(), stale, "m", &[exact, busy]).unwrap();
+        assert_eq!(
+            only_wild
+                .iter()
+                .map(|e| e.agent_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["wild"]
+        );
+
+        // 全部过期 → NoAgent（没人可用）
+        assert!(matches!(
+            pick(inner.values(), now_millis(), Duration::ZERO, "m", &[]),
+            Err(AcquireError::NoAgent)
+        ));
+    }
+
+    /// 规格：**有人但没有一个声明这个模型** → `NoModel`（调用方据此回 404/400 而不是 503）。
+    ///
+    /// 单独一条测试是刻意的：`NoModel` 需要一份**没有 `*` 通配者**的表（通配者在，任何模型
+    /// 都能被服务），而 `pick` 的读锁不能跨 `await`（clippy `await_holding_lock`），
+    /// 混在选路次序那条测试里会既难读又踩 lint。
+    #[tokio::test]
+    async fn pick_reports_no_model_when_none_declares_it() {
+        let reg = Registry::default();
+        reg.register(
+            "only-m".into(),
+            vec!["m".into()],
+            8,
+            test_connection().await,
+        );
+        let inner = reg.inner.read().unwrap();
+        assert!(matches!(
+            pick(
+                inner.values(),
+                now_millis(),
+                Duration::from_secs(10),
+                "other",
+                &[]
+            ),
+            Err(AcquireError::NoModel)
+        ));
     }
 
     #[tokio::test]

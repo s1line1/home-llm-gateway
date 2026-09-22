@@ -662,10 +662,21 @@
       - 注意：这些 client 与 `bounded` 共用同一个 `STEP_TIMEOUT`，所以窗口若调整（见 B 之后的
         讨论），全部一起变。
 
-- [ ] **D. registry 评估 §7 步骤 6 的可选清理**（每项可单独取舍，都不改变行为）
-      - `pick()` 纯函数抽取（规则已被 `try_acquire_excluding` 的测试钉住）；
-      - 删 `Registry::try_acquire`（`registry.rs:686`，生产零调用，只有它自己的一条测试在用）。
-        ⚠️ `Registry::is_empty`（`:638`）**不能单独删**：`len()` 还在，clippy 的
-        `len_without_is_empty`（warn 级）会报——已用实验确认，要收就 `len()`/`is_empty()` 一起收；
-      - `stable_id` 索引（C4）：消掉摘除路径上的全表扫描；
-      - 可选的 `tunnel_health` 拆分：`Entry` 已不透明，此时拆才不是"搬迁同一份状态"。
+- [x] **D. registry 评估 §7 步骤 6 的可选清理（2026-09-21 处置完毕：两项落地、两项裁定不做）**
+      - ✅ **`pick()` 抽成纯函数**（`registry::pick`）：次序（新鲜 → 排除 → 模型 → 精确优先 →
+        负载轻 → 心跳新）与两个错误变体（`NoAgent` / `NoModel`）都在一处；新增
+        `pick_orders_exact_over_wildcard_then_lightest` 与 `pick_reports_no_model_when_none_declares_it`
+        直接用条目断言规则（既有 4 条 `try_acquire_*` 测试同时证明行为没变）。
+      - ✅ **`Registry::try_acquire` 收进 `#[cfg(test)]`**：生产零调用，但**单测里有 24 处在用**
+        （我原先在 TODO 里记的"只有它自己的一条测试"是**错的**），所以选择"退出公开 API"而不是删——
+        测试一字未改。`Registry::is_empty` 保留：`len()` 在，clippy `len_without_is_empty` 会报，
+        代码里已写明"与 `len` 配对存在，不是死代码"。
+      - ❌ **C4 双索引：不做**。评估 §2 的裁决是"**不要在没有 profiling 的情况下动**"——
+        部署实测 `hlmg_agents 1`（n=1–4），扫 4 个元素比它旁边那次 HTTP 往返便宜；
+        `note_tunnel_op_ok` 上方也写着同一条裁定。
+      - ❌ **`tunnel_health` 拆分：不做**。按评估自己的否决条款（"只搬迁同一份状态"是**否决**理由），
+        此时把 3 个 strike 计数 + `last_head_ok` 搬走恰好是"搬走计数、不搬走**决定**"——而决定
+        （`Disposition`）已经在 `registry::report_*` 里，计数与判据也贴在 `Entry` 上。
+        评估原话：C1 模块化是"**第二步的可选精化**，先有处置接口，再看计数是否需要自己的模块"；
+        现在处置接口在、Entry 也不透明了，但**没有第二个消费者、也没有 profiling 说话**，
+        所以先不付这份搬迁成本（真有需要再拆，那时 `Entry` 不透明的前提已经满足）。
