@@ -685,6 +685,34 @@
         双 key 隔离、吊销回收、清扫只丢满桶——前两条是**特性钉**，改前改后都绿，防顺手改坏。
       - 明确不在本条：多实例各算各的（`DESIGN.md:240` 的登记项）、租户级总配额、Redis 外置配额。
 
+- [x] **E. 路径穿越 P1-2：两道守卫都到位（2026-09-22 完成）**（`PROJECT_SCAN` P1-2）
+      - **网关侧（§7 步骤 1，`439e78a`）**：`DELETE /v1/../api/delete` 这类路径原本会**原样**
+        进隧道（catch-all 不做点段归一），agent 拼 URL 时被 WHATWG 归一成 `/api/delete`，
+        持 key 者于是能驱动上游任意端点（Ollama 的 `/api/delete` 直接删模型）。现在在
+        **认证之后、读 body 之前**判：不安全 → `400` + WARN（不读那 16MiB body、也不泄露
+        "路径合法与否"给未认证探测）。判据是**保守拒绝**而非"归一后转发"——归一拦不住
+        `%2e`/`%2f` 这类**由上游解码**的形态。
+      - **agent 侧（本次）**：判据搬到 `proto::path::safe_upstream_path`，**网关与 agent 共享
+        同一份实现**（与 `proto::headers` 的逐跳/凭据两张表同一模式）。agent 在拼上游 URL 前
+        再判一次；不合法就回 `code: 400` 的 `Error` 帧（网关把帧里的 code 直接当客户端状态码
+        → 客户端看到的就是 400）。
+      - 为什么必须共享而不是各写一份：这是**同一条判据的两道防线**，两份实现会漂移，而漂移的
+        方向恰好会是"后面那道更松"（第一道在远端，第二道才在放上游请求的本机）——纵深防御会
+        静默失效。agent 侧那道还覆盖"新 agent 配旧网关"的混版本场景。
+      - 两个刻意的边界：① agent **只判路径、不判 query**（先把 `?` 之后切开）——网关同样只判
+        `uri.path()`，整串一起判会让 agent 比网关更严，把 `?x=/../` 这类合法请求 400 掉；
+        ② 拒绝用 `Error` 帧而不是直接断流，否则客户端只会拿到一条没有因果的 502。
+      - 证据：`proto::path::tests::safe_upstream_path_allows_only_verbatim_forwardable_paths`
+        （从网关搬来，逐条不变）+ agent 5 条单测：越权路径不得拼出 URL（**摘掉守卫即红**）、
+        合法 target 逐字转发、query 不参与判据、拒绝 = 400 Error 帧（内存 writer 解帧断言）、
+        "裸拼接真的会被 WHATWG 归一"的前提钉；外加**接线级**一条
+        `agent::tests::a_traversal_path_never_reaches_the_upstream_and_returns_400`——复用 agent
+        已有的 QUIC 夹具（真连一条 s2n-quic 连接）让"假网关"写 PoC 进双向流、真跑
+        `handle_stream`，断言 ① 回包是 400 Error 帧 ② **上游 listener 一次连接都没有**；
+        把接线摘掉即红（5s 超时）。网关侧回归网是 e2e
+        `chain::e2e_dot_segment_path_is_rejected_instead_of_forwarded`（**先红**：修复前实测
+        转发过、上游归一后回 404）。
+
 - [x] **D. registry 评估 §7 步骤 6 的可选清理（2026-09-21 处置完毕：两项落地、两项裁定不做）**
       - ✅ **`pick()` 抽成纯函数**（`registry::pick`）：次序（新鲜 → 排除 → 模型 → 精确优先 →
         负载轻 → 心跳新）与两个错误变体（`NoAgent` / `NoModel`）都在一处；新增

@@ -6,7 +6,7 @@ use proto::{
 };
 use reqwest::{header::HeaderValue, RequestBuilder};
 use s2n_quic::stream::{BidirectionalStream, SendStream};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
@@ -102,6 +102,61 @@ use tracing::warn;
 //     }
 // }
 
+/// 隧道帧的 `path` 字段是「路径[?query]」（见 [`Frame::ProxyRequest`]）；切出**路径部分**
+/// 单独过守卫。
+///
+/// query 必须切掉再判：判据本身（[`proto::path::safe_upstream_path`]）只判路径——点段放不进
+/// query，而 `%2f` 出现在 query 里是合法的。整串一起判会让 agent **比网关更严**，把网关刚放行
+/// 的合法请求 400 掉（判据不一致 = 两道防线之间出现新的夹缝）。
+fn split_target(target: &str) -> (&str, &str) {
+    match target.find('?') {
+        Some(i) => (&target[..i], &target[i..]),
+        None => (target, ""),
+    }
+}
+
+/// 拼上游 URL；路径不可安全转发 → `None`（调用方回 400，**不转发**）。
+///
+/// 这是纵深防御的**第二道**（第一道在网关，见 `proto::path`）：网关已经拒过一次，但那道防线
+/// 在**远端**，而这里拼出来的 URL 会交给 URL 解析器按 WHATWG 归一——`/v1/../api/delete` 就此
+/// 变成 `/api/delete`。agent 的上游通常与 agent 同机（Ollama 的 `/api/delete` 直接删模型），
+/// 所以"隧道另一端的输入不再受信"时，本端必须自己挡（与 [`forward`] 里"再剥一次凭据头"
+/// 同一个理由：深处那层不能假设外层永远做对了）。
+fn upstream_url(upstream: &str, target: &str) -> Option<String> {
+    let (path, query) = split_target(target);
+    let path = proto::path::safe_upstream_path(path)?;
+    Some(format!("{upstream}{path}{query}"))
+}
+
+/// 拒绝一条不可安全转发的路径：回 `code: 400` 的 [`Frame::Error`]，并半关闭写方向。
+///
+/// 为什么是 400 而不是直接断流：网关拿帧里的 `code` **直接当客户端看到的 HTTP 状态**
+/// （`proxy/head.rs` 的 `StatusCode::from_u16`），于是拒绝会以 `400 invalid request path`
+/// 原样到达调用方——断流则只会变成一条没有因果的 502。
+///
+/// 泛型只是为了让这条**跨层契约**测得动：生产传 `SendStream`，测试传内存 writer。
+async fn reject_unsafe_path<W>(send: &mut W, request_id: u64, path: &str) -> anyhow::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    warn!(
+        request_id,
+        path = %path,
+        "rejecting request: path cannot be forwarded safely (dot segment, backslash or encoded separator)"
+    );
+    let _ = write_frame(
+        send,
+        &Frame::Error {
+            request_id: Some(request_id),
+            code: 400,
+            message: "invalid request path".into(),
+        },
+    )
+    .await;
+    send.shutdown().await?;
+    Ok(())
+}
+
 /// 处理一条代理流：读 ProxyRequest → 转发本地 LLM → 流式回传响应帧。
 /// `request_log` 控制每请求的 INFO 日志（received/responded/done/cancelled）。
 pub async fn handle_stream(
@@ -112,7 +167,7 @@ pub async fn handle_stream(
 ) -> anyhow::Result<()> {
     // let mut frame_stream = FrameStream::new(stream);
 
-    let (recv, send) = stream.split();
+    let (recv, mut send) = stream.split();
 
     let mut reader = FrameReader::new(recv);
 
@@ -125,6 +180,11 @@ pub async fn handle_stream(
     }) = reader.next().await?
     else {
         anyhow::bail!("expect ProxyRequest frame");
+    };
+
+    // 拼 URL 前的守卫（纵深防御第二道）：不合法就当场回 400，既不发上游、也不起监听任务。
+    let Some(url) = upstream_url(&upstream, &path) else {
+        return reject_unsafe_path(&mut send, request_id, &path).await;
     };
 
     // 再把 reader 移交给监听任务：它只负责之后的 Cancel / EOF
@@ -147,7 +207,6 @@ pub async fn handle_stream(
         }
     });
 
-    let url = format!("{upstream}{path}");
     let rb = http.request(reqwest::Method::from_bytes(method.as_bytes())?, url);
 
     // ③ 干活：只持有 send 半
@@ -256,4 +315,134 @@ async fn send_cancelled(send: &mut SendStream, request_id: u64) -> anyhow::Resul
     .await;
     send.shutdown().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 判据的**前提**：裸拼接真的会被 URL 解析器归一掉——这正是守卫存在的原因。
+    ///
+    /// 同时钉住放行时的收益：合法路径经过同一个解析器必须**逐字**不变。
+    #[test]
+    fn the_url_parser_would_normalize_a_dot_segment_away() {
+        let upstream = "http://127.0.0.1:11434";
+        let naive = format!("{upstream}{}", "/v1/../api/delete");
+        assert_eq!(
+            reqwest::Url::parse(&naive).expect("能解析").path(),
+            "/api/delete",
+            "WHATWG 归一：裸拼接会把持 key 者送到上游的任意端点（Ollama 的 /api/delete 会删模型）"
+        );
+        let ok = format!("{upstream}{}", "/v1/chat/completions");
+        assert_eq!(
+            reqwest::Url::parse(&ok).expect("能解析").path(),
+            "/v1/chat/completions",
+            "放行的路径必须逐字不变——守卫的收益就是这一点"
+        );
+    }
+
+    /// 规格（`PROJECT_SCAN` P1-2 的 agent 侧）：越权路径**不得**拼进上游 URL。
+    #[test]
+    fn upstream_url_rejects_paths_that_would_escape_the_v1_prefix() {
+        let up = "http://127.0.0.1:11434";
+        for bad in [
+            "/v1/../api/delete", // 记录里的 PoC
+            "/v1/../../etc/passwd",
+            "/v1/./models",
+            "/v1//models",
+            "/v1/",
+            "/v1",
+            "/api/delete", // 就算不带点段也越出了 `/v1/`
+            "/v2/chat",
+            "/v1/%2e%2e/x", // 上游解码后是 `..`
+            "/v1/%2E%2E/x",
+            "/v1/%2fapi",   // 上游解码后是分隔符
+            "/v1/a%5Cb",    // 编码的反斜杠
+            "/v1/a\\..\\b", // WHATWG 在 http 下把 `\` 当 `/`
+        ] {
+            assert_eq!(
+                upstream_url(up, bad),
+                None,
+                "{bad} 必须被拒（不得拼出传给 reqwest 的 URL）"
+            );
+        }
+    }
+
+    /// 规格：合法 target 逐字转发（路径不归一、query 原样保留）。
+    #[test]
+    fn upstream_url_forwards_safe_targets_verbatim() {
+        let up = "http://127.0.0.1:11434";
+        for ok in [
+            "/v1/chat/completions",
+            "/v1/models",
+            "/v1/a/b-c_d.e",
+            "/v1/..hidden", // 以点开头但不是点段
+            "/v1/chat/completions?stream=true",
+        ] {
+            let url = upstream_url(up, ok).unwrap_or_else(|| panic!("{ok} 应当放行"));
+            assert_eq!(url, format!("{up}{ok}"), "拼接必须与改动前逐字一致");
+            let parsed = reqwest::Url::parse(&url).expect("能解析");
+            let got = match parsed.query() {
+                Some(q) => format!("{}?{q}", parsed.path()),
+                None => parsed.path().to_string(),
+            };
+            assert_eq!(
+                got, ok,
+                "放行的 target 必须逐字到达上游（解析器不得改写它）"
+            );
+        }
+    }
+
+    /// 规格：query **不参与**路径判据——否则 agent 会比网关更严，把合法请求拒掉。
+    ///
+    /// 网关只判 `uri.path()`、之后才拼 query（`proxy/mod.rs`），所以 query 里出现 `/../`、
+    /// `%2f` 是合法的；agent 若把整串一起判就会 400 掉这些请求（判据不一致 = 两道防线之间
+    /// 出现新的夹缝）。
+    #[test]
+    fn query_is_not_judged_as_part_of_the_path() {
+        let up = "http://127.0.0.1:11434";
+        for ok in [
+            "/v1/chat/completions?x=/../api/delete",
+            "/v1/embeddings?model=a%2fb",
+            "/v1/models?next=http://evil.example/v1/",
+        ] {
+            assert_eq!(
+                upstream_url(up, ok),
+                Some(format!("{up}{ok}")),
+                "{ok} 应当放行"
+            );
+        }
+    }
+
+    /// 规格（跨层契约）：拒绝 = 一条 `code: 400` 的 Error 帧。
+    ///
+    /// 网关拿帧里的 `code` 直接当**客户端看到的 HTTP 状态**（`proxy/head.rs` 的
+    /// `StatusCode::from_u16`），所以"400 + 说明原因"是这条防线对外的全部表现，值得钉住；
+    /// 这条测试同时证明拒绝路径**不碰上游**（只写帧就返回）。
+    #[tokio::test]
+    async fn rejecting_an_unsafe_path_sends_a_400_error_frame() {
+        let mut buf: Vec<u8> = Vec::new();
+        reject_unsafe_path(&mut buf, 42, "/v1/../api/delete")
+            .await
+            .expect("写内存 writer 不该失败");
+
+        assert!(buf.len() > 4, "应当写出一个带长度前缀的帧");
+        let len = u32::from_be_bytes(buf[..4].try_into().expect("4 字节前缀")) as usize;
+        assert_eq!(len, buf.len() - 4, "长度前缀应当与载荷一致");
+        match postcard::from_bytes::<Frame>(&buf[4..]).expect("能解出帧") {
+            Frame::Error {
+                request_id,
+                code,
+                message,
+            } => {
+                assert_eq!(request_id, Some(42), "错误帧要能对上请求");
+                assert_eq!(code, 400, "网关会用这个 code 回客户端");
+                assert!(
+                    message.contains("path"),
+                    "文案要指出是路径问题，实际：{message}"
+                );
+            }
+            other => panic!("拒绝应当写出 Error 帧，实际 {other:?}"),
+        }
+    }
 }
