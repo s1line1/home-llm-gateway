@@ -948,6 +948,30 @@
       - 过程小坑（写进测试注释）：对端"先读的那 64 字节"必须留在手里再接后续——丢掉就字节流错位，
         `FrameReader` 会把垃圾当长度前缀（实测报 `frame too large`），断言会因错误的原因变绿。
 
+
+- [x] **M. 写/持久化失败的可见性复核（2026-09-22 完成）**（`PROJECT_SCAN` P2-9 / P1-4 一族）
+  - **复核为"已修、且有测试钉住"**：`create()` 与 `delete()` 现在都是**先落库、失败即 `?`
+    传播、成功才动内存**（`storage/mod.rs`；两条 trigger 单测 `create_that_fails_to_persist_
+    leaves_no_key` / `delete_that_fails_to_persist_keeps_the_key_usable`，用
+    `RAISE(ABORT)` 触发器制造"磁盘满/I-O 错误"那一支）。两条测试里"今天 `create` 先写内存…"
+    的旧叙述也一并改成"修改前"。
+  - 用量写路径同样诚实：`flush_once` 任一语句失败或 commit 失败都**返回 0 且不推进 `flushed`**
+    （下一轮重试），所以调用方不会打出"已落库"的假日志。
+  - **复核查出的新缺口（本次修掉）**：**启动期**失败仍是静默降级——库打不开 / 建不出表 / 迁移
+    或载入失败时只 `warn!` 然后切内存模式 ⇒ "库里明明有 key，网关一个都认不出来"，每个请求 401，
+    而进程、systemd、`/healthz` 全都正常。现在 `KeyStore::persistence_state()` 给出三态
+    （`None` = 没配 keys_file，内存模式是合法配置；`Some(Ok)` = 就绪；`Some(Err(why))` = 降级 +
+    原因），`Gateway::start` 对"配了却用不了"直接 `GatewayError::Config` fail-fast
+    （在绑端口之后、起任务之前；Err 时已绑 socket 随局部变量 drop）。
+  - 证据：`storage::tests::persistence_state_distinguishes_unconfigured_ready_and_degraded`
+    （三态 + 原因带路径）+ e2e
+    `lifecycle::e2e_unusable_keys_db_fails_fast_instead_of_starting_keyless`（坏库启动失败、
+    报错点名 `keys_file` 与路径；可用的库与 `keys_file: None` 两个对照都能启动）。
+    **去掉那个检查即红**——实测网关照常起来了。
+  - **复核后刻意不改**：WAL/`synchronous` pragma、迁移后的 `VACUUM`、`0600` 收紧失败都只是
+    `warn!`（best-effort，各有理由）；`key_usage` 表单独损坏仍是"告警 + 空账本继续"
+    （凭据表可用则服务不受影响，比"起不来"轻）。
+
 - [x] **D. registry 评估 §7 步骤 6 的可选清理（2026-09-21 处置完毕：两项落地、两项裁定不做）**
       - ✅ **`pick()` 抽成纯函数**（`registry::pick`）：次序（新鲜 → 排除 → 模型 → 精确优先 →
         负载轻 → 心跳新）与两个错误变体（`NoAgent` / `NoModel`）都在一处；新增

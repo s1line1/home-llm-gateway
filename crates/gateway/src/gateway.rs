@@ -144,6 +144,18 @@ impl Gateway {
             opts.verified_cache_max,
             KeyStore::default_verified_ttl(),
         );
+        // ④.1 持久化自检（fail-fast）：配了 `keys_file` 却打不开/建不出表/迁移或载入失败时，
+        //     `KeyStore` 会降级成**内存模式**——库里明明有 key，网关却一个都认不出来，于是每个
+        //     请求 401，而进程、systemd、`/healthz` 全都正常。这与本文件开头的原则同源
+        //     （"不留一个看起来启动了的空壳进程"）。位置在**绑端口之后、起任何任务之前**：
+        //     返回 Err 时④之前绑好的 socket 随局部变量一起 drop（这正是"全有或全无"）。
+        //     `keys_file: None`（内存模式，测试/开发）不受影响——那不是故障。
+        if let Some(Err(why)) = key_store.persistence_state() {
+            return Err(GatewayError::Config(format!(
+                "config: keys_file is configured but unusable ({why}); refusing to start with an \
+                 empty key store (every request would 401 while the gateway looks healthy)"
+            )));
+        }
         let app_state =
             state::AppState::new(registry.clone(), key_store.clone(), metrics.clone(), &opts);
         // 关闭阶段的发送端留在 `Gateway`；接收端给 accept 循环，在途响应各自 `subscribe()`。

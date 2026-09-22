@@ -39,6 +39,10 @@ pub struct Options {
     /// Admin token；提供后启用 `/admin/*`（None = 整块路由不注册）。
     pub admin_token: Option<String>,
     /// 动态 API Key 持久化文件（None = 仅内存：**进程重启后所有 Key 消失**）。
+    ///
+    /// 配了它却**用不了**（打不开 / 建不出表 / 迁移或载入失败）时 `Gateway::start` **直接失败**：
+    /// 那种情况下网关会认不出任何 key（每个请求 401），却照样报健康——与其起一个空壳，不如
+    /// 启动就报错（见 `KeyStore::persistence_state`）。
     pub keys_file: Option<PathBuf>,
     /// React UI 静态目录（含 index.html；None = `/` 显示构建提示页）。
     pub ui_dir: Option<PathBuf>,

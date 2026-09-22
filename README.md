@@ -852,7 +852,7 @@ INFO gateway::nofile: raised NOFILE soft limit from=1024 to=16384 hard=524288 ta
 
 - **网页管理页**：浏览器打开 `http://<网关地址>/` 即进入管理界面——输入 admin token 后可直接**创建 / 吊销 / 列出 key**
 - 配置项 `admin_token`（`gateway-config.yml`）：管理口令（与 API Key 相互独立），提供后启用 `/admin/*` 与页面中的管理功能
-- 配置项 `keys_file`：动态 key 持久化数据库文件（SQLite，默认 `keys.db`），重启后依然有效；**只存 argon2 哈希，明文仅创建时返回一次**；文件权限由网关在打开时收紧为 `0600`
+- 配置项 `keys_file`：动态 key 持久化数据库文件（SQLite，默认 `keys.db`），重启后依然有效；**只存 argon2 哈希，明文仅创建时返回一次**；文件权限由网关在打开时收紧为 `0600`。⚠️ **配了却用不了**（打不开 / 建不出表 / 迁移或载入失败）时**启动直接失败**——那种情况下网关认不出任何 key（每个请求 401）却会报健康，宁可起不来也不要空壳
 - 网关没有静态 key——所有 key 都由 Admin API 创建（全部持久化在 SQLite），统一用于调用 `/v1/*`
 
 ```bash

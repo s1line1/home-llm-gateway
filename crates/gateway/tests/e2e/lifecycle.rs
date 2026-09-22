@@ -3,6 +3,59 @@
 
 use super::common::*;
 
+/// 规格：**keys 库不可用时必须在启动时失败**，而不是"起来了但每个请求 401"。
+///
+/// 记录 P2-9/P1-4 那一批讲的是**写**失败要冒到调用方；本条是同一家族的**启动**一档：库打不开 /
+/// 建不出表 / 迁移或载入失败时，`KeyStore` 会降级成内存模式——库里明明有 key，网关一个都认不出来，
+/// 于是每个请求 401，而进程、systemd、`/healthz` 全都正常。这与"不留一个看起来启动了的空壳进程"
+/// 同源，所以在 `Gateway::start` 里 fail-fast（`keys_file: None` 的内存模式不受影响）。
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn e2e_unusable_keys_db_fails_fast_instead_of_starting_keyless() {
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    let certs = TestCerts::generate();
+    let dir = tempfile::tempdir().unwrap();
+
+    // 不是 SQLite 库的文件：open 会成功（SQLite 惰性），建表时必然失败 ⇒ 降级 ⇒ 必须 fail-fast
+    let bogus = dir.path().join("bogus-keys.db");
+    std::fs::write(&bogus, b"this is definitely not a sqlite database").unwrap();
+    let opts = Options {
+        keys_file: Some(bogus.clone()),
+        ..e2e_options(None)
+    };
+    let msg = match Gateway::start(gateway_config(&certs, opts)).await {
+        Ok(gw) => {
+            gw.shutdown().await;
+            panic!("坏 keys 库必须让启动失败——否则网关认不出任何 key，却报健康（每个请求 401）");
+        }
+        Err(e) => e.to_string(),
+    };
+    assert!(msg.contains("keys_file"), "报错要点名配置项，实际：{msg}");
+    assert!(
+        msg.contains("bogus-keys.db"),
+        "报错要带上具体路径与原因，实际：{msg}"
+    );
+
+    // 对照①：换成一个可用的库（不存在会被自动创建）就能起来
+    let good = dir.path().join("good-keys.db");
+    let opts = Options {
+        keys_file: Some(good.clone()),
+        ..e2e_options(None)
+    };
+    let gw = Gateway::start(gateway_config(&certs, opts))
+        .await
+        .expect("可用的 keys 库必须能启动");
+    gw.shutdown().await;
+
+    // 对照②：`keys_file: None`（内存模式）也是合法配置，不该被这条检查误伤
+    let opts = e2e_options(None);
+    assert!(opts.keys_file.is_none(), "前提：对照组确实没配 keys_file");
+    let gw = Gateway::start(gateway_config(&certs, opts))
+        .await
+        .expect("内存模式必须能启动");
+    gw.shutdown().await;
+}
+
 /// 规格（P2-8）：**零值旋钮必须在启动时失败，而不是让网关"起来了但全量 503"**。
 ///
 /// `head_timeout_secs: 0` 是最毒的一个：每个请求 504，同时 `head_alive_window = 4 × 0 = 0`
