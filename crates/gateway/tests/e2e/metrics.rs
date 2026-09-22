@@ -7,7 +7,7 @@ use super::common::*;
 async fn e2e_metrics_endpoint() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     let (gw, agent, base, key) = start_stack(4, |_| {}).await;
-    let client = reqwest::Client::new();
+    let client = test_client();
 
     // 先发两个请求（一个 401、一个 200），让计数器有值
     let _ = client

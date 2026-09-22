@@ -411,6 +411,12 @@ s2n-quic 的 `initial_max_streams_bidi` 默认只有 **100**（`InitialMaxStream
 半个请求头、额度满时排队各一条）与 `io_stall` 的单测（写不动必须 `TimedOut`、持续有进展绝不断开）。
 都做过红检。
 
+**e2e 自己也按同一套口径上界**：HTTP 一律用 `common::test_client()`（整条请求含读响应体的
+总超时 = `STEP_TIMEOUT`），原始帧/channel 等待用 `common::bounded(step, ..)`——卡住会变成
+**带步骤名**的失败，而不是 nextest 的 180s TIMEOUT、或 `make test`（e2e 是 `#[serial]`）下
+整个套件无限期挂起。**故意让客户端卡住的用例豁免**（`stalls.rs`、`write_backpressure.rs`、
+`https::e2e_proxy_protocol_edge_cases`），理由见 `common.rs` 的 `test_client` 文档。
+
 #### 隧道坏掉时的典型症状（都踩过）
 
 `/healthz` 正常但**所有 API 请求挂住不返回**、日志停在最后一行的 `agent registered`、内存只涨不落 —— 因为请求卡在"等响应头"上，占着连接、并发槽位与缓冲区，客户端早已断开也发现不了。监控可关注：

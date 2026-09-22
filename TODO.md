@@ -645,13 +645,22 @@
       - 明确不在本条：`listener.accept()` 拿到 `Err`（EMFILE）仍会结束整个 accept 循环 —— 那是
         P2-10（第 2 批），**仍未修**；本条只是让它不再能被半开连接触发。
 
-- [ ] **C. 其余 40+ 条 e2e 仍没有逐步超时**（`PROJECT_SCAN` P2-17 的剩余）
-      - 现状：`tests/e2e/common.rs` 已有 `STEP_TIMEOUT`(30s) + `bounded(step, fut)`，
-        但只给 `https::e2e_https_public_entry` 的每一步套上了（那次真实 TIMEOUT 的现场）。
-      - 注意：`stalls.rs` / `write_backpressure.rs` 那几类是**故意**让客户端卡住的用例，必须豁免
-        ——所以不能无脑加 `Client::builder().timeout(..)`，要逐条判断"这一步本该完成吗"。
-      - 价值：卡住会变成**带步骤名**的失败，而不是 nextest 的 180s TIMEOUT、
-        或 `make test`（`cargo test`，e2e 是 `#[serial]`）下整个套件无限期挂起。
+- [x] **C. 其余 e2e 的等待全部上界（2026-09-21 完成）**（`PROJECT_SCAN` P2-17 的剩余）
+      - 已做：`common.rs` 新增 `test_client()` / `test_client_within()`——**整条请求（含读响应体）**
+        的总超时为 `STEP_TIMEOUT`(30s)；**34 处** `reqwest::Client::new()` 换成它（admin 5、
+        agents 11、chain 9、https 1、head_timeout 3、lifecycle 2、evict_close 1、metrics 1、
+        entry_limits 1）；另 6 处非 HTTP 的"本该完成"等待用 `bounded(step, ..)` 包住
+        （5 处原始 QUIC 帧读：注册回应/控制流 EOF/ghost 心跳；1 处跨任务 `rx.recv()`）。
+      - **刻意保持裸 client 的三类**（要的就是"卡住"）：`stalls.rs`（请求体/响应体停滞）、
+        `write_backpressure.rs`（写背压）、`https::e2e_proxy_protocol_edge_cases`（多个断言
+        期待"body 读到一半出错"，加总超时会变成"超时才出错"——断言仍通过但验的不是同一件事）。
+      - 本来就有界、无需再包：`Gateway::shutdown`（排空+落库+收尾 ≈26s 上界）、
+        `Agent::shutdown`（`abort()`）、`wait_for_agents`（自带 10s deadline）、
+        raw agent 应答循环里的 `read_frame`（事件循环，靠连接关闭结束，不是"步骤"）。
+      - 哨兵：`a_bare_client_waits_forever_while_a_bounded_one_gives_up` **在测试里同时证明**
+        "裸 client 对黑洞连接不会自己放弃"（缺陷本身）与"带窗口的 client 会自己放弃"（契约）。
+      - 注意：这些 client 与 `bounded` 共用同一个 `STEP_TIMEOUT`，所以窗口若调整（见 B 之后的
+        讨论），全部一起变。
 
 - [ ] **D. registry 评估 §7 步骤 6 的可选清理**（每项可单独取舍，都不改变行为）
       - `pick()` 纯函数抽取（规则已被 `try_acquire_excluding` 的测试钉住）；

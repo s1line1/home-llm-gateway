@@ -7,7 +7,7 @@ use super::common::*;
 async fn e2e_chain_with_mock_llm() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     let (gw, agent, base, key) = start_stack(4, |_| {}).await;
-    let client = reqwest::Client::new();
+    let client = test_client();
 
     // 无认证 → 401
     let resp = client
@@ -89,7 +89,7 @@ async fn e2e_chain_with_mock_llm() {
 async fn e2e_sse_streaming_passthrough() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     let (gw, agent, base, key) = start_stack(4, |_| {}).await;
-    let client = reqwest::Client::new();
+    let client = test_client();
 
     let resp = client
         .post(format!("{base}/v1/chat/completions"))
@@ -151,7 +151,7 @@ async fn e2e_gateway_timeout_cancels_upstream() {
     // 正文在超时点被截断（收不到 [DONE]，流以错误结束），而不是让客户端一直挂着。
     let (gw, agent, base, key) =
         start_stack(4, |o| o.request_timeout = Duration::from_millis(300)).await;
-    let client = reqwest::Client::new();
+    let client = test_client();
 
     let t0 = std::time::Instant::now();
     let resp = client
@@ -215,7 +215,7 @@ async fn e2e_client_disconnect_cancels_upstream() {
 
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     let (gw, agent, base, key) = start_stack(4, |_| {}).await;
-    let client = reqwest::Client::new();
+    let client = test_client();
 
     // 发起 SSE 流式请求，读到一个 chunk 后直接丢弃响应（模拟客户端断开）
     let resp = client
@@ -308,7 +308,7 @@ async fn e2e_upstream_never_receives_client_credentials() {
     let agent = certs.agent(&gw, "cred-agent", &["mock-llm"], upstream_addr, 4, false);
     wait_for_agents(&gw, 1, Duration::from_secs(10)).await;
 
-    let client = reqwest::Client::new();
+    let client = test_client();
     let resp = client
         .post(format!("http://{}/v1/chat/completions", gw.http_addr))
         .header("Authorization", format!("Bearer {key}"))
@@ -356,7 +356,7 @@ async fn e2e_verified_cache_reuses_argon2_across_requests() {
         o.verified_cache_max = gateway::storage::DEFAULT_VERIFIED_MAX;
     })
     .await;
-    let client = reqwest::Client::new();
+    let client = test_client();
     let req = || {
         client
             .post(format!("{base}/v1/chat/completions"))
@@ -413,7 +413,7 @@ async fn e2e_concurrent_cold_requests_hash_once() {
         o.verified_cache_max = gateway::storage::DEFAULT_VERIFIED_MAX;
     })
     .await;
-    let client = reqwest::Client::new();
+    let client = test_client();
 
     // 8 个并发请求同时到达（同一个 key，从未校验过）
     let mut handles = Vec::new();
@@ -505,7 +505,7 @@ async fn e2e_client_disconnect_while_upstream_is_silent_releases_the_slot() {
         String::from_utf8_lossy(&buf[..n])
     );
 
-    let client = reqwest::Client::new();
+    let client = test_client();
     let inflight = || async {
         let v: serde_json::Value = client
             .get(format!("{base}/admin/agents"))
@@ -601,7 +601,7 @@ async fn e2e_tunnel_request_id_is_unique_across_x_request_id_shapes() {
     .await
     .unwrap();
     rs.finish().unwrap();
-    let _ = read_frame(&mut rr).await;
+    let _ = bounded("read the register reply", read_frame(&mut rr)).await;
     drop((rs, rr));
     wait_for_agents(&gw, 1, Duration::from_secs(10)).await;
 
@@ -643,7 +643,7 @@ async fn e2e_tunnel_request_id_is_unique_across_x_request_id_shapes() {
         }
     });
 
-    let http = reqwest::Client::new();
+    let http = test_client();
     let uuid = "0197f1c2-9f0b-7c31-8a44-1b2c3d4e5f60";
     let payload = serde_json::json!({"model": "raw", "messages": []});
     let mut seen = Vec::new();
@@ -658,7 +658,11 @@ async fn e2e_tunnel_request_id_is_unique_across_x_request_id_shapes() {
             }
             let resp = req.send().await.unwrap();
             assert_eq!(resp.status(), 200, "裸 agent 回的是空 200");
-            seen.push(rx.recv().await.expect("每个请求都应有一条代理流"));
+            seen.push(
+                bounded("the agent reported the proxied request", rx.recv())
+                    .await
+                    .expect("每个请求都应有一条代理流"),
+            );
         }
     }
 

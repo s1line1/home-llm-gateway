@@ -59,7 +59,7 @@ async fn eviction_while_generating(grace: Duration, window: Duration) -> (Durati
         // 所以"请求被打断"只可能来自摘除的宽限期——A/B 两组唯一不同的就是宽限期。
     })
     .await;
-    let client = reqwest::Client::new();
+    let client = test_client();
 
     // ① 正在生成的请求。用 oneshot 确认"响应头已经到了"，否则后面的睡 500ms 可能跑在
     //    响应头之前，第 2 步的窗口前提就不成立。

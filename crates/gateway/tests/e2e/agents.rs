@@ -8,7 +8,7 @@ async fn e2e_admission_control() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     // agent max_concurrency=1：两个并发慢请求，一个 200、一个 429；完成后槽位释放
     let (gw, agent, base, key) = start_stack(1, |_| {}).await;
-    let client = reqwest::Client::new();
+    let client = test_client();
     let url = format!("{base}/v1/slow");
     let req = || {
         client
@@ -58,7 +58,7 @@ async fn e2e_multi_agent_least_loaded() {
     let agent_b = certs.agent(&gw, "agent-b", &["mock-llm"], mock_b, 1, true);
     wait_for_agents(&gw, 2, Duration::from_secs(10)).await;
 
-    let client = reqwest::Client::new();
+    let client = test_client();
     let url = format!("http://{}/v1/slow", gw.http_addr);
     let req = || {
         client
@@ -102,7 +102,7 @@ async fn e2e_rate_limit_per_key() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     // 每分钟 5 次：前 5 个请求放行，第 6 个 429
     let (gw, agent, base, key) = start_stack(4, |o| o.rate_limit_per_min = 5).await;
-    let client = reqwest::Client::new();
+    let client = test_client();
 
     for i in 0..5 {
         let resp = client
@@ -150,7 +150,7 @@ async fn e2e_model_routing_and_models_endpoint() {
     );
     wait_for_agents(&gw, 2, Duration::from_secs(10)).await;
 
-    let client = reqwest::Client::new();
+    let client = test_client();
     let base = format!("http://{}", gw.http_addr);
     let post_model = |model: &str| {
         client
@@ -226,7 +226,7 @@ async fn e2e_admin_agents_lists_registry() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     let (gw, agent, base, _key) =
         start_stack(4, |o| o.admin_token = Some("admin-token".into())).await;
-    let client = reqwest::Client::new();
+    let client = test_client();
 
     // 无 admin token → 401
     let resp = client
@@ -275,7 +275,7 @@ async fn e2e_client_cancel_does_not_leak_concurrency_slot() {
         o.max_concurrent_requests = 1;
     })
     .await;
-    let client = reqwest::Client::new();
+    let client = test_client();
 
     // 发起请求后 150ms 放弃 → 网关此刻仍 parked 在 read_head（上游 800ms 才回头）
     let cancelled = tokio::time::timeout(
@@ -341,7 +341,7 @@ async fn e2e_streaming_holds_concurrency_slot_until_body_ends() {
         o.max_concurrent_requests = 1;
     })
     .await;
-    let client = reqwest::Client::new();
+    let client = test_client();
 
     // mock 的 SSE 逐字输出（10ms/字）：200 字 ≈ 2s 流，足够在流中做断言
     let stream_resp = client
@@ -415,7 +415,7 @@ async fn e2e_mid_stream_cancel_releases_concurrency_slot() {
         o.max_concurrent_requests = 1;
     })
     .await;
-    let client = reqwest::Client::new();
+    let client = test_client();
 
     // 拿到响应头即开始流式回传（200 字 ≈ 2s）
     let stream_resp = client
@@ -486,7 +486,7 @@ async fn e2e_http_concurrent_request_limit() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     let (gw, agent, _base, key) = start_stack(4, |o| o.max_concurrent_requests = 1).await;
 
-    let client = reqwest::Client::new();
+    let client = test_client();
     let url = format!("http://{}/v1/slow", gw.http_addr); // mock 睡 800ms → 并发窗口大
     let req = || {
         client
@@ -574,7 +574,7 @@ async fn e2e_dead_tunnel_fails_fast_instead_of_hanging() {
     let _ = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut reg_recv)).await;
     wait_for_agents(&gw, 1, Duration::from_secs(5)).await;
 
-    let http = reqwest::Client::new();
+    let http = test_client();
     let url = format!("http://{}/v1/chat/completions", gw.http_addr);
     let send = || {
         http.post(&url)
@@ -674,7 +674,7 @@ async fn e2e_more_concurrent_tunnels_than_the_default_quic_stream_ceiling() {
         o.tunnel_op_timeout = Duration::from_secs(1);
     })
     .await;
-    let client = reqwest::Client::new();
+    let client = test_client();
 
     const CONCURRENCY: usize = 120;
     let mut handles = Vec::new();

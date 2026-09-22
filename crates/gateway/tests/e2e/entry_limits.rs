@@ -87,7 +87,7 @@ async fn the_entry_holds_new_connections_back_at_the_cap() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // ② 第二条连接：TCP 连得上（内核 backlog 收着），但不会被 accept ⇒ 拿不到响应
-    let client = reqwest::Client::new();
+    let client = test_client();
     let blocked = tokio::time::timeout(
         Duration::from_millis(700),
         client.get(format!("{base}/healthz")).send(),

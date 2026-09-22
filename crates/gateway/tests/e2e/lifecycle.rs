@@ -95,7 +95,7 @@ async fn e2e_is_serving_reports_a_running_gateway() {
 async fn e2e_shutdown_drains_in_flight_requests_before_returning() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     let (gw, agent, base, key) = start_stack(4, |_| {}).await;
-    let client = reqwest::Client::new();
+    let client = test_client();
     // 在途请求必须**读完响应体**：准入票据绑在 body 上，不消费 body 就永远算"在途"。
     let inflight = tokio::spawn({
         let client = client.clone();
@@ -158,7 +158,7 @@ async fn e2e_shutdown_announces_incomplete_sse_instead_of_cutting() {
         o.request_timeout = Duration::from_secs(30);
     })
     .await;
-    let client = reqwest::Client::new();
+    let client = test_client();
     let resp = client
         .post(format!("{base}/v1/slow_body"))
         .header("Authorization", format!("Bearer {key}"))
