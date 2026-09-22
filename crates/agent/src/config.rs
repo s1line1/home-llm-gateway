@@ -84,6 +84,15 @@ pub fn from_file(cfg: ConfigFile) -> anyhow::Result<AgentConfig> {
     {
         anyhow::bail!("config: ca/cert/key paths are required");
     }
+    // 零值校验（记录 P2-8 的 agent 侧）：`heartbeat_secs: 0` 会让心跳循环 `sleep(0)` +
+    // `timeout(0, ..)` 每次都立刻失败，两次失败即强制重连 ⇒ 拨号风暴 + 网关侧反复摘除/注册。
+    // 配置文件里那个 `0` 看起来同样毫无异常，所以在这里就拒掉。
+    if cfg.heartbeat_secs == 0 {
+        anyhow::bail!(
+            "config: heartbeat_secs must be at least 1 second, but is 0: a zero heartbeat makes \
+             every wait time out immediately, forcing a reconnect on every cycle"
+        );
+    }
     Ok(AgentConfig {
         cloud_addr: cfg
             .cloud_addr
@@ -139,6 +148,39 @@ mod tests {
 
     fn parse_yaml(yaml: &str) -> ConfigFile {
         serde_yaml_ng::from_str(yaml).unwrap()
+    }
+
+    /// 规格（P2-8 agent 侧）：`heartbeat_secs: 0` 必须在加载时就拒掉。
+    ///
+    /// 零心跳 = 每个等待都立刻超时 → 两次失败即强制重连：网关侧会看到永不停歇的
+    /// "注册 → 摘除 → 再注册"，而 agent 日志里只有心跳失败。配置文件里那个 `0` 看起来毫无异常。
+    #[test]
+    fn zero_heartbeat_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ca, cert, key) = gen_cert_files(dir.path());
+        let yaml = format!(
+            r#"
+cloud_addr: "127.0.0.1:4433"
+ca: "{}"
+cert: "{}"
+key: "{}"
+heartbeat_secs: {{}}
+"#,
+            ca.display(),
+            cert.display(),
+            key.display()
+        );
+        let err = match from_file(parse_yaml(&yaml.replace("{}", "0"))) {
+            Ok(_) => panic!("零心跳必须被拒"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("heartbeat_secs"), "报错要点名 YAML 键：{err}");
+
+        // 正常值照样通过（别把合法配置一起拒了）
+        assert!(
+            from_file(parse_yaml(&yaml.replace("{}", "5"))).is_ok(),
+            "非零心跳必须正常加载"
+        );
     }
 
     #[test]

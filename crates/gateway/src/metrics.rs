@@ -93,6 +93,11 @@ impl Metrics {
         AcceptingGuard(self.clone())
     }
 
+    /// 当前在线 agent 连接数（`hlmg_quic_connections` 同一份读数）。
+    pub fn quic_connections(&self) -> u64 {
+        self.inner.quic_connections.load(Ordering::Relaxed)
+    }
+
     /// 隧道入口是否仍在接受新连接（1/0）。
     pub fn quic_accepting(&self) -> u64 {
         self.inner.quic_accepting.load(Ordering::Relaxed)
@@ -110,22 +115,44 @@ impl Metrics {
             .store(u64::from(accepting), Ordering::Relaxed);
     }
 
-    /// 原子占位（HTTP 全局并发 admission）：`fetch_add` 用**旧值**判定是否超限——
-    /// 两个并发请求各自拿到唯一旧值，恰好允许 limit 个进入，无 check-then-act 竞态。
-    /// 超限 → 回退占位并返回 None（调用方返回 429）；
+    /// 原子占位（HTTP 全局并发 admission）：**CAS 循环**，超限直接返回 `None`（调用方 429）；
     /// 通过 → 返回 [`Admission`] 票据，**槽位由票据的 Drop 释放**（见其文档）。
+    ///
+    /// 为什么是 CAS 而不是 `fetch_add` + 超限回滚（记录 R8）：后者在"加了但还没回滚"的那一瞬间
+    /// 让计数**比真实持票数多 1**（幽灵占位）。若恰好有持票者在这一刻释放，紧接着到达的请求会
+    /// 读到 `prev >= limit` 而被拒——**闸门其实是空的**（"双双误拒"，客户端拿到本不该有的 429）。
+    /// CAS 只在"确实要到票"时才加计数，因此
+    /// `active_count()` **恒等于**已发出的票数（顺带让 `hlmg_active_requests` 不再有瞬时尖峰，
+    /// 排空判据 `drain()` 读的也是它）。
+    ///
+    /// `limit == 0` = 不限：直接占位（仍然计数，票据照常负责 `request_count` 与时长记账）。
     pub fn try_enter(&self, limit: u32) -> Option<Admission> {
-        let prev = self.inner.active.fetch_add(1, Ordering::Relaxed);
-        if limit > 0 && prev >= limit as u64 {
-            self.inner.active.fetch_sub(1, Ordering::Relaxed);
-            None
+        if limit > 0 {
+            let limit = u64::from(limit);
+            let mut current = self.inner.active.load(Ordering::Relaxed);
+            loop {
+                if current >= limit {
+                    return None;
+                }
+                match self.inner.active.compare_exchange_weak(
+                    current,
+                    current + 1,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    // 别的线程改了计数：用观测到的新值重试（不重试就真的会漏放行）
+                    Err(observed) => current = observed,
+                }
+            }
         } else {
-            self.inner.request_count.fetch_add(1, Ordering::Relaxed);
-            Some(Admission {
-                metrics: self.clone(),
-                start: Instant::now(),
-            })
+            self.inner.active.fetch_add(1, Ordering::Relaxed);
         }
+        self.inner.request_count.fetch_add(1, Ordering::Relaxed);
+        Some(Admission {
+            metrics: self.clone(),
+            start: Instant::now(),
+        })
     }
 
     /// 记录被 admission 拒绝的请求（不计 active/耗时，但计入请求数与状态码分布）。
@@ -231,16 +258,26 @@ impl Metrics {
     }
 
     /// agent 连接建立：累计 +1、当前在线 +1。
-    pub fn agent_connected(&self) {
+    pub fn mark_agent_connected(&self) -> AgentConnectionGuard {
         self.inner
             .agent_connections_total
             .fetch_add(1, Ordering::Relaxed);
         self.inner.quic_connections.fetch_add(1, Ordering::Relaxed);
+        AgentConnectionGuard(self.clone())
     }
 
-    /// agent 连接断开：当前在线 -1。
-    pub fn agent_disconnected(&self) {
-        self.inner.quic_connections.fetch_sub(1, Ordering::Relaxed);
+    /// agent 连接断开：当前在线 -1。**只由 [`AgentConnectionGuard`] 调用**。
+    ///
+    /// 饱和减而不是裸 `fetch_sub`：gauge 在 0 上回绕会变成 `u64::MAX`（`hlmg_quic_connections`
+    /// 永远报警）。守卫已经保证每 +1 恰好配一次 -1，这里是第二道保险——一处逻辑错误不该把
+    /// 仪表盘彻底毁掉。
+    fn agent_disconnected(&self) {
+        let _ =
+            self.inner
+                .quic_connections
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                    Some(n.saturating_sub(1))
+                });
     }
 
     /// 渲染为 Prometheus 文本格式。
@@ -485,6 +522,20 @@ impl Drop for AcceptingGuard {
     }
 }
 
+/// 一条 agent 连接的生命周期守卫：见 [`Metrics::mark_agent_connected`]。
+///
+/// **为什么必须用 Drop**（评估记录 P2-11）：以前 `quic.rs` 是在连接任务里"先 +1、末尾 -1"，
+/// 而 `handle_conn` 里任何 panic 都会让末尾那句不执行——`hlmg_quic_connections` 于是**永久虚高**，
+/// 而且注册表条目也再也摘不掉（没有 stale 清扫器）。仓库其它资源（`AcceptingGuard` /
+/// `Admission` / `SlotGuard`）早就是这个模式，这是最后一处例外。
+pub struct AgentConnectionGuard(Metrics);
+
+impl Drop for AgentConnectionGuard {
+    fn drop(&mut self) {
+        self.0.agent_disconnected();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Metrics;
@@ -516,6 +567,130 @@ mod tests {
         assert!(
             text.contains("hlmg_requests_total{status=\"204\"} 1"),
             "中毒后新记的状态码也要出现：\n{text}"
+        );
+    }
+
+    /// 规格（记录 R8）：**占位不得制造"幽灵占位"**——`active_count()` 永远不超过已发出的票数。
+    ///
+    /// 旧实现（`fetch_add` 后超限回滚）在回滚前那一瞬间把计数抬高 1；若持票者恰在那一刻释放，
+    /// 紧接着到达的请求会读到 `prev >= limit` 而被拒，而闸门其实是空的。这条用一个**采样线程**
+    /// 盯住计数上界：M 个线程在 barrier 上对齐、同时抢同一个槽位，采样到 `active > limit` 即红。
+    #[test]
+    fn try_enter_never_inflates_the_counter_above_the_limit() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Barrier,
+        };
+
+        for round in 0..50 {
+            let metrics = Metrics::default();
+            let threads = 8usize;
+            let barrier = Arc::new(Barrier::new(threads + 1));
+            let stop = Arc::new(AtomicBool::new(false));
+
+            let sampler = {
+                let (m, b, stop) = (metrics.clone(), barrier.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    b.wait();
+                    let mut worst = 0u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        worst = worst.max(m.active_count());
+                    }
+                    worst
+                })
+            };
+            let workers: Vec<_> = (0..threads)
+                .map(|_| {
+                    let (m, b) = (metrics.clone(), barrier.clone());
+                    std::thread::spawn(move || {
+                        b.wait();
+                        // 抢到就立刻放：制造"持票者释放"与"别人正在占位"重叠的窗口
+                        if let Some(ticket) = m.try_enter(1) {
+                            drop(ticket);
+                        }
+                    })
+                })
+                .collect();
+            for w in workers {
+                w.join().unwrap();
+            }
+            stop.store(true, Ordering::Relaxed);
+            let worst = sampler.join().unwrap();
+            assert!(
+                worst <= 1,
+                "第 {round} 轮采样到 active={worst} > limit=1：存在幽灵占位 ⇒ 会误拒（R8）"
+            );
+        }
+    }
+
+    /// 规格（R8 的另一半）：**占位/释放的记账必须精确**，`0` 仍然是"不限"。
+    #[test]
+    fn try_enter_accounts_exactly_and_treats_zero_as_unlimited() {
+        let m = Metrics::default();
+        let a = m.try_enter(2).expect("第 1 个应当放行");
+        let b = m.try_enter(2).expect("第 2 个应当放行");
+        assert!(m.try_enter(2).is_none(), "第 3 个必须被拒");
+        assert_eq!(
+            m.active_count(),
+            2,
+            "被拒的那次不得留下任何计数（否则会连锁误拒）"
+        );
+
+        drop(a);
+        assert_eq!(m.active_count(), 1);
+        let c = m.try_enter(2).expect("释放一个之后必须能再进");
+        assert_eq!(m.active_count(), 2);
+        drop((b, c));
+        assert_eq!(m.active_count(), 0);
+
+        // `0` = 不限：一直放行，但仍然计数
+        let m2 = Metrics::default();
+        let t1 = m2.try_enter(0).expect("limit=0 无条件放行");
+        let t2 = m2.try_enter(0).expect("limit=0 无条件放行");
+        assert_eq!(m2.active_count(), 2);
+        drop(t1);
+        assert_eq!(m2.active_count(), 1);
+        drop(t2);
+        assert_eq!(m2.active_count(), 0);
+    }
+
+    /// 规格（P2-11）：**连接任务的 panic 必须把 `hlmg_quic_connections` 降回去**。
+    ///
+    /// 旧的"先 +1、末尾 -1"写法在这条测试下必然红：panic 展开时末尾那句不执行，gauge 永久虚高，
+    /// 而没有任何东西会去纠正它（注册表条目同样漏掉，见 `registry::Registration`）。
+    #[test]
+    fn the_connection_gauge_is_released_even_when_the_task_panics() {
+        let m = Metrics::default();
+        assert_eq!(m.quic_connections(), 0);
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = m.mark_agent_connected();
+            assert_eq!(m.quic_connections(), 1, "在连时应为 1");
+            panic!("connection task blew up");
+        }));
+        assert!(panicked.is_err(), "前提：panic 发生了");
+        assert_eq!(
+            m.quic_connections(),
+            0,
+            "panic 展开也必须归还 gauge（否则永久虚高，只能重启）"
+        );
+        assert!(
+            m.render(0, 0, 0, 0)
+                .contains("hlmg_agent_connections_total 1"),
+            "累计连接数是 counter，不因 panic 回退"
+        );
+    }
+
+    /// 规格（P2-11）：递减**饱和**——0 上再减不许回绕成 `u64::MAX`。
+    #[test]
+    fn the_connection_gauge_never_wraps_around() {
+        let m = Metrics::default();
+        m.agent_disconnected();
+        m.agent_disconnected();
+        assert_eq!(
+            m.quic_connections(),
+            0,
+            "裸 fetch_sub 会回绕成 u64::MAX，仪表盘彻底不可读"
         );
     }
 

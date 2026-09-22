@@ -23,7 +23,7 @@ edge-agent（LLM 所在机器）  主动拨号 + 心跳 + 断线重连，转发�
 
 - **QUIC 隧道 + mTLS**：边缘端主动向外拨长连接，天然穿透 NAT / 动态 IP；双向证书认证，未注册 agent 无法接入
 - **流式优先**：SSE 逐块透传（打字机效果）；客户端断开/超时自动 `Cancel` 上游，不白算 token；逐帧空闲超时，不误杀长流
-- **公网 HTTPS 原生支持**：rustls 直接监听 443，无需 nginx/caddy
+- **公网 HTTPS 原生支持**：rustls 直接监听 HTTPS 端口（示例配置 **8443**；QUIC 隧道另占 UDP **4433**），无需 nginx/caddy
 - **安全与治理**：API Key 认证（`sha256(token)` 索引定位 + argon2 校验，明文不落盘）、按 Key 令牌桶限流、按 agent 并发上限的 admission control（超限 429）
 - **多 edge 模型感知路由**：按请求 model 路由到能服务它的 edge（精确优先、`*` 兜底），同组最少负载均衡，失联 agent 不再参与路由；`/v1/models` 网关聚合
 - **可观测性**：`/metrics` Prometheus 指标、结构化请求日志（`request_id` / 状态码 / 耗时）、`/healthz` 探针
@@ -151,7 +151,7 @@ curl -N -H "Authorization: Bearer dev-key" \
 
 ```bash
 cargo test             # proto roundtrip + 端到端集成测试（内存生成证书，无需任何外部服务）
-cargo nextest run -w   # 同上，但用 nextest（CI 用的就是它，见下）
+cargo nextest run --workspace   # 同上，但用 nextest（CI 用的就是它，见下）
 ```
 
 > **CI 用 `cargo nextest`**（`cargo test` 仍然可用，两者都要能过）。换它的原因：nextest
@@ -293,7 +293,7 @@ max_concurrency: 4
 
 ### 超时与"隧道卡死"排障
 
-三条超时各管一段（详见 `DESIGN.md` §5.6），配置项都在 `gateway-config.yml`：
+三条超时各管一段（详见 `DESIGN.md` §5 的「三条超时」那一条），配置项都在 `gateway-config.yml`：
 
 | 配置 | 默认 | 覆盖范围 | 超时后 |
 |---|---|---|---|
@@ -312,7 +312,7 @@ max_concurrency: 4
 | 失败点 | 是否重试 | 依据 |
 |---|---|---|
 | 打开隧道流失败 | **重试**（换另一个 agent） | 还没写过任何字节，请求帧必然**未送达** |
-| 写请求帧失败 | **重试**（换另一个 agent） | `write_frame` 是一整块 `write_all`，只有**全部字节被接受**才返回；超时 ⇒ 帧不完整 ⇒ agent 读不到完整帧（`FrameReader` 先读满长度前缀+载荷）⇒ 它不会调用上游 |
+| 写请求帧失败 | **重试**（换另一个 agent） | `write_frame` 是一整块 `write_all`，只有**全部字节被接受**才返回；超时 ⇒ 帧不完整 ⇒ agent 读不到完整帧（`FrameReader` 先读满长度前缀+载荷）⇒ 它不会调用上游。2026-09-22 用"读到一半就停"的 peer 实测确认（`tests/e2e/write_backpressure.rs`）：对端只拿到真帧的**严格前缀**，随后收到网关 `SendStream` Drop 时的 `finish()`（= FIN）⇒ `FrameReader` 报 `early eof`，那条流上的请求**永远不会被执行**，也不会挂在连接上。另一半同样成立：`tokio::time::timeout` **先轮询内层 future**，所以"整帧已送达但超时先到"这种情况根本不会被判成失败（`tokio::time::timeout` 的 `Timeout::poll` 第一句就是 `me.value.poll(cx)`） |
 | **等响应头超时** | **不重试** | 请求帧已完整送达，**模型可能已经在执行**；重试会重复计费、重复生成（`temperature > 0` 时结果还不一样）。宁可报错，也不做不安全的静默重放 |
 | 响应体中途断流/超时 | 不重试 | 已经产出字节，无法重放 |
 
@@ -610,7 +610,10 @@ agent 侧心跳超时→主动断开→重连握手超时（**已修**，见下�
 | 中位延迟 | 54.7 ms | 2.06 s |
 
 8 KB 那档日志里全是 `upstream head timeout; evicting agent`。折算施加速率：每迭代 ≈28 KB
-（请求 base64 后 body ≈11 KB + `/v1/echo` 把整包回吐 ≈15 KB + 流式端点 ≈2.5 KB）× 50 iters/s
+（请求 base64 后 body ≈11 KB + 回吐整包 ≈15 KB + 流式端点 ≈2.5 KB）× 50 iters/s
+> ⚠️ 原文这里写的是 `/v1/echo`——**mock-llm 从来没有这个端点**（只有 `/v1/models`、
+> `/v1/chat/completions`、`/v1/embeddings`、`/v1/slow`、`/v1/slow_body`、`/v1/flood`）。
+> 这段算术对应的是当时自建的压测上游，别拿 mock-llm 去复现它（记录 2026-09-22 校正）。
 ≈ **1.4 MB/s**——**按载荷折算的估算值，不是直接采 `data_sent`**；对 0.4 MB/s 的上限就是
 **超载约 3.5 倍**；16 B 那档 ≈150 KB/s，在上限之内。
 
@@ -849,7 +852,7 @@ INFO gateway::nofile: raised NOFILE soft limit from=1024 to=16384 hard=524288 ta
 
 - **网页管理页**：浏览器打开 `http://<网关地址>/` 即进入管理界面——输入 admin token 后可直接**创建 / 吊销 / 列出 key**
 - 配置项 `admin_token`（`gateway-config.yml`）：管理口令（与 API Key 相互独立），提供后启用 `/admin/*` 与页面中的管理功能
-- 配置项 `keys_file`：动态 key 持久化数据库文件（SQLite，默认 `keys.db`），重启后依然有效；**只存 argon2 哈希，明文仅创建时返回一次**；文件权限由网关在打开时收紧为 `0600`
+- 配置项 `keys_file`：动态 key 持久化数据库文件（SQLite，默认 `keys.db`），重启后依然有效；**只存 argon2 哈希，明文仅创建时返回一次**；文件权限由网关在打开时收紧为 `0600`。⚠️ **配了却用不了**（打不开 / 建不出表 / 迁移或载入失败）时**启动直接失败**——那种情况下网关认不出任何 key（每个请求 401）却会报健康，宁可起不来也不要空壳
 - 网关没有静态 key——所有 key 都由 Admin API 创建（全部持久化在 SQLite），统一用于调用 `/v1/*`
 
 ```bash

@@ -23,7 +23,7 @@ Local LLM (Ollama / vLLM / llama.cpp / mock-llm)
 
 - **QUIC tunnel + mTLS**: the agent dials an outbound long-lived connection, naturally punching through NAT / dynamic IPs; two-way certificate authentication keeps unregistered agents out
 - **Streaming-first**: SSE chunks are forwarded as they arrive (typewriter effect); client disconnect / timeout sends `Cancel` upstream so you never pay for abandoned tokens; per-frame idle timeout never kills long streams
-- **Native public HTTPS**: rustls directly on port 443 — no nginx/caddy needed
+- **Native public HTTPS**: rustls listens on the HTTPS port itself (the example config uses **8443**; the QUIC tunnel takes UDP **4433**) — no nginx/caddy needed
 - **Security & governance**: API-key auth (`sha256(token)` index lookup + argon2 verify, plaintext never stored), per-key token-bucket rate limiting, per-agent concurrency admission control (429 when full)
 - **Model-aware multi-edge routing**: routes each request by its `model` to an edge that can serve it (exact match first, `*` wildcard as fallback), least-loaded within the same model group; stale agents stop being routing candidates; `/v1/models` is aggregated by the gateway
 - **Observability**: `/metrics` in Prometheus text format, structured request logs (`request_id` / status / latency), `/healthz` probe
@@ -259,6 +259,7 @@ curl -X DELETE http://127.0.0.1:8080/admin/keys/<id> -H "Authorization: Bearer <
 | Public entry | TLS 1.3 (HTTPS once `tls_cert`/`tls_key` are set; plaintext HTTP otherwise), API-key auth (sha256 index + argon2 verify), token-bucket rate limiting, request body size cap |
 | Tunnel | QUIC built-in TLS 1.3 + mTLS (agent certs issued by your CA); unregistered agents cannot connect |
 | Concurrency | Atomic slot reservation against the agent's `max_concurrency`; 429 when full |
+| Credential boundary | Caller credentials (`Authorization` / `Cookie`) stay on the client-to-gateway hop and are **not** forwarded to the edge or the upstream in tunnel frames (if your upstream needs auth, configure its credentials on the agent side) |
 | Secrets | The CA private key never leaves your hands; a separate client cert per agent; `certs/out/` is git-ignored |
 
 ## Design Document

@@ -148,6 +148,8 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::Frame;
     use bytes::Bytes;
@@ -602,5 +604,83 @@ mod tests {
             }
             other => panic!("应当解出 ProxyResponseBody，实际 {other:?}"),
         }
+    }
+
+    /// 规格（并集报告 H8 的机制那一半）：**写到一半被超时放弃的帧，只在对端留下一个严格前缀**。
+    ///
+    /// `write_frame` 是**一次** `write_all`（长度前缀 + 载荷在同一缓冲里），而 `write_all` 内部
+    /// 是"部分写 + 循环"：超时把它 drop 掉时，剩下的字节**再也不会**写到这条流上。所以对端最多
+    /// 拿到真帧的一个前缀，`FrameReader` 的 `read_exact` 永远等不齐——请求不可能被执行。
+    ///
+    /// 这条钉住的是那个前提。另一半（网关不会把剩余字节补写到同一条流、而是换新流重试）在
+    /// `proxy::routing::open_and_send` 的重试循环里，见那里的注释与 e2e
+    /// `write_backpressure::e2e_a_write_that_times_out_mid_frame_never_reaches_the_agent_as_a_request`。
+    #[tokio::test]
+    async fn a_timed_out_write_leaves_only_a_strict_prefix_of_the_frame() {
+        /// 前 `limit` 字节照收、之后永远 `Pending`（且**不唤醒**）的 writer——模拟"对端不读"。
+        struct StallingWriter {
+            limit: usize,
+            buf: Vec<u8>,
+        }
+
+        impl AsyncWrite for StallingWriter {
+            fn poll_write(
+                mut self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                buf: &[u8],
+            ) -> std::task::Poll<io::Result<usize>> {
+                if self.buf.len() >= self.limit {
+                    return std::task::Poll::Pending; // 卡住，永不就绪
+                }
+                let n = buf.len().min(self.limit - self.buf.len());
+                self.buf.extend_from_slice(&buf[..n]);
+                std::task::Poll::Ready(Ok(n))
+            }
+
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        let frame = Frame::ProxyRequest {
+            request_id: 1,
+            method: "POST".into(),
+            path: "/v1/chat/completions".into(),
+            headers: vec![],
+            body: Bytes::from(vec![b'x'; 4096]),
+        };
+        // 完整帧的字节（长度前缀 + postcard 载荷）
+        let payload = postcard::to_allocvec(&frame).expect("encode");
+        let mut full = Vec::with_capacity(4 + payload.len());
+        full.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        full.extend_from_slice(&payload);
+        assert!(full.len() > 64, "前提：这一帧要比注入的前缀长");
+
+        let mut writer = StallingWriter {
+            limit: 64,
+            buf: Vec::new(),
+        };
+        let timed_out =
+            tokio::time::timeout(Duration::from_millis(50), write_frame(&mut writer, &frame)).await;
+        assert!(timed_out.is_err(), "对端不读时写应当超时");
+        assert_eq!(writer.buf.len(), 64, "超时前应当恰好写满注入的前缀");
+        assert!(
+            full.starts_with(&writer.buf),
+            "对端拿到的必须是真帧的前缀（否则线上格式已变）"
+        );
+        assert!(
+            writer.buf.len() < full.len(),
+            "前缀必须**严格短于**整帧——等长的意思是对端可能已经解出完整请求"
+        );
     }
 }

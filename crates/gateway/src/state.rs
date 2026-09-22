@@ -54,8 +54,9 @@ pub struct AppState {
     /// 摘除一条连接后，等它在途请求收尾的宽限。见 [`crate::Options::evict_close_grace`]。
     ///
     /// 透传给 `registry::Registry::evict`。与 `head_timeout` 的大小关系是**刻意保留**的：
-    /// 默认 5s 短于 15s，意味着摘除发生时仍在等响应头的在途请求会被一并掐断——这个值该
-    /// 调到多少是策略决策（见评估报告 §5 H1），本字段只负责让它可配、可回滚。
+    /// 默认与 `head_timeout` **相等（都是 15s，2026-09 由 5s 上调）**，于是"仍在合法等响应头"
+    /// 的那类在途请求不会被宽限掐断；把它配得更短时启动会 WARN（见 `Gateway::start`）。
+    /// 这个值该调到多少是策略决策（见评估报告 §5 H1），本字段只负责让它可配、可回滚。
     pub evict_close_grace: Duration,
     /// 「响应头静默」判据里对端还在说话时的静默容忍上限。见 [`crate::Options::head_silent_grace`]。
     pub head_silent_grace: Duration,

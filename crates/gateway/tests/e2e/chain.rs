@@ -767,3 +767,204 @@ async fn e2e_dot_segment_path_is_rejected_instead_of_forwarded() {
     agent.shutdown().await;
     gw.shutdown().await;
 }
+
+/// 规格（记录 R9 的**正面**一侧）：上游给的大块（1 MiB/块）必须**完整**到达客户端。
+///
+/// agent 侧按 `MAX_RESPONSE_CHUNK`（64 KiB）切块后逐片回传，网关侧只接受 ≤ 该上限的块。
+/// 两边必须成对存在：少了 agent 的切块，网关的检查会把合法的 1 MiB 上游块判成违约 502 ✗。
+/// 这条同时是"切块不改字节"的端到端证据（3 MiB 内容逐字节对得上）。
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn e2e_large_upstream_chunks_survive_the_byte_bound() {
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    let (gw, agent, base, key) = start_stack(4, |_| {}).await;
+
+    // mock-llm 的 kb 上限是 1024 ⇒ 每块 1 MiB，远大于 MAX_RESPONSE_CHUNK(64 KiB)
+    const KB: usize = 1024;
+    const CHUNKS: usize = 3;
+    let resp = test_client()
+        .post(format!(
+            "{base}/v1/flood?chunks={CHUNKS}&kb={KB}&delay_ms=0"
+        ))
+        .header("Authorization", format!("Bearer {key}"))
+        .json(&serde_json::json!({ "model": "mock-llm" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "合法的大块响应不该被字节上限拒掉");
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(
+        body.len(),
+        CHUNKS * KB * 1024,
+        "切块 + 重组的字节数必须与上游一致"
+    );
+    assert!(
+        body.iter().all(|b| *b == b'F'),
+        "内容必须逐字节一致（mock-llm 的 flood 全是 'F'）"
+    );
+
+    drop(agent);
+    gw.shutdown().await;
+}
+
+/// 规格（记录 R9 的**纵深防御**一侧）：agent 发来超标的响应块时，网关必须**拒绝**而不是照单全收。
+///
+/// 为什么必须有这一道：回写客户端的通道按**条数**有界（32），单块大小就是这个上界的乘数——
+/// 没有检查时，一个坏/旧 agent 每块 64 MiB，慢客户端足以让网关堆下 GB 级内存。agent 侧的正常
+/// 路径已经切块（上一条测试），这里用一个**故意违规的裸 agent** 钉住网关这一侧的判据。
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn e2e_an_oversized_response_chunk_is_refused() {
+    use std::sync::Arc;
+    use tokio::io::AsyncWriteExt as _;
+
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    let TestGateway {
+        gw,
+        certs,
+        key,
+        base,
+        ..
+    } = start_gateway(|_| {}).await;
+
+    // 裸 QUIC agent：注册（声明一个模型），然后对每个代理流回"超标的响应块"
+    let client = s2n_quic::Client::builder()
+        .with_tls(s2n_quic::provider::tls::rustls::Client::from(Arc::new(
+            agent::tls::rustls_client_tls(
+                &certs.ca,
+                certs.client_cert.clone(),
+                certs.client_key.clone_key(),
+            )
+            .unwrap(),
+        )))
+        .unwrap()
+        .with_io("0.0.0.0:0")
+        .unwrap()
+        .start()
+        .unwrap();
+    let mut conn = client
+        .connect(s2n_quic::client::Connect::new(gw.quic_addr).with_server_name("localhost"))
+        .await
+        .unwrap();
+    let stream = conn.open_bidirectional_stream().await.unwrap();
+    let (mut reg_recv, mut reg_send) = stream.split();
+    write_frame(
+        &mut reg_send,
+        &Frame::Register {
+            agent_id: "oversized".into(),
+            models: vec!["mock-llm".into()],
+            max_concurrency: 4,
+            version: "test".into(),
+        },
+    )
+    .await
+    .unwrap();
+    reg_send.finish().unwrap();
+    let _ = bounded(
+        "read the oversized agent's register reply",
+        read_frame(&mut reg_recv),
+    )
+    .await;
+    wait_for_agents(&gw, 1, Duration::from_secs(5)).await;
+
+    tokio::spawn(async move {
+        let _keep_alive = (client, reg_recv);
+        while let Ok(Some(stream)) = conn.accept_bidirectional_stream().await {
+            let (mut recv, mut send) = stream.split();
+            let _ = read_frame(&mut recv).await; // 丢弃 ProxyRequest
+            write_frame(
+                &mut send,
+                &Frame::ProxyResponseHead {
+                    request_id: 1,
+                    status: 200,
+                    headers: vec![],
+                },
+            )
+            .await
+            .unwrap();
+            // 先发一小块（证明体路径本身是通的），再发比上限多 1 字节的块
+            write_frame(
+                &mut send,
+                &Frame::ProxyResponseBody {
+                    request_id: 1,
+                    chunk: axum::body::Bytes::from_static(b"ok-until-here"),
+                },
+            )
+            .await
+            .unwrap();
+            // 给 hyper 一点时间把上一块真正刷给客户端（否则它会在读到 Err 时整体中止，
+            // 连合法块都看不到——那样就测不出"只有超标块被拒"）
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            write_frame(
+                &mut send,
+                &Frame::ProxyResponseBody {
+                    request_id: 1,
+                    chunk: axum::body::Bytes::from(vec![
+                        b'X';
+                        proto::frame::MAX_RESPONSE_CHUNK + 1
+                    ]),
+                },
+            )
+            .await
+            .unwrap();
+            let _ = write_frame(
+                &mut send,
+                &Frame::ProxyResponseEnd {
+                    request_id: 1,
+                    ok: true,
+                },
+            )
+            .await;
+            let _ = send.shutdown().await;
+        }
+    });
+
+    let resp = tokio::time::timeout(
+        Duration::from_secs(10),
+        test_client()
+            .post(format!("{base}/v1/chat/completions"))
+            .header("Authorization", format!("Bearer {key}"))
+            .json(&serde_json::json!({
+                "model": "mock-llm",
+                "messages": [{ "role": "user", "content": "hi" }],
+            }))
+            .send(),
+    )
+    .await
+    .expect("网关必须立刻拒绝，而不是等超时")
+    .unwrap();
+    let status = resp.status();
+    // 不能用 `text()`：超标的块被拒后连接是**中途断掉**的，reqwest 会整段丢弃已收到的字节
+    // （返回 Err ⇒ `unwrap_or_default()` 得到空串，什么都验不出来）。逐块收，收到哪算哪。
+    let body = {
+        use futures_util::StreamExt as _;
+        let mut acc: Vec<u8> = Vec::new();
+        let mut stream = resp.bytes_stream();
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(b) => acc.extend_from_slice(&b),
+                Err(_) => break,
+            }
+        }
+        acc
+    };
+    // 响应头**先于** body 流给客户端（流式转发的固有语义），所以 body 期的违约不可能变成 5xx，
+    // 也没法在头里报错。能期望、也必须期望的是：**超标的那一块没有被转发**。
+    assert_eq!(status, 200, "头已经流出去了，这是流式语义：{body:?}");
+    assert!(
+        body.starts_with(b"ok-until-here"),
+        "违约之前的合法块必须照常到达（否则这条测的就不是「超标块被拒」）：{body:?}"
+    );
+    assert!(
+        !body.contains(&b'X'),
+        "超标的块不得被转发，实际收到 {} 字节（其中含 X）",
+        body.len()
+    );
+    assert!(
+        body.len() < proto::frame::MAX_RESPONSE_CHUNK,
+        "客户端的 body 必须远小于上限（收到 {} 字节）",
+        body.len()
+    );
+
+    gw.shutdown().await;
+}

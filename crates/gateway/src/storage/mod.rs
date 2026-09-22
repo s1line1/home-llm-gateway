@@ -87,6 +87,13 @@ struct KeyStoreInner {
     /// 凭据代数：**只在凭据相关变更时**自增（创建/吊销/轮换）。
     /// 每条记录带一个 `cred_version`，变更后旧缓存条目的版本对不上 → 立即失效。
     cred_generation: AtomicU64,
+    /// 启动期持久化自检：`None` = **没配 `keys_file`**（内存模式）；
+    /// `Some(Ok(()))` = 库已就绪；`Some(Err(why))` = 已降级成内存模式，`why` 是原因。
+    ///
+    /// 库/测试语义：失败仍降级（构造器刻意保持不可失败）。**生产启动路径据此 fail-fast**
+    /// ——见 [`KeyStore::persistence_state`] 与 `Gateway::start`：一个载不出任何 key 的网关
+    /// 就是个空壳（每个请求 401），却会一直报健康。
+    persistence: Option<Result<(), String>>,
 }
 
 /// 一条动态 key 的记录。**凭据字段不出本模块**：`key_hash` 是 argon2 的 PHC 串、
@@ -170,6 +177,16 @@ const USAGE_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS key_usage (
 impl KeyStore {
     /// 默认：1650 条缓存、30 分钟有效期（够覆盖"同一批客户端持续打"的场景；
     /// 吊销仍然是即时的——版本校验在缓存之前，不依赖 TTL）。
+    /// 启动期持久化自检的结果：`None` = 没配 `keys_file`；`Some(Ok(()))` = 就绪；
+    /// `Some(Err(why))` = 已降级为内存模式（磁盘/权限/损坏/迁移失败…）。
+    ///
+    /// 为什么单独暴露：构造器**刻意保持不可失败**（库与测试里"内存模式"是合法用法），
+    /// 而**生产启动必须 fail-fast**——一个载不出任何 key 的网关是个空壳（每个请求 401），
+    /// 却会一直报健康。判据由 [`crate::Gateway::start`] 执行。
+    pub fn persistence_state(&self) -> Option<Result<(), String>> {
+        self.inner.persistence.clone()
+    }
+
     pub fn new(file: Option<PathBuf>) -> Self {
         Self::with_verified(file, DEFAULT_VERIFIED_MAX, DEFAULT_VERIFIED_TTL)
     }
@@ -184,6 +201,8 @@ impl KeyStore {
 
     /// 指定已验证缓存容量与有效期；`max = 0` 关闭缓存（恢复"每请求都跑 argon2"的旧行为）。
     pub fn with_verified(file: Option<PathBuf>, max: usize, ttl: Duration) -> Self {
+        // `file` 为 None ⇒ 保持 None（内存模式是合法配置，不是故障）
+        let mut persistence: Option<Result<(), String>> = file.as_ref().map(|_| Ok(()));
         let db = match &file {
             Some(path) => match Connection::open(path) {
                 Ok(mut conn) => {
@@ -225,6 +244,10 @@ impl KeyStore {
                                     tracing::warn!(
                                         "keys db migration failed: {e}; using empty store"
                                     );
+                                    persistence = Some(Err(format!(
+                                        "cannot migrate the legacy keys db {}: {e}",
+                                        path.display()
+                                    )));
                                 }
                             }
                             Some(conn)
@@ -234,12 +257,15 @@ impl KeyStore {
                                 "keys db {:?} init failed: {e}; using memory only",
                                 path
                             );
+                            persistence =
+                                Some(Err(format!("cannot initialise {}: {e}", path.display())));
                             None
                         }
                     }
                 }
                 Err(e) => {
                     tracing::warn!("keys db {:?} open failed: {e}; using memory only", path);
+                    persistence = Some(Err(format!("cannot open {}: {e}", path.display())));
                     None
                 }
             },
@@ -250,6 +276,9 @@ impl KeyStore {
                 Ok(map) => map,
                 Err(e) => {
                     tracing::warn!("keys db load failed: {e}; using empty store");
+                    if matches!(persistence, Some(Ok(()))) {
+                        persistence = Some(Err(format!("cannot load the keys db: {e}")));
+                    }
                     HashMap::new()
                 }
             },
@@ -267,6 +296,7 @@ impl KeyStore {
                 usage,
                 verified: verified::VerifiedCache::new(max, ttl),
                 cred_generation: AtomicU64::new(1),
+                persistence,
             }),
         }
     }
@@ -1011,10 +1041,44 @@ mod tests {
         assert!(reloaded.authorize(&created.plaintext));
     }
 
+    /// 规格（启动期持久化自检）：三种状态必须分得开——**没配 / 就绪 / 降级（带原因）**。
+    ///
+    /// 为什么要有这个区分：`Gateway::start` 只对"配了 `keys_file` 却用不了"这一档 fail-fast；
+    /// 没配 keys_file 的内存模式（测试/开发）是合法配置，不能一起拒掉。而"坏库"必须能给出
+    /// **路径与原因**，否则运维只看到"起不来"三个字。
+    #[test]
+    fn persistence_state_distinguishes_unconfigured_ready_and_degraded() {
+        // ① 没配 keys_file：内存模式，不是故障
+        assert!(
+            KeyStore::new(None).persistence_state().is_none(),
+            "没配 keys_file 不该有'持久化状态'"
+        );
+
+        let dir = tempdir().unwrap();
+        // ② 可用（会被自动创建）的库：就绪
+        let path = dir.path().join("keys.db");
+        assert_eq!(
+            KeyStore::new(Some(path.clone())).persistence_state(),
+            Some(Ok(())),
+            "正常库应当是就绪"
+        );
+
+        // ③ 不是 SQLite 库的文件：降级，且原因里带路径
+        let bogus = dir.path().join("bogus.db");
+        std::fs::write(&bogus, b"this is definitely not a sqlite database").unwrap();
+        let store = KeyStore::new(Some(bogus.clone()));
+        let why = store
+            .persistence_state()
+            .expect("配了 keys_file 就该有状态")
+            .expect_err("坏库必须报降级");
+        assert!(why.contains("bogus.db"), "原因里要带路径，实际：{why}");
+        assert!(!why.is_empty(), "原因不能是空串（运维要靠它定位）");
+    }
+
     /// 规格：**持久化失败时不能声称"创建成功"**（评估报告 §5 H2 / 记录 P2-9）。
     ///
     /// 触发方式：给 `api_keys` 加一个必然 ABORT 的 INSERT 触发器——磁盘满 / I/O 错误 /
-    /// `SQLITE_BUSY` 在真实世界里就是这一支。今天 `create` 先写内存、后落库，落库失败只
+    /// `SQLITE_BUSY` 在真实世界里就是这一支。修改前 `create` 先写内存、后落库，落库失败只
     /// `warn!` 然后照常返回 → 管理页显示一把**重启后就消失**的 key。
     #[test]
     fn create_that_fails_to_persist_leaves_no_key() {
@@ -1047,7 +1111,7 @@ mod tests {
 
     /// 规格：**吊销落库失败时 key 必须仍然可用**（评估报告 §5 H2 / 记录 P1-4）。
     ///
-    /// 与上一条对称：今天 `delete` 先删内存、后落库，落库失败只 `warn!` 却仍返回 `true`
+    /// 与上一条对称：修改前 `delete` 先删内存、后落库，落库失败只 `warn!` 却仍返回 `true`
     /// → admin 回 204、日志写 "api key revoked"，而重启后 `load_keys` 会把 key 复活。
     /// 正确语义只有两种：内存与库**一起变**，或**都不变**——绝不能"内存说没了、库还在"。
     #[test]

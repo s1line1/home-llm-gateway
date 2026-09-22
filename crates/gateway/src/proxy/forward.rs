@@ -51,7 +51,7 @@ pub(super) enum SendOutcome {
 /// `Gateway::shutdown` 早返回了（并集报告 H5）。
 const SHUTDOWN_EVENT_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
 
-/// 响应转发结束的方式。**八个出口各自的处置不同**，以前它们只是散落的 `return`——
+/// 响应转发结束的方式。**九个出口各自的处置不同**，以前它们只是散落的 `return`——
 /// 日志能看出差别，返回值看不出来。显式化之后：调用方拿到一个可匹配的结论，
 /// 而第 9 步要修的那个缺口（客户端断开却因上游静默而未察觉）就落在 `ClientGone` 上。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +72,10 @@ pub(super) enum ForwardEnd {
     ClientStalled,
     /// 网关关闭（`Terminating`）：已给客户端一个"不完整"事件、取消上游并结算。
     GatewayShutdown,
+    /// agent 违反了隧道协议（目前只有"响应块超过 `MAX_RESPONSE_CHUNK`"）：已把错误送给客户端、
+    /// 取消上游并结算。与 [`ForwardEnd::UpstreamError`] 分开：这**不是上游的错误**——上游内容没问题，
+    /// 是 agent 没按约定切块（记录 R9）。
+    ProtocolViolation,
 }
 
 /// 关闭时写给在途 SSE 的终止事件。
@@ -230,6 +234,27 @@ pub(super) async fn forward_body(
         };
         match frame {
             Ok(Ok(Some(Frame::ProxyResponseBody { chunk, .. }))) => {
+                // 内存边界（记录 R9）：通道按**条数**有界（32），所以单块大小决定上界。
+                // agent 侧负责切块；这里是**纵深防御**——坏/旧 agent 不该让网关堆下 GB 级内存。
+                if chunk.len() > proto::frame::MAX_RESPONSE_CHUNK {
+                    warn!(
+                        request_id,
+                        len = chunk.len(),
+                        limit = proto::frame::MAX_RESPONSE_CHUNK,
+                        "agent sent an oversized response chunk; refusing the response"
+                    );
+                    let _ = send_to_client_or_shutdown(
+                        &tx,
+                        Err("upstream sent an oversized response chunk".into()),
+                        client_stall,
+                        &mut shutdown,
+                    )
+                    .await;
+                    tunnel_cancel(send, request_id, op_timeout).await;
+                    let _ = send.finish();
+                    usage.finish();
+                    return ForwardEnd::ProtocolViolation;
+                }
                 match send_to_client_or_shutdown(
                     &tx,
                     Ok(chunk.clone()),

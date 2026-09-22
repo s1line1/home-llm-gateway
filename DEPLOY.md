@@ -103,12 +103,14 @@ cargo build --release            # 产出 target/release/{gateway,agent,mock-llm
 ## 4. 目录规划（中转服务器）
 
 ```bash
-sudo mkdir -p /etc/home-llm-gateway/certs
+sudo mkdir -p /etc/home-llm-gateway
 # 二进制（方案 A 构建后在 home-llm-gateway/target/release/ 下，方案 B 解包 dist/）
 sudo cp target/release/gateway /usr/local/bin/gateway
-# 证书
-sudo cp server.crt server.key ca.crt /etc/home-llm-gateway/certs/
-sudo chmod 600 /etc/home-llm-gateway/certs/server.key
+# 证书：**直接放配置目录**——`gateway_config.example.yml` 里的 cert/key/ca 就是
+# /etc/home-llm-gateway/{server.crt,server.key,ca.crt}（没有 certs/ 子目录，别自建一层，
+# 否则示例配置"零改动"启动时读不到证书）
+sudo cp server.crt server.key ca.crt /etc/home-llm-gateway/
+sudo chmod 600 /etc/home-llm-gateway/server.key
 # Web UI（可选）：本机构建后把产物整个上传（含 index.html + assets/）
 #   cd web && pnpm install && pnpm build
 #   scp -r web/dist <服务器>:/etc/home-llm-gateway/web
@@ -130,8 +132,8 @@ sudo cp deploy/gateway.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now gateway
 
-# 4) 看日志（日志落盘到文件，见 deploy/gateway.service 的 StandardOutput；
-#    也可 journalctl -u gateway -f 看 systemd 侧）
+# 4) 看日志（deploy/gateway.service 的 StandardOutput/StandardError 把应用日志**落盘**，
+#    所以 journalctl -u gateway 里只有 systemd 自己的启停消息，没有网关日志）
 sudo tail -f /var/log/home-llm-gateway/gateway.log
 ```
 
@@ -181,9 +183,14 @@ curl -s http://127.0.0.1:11434/v1/models          # 本机确认 OpenAI 兼容�
 安装 agent（同样放二进制 + 证书，注意用**该机器自己那份** client 证书）：
 
 ```bash
-sudo mkdir -p /opt/home-llm-gateway/certs
-sudo cp agent ca.crt client-edge1.crt client-edge1.key /opt/home-llm-gateway/certs/
-# 目录里只有 agent 二进制 + 证书
+sudo mkdir -p /etc/home-llm-gateway
+# 二进制（agent.service 的 ExecStart 是 /usr/local/bin/agent）
+sudo cp target/release/agent /usr/local/bin/agent
+# 证书：与 agent_config.example.yml 的路径一致（/etc/home-llm-gateway/{ca.crt,client.crt,client.key}）
+sudo cp ca.crt /etc/home-llm-gateway/ca.crt
+sudo cp client-edge1.crt /etc/home-llm-gateway/client.crt
+sudo cp client-edge1.key /etc/home-llm-gateway/client.key
+sudo chmod 600 /etc/home-llm-gateway/client.key
 
 # 基于 agent_config.example.yml 生成 agent 配置：
 #   cloud_addr: <公网IP>:4433
@@ -347,5 +354,7 @@ curl -s localhost:8080/metrics | grep -E 'hlmg_key_verify_(hits|misses)_total'
 ```bash
 docker compose config -q          # 只校验配置，不起容器
 docker compose up -d gateway
-docker compose logs -f gateway    # 日志走 stdout（没有日志文件配置项）
+# 日志：compose 的 command 把 stdout 重定向到了 /var/log/home-llm-gateway/gateway.log，
+# 所以 `docker compose logs -f gateway` 是**空的**（容器 stdout 没有内容）——直接看那个文件：
+sudo tail -f /var/log/home-llm-gateway/gateway.log
 ```

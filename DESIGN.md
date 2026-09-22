@@ -25,7 +25,7 @@
 │  · Agent 路由 / 健康管理   │
 │  · QUIC Server（隧道端）   │
 └──────────┬───────────────┘
-           │ QUIC（UDP 443，mTLS，一条连接多路复用）
+           │ QUIC（UDP 4433，mTLS，一条连接多路复用）
            │ ← 边缘端主动拨出的长连接，云端永不主动连对端
            ▼
 ┌──────────────────────────┐
@@ -114,7 +114,7 @@
 **技术栈**：`axum` + `hyper` + `tower` + `s2n-quic` + `clap` + `tracing` + `serde`
 
 职责：
-1. **公网 HTTP(S) 入口**：监听 443（TLS），暴露 OpenAI 兼容路径 `/v1/models`、`/v1/chat/completions`、`/v1/embeddings` 等，**逐字**透传给隧道内的 agent——但转发前先过路径守卫（`proto::path::safe_upstream_path`）：点段 / 反斜杠 / `%2e`·`%2f`·`%5c` 一类编码分隔符会让上游的 URL 归一（或解码）出 `/v1/` 之外的路径，持 key 者因此能越权访问上游任意端点（`PROJECT_SCAN` P1-2），这类请求直接 `400`。**agent 侧用同一份判据再拒一次**（纵深防御：网关在远端，而 agent 的上游通常与它同机；隧道另一端不再受信时，agent 仍会回 `400` 而不是照拼）。
+1. **公网 HTTP(S) 入口**：监听 HTTPS 端口（示例配置 8443；QUIC 隧道另占 UDP 4433），走 TLS，暴露 OpenAI 兼容路径 `/v1/models`、`/v1/chat/completions`、`/v1/embeddings` 等，**逐字**透传给隧道内的 agent——但转发前先过路径守卫（`proto::path::safe_upstream_path`）：点段 / 反斜杠 / `%2e`·`%2f`·`%5c` 一类编码分隔符会让上游的 URL 归一（或解码）出 `/v1/` 之外的路径，持 key 者因此能越权访问上游任意端点（`PROJECT_SCAN` P1-2），这类请求直接 `400`。**agent 侧用同一份判据再拒一次**（纵深防御：网关在远端，而 agent 的上游通常与它同机；隧道另一端不再受信时，agent 仍会回 `400` 而不是照拼）。
 2. **认证**：Bearer API Key。鉴权分三步：`sha256(token)` 查已验证身份缓存 → 该记录 `enabled` 且 `cred_version` 与当前代次一致即放行（O(1)，**不跑 argon2**）；未命中才做 argon2 校验（全表遍历早已不存在）。恒定时间比较只用在 admin token 上。细节见下方「已验证身份缓存」。
 3. **限流**：token bucket 按 Key 限流（桶键是 **`key_id`**，不是明文 token：明文只在认证那一刻的栈上，桶表是长生命周期内存，不能被凭据污染；吊销成功即回收该桶，空闲满桶按 10 分钟清扫）；按 agent 并发上限 admission control（429）。
 4. **Agent 路由**：维护 agent 注册表（agent_id → 当前 QUIC 连接 + 健康状态）；按请求 `model` 过滤候选（精确声明优先、`models: ["*"]` 通配兜底），同组内取在途最少者（见 `MODEL_ROUTING.md`）；无健康 agent → 503，有健康 agent 但无人能服务该模型 → 404。
@@ -142,7 +142,7 @@
 
    **摘除连接时延迟关闭**：达到"连续 3 次隧道操作超时"后先移出路由，再决定何时关连接——
    若还有别的在途请求（它们已送达 agent、模型正在生成，不属于可重试范围），
-   等在途归零或超过 5s 宽限期再关，避免为了修一条坏流而打断正常请求。
+   等在途归零或超过 `evict_close_grace`（默认 15s）再关，避免为了修一条坏流而打断正常请求。
 
    **"忙"与"死"必须分开，两类超时都要分**（`Entry::open_timeout_is_fatal` 与
    `Entry::head_timeout_is_fatal`）：响应头超时问的是"这条隧道最近还干活吗"——窗口
@@ -211,7 +211,7 @@
 
 ## 10. 风险与备选方案
 
-1. **UDP 被封锁**：极少数 edge 侧网络封出站 UDP。备选：隧道降级为 TCP+TLS 并复用同一套帧协议（帧层不变，只换传输层），或提示用户放行 UDP 443。
+1. **UDP 被封锁**：极少数 edge 侧网络封出站 UDP。备选：隧道降级为 TCP+TLS 并复用同一套帧协议（帧层不变，只换传输层），或提示用户放行 UDP 4433。
 2. **QUIC 库 API 学习成本**（迁移到 `s2n-quic` 时踩过 `Server: !Clone`、`Connection::split()` 等）：备选直接上 HTTP/3（`h3` crate），用标准 HTTP 语义替代自定义帧，代价是少一点控制力、多一层依赖。
 3. **帧协议 bug 排查成本**：协议保持最小集（上表 8 种帧），先做对再做优化；用 `postcard` 保证序列化简单可调试。
 4. **edge 断网/断电**：云端靠心跳超时把 agent **排除出路由候选**（`agent_stale_secs`，默认 15s），客户端得到 503/404 而非悬挂；agent 恢复后自动重连，无需人工干预。注意现状：注册表条目要等连接真正关闭才摘除，因此 `Registry::len()`、`/metrics hlmg_agents`、`/admin/agents` 会把失联连接一并算作"在线"（见 TODO 审查登记）。
@@ -247,15 +247,17 @@
 
 - key 校验改为"先哈希定位、再恒定时间比较"，避免全表遍历 ✅ 已实施（`sha256(token)` lookup 索引 + argon2 校验，见 `gateway/src/storage/`；恒定时间比较落在 admin token 上）
 - SQLite 写操作（create/revoke）挪到 `spawn_blocking`，不阻塞 async runtime ✅ 已实施（OPTIMIZATION.md C2；keystore argon2/落库走阻塞线程池）
-- QUIC 流上限调优：s2n-quic 默认 100，高并发流场景上调 ✅ 已实施（网关侧 `max_open_tunnel_streams` 默认 **1024**，见 `gateway.rs` 的 `DEFAULT_MAX_OPEN_TUNNEL_STREAMS`，应用点在 `listen.rs`）
+- QUIC 流上限调优：s2n-quic 默认 100，高并发流场景上调 ✅ 已实施（网关侧 `max_open_tunnel_streams` 默认 **1024**，见 `options.rs` 的 `DEFAULT_MAX_OPEN_TUNNEL_STREAMS`，应用点在 `listen.rs`）
 - 慢上游排队：agent 满时先排队（带超时）而非直接 429
-- SSE 流式转发增加内存缓冲上限，防慢客户端拖垮
+- ~~SSE 流式转发增加内存缓冲上限，防慢客户端拖垮~~ ✅ 已实施（2026-09-22）：单块
+  ≤ `proto::frame::MAX_RESPONSE_CHUNK`（64 KiB，agent 侧切块 + 网关侧拒绝），
+  回写队列 32 块 ⇒ 每请求 ≈ 2 MiB 上界；hyper 自身的 socket 缓冲不在应用层可控范围（记录 R9）
 
 ### 11.3 阶段 2：多租户（大团队核心需求）
 
 - **租户模型**：API key 增加 `tenant_id`、`permissions`（模型白名单）、`expires_at`、`quota`
 - **两级限流**：按 key + 按租户（租户级总配额）
-- **用量计量**：从上游 `usage` 字段统计 **token 消耗**（当前只统计 bytes），按租户记量
+- **用量计量**：从上游 `usage` 字段统计 **token 消耗**（缺失时按字符数/字节数估算并标 `estimated`；见 `usage_meter.rs`），按租户记量
 - **审计**：日志/请求带 tenant_id，支持"谁用了多少"查询
 - **管理面升级**：现有 Admin API/管理页扩展为租户管理、key 生命周期、用量报表
 

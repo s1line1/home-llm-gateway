@@ -49,11 +49,12 @@ pub async fn accept_loop(
         info!(%remote, "edge connected");
 
         tokio::spawn(async move {
-            metrics.agent_connected();
+            // 连接计数的 +1/-1 绑在守卫上（记录 P2-11）：末尾语句在 panic 展开时不会执行，
+            // gauge 会永久虚高；注册表条目的摘除同理，见 `registry::Registration`。
+            let _connection = metrics.mark_agent_connected();
             if let Err(e) = handle_conn(conn, registry, stream_ceiling).await {
                 warn!("agent connection error: {e}");
             }
-            metrics.agent_disconnected();
         });
     }
 
@@ -75,27 +76,23 @@ async fn handle_conn(
     // split 消耗连接，只能一次。Handle: Clone（给 registry 存一份）；
     // StreamAcceptor: 单消费者且不可 Clone（acceptor.rs:182 只有 Debug），按 &mut 传下去。
     let (handle, mut acceptor) = conn.split();
-    let mut agent_id: Option<(String, usize)> = None;
-    let result = handle_conn_inner(
+    // 摘除绑在守卫上（记录 P2-11）：正常返回、`?` 提前返回、panic 展开都走同一条路。
+    let mut registration = crate::registry::Registration::new(&registry);
+    handle_conn_inner(
         &handle,
         &mut acceptor,
         &registry,
-        &mut agent_id,
+        &mut registration,
         stream_ceiling,
     )
-    .await;
-    // 无论正常/异常退出，都尝试摘除（仅当仍是同一连接）
-    if let Some((id, sid)) = &agent_id {
-        registry.remove_if_same(id, *sid);
-    }
-    result
+    .await
 }
 
 async fn handle_conn_inner(
     handle: &s2n_quic::connection::Handle,
     acceptor: &mut s2n_quic::connection::StreamAcceptor,
     registry: &Registry,
-    agent_id: &mut Option<(String, usize)>,
+    registration: &mut crate::registry::Registration<'_>,
     stream_ceiling: u32,
 ) -> anyhow::Result<()> {
     loop {
@@ -125,7 +122,7 @@ async fn handle_conn_inner(
                         }
                         let stable_id =
                             registry.register(id.clone(), models, max_concurrency, handle.clone());
-                        *agent_id = Some((id.clone(), stable_id));
+                        registration.note(id.clone(), stable_id);
                         let _ = send.finish();
                         info!(agent = %id, "agent registered");
                     }

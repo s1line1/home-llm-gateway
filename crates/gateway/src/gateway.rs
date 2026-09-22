@@ -78,11 +78,16 @@ impl Gateway {
     /// ② `nofile::install()` 产出凭证；③ `listen::Sockets::bind` 同时要求这两样
     /// （已校验的 TLS + 已抬额度的凭证），所以"先绑端口再校验"与"没抬额度就绑"都写不出来。
     ///
-    /// 错误：`Config`（HTTPS 材料构建不出 / 流额度非法）、`Tls`、`Verifier`、
-    /// `Io`（端口占用）、`QuicStart`。**已知的刻意放宽**（保持原有设计）：NOFILE 抬不动
+    /// 错误：`Config`（旋钮零值非法——见 [`Options::validate`] / HTTPS 材料构建不出）、`Tls`、
+    /// `Verifier`、`Io`（端口占用）、`QuicStart`。**已知的刻意放宽**（保持原有设计）：NOFILE 抬不动
     /// 只 WARN、`ui_dir` 不可用只降级成占位页，两者都不阻止启动。
     pub async fn start(cfg: GatewayConfig) -> Result<Self, GatewayError> {
         let GatewayConfig { tunnel, opts } = cfg;
+
+        // ⓪ 旋钮校验（记录 P2-8）：零值不是"关闭"而是"立刻超时"，其中 `head_timeout`/`agent_stale`
+        //    的零值会让网关起来就开始全量 503。放在最前面——比 TLS 材料还早，因为这是配置作者的
+        //    笔误，越早指出越省事。
+        opts.validate().map_err(GatewayError::Config)?;
 
         // ① 纯校验 + 派生：TLS 材料有问题必须**在碰任何资源之前**失败（fail fast）。
         //    否则进程会"启动成功"却从未监听公网端口——systemd 显示 active(running)、
@@ -139,6 +144,18 @@ impl Gateway {
             opts.verified_cache_max,
             KeyStore::default_verified_ttl(),
         );
+        // ④.1 持久化自检（fail-fast）：配了 `keys_file` 却打不开/建不出表/迁移或载入失败时，
+        //     `KeyStore` 会降级成**内存模式**——库里明明有 key，网关却一个都认不出来，于是每个
+        //     请求 401，而进程、systemd、`/healthz` 全都正常。这与本文件开头的原则同源
+        //     （"不留一个看起来启动了的空壳进程"）。位置在**绑端口之后、起任何任务之前**：
+        //     返回 Err 时④之前绑好的 socket 随局部变量一起 drop（这正是"全有或全无"）。
+        //     `keys_file: None`（内存模式，测试/开发）不受影响——那不是故障。
+        if let Some(Err(why)) = key_store.persistence_state() {
+            return Err(GatewayError::Config(format!(
+                "config: keys_file is configured but unusable ({why}); refusing to start with an \
+                 empty key store (every request would 401 while the gateway looks healthy)"
+            )));
+        }
         let app_state =
             state::AppState::new(registry.clone(), key_store.clone(), metrics.clone(), &opts);
         // 关闭阶段的发送端留在 `Gateway`；接收端给 accept 循环，在途响应各自 `subscribe()`。

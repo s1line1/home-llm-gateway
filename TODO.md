@@ -4,6 +4,13 @@
 > 状态：P0 主体已实施（2026-09）；其余按优先级推进，`[x]` 表示已完成，未勾选项为待办。
 > 文末「2026-09 全项目代码审查（两轴）」登记了最近一次全量审查发现的代码问题与文档漂移。
 
+> **阶段目标（2026-09-22，人工指示）：这一阶段主要还技术债、解决 bug。新功能一律先不做。**
+> 含义：**不新增能力/接口/表结构/依赖/配置旋钮**——包括多租户、配额与超限拒绝、按 model 归因、
+> 用量 reset/告警、Redis 外置、协议换 protobuf、管理面板扩展、多实例无状态化等（下方带 ⛔ 的条目）。
+> **仍在做**：已登记**缺陷**的修复（正确性 / 并发与资源生命周期 / 安全 / 可观测性与文档漂移）、
+> 测试补齐、以及不改变对外行为的重构。判断标准：这一条的目的是"**让已有行为更正确/更可观测**"
+> （做）还是"**让网关多一个本事**"（不做）。新功能条目只做登记，不排期、不开工。
+
 ## P0 — 工具接入（DSH / Codex / Claude Code 直连）
 
 背景：cloud-gateway 需作为 DeepSeek Harness、Codex CLI、Claude Code 等工具的 LLM 后端。
@@ -85,8 +92,9 @@
       一条单调曲线——1 KB → **0.00%**、4 KB → 5.35%、8 KB → **48.16%**、16 KB → 76.53%、
       64 KB → **98.38%**；A/B 那一对是 16 B → **0.06%**、8 KB → **48.97%**（8 KB 档重复跑两次
       得 48.16% / 48.97%，属正常波动）。
-      折算一下为什么必然如此：8 KB 那档每迭代 ≈28 KB（请求 base64 后 body ≈11 KB + `/v1/echo`
-      把整包回吐 ≈15 KB + 流式端点 ≈2.5 KB）× 50 iters/s ≈ **1.4 MB/s**，对 0.4 MB/s 的上限
+      折算一下为什么必然如此：8 KB 那档每迭代 ≈28 KB（请求 base64 后 body ≈11 KB + 回吐整包
+      ≈15 KB + 流式端点 ≈2.5 KB）× 50 iters/s（⚠️ 原文写的是 `/v1/echo`——mock-llm 从来没有这个
+      端点，这里指的是当时自建的压测上游；2026-09-22 校正） ≈ **1.4 MB/s**，对 0.4 MB/s 的上限
       是**超载约 3.5 倍**（按载荷折算的估算，未直接采 `data_sent`）；16 B 那档 ≈150 KB/s 在上限内。
       同一窗口内 `upstream head timeout; evicting agent` 1 026 次、`registry-empty` +3 753。
       ⚠️ 期间 `hlmg_tunnel_open_timeouts_total` 恒为 **0** —— 也就是说开流路径完全正常，
@@ -227,7 +235,7 @@
       5. 测试：单测（usage_meter.rs 提取/SSE 行/无 usage 估算 ×6、keystore 累加+持久化+
          吊销保留 ×2）；e2e `e2e_usage_metering`（打 2 次请求 → /admin/usage 与
          mock 返回的 usage 一致、/admin/keys 内嵌一致、吊销后记录仍可查）
-- [ ] **计量与治理延伸（待定：暂未决定是否实施）**：usage 计量完成后的候选方向，
+- [ ] **⛔ 计量与治理延伸（新功能——按顶部范围约定先不做，仅登记）**：usage 计量完成后的候选方向，
       按价值排序与口径待定（含"放哪"的架构判断——现阶段放 gateway 合适，多实例/
       多租户时随 11.4 无状态化外置 Redis）：
       1. **per-key quota**：总量 token 配额 → 超限 429；实现收敛为可替换模块
@@ -335,7 +343,8 @@
 
 ## P2 — 协议级去重（提案已写，未实现）
 
-- [ ] **`request_uid` + agent 侧去重表**，让"响应头超时"也能安全重试。设计见
+- [ ] **⛔ `request_uid` + agent 侧去重表**（新功能 + **帧协议不兼容变更**——按顶部范围约定先不做），
+      让"响应头超时"也能安全重试。设计见
       [`EXACTLY_ONCE.md`](EXACTLY_ONCE.md)：现有重试只覆盖建立阶段（开流/写帧失败，
       那时帧未完整送达，重放安全）；504 不重试是因为请求可能已在模型侧执行。
       要点：全局唯一 uid（UUIDv7 或 instance+counter）、agent 侧 `InFlight/Done` 表、
@@ -355,7 +364,7 @@
       如未来工具链支持行级排除再重新评估。
 - [ ] **/admin/* 暴露面收敛**：安全组只放行管理网段（README 已提示，可补部署脚本/检查项）
 
-## P3 — 协议层改造（postcard → protobuf）
+## P3 — 协议层改造（postcard → protobuf）⛔ 新功能/大改造——按顶部范围约定先不做
 
 > 前置判断：**只有动机是"跨语言互操作 / 生态标准化"才值得做**；postcard 在性能和简单性上仍更优
 > （小帧更快更小，64KiB body 序列化 ~2 GiB/s 已是 memcpy 级）。若仅为协议演进，
@@ -413,16 +422,20 @@
       语义统一为"**停滞**"而非"总时长"（有字节流动就续期），所以慢客户端不会被误伤；
       三处共用 `client_stall_secs`（默认 60s）。回归测试 `tests/e2e/stalls.rs`（判据：
       `max_concurrent_requests: 1` 下后续请求不得 429）+ `io_stall` 单测，均已红检。
-      **仍未做**：响应体**内存缓冲上限**（DESIGN §11.2 与本项原本合并做的那半）——
-      现在通道是 32 块的有界队列，但 hyper 侧仍会缓冲到 socket 缓冲被写满为止。
+      **字节上界那一半已做（2026-09-22，见 R9）**：单块 ≤ `MAX_RESPONSE_CHUNK`（64 KiB），
+      于是"32 块的有界队列"≈ 2 MiB；agent 侧切块、网关侧拒绝超标块，两端都有测试。
+      **仍未做**：hyper 侧仍会缓冲到 socket 缓冲被写满为止（应用层改不到），以及单个超标帧在
+      `FrameReader` 里已经发生的那一次分配（要封住得改线格式分片）。
 - [x] **Cancel→上游缺上游侧断言（2026-09-22 完成）**：`mock-llm` 现在有 `GET /stats`，里面的
       `cancelled` = **被中途丢弃的响应体数**（`CancelGuard` 的 Drop 计数：流正常跑完置
       `completed`，被 axum 丢掉 body 时 +1）。上游侧可观测 ⇒ H5 的 e2e 判据落在这里
       （`lifecycle::e2e_shutdown_cancels_a_client_stalled_stream_without_waiting_for_the_stall`：
       先读完整条 flood 断言 `cancelled == 0` 作对照，再制造"客户端停读 + 关停"断言 >0）。
-- [ ] **公网入口 accept 出错即永久停服**：`gateway/src/lib.rs:175` 的 `listener.accept().await?`
-      用 `?` 结束整个循环，外层只有一句 `warn!("https server stopped")`。对比 QUIC 侧专门做了
-      `hlmg_quic_accepting` + `error!` 告警（`quic.rs:29-36`），HTTP 入口（唯一公网入口）反而没有
+- [x] **公网入口 accept 出错即永久停服（2026-09-22 已完成，见本节 H 条 / `PROJECT_SCAN` P2-10）
+      （指针已校正：原引用 `gateway/src/lib.rs:175` 早已失效——`lib.rs` 现在只剩模块声明，
+      循环在 `crates/gateway/src/http/entry.rs` 的 `serve_entry`）**：`listener.accept().await?`
+      用 `?` 结束整个循环，外层只有一句 `warn!("public entry stopped: {e}")`。对比 QUIC 侧专门做了
+      `hlmg_quic_accepting` + `error!` 告警（`quic.rs`），HTTP 入口（唯一公网入口）反而没有
       等价信号——瞬时错误（EMFILE 等）就能让网关"进程活着但不监听"。修法：accept 错误重试 + 计数指标。
 - [x] **Cancel→上游缺上游侧断言（2026-09-22 完成）**：见上一条——`mock-llm` 的 `GET /stats`
       暴露 `cancelled`（被中途丢弃的响应体数），不再只有"断开后 `/v1/models` 仍可用"这种间接覆盖。
@@ -458,10 +471,11 @@
 - [ ] **A3 类型化错误收尾**（OPTIMIZATION.md 已改标 ⚠️ 部分）：`Agent::start`
       （`agent/src/lib.rs:40`）与 `tls::https_server_config`（`gateway/src/tls.rs:51-54`）仍返回 anyhow；
       `config_err`、`AgentError::Forward`、`GatewayError::Sqlite` 是从未被构造的死变体。
-- [ ] **Makefile `deny` 目标 ≠ hook/CI**：目标只跑 `cargo deny check licenses`，而 pre-commit hook
-      与 CI 跑完整 `cargo deny check`（广告语已改，行为未变）。二选一：把目标改成完整检查，
-      或明确 `make check` 不含完整 cargo-deny。
-- [ ] **工具链没真的锁版本 → 本地与 CI 的 lint 会漂移**（`OPTIMIZATION.md` 的 E2 已从 ✅ 改标 ⚠️ 名义）：
+- [x] **Makefile `deny` 目标 ≠ hook/CI（2026-09-22 完成）**：目标现在就是完整的
+      `cargo deny check`（advisories/bans/licenses/sources 全跑，与 hook/CI 同一条命令），
+      注释也改成"完整检查"而不是"由 hook 与 CI 执行"；`make check` 的说明补上"CI 还会跑
+      `cargo deny`"（它本身不含，见 `deny` 目标）。
+- [x] **工具链没真的锁版本 → 本地与 CI 的 lint 会漂移**（`OPTIMIZATION.md` 的 E2 已从 ✅ 改标 ⚠️ 名义）：
       `rust-toolchain.toml` 是 `channel = "stable"`（**浮动 channel，不是钉版本**），
       `.github/workflows/ci.yml:18-21` 用 `dtolnay/rust-toolchain@stable`——**不读那个文件**，
       装的是 CI 当刻的最新 stable（步骤名却叫 `Install Rust (rust-toolchain.toml)`），
@@ -471,6 +485,21 @@
       + 在 `[workspace.package]` 补 `rust-version` 声明 MSRV；升级工具链变成一次显式提交。
       根因不清掉，后面每轮 CI 都可能冒出新的 nightly/stable 新 lint（例如 `Atomic::fetch_update`
       弃用就是靠本地 nightly 才提前发现的，见本文件「坏味道 / 清理」里那条）。
+      - **已修（2026-09-22）**：① `rust-toolchain.toml` 钉到 **1.97.1**（具体补丁版本，不再浮动）；
+      ② **CI 不再写死 `@stable`**：新增一步从 `rust-toolchain.toml` 读出 channel 再交给
+      `dtolnay/rust-toolchain`，步骤名也改成带真实版本——`rust-toolchain.toml` 成为**唯一来源**；
+      ③ `Dockerfile` 对齐到 `FROM rust:1.97.1-bookworm` + `ARG RUST_TOOLCHAIN=1.97.1`（镜像里预装的
+      就是它，构建不碰网络；原来钉 1.95、文件写 stable 的组合会让 rustup 去下载整套工具链而挂住），
+      并修掉那段自相矛盾的注释（原文说"rust:1.95 现在是 trixie"，而标签是 `-bookworm`）；
+      ④ `Cargo.toml` 补 `rust-version = "1.97"`（MSRV，只到 minor）并在四个成员里继承——它回答的是
+      "最低能编译什么"，与"用什么编译"是两个问题，所以只比前缀；
+      ⑤ 新增 `scripts/check-toolchain.sh`：逐处比对这四处（channel 必须是 x.y.z、Dockerfile 的
+      FROM/ARG、MSRV 前缀），CI 与 `make check` 都跑。**故意改错即红**（实测把 FROM 改回 1.95 后
+      脚本以非零退出并指名 Dockerfile）。
+      - 过程记录（供后人参考）：钉版本要求本机**真的装有**该工具链，否则仓库里每条 `cargo` 都会去下载；
+      本次用 `rustup toolchain install 1.97.1 --profile minimal -c rustfmt,clippy` 装好（顺带被 rustup
+      自己升级到 1.29.1），本地/CI/镜像三处现在都是 1.97.1（同一 commit `8bab26f4f`，验证基座不变）。
+
 - [ ] **Heartbeat 载荷空洞**：`Frame::Heartbeat { inflight }` 恒为 0（`agent/src/lib.rs:136-140`），
       网关只打 debug 日志（`quic.rs:76-84`）。它是"容量感知路由"的前置数据：要么实现上报，
       要么删掉该字段（现在是死载荷，容易误导）。
@@ -564,6 +593,8 @@
 
 ## 重建蓝图 §6 未修项
 
+> ⛔ 本节含多租户 / Redis 外置 / 无状态化等**新功能**路线图条目：按顶部范围约定先不做，只登记。
+
 > 来源：`REBUILD.md` §6 的 12 条验收断言。它那列"反面案例"钉在 `745e8e8`，其中一部分
 > 此后已经修掉；**本节只登记仍未修的**，避免同一件事在两处各维护一份。行号对应 `6609a8c`。
 
@@ -582,11 +613,38 @@
       那侧已经分清了（`io.rs:108-115`，测试 `frame_reader_truncated_frame_errors`），差的只是老路径。
 - [ ] **R6 "流即会话"可断言**：首帧必须是 `ProxyRequest`、后续帧 `request_id` 必须一致
       ——现在既无断言也无日志，不一致只会表现成"上游好像没在收流"。
-- [ ] **R8 原子占位改 CAS**：`Admission::try_enter` 仍是 `fetch_add` 后回滚
-      （`crates/gateway/src/metrics.rs:83-92`），并发下存在"双双误拒"窗口。
-- [ ] **R9 背压按字节有界**：回写客户端的通道仍是 `mpsc::channel(32)`，**按条数**有界
-      （`crates/gateway/src/proxy/mod.rs:566`）——大帧场景下"32 条"不等于"字节有界"。
-      相关的"响应体内存缓冲上限"见上文 P1。
+- [x] **R8 原子占位改 CAS（2026-09-22 完成）**：`Admission::try_enter` 原先是 `fetch_add` +
+  超限回滚（`crates/gateway/src/metrics.rs`），回滚前那一瞬间计数**比真实持票数多 1**（幽灵占位）；
+  若持票者恰在这一刻释放，紧随其后的请求会读到 `prev >= limit` 而被拒——**闸门明明是空的**
+  （"双双误拒"：客户端拿到本不该有的 429）。现在改成 **CAS 循环**：只在确实要到票时才加计数，
+  因此 `active_count()` **恒等于**已发出的票数（顺带消掉 `hlmg_active_requests` 的瞬时尖峰，
+  而排空判据 `drain()` 读的正是它）。`limit == 0`（不限）路径保持占位 + 记账不变。
+  证据：`metrics::tests::try_enter_never_inflates_the_counter_above_the_limit`（8 线程 barrier
+  对齐抢同一个槽位 + 一个**采样线程**盯计数上界，50 轮）与
+  `try_enter_accounts_exactly_and_treats_zero_as_unlimited`（放行/拒绝/释放 + `0` 不限的记账）。
+  **退回旧实现即红**：实测 5 次里红 4 次（失败信息形如"采样到 active=2 > limit=1：存在幽灵占位"）。
+  另：`PROJECT_SCAN` 里"`try_enter` 的 `fetch_add` + 回滚是**正确**的、别去改它"那句已更正——
+  "不超发"确实成立，但"不误拒"不成立，两者是不同性质。
+- [x] **R9 背压按字节有界（2026-09-22 完成）**：回写客户端的通道按**条数**有界
+  （`mpsc::channel(32)`），所以**单块大小就是内存上界的乘数**——没有上限时"32 条"可能是
+  32 × `MAX_FRAME`(64MiB)，慢客户端足以让网关堆下 GB 级。
+  - 已做：① 新增 `proto::frame::MAX_RESPONSE_CHUNK`（64 KiB）+ `take_chunk_piece`（`Bytes::split_to`
+    零拷贝切片）；② **agent 侧回传响应体时切块**（正常上游块本来多为 ≤64 KiB，切块是零拷贝，
+    不产生额外内存）；③ **网关侧拒绝**超标的响应块（纵深防御：坏/旧 agent）→ 记 WARN、
+    给客户端一个错误、取消上游并结算，新的 `ForwardEnd::ProtocolViolation`（第九个出口，
+    与 `UpstreamError` 分开：这不是上游内容的问题，是 agent 没按约定切块）。
+  - 得到了什么：一个请求在通道里最多 32 块 × ≤64 KiB ≈ **2 MiB**（外加 hyper 自己手里的一块），
+    这个算式现在写在常量文档里，而不是"看代码推断"。
+  - 证据：`proto::frame::tests::response_chunks_are_split_to_the_byte_bound_without_losing_bytes`
+    （0/1/上限-1/恰好上限/上限+1/整数倍/带零头 七种长度：每片 ≤ 上限、片数正确、拼回来逐字节相同）
+    + `an_empty_chunk_yields_no_piece`；e2e `chain::e2e_large_upstream_chunks_survive_the_byte_bound`
+    （上游 3 × 1 MiB 的块经切块后**完整**到达：这一条是"网关的检查不会误伤合法大块"的保险——
+    少了 agent 的切块，它就会变成 502）；e2e `chain::e2e_an_oversized_response_chunk_is_refused`
+    （故意违规的裸 agent 发 64 KiB+1 的块：违约前的合法块照常到达、超标块**未被转发**；
+    **去掉网关侧判据即红**——实测客户端收到 65550 字节且含 X）。
+  - **仍未做**（与上一条 P1 的"响应体内存缓冲上限"是同一件事的两半，那半原样保留）：hyper 侧
+    仍会缓冲到 socket 缓冲写满为止（应用层改不到）；且**单个**超标帧在 `FrameReader` 里就已经
+    分配（检查只能阻止"多块累积"，不能阻止那一次分配——真要封住得改线格式分片）。
 - [ ] **R10 总时长上限**：`timeout_secs`（120s）是响应体**逐帧空闲**超时，没有整请求总时限
       （`DESIGN.md` §5 自认）。SSE 长流不能被总时限误杀，动之前要先把语义想清楚。
 - [ ] **R11 延迟分位数**：`hlmg_request_duration_ms` 只有 sum，没有直方图
@@ -824,6 +882,111 @@
         `send_to_client` 即红**——实测等满 5s 仍为 0）。
       - 顺带关闭记录里的缺口「`Cancel` → 上游确实被取消**缺上游侧断言**」（`mock-llm` 新增
         `/stats`，见本节上一条）。
+
+
+- [x] **I. quic 每连接清理上 Drop guard（2026-09-22 完成）**（`PROJECT_SCAN` P2-11 / 评估 H10）
+      - 缺陷：`accept_loop` 的每连接任务里是"先 `agent_connected()`、末尾 `agent_disconnected()`"，
+        `handle_conn` 里则把注册表条目摘除写成末尾一句 `remove_if_same`。**panic 展开时末尾语句不
+        执行** ⇒ `hlmg_quic_connections` 永久虚高、条目永久留在注册表（本仓库**没有 stale 清扫器**，
+        心跳过期只是不再可路由），表现为 `hlmg_agents` 虚高 + `/admin/agents` 里的幽灵条目，
+        只能重启。仓库其它资源（`AcceptingGuard`/`Admission`/`SlotGuard`）早就是 RAII，这是最后一处例外。
+        另外 `agent_disconnected` 是裸 `fetch_sub`：在 0 上回绕会把 gauge 变成 `u64::MAX`。
+      - 已做：① `Metrics::mark_agent_connected()` 返回 `AgentConnectionGuard`（Drop 减一），
+        **删掉**旧的 `agent_connected`/`agent_disconnected` 两个公开方法——只留一条配对路径；
+        递减改成饱和 `fetch_update`（第二道保险）。② 新增 `registry::Registration`
+        （`new/note` + Drop 时 `remove_if_same`），`quic::handle_conn` 用它取代末尾语句。
+        两条 Drop 路径覆盖**正常返回 / `?` 提前返回 / panic 展开**。
+      - 证据：`metrics::tests::the_connection_gauge_is_released_even_when_the_task_panics`
+        （在 `catch_unwind` 里持有守卫后 panic，断言 gauge 归零、counter 不回退）、
+        `the_connection_gauge_never_wraps_around`；
+        `registry::tests::registration_guard_removes_the_entry_on_drop_and_on_panic`、
+        `registration_guard_removes_only_the_last_registration`（同名重复注册只摘最后一次；
+        stable_id 不匹配时不许误删别人的条目）。**把两个 Drop 体改空即红**——实测两条断言同时失败。
+
+
+- [x] **J. 配置零值校验（2026-09-22 完成）**（`PROJECT_SCAN` P2-8）
+      - 缺陷：`head_timeout_secs: 0` 能让网关**起来了就开始全量 503**：每个请求 504，且
+        `head_alive_window = 4 × 0 = 0` 让"连续 3 次没等到响应头"立刻成立 ⇒ 所有 agent 被摘光。
+        `tunnel_op_secs: 0` / `timeout_secs: 0` / `agent_stale_secs: 0` / `client_stall_secs: 0`
+        同类；agent 侧 `heartbeat_secs: 0` → 每次等待立刻超时 → 强制重连风暴。配置文件里那个 `0`
+        看起来毫无异常，此前只有一句 warn（或什么都没有）。
+      - 已做：新增 `Options::validate()`，由 `Gateway::start` **在碰任何资源之前**调用（比 TLS
+        材料解析还早）→ `GatewayError::Config`；报错**同时点名 YAML 键与结构体字段**并写清后果
+        （`timeout_secs` ↔ `request_timeout` 名字不同，配置作者与库调用方各看各的）。agent 侧
+        `heartbeat_secs: 0` 在 `agent::config::from_file` 直接 `bail!`。
+      - **刻意不拒**已文档化的零语义（拒了就是改对外契约）：`head_silent_grace`、`evict_close_grace`、
+        `verified_cache_max`、`rate_limit_per_min`、`max_concurrent_requests`、`max_entry_connections`、
+        `max_open_tunnel_streams`、`shutdown_grace`、`shutdown_flush_timeout`；`verified_cache_max`
+        过大只 WARN（按每条约 100 字节，10 万条 ≈ 10MB）。
+      - 证据：`options::tests::zero_valued_timeouts_are_rejected_by_name`（5 个键逐个断言报错点名）、
+        `documented_zero_semantics_are_not_rejected`（9 个合法零值 + 默认配置都必须通过）、
+        `agent::config::tests::zero_heartbeat_is_rejected`、e2e
+        `lifecycle::e2e_zero_valued_config_fails_fast_before_binding_anything`。**去掉那个
+        `validate()` 调用即红**——实测该 e2e 立刻失败（网关照常起来了）。
+      - 顺带：**P2-7 经复核确认为"空操作"**（rusqlite 0.40.2 的 `open` 已设
+        `sqlite3_busy_timeout(db, 5000)`，见 vendored `inner_connection.rs:118`），scan 的批次清单
+        已标注，不再排期。
+
+
+- [x] **L. 文档漂移批（2026-09-22 完成）**（`PROJECT_SCAN` §5.1/§5.2 两张表）
+  - 修的（逐条先对着代码核过）：`README` 的 `cargo nextest run -w`（该 flag 不存在）→
+    `--workspace`；`DEPLOY.md` 的 agent 安装段补齐二进制/目录/证书名、网关证书不再放 `certs/`
+    子目录（示例配置的路径没有这一层）、两处看日志改成看落盘文件（`journalctl` 与
+    `docker compose logs` 里都没有应用日志）；`docker-compose.yml` 的 `9090:9090` → `8443:8443`；
+    `DESIGN`/`README`/`README.en` 的五处 443 → 示例配置的 UDP 4433 / TCP 8443；
+    `README` 的 `/v1/echo` 幻影端点、`DESIGN.md:258` 的"只统计 bytes"、`README.md` 引的
+    `DESIGN §5.6`、`README.en` 缺的"凭据边界"整行、`Makefile` 的 `deny`/`check` 注释、
+    `REBUILD`/`CODE_READING`/`EXACTLY_ONCE` 的失效指针、`state.rs` 的宽限注释。
+  - **复核后判定为"已过期结论"、无需改**：`README.md` 的 `flush_usage_on_shutdown`（README 早已
+    改对，只有 gitignore 的评估正文按旧名写）、`MODEL_ROUTING.md`/`OPTIMIZATION.md`/
+    `CODE_READING.md:59` 的 `http.rs` 引用（那些文件里已经没有该字样）。
+  - 方法：全部按**内容**定位（scan 的行号本身早已漂移），每处改前先 `grep`/读代码确认，改动用
+    带断言的脚本盖章（匹配不上就中止，不盲改）。
+
+- [x] **K. H8 复核：写帧超时不会导致双执行（2026-09-22 完成，结论=推翻）**（评估 H8）
+      - 原担忧：`write_frame` 是非原子 `write_all`，若"整帧已送达而超时先到"，换 agent 重放就会
+        **双执行**；另外旧流可能残留半帧、挂到连接关闭。
+      - 复核结论：**不可达**，四条独立的腿（每条都可在仓库里指出来）：
+        ① 超时的 `write_all` 被 drop ⇒ 对端只拿到**严格前缀**
+        （`proto::io::tests::a_timed_out_write_leaves_only_a_strict_prefix_of_the_frame`，
+        用"前 N 字节照收、之后永远 Pending"的 writer 钉住）；
+        ② 重试必然**换新流**：`routing::open_and_send` 每轮重新 `try_acquire_excluding` +
+        `open_tunnel`，剩余字节绝不补写到旧流；
+        ③ 丢弃旧 `SendStream` 会调 `finish()`（s2n-quic `send.rs` 的 `finish` 文档明写
+        "This method will be called when the stream is dropped"）⇒ 对端在帧中途收到 FIN
+        ⇒ `FrameReader` 报 `early eof` ⇒ **既不执行也不挂住**；
+        ④ `tokio::time::timeout` **先轮询内层 future**（`timeout.rs:217`）⇒ 写完成不可能被误判超时。
+      - 实测：e2e `write_backpressure::e2e_a_write_that_times_out_mid_frame_never_reaches_the_agent_as_a_request`
+        ——8MiB 帧、`tunnel_op_timeout=300ms`、对端只读 64 字节就停（客户端拿到
+        `502 tunnel write timed out`，`hlmg_tunnel_write_failures_total{class="backpressure"}≥1`），
+        放行后对端报告 `EofMidFrame("early eof", saw_eof=true)`：**只拿到前缀 + 干净的 FIN**，
+        从未解出完整 `ProxyRequest`。README 的《能重试什么》那一行按实测补齐了这两条依据。
+      - 过程小坑（写进测试注释）：对端"先读的那 64 字节"必须留在手里再接后续——丢掉就字节流错位，
+        `FrameReader` 会把垃圾当长度前缀（实测报 `frame too large`），断言会因错误的原因变绿。
+
+
+- [x] **M. 写/持久化失败的可见性复核（2026-09-22 完成）**（`PROJECT_SCAN` P2-9 / P1-4 一族）
+  - **复核为"已修、且有测试钉住"**：`create()` 与 `delete()` 现在都是**先落库、失败即 `?`
+    传播、成功才动内存**（`storage/mod.rs`；两条 trigger 单测 `create_that_fails_to_persist_
+    leaves_no_key` / `delete_that_fails_to_persist_keeps_the_key_usable`，用
+    `RAISE(ABORT)` 触发器制造"磁盘满/I-O 错误"那一支）。两条测试里"今天 `create` 先写内存…"
+    的旧叙述也一并改成"修改前"。
+  - 用量写路径同样诚实：`flush_once` 任一语句失败或 commit 失败都**返回 0 且不推进 `flushed`**
+    （下一轮重试），所以调用方不会打出"已落库"的假日志。
+  - **复核查出的新缺口（本次修掉）**：**启动期**失败仍是静默降级——库打不开 / 建不出表 / 迁移
+    或载入失败时只 `warn!` 然后切内存模式 ⇒ "库里明明有 key，网关一个都认不出来"，每个请求 401，
+    而进程、systemd、`/healthz` 全都正常。现在 `KeyStore::persistence_state()` 给出三态
+    （`None` = 没配 keys_file，内存模式是合法配置；`Some(Ok)` = 就绪；`Some(Err(why))` = 降级 +
+    原因），`Gateway::start` 对"配了却用不了"直接 `GatewayError::Config` fail-fast
+    （在绑端口之后、起任务之前；Err 时已绑 socket 随局部变量 drop）。
+  - 证据：`storage::tests::persistence_state_distinguishes_unconfigured_ready_and_degraded`
+    （三态 + 原因带路径）+ e2e
+    `lifecycle::e2e_unusable_keys_db_fails_fast_instead_of_starting_keyless`（坏库启动失败、
+    报错点名 `keys_file` 与路径；可用的库与 `keys_file: None` 两个对照都能启动）。
+    **去掉那个检查即红**——实测网关照常起来了。
+  - **复核后刻意不改**：WAL/`synchronous` pragma、迁移后的 `VACUUM`、`0600` 收紧失败都只是
+    `warn!`（best-effort，各有理由）；`key_usage` 表单独损坏仍是"告警 + 空账本继续"
+    （凭据表可用则服务不受影响，比"起不来"轻）。
 
 - [x] **D. registry 评估 §7 步骤 6 的可选清理（2026-09-21 处置完毕：两项落地、两项裁定不做）**
       - ✅ **`pick()` 抽成纯函数**（`registry::pick`）：次序（新鲜 → 排除 → 模型 → 精确优先 →

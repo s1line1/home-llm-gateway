@@ -18,10 +18,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust (rust-toolchain.toml)
-        uses: dtolnay/rust-toolchain@stable
+      # 工具链的**单一来源**是 `rust-toolchain.toml`：这里读出它的 channel 再交给 action。
+      # 以前写死 `@stable`（不读那个文件，步骤名却叫 "Install Rust (rust-toolchain.toml)"），
+      # 于是本地/CI/Docker 三个环境三套编译器，lint 漂移（只在某一个版本报）成了必然。
+      - name: Read the pinned toolchain
+        id: toolchain
+        run: |
+          set -euo pipefail
+          channel="$(sed -n 's/^channel *= *"\([^"]*\)"/\1/p' rust-toolchain.toml)"
+          if [ -z "$channel" ]; then
+            echo "rust-toolchain.toml does not pin a channel"; exit 1
+          fi
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust (${{ steps.toolchain.outputs.channel }})
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
           components: rustfmt, clippy
+
+      - name: Toolchain pins agree
+        run: ./scripts/check-toolchain.sh
 
       - uses: Swatinem/rust-cache@v2
 
