@@ -623,6 +623,10 @@
         `read_or_recover` / `write_or_recover`，模块头写明"唯一允许的加锁方式"），
         调用点全部替换——storage 26 处、`metrics.rs` **14** 处、`registry.rs` 生产代码
         **12** 处（另有 3 处测试内的读取保持原样）。
+        **补（2026-09-22）**：当时"全 crate 完成"说早了——`ratelimit.rs:38` 与 `ui.rs:66,75`
+        仍漏在外面（`crates/gateway/src/` 并集评估的三份独立样本一致命中）。现已改走
+        `lock_or_recover` 并各配一条中毒测试；机器化核验确认生产代码里已无裸加锁。
+        这条纪律**没有强制点**（无 lint 拦新的裸锁），只能靠复核。
       - 测试：`storage` 三条（毒化 runtime / db / entries+inflight）+ `metrics` 一条
         （毒化后 `/metrics` 仍渲染出中毒前后的计数）+ `registry` 一条（毒化后仍能注册并
         选路），共 5 条 `a_poisoned_*`，都在修复前**先红**（panic 就发生在被毒化的

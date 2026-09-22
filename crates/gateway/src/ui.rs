@@ -17,6 +17,8 @@ use std::time::SystemTime;
 
 use tracing::{error, warn};
 
+use crate::sync::lock_or_recover;
+
 /// `ui_dir` 里 `index.html` 的**缓存读**（服务期每个请求都要它）。
 ///
 /// 放在本模块而不是 `http/` 的原因与判定一样：`AppState` 要持有它，而 `AppState` 定义在
@@ -63,7 +65,7 @@ impl IndexHtml {
         // 只有"缓存里有 mtime 且与磁盘一致"才算命中。mtime 不可知（None）时一律重读：
         // 宁可多读一次盘，也不要在这类文件系统上永久钉住旧内容。
         {
-            let guard = self.cached.lock().expect("index cache mutex poisoned");
+            let guard = lock_or_recover(&self.cached);
             if let Some(c) = guard.as_ref() {
                 if mtime.is_some() && c.mtime == mtime {
                     return Some(c.html.clone());
@@ -72,7 +74,7 @@ impl IndexHtml {
         }
         // 先在锁外读：这里是唯一可能的 await，持锁跨 await 会把并发请求串起来
         let html: Arc<str> = tokio::fs::read_to_string(&self.path).await.ok()?.into();
-        *self.cached.lock().expect("index cache mutex poisoned") = Some(Cached {
+        *lock_or_recover(&self.cached) = Some(Cached {
             mtime,
             html: html.clone(),
         });
@@ -202,6 +204,31 @@ mod tests {
             .unwrap()
             .set_modified(mtime)
             .unwrap();
+    }
+
+    /// 规格（并集评估 §7 步骤 2 / `sync.rs:15`）：**缓存锁中毒后仍要能服务**。
+    ///
+    /// 这个锁就在请求路径上：`/metrics` 的浏览器分支与 SPA fallback 都走
+    /// `IndexHtml::load`。它此前用 `.expect("index cache mutex poisoned")`——一次守卫内
+    /// panic 之后，每个这样的请求都会 panic（连接被 reset），而页面渲染不出来恰恰是
+    /// 排障时最难受的时候。
+    #[tokio::test]
+    async fn a_poisoned_index_cache_lock_still_serves() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.html");
+        write_with_mtime(&path, "A", SystemTime::now());
+        let cache = IndexHtml::new(path.clone());
+        assert_eq!(&*cache.load().await.unwrap(), "A", "前提：能读到");
+
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = cache.cached.lock().unwrap();
+            panic!("poison the index cache");
+        }));
+        assert!(poisoned.is_err(), "前提：panic 发生了");
+        assert!(cache.cached.is_poisoned(), "前提：锁中毒了");
+
+        let html = cache.load().await.expect("中毒后仍应能读出 index.html");
+        assert_eq!(&*html, "A", "中毒不该改变内容");
     }
 
     #[tokio::test]
