@@ -249,6 +249,7 @@ curl -N -k -H "Authorization: Bearer <你的key>" \
 | curl 返回 401 | API Key 不对或没带 `Authorization: Bearer` |
 | curl 返回 503 | 网关没注册到健康 agent（看网关/agent 日志） |
 | curl 返回 429 | 限流超了（等下一分钟）或 agent 并发占满 |
+| **大请求体（≥1 MB）或大响应吞吐上不去、成片 504** | **云服务器的出口带宽上限**：实测该 ECS 出口 ≈0.40 MB/s（3.2 Mbps），`QPS × (请求字节+响应字节)` 超了就排队；并发大请求还会按 `1/N` 摊薄每条可用速率，于是 15 s 的 `head_timeout` 先到 ⇒ 504（日志是 `… still answering; not evicting`）。**这不是网关缺陷**：先按字节预算设计负载，或把带宽调上去；判据与实测表见 `README.md`《云出口带宽上限》《请求体阶梯复测》 |
 | 浏览器打开 8443 显示"尚未构建"提示页 | 未上传 web/dist（§4）或 gateway-config.yml 未配 `ui_dir`；API 不受影响，可后补 UI 再 `systemctl restart gateway` |
 | edge 侧 IP 变了连不上 | 用域名 SAN 证书 + `server_name` 填域名，配 DDNS 指向新 IP |
 

@@ -139,6 +139,25 @@
       说明瓶颈不在对端授予的流控窗口，而在**链路本身**（这点从"TCP 直下也只有 0.40 MB/s"
       就能反证）。同理，`initial_congestion_window`（`cubic::Builder::with_initial_congestion_window`
       是公开 API）当时没来得及试，但在 3.2 Mbps 的链路上下调它不会突破上限。
+      **2026-09-22 第二轮复测（部署 `bb6351b` = PR #129，客户端也放到 ECS 上、闭环施压）**：
+      请求体阶梯 8 KB/64 并发 → 51.3 rps、0.44 MB/s；8 KB/128 → 50.9 rps、0.44 MB/s；
+      64 KB/32 → 6.4 rps、0.42 MB/s；256 KB/16 → 1.6 rps、0.42 MB/s；1 MB/4 → 0.4 rps、0.42 MB/s。
+      **带宽恒定 0.42 MB/s、与 payload 和并发都无关，延迟随 payload 线性增长**（8 KB→1.26 s、
+      64 KB→5.1 s、256 KB→10.2 s）。把请求体设成 256 KB 但改打 `/v1/embeddings`（响应只有几百字节）
+      后**上行**仍是 0.42 MB/s ⇒ 卡的是**请求下发那一跳（云出口）**，每个请求都要先过它。
+      本轮网络基线：Mac→ECS 上传 75 Mbps、ECS→Mac **3.2 / 3.35 Mbps**（20 MB 与 5 MB 两次同值，
+      是固定上限）、Mac ← 清华镜像 16.6 MB/s（排除客户端）、容器 CPU 0.01–0.98%。
+      **对上面"单发超时"判据的修正**：可用速率被并发摊薄，触发尺寸是 ≈ `6 MB / N` 量级——
+      实测 4 MB × 2 并发（共享 0.42 MB/s ⇒ 单个约 19 s）⇒ 4 个请求全 504、
+      `upstream head timeout while the agent is still answering; not evicting`，
+      **不是**只有"单个 ≳ 6 MB"才会触发。
+      **口径提醒（解释为什么今天 8 KB 档 0 失败、而 2026-09-18 那档 48.97%）**：那天用 k6 的
+      **定速/开环**施压（8 KB 档折算 ≈1.4 MB/s，超预算 3.5 倍）；今天客户端是**闭环**的（每个并发
+      等响应回来才发下一个），它**自己撑不到预算之上**（8 KB 档实测 0.44 MB/s，贴着上限）。
+      ⇒ **要测"超预算会怎样"必须用开环/定速驱动（k6 的 RATE，或按字节预算算并发数）；闭环客户端
+      测不出超载，只能测"预算之内能跑多快"。** 这条已补进 `README.md` 的《请求体阶梯复测》一节。
+      **同轮正面证据**：`hlmg_requests_aborted_total = 0`，4 MB 那批虽 504 但 `registry-empty` 为 0、
+      agent 零重连 ⇒ "慢 ≠ 死"判据在新部署上依旧成立（链路饱和只产出若干 504，不拖成全量 503）。
 - [ ] **监听 backlog 被硬编码成 128**：`tokio::net::TcpListener::bind` 走 mio，而 mio 为对齐 std
       写死 `listen(.., 128)`（`mio-1.2.2/src/net/tcp/listener.rs`），云端 `net.core.somaxconn=4096`
       完全用不上。实测 `ss -lnt` 的 Send-Q 就是 128；dmesg 里 10 次
