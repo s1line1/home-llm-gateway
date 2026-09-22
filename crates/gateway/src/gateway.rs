@@ -154,6 +154,7 @@ impl Gateway {
                 app,
                 https,
                 opts.client_stall,
+                opts.max_entry_connections,
                 shutdown.subscribe(),
             ),
             tokio::spawn(quic::accept_loop(

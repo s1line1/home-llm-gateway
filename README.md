@@ -380,16 +380,24 @@ s2n-quic 的 `initial_max_streams_bidi` 默认只有 **100**（`InitialMaxStream
 回归测试：`e2e_more_concurrent_tunnels_than_the_default_quic_stream_ceiling`
 （120 条并发慢流；把额度改回 100 时正好 20/120 失败，且失败的是 503——正是上面那条放大链）。
 
-#### 客户端停滞：为什么三个方向都必须设上限（`client_stall_secs`，默认 60s）
+#### 客户端停滞：为什么入口侧每一处都必须设上限（`client_stall_secs`，默认 60s）
 
 准入票据（`max_concurrent_requests` 那道闸）的释放挂在 Drop 上，但**释放的前提是相关任务/连接
-能结束**。以前有三处客户端侧等待**没有任何超时**，任一处都能让在途请求永久占住槽位：
+能结束**。以前有五处客户端侧等待**没有任何超时**，任一处都能让连接/任务永久占住资源：
 
 | 位置 | 谁能触发 | 修法 |
 |---|---|---|
 | 读请求体（曾是 `Bytes` 提取器） | 只发 headers、声明大 `Content-Length` 却不发 body 的客户端 | 改为逐块读 + **停滞**超时（有字节就续期）→ `408` |
 | 写响应体通道（`tx.send().await`） | 读完响应头就不再读 socket 的客户端 | 通道满且 `stall` 内无人取 → 记指标 + 取消上游（`Cancel`，别白烧 token）+ 结束响应体 |
 | hyper 往 socket 写响应 | 同上（这一半**应用层修不到**：数据已在 hyper/socket 缓冲里） | IO 层包 `io_stall::WriteStall`：连续 `stall` 写不进一个字节 → 断开连接，body 随连接任务 drop，票据归还 |
+| TLS 握手（`acceptor.accept`） | 连上却**一个字节都不发**的客户端（半开连接） | `tokio::time::timeout(client_stall, ..)` → 记 WARN 并断开 |
+| 读请求头（hyper） | 发了**半个请求头**就不再发的客户端 | `http1::Builder::header_read_timeout(client_stall)` **+ `.timer(TokioTimer::new())`**：不 set timer 时 hyper 只是"记下配置"，超时值不生效——它默认的 30s 就是这样一直没生效的 |
+
+后两处（2026-09-21 补，评估 H8 / `PROJECT_SCAN` P1-1）与前三处有一个关键区别：前三处是
+**准入之后**占住槽位，这两处**连闸门都没进**（闸门在"解析出请求"之后才生效），所以它们吃的是
+**fd 与连接任务**，此前只受 NOFILE 约束。与之配套的是并发连接数上限
+`max_entry_connections`（默认 1024，0 = 不限）：满额时**暂停 accept**，新连接留在内核 backlog
+里排队——不是拒绝，所以突发流量只会变慢、不会变成 5xx，fd 也不会被吃光。
 
 实测（2026-09-18 云端）：这类泄漏沉淀过 **8 个永不复位的槽位**——`hlmg_active_requests` 恒定 8，
 而 `hlmg_request_count − Σ状态码 = 8` 精确对上（= "被准入但永不结束"）。它只增不减：
@@ -397,10 +405,11 @@ s2n-quic 的 `initial_max_streams_bidi` 默认只有 **100**（`InitialMaxStream
 8 个就是 25%，且**只能重启恢复**。
 
 判定的是**停滞**而不是**总时长**：该方向只要还有字节在动就持续续期，所以慢而持续的大 body
-上传、弱网下逐块到达的 SSE 都不会被误杀。三个方向共用同一个 `client_stall_secs`。
+上传、弱网下逐块到达的 SSE 都不会被误杀。五个方向共用同一个 `client_stall_secs`。
 回归测试：`tests/e2e/stalls.rs`（请求体停滞、响应体停滞各一条；判据是 `max_concurrent_requests: 1`
-下**后续请求不得 429**——槽位一泄漏就必然 429）与 `io_stall` 的单测（写不动必须 `TimedOut`、
-持续有进展绝不断开）。三条都做过红检。
+下**后续请求不得 429**——槽位一泄漏就必然 429）、`tests/e2e/entry_limits.rs`（半开握手、
+半个请求头、额度满时排队各一条）与 `io_stall` 的单测（写不动必须 `TimedOut`、持续有进展绝不断开）。
+都做过红检。
 
 #### 隧道坏掉时的典型症状（都踩过）
 
@@ -786,7 +795,10 @@ CPU/内存都不高；网关日志里是 `accept error: Too many open files (os 
 
 **处理**：网关启动时（绑任何 socket 之前）自己把 soft 抬到 `min(hard, 16384)`
 （`gateway/src/nofile.rs`）。任何进程都能在 hard 以内抬自己的 soft，不需要特权；
-失败只记 WARN 不阻止启动。启动日志会留一行，便于事后核对：
+失败只记 WARN 不阻止启动。另有一道**业务级**的水位：公网入口的并发连接数上限
+`max_entry_connections`（默认 1024，0 = 不限）——它把"半开连接能吃多少 fd"从一个进程级天花板
+收成一个明确的数字，满额时暂停 accept、新连接在内核 backlog 排队（见《客户端停滞》）。
+启动日志会留一行，便于事后核对：
 
 ```
 INFO gateway::nofile: raised NOFILE soft limit from=1024 to=16384 hard=524288 target=16384 limited_by_hard=false

@@ -126,6 +126,10 @@ pub struct ConfigFile {
     /// 产出、客户端已僵住"时白烧 token。
     #[serde(default = "default_client_stall_secs")]
     client_stall_secs: u64,
+    /// 公网入口并发连接数上限（0 = 不限）。见 `Options::max_entry_connections`：
+    /// 满额时**暂停 accept**（新连接留在内核 backlog 排队），所以它是资源上限而不是限流闸。
+    #[serde(default = "default_max_entry_connections")]
+    max_entry_connections: usize,
     /// 关闭时强制用量落库的等待上限（秒）。见 `Options::shutdown_flush_timeout`。
     #[serde(default = "default_shutdown_flush_secs")]
     shutdown_flush_secs: u64,
@@ -191,6 +195,11 @@ fn default_head_silent_grace_secs() -> u64 {
 /// 所以对慢而持续的传输无影响；60s 足以覆盖人类可感知的正常停顿。
 fn default_client_stall_secs() -> u64 {
     Options::DEFAULT_CLIENT_STALL.as_secs()
+}
+/// 公网入口并发连接数默认上限。见 `Options::max_entry_connections`：
+/// 1024 是"README 实测 768 并发客户端、fd 峰值 785"之上留了余量的水位。
+fn default_max_entry_connections() -> usize {
+    Options::DEFAULT_MAX_ENTRY_CONNECTIONS
 }
 /// 关闭落库等待上限默认值（秒）。见 `Options::shutdown_flush_timeout`。
 fn default_shutdown_flush_secs() -> u64 {
@@ -266,6 +275,7 @@ pub fn from_file(cfg: ConfigFile) -> anyhow::Result<GatewayConfig> {
             head_silent_grace: Duration::from_secs(cfg.head_silent_grace_secs),
             agent_stale_after: Duration::from_secs(cfg.agent_stale_secs),
             client_stall: Duration::from_secs(cfg.client_stall_secs),
+            max_entry_connections: cfg.max_entry_connections,
             shutdown_flush_timeout: Duration::from_secs(cfg.shutdown_flush_secs),
             shutdown_grace: Duration::from_secs(cfg.shutdown_grace_secs),
             rate_limit_per_min: cfg.rate_limit_per_min,
@@ -445,6 +455,7 @@ rate_limit_per_min: 60
             "evict_close_grace_secs",
             "head_silent_grace_secs",
             "max_open_tunnel_streams",
+            "max_entry_connections",
             "client_stall_secs",
             "shutdown_flush_secs",
             "shutdown_grace_secs",
@@ -463,6 +474,7 @@ rate_limit_per_min: 60
             default_max_open_tunnel_streams()
         );
         assert_eq!(cfg.client_stall_secs, default_client_stall_secs());
+        assert_eq!(cfg.max_entry_connections, default_max_entry_connections());
         assert_eq!(cfg.shutdown_flush_secs, default_shutdown_flush_secs());
         assert_eq!(cfg.shutdown_grace_secs, default_shutdown_grace_secs());
     }

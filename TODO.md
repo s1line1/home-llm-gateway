@@ -633,17 +633,17 @@
         `evict` 的写锁范围只够 map 与原子量，关闭动作与 `defer_close` 调度留在锁外，
         代码里有纪律注释（`registry.rs` 的 `register`/`evict`）。
 
-- [ ] **B. 公网入口：TLS 握手与请求头读取没有超时，也没有连接数上限**（`PROJECT_SCAN` P1-1 / 评估 H8）
-      - 位置：`http/entry.rs` 的 `acceptor.accept(stream).await`（无超时）与
-        `http1::Builder::new()`（未设 `header_read_timeout`）；只有**写**方向包了 `WriteStall`。
-      - 为什么现在记它：2026-09-21 查那次 e2e `TIMEOUT [180s]` 时逐段量过——**这是整条请求链上
-        唯一"客户端会等、服务端没有任何上界"的步骤**，其余每一步都有 `head_timeout` /
-        `request_timeout`（逐帧空闲）/ `shutdown_grace` 兜住。半开连接又不经准入闸门
-        （闸门在"解析出请求"之后才生效），只受 NOFILE（启动时抬到 16384）约束。
-      - 做法：握手与请求头读取各加 `tokio::time::timeout`（旋钮可复用 `client_stall`，量级不要
-        低于 `head_timeout`，否则会把"慢但合法"的首字节场景误杀），并给入口总连接数设上限。
-      - 验收：连上不发 ClientHello、以及发一半请求头的连接必须在超时后被断开（确定性测试），
-        同时 `https::e2e_https_public_entry` 等正常路径不受影响。
+- [x] **B. 公网入口：握手/请求头超时 + 连接数上限（2026-09-21 完成）**（`PROJECT_SCAN` P1-1 / 评估 H8）
+      - 已做：① `http1::Builder::new().timer(TokioTimer::new()).header_read_timeout(client_stall)`
+        —— hyper 默认那个 30s 请求头超时此前**静默失效**（`Time::Empty` 分支只打一条 warn），
+        现在既生效又可配；② TLS 握手 `tokio::time::timeout(client_stall, acceptor.accept(..))`，
+        超时记 WARN 并断开；③ 新旋钮 `max_entry_connections`（默认 1024，0 = 不限）：
+        **先取额度再 accept**，满额时暂停 accept、新连接留在内核 backlog 排队。
+      - 为什么这三处特殊：它们是整条请求链上**唯一"客户端会等、服务端没有上界"**的步骤，
+        而且不进准入闸门（闸门在解析出请求之后才生效）→ 只吃 fd 与任务，此前只受 NOFILE 约束。
+      - 证据：`tests/e2e/entry_limits.rs` 三条（半开握手 / 半个请求头 / 额度满时排队），都**先红**。
+      - 明确不在本条：`listener.accept()` 拿到 `Err`（EMFILE）仍会结束整个 accept 循环 —— 那是
+        P2-10（第 2 批），**仍未修**；本条只是让它不再能被半开连接触发。
 
 - [ ] **C. 其余 40+ 条 e2e 仍没有逐步超时**（`PROJECT_SCAN` P2-17 的剩余）
       - 现状：`tests/e2e/common.rs` 已有 `STEP_TIMEOUT`(30s) + `bounded(step, fut)`，

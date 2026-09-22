@@ -14,8 +14,8 @@ use std::{sync::Arc, time::Duration};
 
 use axum::Router;
 use hyper::{body::Incoming, server::conn::http1, service::service_fn};
-use hyper_util::rt::TokioIo;
-use tokio::sync::watch;
+use hyper_util::rt::{TokioIo, TokioTimer};
+use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tokio_rustls::TlsAcceptor;
 use tower::Service as TowerService;
 use tracing::{info, warn};
@@ -35,6 +35,7 @@ pub(crate) fn spawn_entry(
     app: Router,
     https: Option<Arc<rustls::ServerConfig>>,
     client_stall: Duration,
+    max_connections: usize,
     shutdown: watch::Receiver<ShutdownPhase>,
 ) -> tokio::task::JoinHandle<()> {
     // 日志记**真实**监听地址：配置写 `:0` 时只有 `local_addr()` 知道内核给了哪个端口。
@@ -43,15 +44,42 @@ pub(crate) fn spawn_entry(
         Ok(addr) => info!(addr = %addr, "http public entry enabled"),
         Err(e) => warn!("cannot read the public entry's local_addr: {e}"),
     }
+    let limiter = connection_limiter(max_connections);
     tokio::spawn(async move {
         let result = match https {
-            Some(cfg) => serve_https(listener, app, cfg, client_stall, shutdown).await,
-            None => serve_plain(listener, app, client_stall, shutdown).await,
+            Some(cfg) => serve_https(listener, app, cfg, client_stall, limiter, shutdown).await,
+            None => serve_plain(listener, app, client_stall, limiter, shutdown).await,
         };
         if let Err(e) = result {
             warn!("public entry stopped: {e}");
         }
     })
+}
+
+/// 连接额度：`0` = 不限。
+///
+/// "不限"用 [`Semaphore::MAX_PERMITS`] 表达，而不是 `Option<Semaphore>`：每个连接都要
+/// `acquire`，多一个 `Option` 只会让两条 accept 循环各多一层分叉。
+fn connection_limiter(max_connections: usize) -> Arc<Semaphore> {
+    Arc::new(Semaphore::new(if max_connections == 0 {
+        Semaphore::MAX_PERMITS
+    } else {
+        max_connections
+    }))
+}
+
+/// 取一个连接额度；`None` = 收到关闭信号（`Draining` 或发送端被 drop）。
+///
+/// **先取额度、再 accept**：满额时循环停在这里，新连接留在内核 backlog 里排队，
+/// 而不是先收进来再拒绝（后者只是把"fd 耗尽"换成"5xx"）。
+async fn acquire_connection(
+    limiter: &Arc<Semaphore>,
+    shutdown: &mut watch::Receiver<ShutdownPhase>,
+) -> Option<OwnedSemaphorePermit> {
+    tokio::select! {
+        _ = shutdown.changed() => None,
+        permit = limiter.clone().acquire_owned() => permit.ok(),
+    }
 }
 
 /// 服务一条客户端连接（TLS 与明文共用）。
@@ -60,6 +88,11 @@ pub(crate) fn spawn_entry(
 /// 就不再读时，hyper 会永久阻塞在 `poll_write`，而准入票据绑在 response body 上——
 /// body 不被丢弃，槽位就永不归还（实测云端沉淀 8 个僵尸槽位，只能重启）。
 /// 应用层的响应体停滞超时修不掉这一半，因为数据已经在 hyper/socket 的缓冲里。
+///
+/// **读方向（请求头）也要显式设界**（评估 §5 H8）：客户端连上（甚至握手完成）却不发完
+/// 请求头，同样是白占一个 fd 与一个任务，而且**不经准入闸门**（闸门在解析出请求之后才
+/// 生效）。hyper 的 `header_read_timeout` 需要 [`Builder::timer`] 才生效——它的默认值
+/// 30s 一直没生效，就是因为这里没有 set timer；不设 timer 只配超时值会 panic。
 async fn serve_conn<I>(io: I, app: Router, peer: std::net::SocketAddr, client_stall: Duration)
 where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -70,7 +103,12 @@ where
         let mut app = app.clone();
         async move { app.call(req).await }
     });
-    if let Err(e) = http1::Builder::new().serve_connection(io, service).await {
+    if let Err(e) = http1::Builder::new()
+        .timer(TokioTimer::new())
+        .header_read_timeout(client_stall)
+        .serve_connection(io, service)
+        .await
+    {
         warn!("http connection {peer} error: {e}");
     }
 }
@@ -81,10 +119,15 @@ async fn serve_https(
     app: Router,
     server_config: Arc<rustls::ServerConfig>,
     client_stall: Duration,
+    limiter: Arc<Semaphore>,
     mut shutdown: watch::Receiver<ShutdownPhase>,
 ) -> anyhow::Result<()> {
     let acceptor = TlsAcceptor::from(server_config);
     loop {
+        let Some(permit) = acquire_connection(&limiter, &mut shutdown).await else {
+            info!("shutdown requested; https public entry stops accepting new connections");
+            return Ok(());
+        };
         let (stream, peer) = tokio::select! {
             // 阶段一变（`Draining`）就停止接受；发送端被 drop（`Err`）同样停。
             _ = shutdown.changed() => {
@@ -96,9 +139,19 @@ async fn serve_https(
         let acceptor = acceptor.clone();
         let app = app.clone();
         tokio::spawn(async move {
-            match acceptor.accept(stream).await {
-                Ok(tls_stream) => serve_conn(tls_stream, app, peer, client_stall).await,
-                Err(e) => warn!("tls handshake from {peer} failed: {e}"),
+            // 额度随这个任务存活：响应写完 / 停滞超时 / 握手失败才归还。
+            let _permit = permit;
+            // **握手必须有上界**（评估 §5 H8）：客户端连上却不发 ClientHello 时，
+            // `acceptor.accept` 永不返回——一个 fd + 一个任务被白占，且这类半开连接
+            // 不经准入闸门（闸门在解析出请求之后才生效），此前只受 NOFILE 约束。
+            match tokio::time::timeout(client_stall, acceptor.accept(stream)).await {
+                Ok(Ok(tls_stream)) => serve_conn(tls_stream, app, peer, client_stall).await,
+                Ok(Err(e)) => warn!("tls handshake from {peer} failed: {e}"),
+                Err(_) => warn!(
+                    peer = %peer,
+                    stall_ms = client_stall.as_millis(),
+                    "tls handshake stalled; dropping the connection (the client never spoke)"
+                ),
             }
         });
     }
@@ -110,9 +163,14 @@ async fn serve_plain(
     listener: tokio::net::TcpListener,
     app: Router,
     client_stall: Duration,
+    limiter: Arc<Semaphore>,
     mut shutdown: watch::Receiver<ShutdownPhase>,
 ) -> anyhow::Result<()> {
     loop {
+        let Some(permit) = acquire_connection(&limiter, &mut shutdown).await else {
+            info!("shutdown requested; http public entry stops accepting new connections");
+            return Ok(());
+        };
         let (stream, peer) = tokio::select! {
             // 阶段一变（`Draining`）就停止接受；发送端被 drop（`Err`）同样停。
             _ = shutdown.changed() => {
@@ -122,6 +180,9 @@ async fn serve_plain(
             accepted = listener.accept() => accepted?,
         };
         let app = app.clone();
-        tokio::spawn(async move { serve_conn(stream, app, peer, client_stall).await });
+        tokio::spawn(async move {
+            let _permit = permit;
+            serve_conn(stream, app, peer, client_stall).await
+        });
     }
 }
