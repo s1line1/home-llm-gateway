@@ -246,6 +246,15 @@ impl Gateway {
     /// 最后 abort 时消失。配套：`deploy/gateway.service` 的 `TimeoutStopSec` 必须**大于**
     /// `shutdown_grace + shutdown_flush_timeout`（再加收尾窗口），否则没走完就被 SIGKILL。
     ///
+    /// **后置条件（H5 之后）**：`Terminating` 会叫停在途**转发任务**（它们不再 park 在"客户端
+    /// 不读"的发送上，见 `proxy::forward::send_to_client_or_shutdown`）——所以本函数返回时，
+    /// 转发任务已经收尾：Cancel 已发给上游、用量已结算（结算是落库的前置，所以这里刻意**不**
+    /// abort 它们：abort 会丢掉尚未结算的用量）。
+    ///
+    /// ⚠️ 但 `hlmg_active_requests` **未必**归零：那张票据由**响应 body** 持有，而 body 归
+    /// HTTP 连接任务；客户端停读时它会 park 在写 socket 上直到 `client_stall`（`io_stall`），
+    /// 与转发任务是否退出无关。`await_end_event_window` 到点仍 >0 时会 WARN 说明这一点。
+    ///
     /// ⚠️ `registry.rs::close_when_drained` 是"摘除单个 agent 时等它在途请求收尾"，
     /// **不是进程退出路径**，别直接复用到这里。
     pub async fn shutdown(self) {
@@ -308,13 +317,28 @@ impl Gateway {
 
     /// 宣布 `Terminating` 之后，等在途响应把明确事件写出去：在途归零或到
     /// [`END_EVENT_WINDOW`] 为止。正常情况下一个调度周期内就归零。
+    ///
+    /// **窗口到点仍有在途要说出来**：这个读数（`hlmg_active_requests`）由**响应 body** 持有，
+    /// 而 body 归 HTTP 连接任务；客户端停止读取时它会 park 在写 socket 上，直到 `client_stall`
+    /// （见 `io_stall::WriteStall`）——此时**转发任务早已收尾**（H5 修好后它在 `Terminating` 就
+    /// 被叫停并把 Cancel 发给了上游），在途读数却仍 >0。所以这条 WARN 说的是"有客户端不读，
+    /// 票据要等停滞上限才归还"，不是"任务泄漏"；要区分得看
+    /// `hlmg_client_stalls_total{phase="response-body"}`。
     async fn await_end_event_window(&self) {
         let deadline = tokio::time::Instant::now() + END_EVENT_WINDOW;
         loop {
-            if self.metrics.active_count() == 0 {
+            let active = self.metrics.active_count();
+            if active == 0 {
                 return;
             }
             if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    active,
+                    window_ms = END_EVENT_WINDOW.as_millis(),
+                    "still in flight when the end-event window elapsed: the forward tasks have been \
+                     told to stop, but these admission tickets are held by HTTP connection tasks \
+                     whose client stopped reading; they are released at client_stall at the latest"
+                );
                 return;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;

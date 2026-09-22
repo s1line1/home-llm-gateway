@@ -415,14 +415,17 @@
       `max_concurrent_requests: 1` 下后续请求不得 429）+ `io_stall` 单测，均已红检。
       **仍未做**：响应体**内存缓冲上限**（DESIGN §11.2 与本项原本合并做的那半）——
       现在通道是 32 块的有界队列，但 hyper 侧仍会缓冲到 socket 缓冲被写满为止。
-- [ ] **Cancel→上游缺上游侧断言**（原与本项相邻，仍缺）：`mock-llm` 没有"请求被取消"的
-      可观测信号（新加的 `/v1/flood` 提供了持续产出的上游，但还没暴露"被中途丢弃"的计数）。
+- [x] **Cancel→上游缺上游侧断言（2026-09-22 完成）**：`mock-llm` 现在有 `GET /stats`，里面的
+      `cancelled` = **被中途丢弃的响应体数**（`CancelGuard` 的 Drop 计数：流正常跑完置
+      `completed`，被 axum 丢掉 body 时 +1）。上游侧可观测 ⇒ H5 的 e2e 判据落在这里
+      （`lifecycle::e2e_shutdown_cancels_a_client_stalled_stream_without_waiting_for_the_stall`：
+      先读完整条 flood 断言 `cancelled == 0` 作对照，再制造"客户端停读 + 关停"断言 >0）。
 - [ ] **公网入口 accept 出错即永久停服**：`gateway/src/lib.rs:175` 的 `listener.accept().await?`
       用 `?` 结束整个循环，外层只有一句 `warn!("https server stopped")`。对比 QUIC 侧专门做了
       `hlmg_quic_accepting` + `error!` 告警（`quic.rs:29-36`），HTTP 入口（唯一公网入口）反而没有
       等价信号——瞬时错误（EMFILE 等）就能让网关"进程活着但不监听"。修法：accept 错误重试 + 计数指标。
-- [ ] **Cancel→上游缺上游侧断言**：`mock-llm` 没有"请求被取消"的可观测信号，`chain.rs:205-217`
-      只断言断开后 `/v1/models` 仍可用；README 承诺的"客户端断开 → 不白算 token"因此只有间接覆盖。
+- [x] **Cancel→上游缺上游侧断言（2026-09-22 完成）**：见上一条——`mock-llm` 的 `GET /stats`
+      暴露 `cancelled`（被中途丢弃的响应体数），不再只有"断开后 `/v1/models` 仍可用"这种间接覆盖。
       修法：mock-llm 暴露取消计数（或日志端点），e2e 断言断开后上游请求确实被中断。
 
 ### P2 — 契约 / 一致性
@@ -793,6 +796,34 @@
         （卡住非 chat 端点）原样保留（`PROJECT_SCAN` 已登记，改它要按路径/方法白名单）；
         帧体进 postcard 的那次拷贝现在只剩 1.6ms/16MiB，且 streaming 帧写要动线格式处理，
         不值得再切一刀。
+
+
+- [x] **H. 关停语义：在途转发任务不再活过 `shutdown` 返回（2026-09-22 完成）**（评估 H5）
+      - 缺陷：`forward_body` 只在**循环顶部**查 `shutdown_terminating`，而它可以 park 在
+        `tx.send` 上（客户端不读 → 通道满）直到 `client_stall`（默认 60s）。`Gateway::shutdown`
+        的收尾窗口只有 1s ⇒ 它返回时那个游离任务还持有 agent 槽位（`SlotGuard`）与 QUIC 流，
+        Cancel 也要 60s 后才发给上游（= 上游白算 token 一分钟）。
+      - 已做：① 新增 `send_to_client_or_shutdown`——发送与 `Terminating` 赛跑，被卡住时立刻返回
+        `SendOutcome::ShuttingDown`，转发循环因此马上走收尾分支（发"不完整"事件 + Cancel + 结算）。
+        **`Draining` 刻意不叫停**（那个阶段只停 accept，在途响应必须跑完，丢一块就是数据丢失），
+        所以那条分支是**重试发送**。② 关停时"不完整"事件的写入上限用新的
+        `SHUTDOWN_EVENT_WRITE_TIMEOUT`（250ms）而不是 `client_stall`：正常读取的客户端微秒级就
+        收下，不读的不能把关停拖住。③ 终止性的错误帧也走可叫停版本。④ 收尾窗口到点仍有在途时
+        **WARN**（并说清那是 HTTP 连接任务在等客户端，不是转发任务泄漏）。
+      - **刻意不做**：不在关停末尾 abort 这些转发任务——`usage.finish()` 的结算排在落库之前，
+        abort 会丢掉它们尚未结算的用量。也**不**保证 `hlmg_active_requests` 归零：那张票据由
+        响应 body（HTTP 连接任务）持有，客户端停读时要到 `client_stall` 才归还，与转发任务是否
+        退出无关（这条已写进 `shutdown` 的文档，免得后人误判）。
+      - 证据：`proxy::forward::tests::terminating_interrupts_a_stalled_send_but_draining_does_not`
+        （容量 1 的通道灌满 → `Draining` 不许结束、`Terminating` 必须 500ms 内结束；另含"阶段
+        发送端被 drop 也算收尾"）+ `a_stalled_send_still_reports_stalled_without_a_shutdown`
+        （没有关停信号时停滞判定不变，仍记 `hlmg_client_stalls_total`）+ e2e
+        `lifecycle::e2e_shutdown_cancels_a_client_stalled_stream_without_waiting_for_the_stall`
+        （**上游侧**判据：`client_stall` 设成 30s、宽限 200ms，客户端读完响应头就停读，随后
+        `shutdown()`；断言 5s 内 mock-llm 的 `/stats.cancelled` > 0。**退回旧的裸
+        `send_to_client` 即红**——实测等满 5s 仍为 0）。
+      - 顺带关闭记录里的缺口「`Cancel` → 上游确实被取消**缺上游侧断言**」（`mock-llm` 新增
+        `/stats`，见本节上一条）。
 
 - [x] **D. registry 评估 §7 步骤 6 的可选清理（2026-09-21 处置完毕：两项落地、两项裁定不做）**
       - ✅ **`pick()` 抽成纯函数**（`registry::pick`）：次序（新鲜 → 排除 → 模型 → 精确优先 →
