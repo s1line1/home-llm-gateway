@@ -284,7 +284,7 @@ pub struct FrameReader<R> {
 
 **生命周期绑定（易错点）**：SSE 长流的 body 在 handler 返回后**还在流**。
 所以闸门票据必须绑到**响应 body 的生命周期**，而不是 handler 的返回。
-现有项目用 `BodyExt::map_frame` 把票据挂进 body（`http.rs:312-317`），做法正确。
+现有项目用 `BodyExt::map_frame` 把票据挂进 body（`crates/gateway/src/http/admission.rs:81`），做法正确。
 不这么做，闸门只覆盖首字节，**恰好在最重要的负载上失效**。
 
 ### 4.3 原子占位必须用 CAS
@@ -510,7 +510,7 @@ quinn 的名字抄进来**：s2n-quic 全在 `Limits` 上用 `with_*` setter，�
 | **R4** | EOF 四格分明：帧边界 / 载荷中途 / **头部中途** / 超上限 | 头部 1–3 字节截断被误判为正常关闭（`io.rs:37-41`），且注释谎称与 `FrameReader` 一致 | 四格各一条断言 |
 | **R5** | 解码/方向/`request_id` 错误 → **只 reset 该流**，不摘连接 | 控制面 `?` 直接退出循环 → 整台 edge 被摘除（`quic.rs:63` + `46-48`），且被 e2e 固化为期望 | e2e：发坏帧后该 agent 仍在册、其他请求正常 |
 | **R6** | "流即会话"可断言：首帧必须 `ProxyRequest`，后续帧 `request_id` 一致 | `request_id` 被 `..` 丢弃（`proxy/mod.rs:418/431/444`），无断言无日志 | 不一致时错误可观测 + 该流被 reset |
-| **R7** | 计数一律 RAII 释放，且票据绑到**响应 body** 生命周期 | ✅ 已做对（`metrics.rs:203`, `registry.rs:196`, `http.rs:312`）——**照搬** | e2e：客户端中断 + **上游静默**场景下，槽位须在秒级归零（现有实现会拖到 120 s，见 §4.7） |
+| **R7** | 计数一律 RAII 释放，且票据绑到**响应 body** 生命周期 | ✅ 已做对（`metrics.rs` 的 `Admission`、`registry.rs` 的 `SlotGuard`、`http/admission.rs:81` 的 `map_frame`）——**照搬** | e2e：客户端中断 + **上游静默**场景下，槽位须在秒级归零（现有实现会拖到 120 s，见 §4.7） |
 | **R8** | 原子占位用 CAS，无 check-then-act | ✅ 已做对（`registry.rs:170`, `metrics.rs:57`）——**照搬**；HTTP 侧有良性误拒窗口 | 并发 N 请求恰好 limit 通过、零误拒 |
 | **R9** | 背压端到端有界，且**按字节**而非按条数 | 通道 `mpsc(32)` 条数有界、字节无界（`proxy/mod.rs:221`） | 慢客户端压测下进程 RSS 有上界 |
 | **R10** | 超时矩阵完整，区分"空闲"与"总时长"；取消**即时**传播 | 无总时长上限；无 TLS 握手/`open_bi`/写帧/控制流超时；取消可延迟 120 s（`proxy/mod.rs:419`） | 静默上游的取消在秒级释放槽位，而非等 `idle_timeout` |

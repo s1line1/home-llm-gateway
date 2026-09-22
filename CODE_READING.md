@@ -80,17 +80,20 @@ gateway/src/admin.rs        Admin API（key 管理 + agents 列表 + usage 查�
 gateway/src/usage_meter.rs        per-key token 用量提取 / 无 usage 时估算（纯函数，由 proxy 调用）
 gateway/src/ratelimit.rs    令牌桶
 gateway/src/metrics.rs      Prometheus 指标（HTTP 层 + 隧道层）
-gateway/src/error.rs        GatewayError（thiserror；anyhow 只留 main.rs）
+gateway/src/error.rs        GatewayError（thiserror；anyhow 仍用于 config/quic/tls 与 agent 侧）
 gateway/src/tls.rs          mTLS 配置（动态信任根方向见 TODO P1 多 CA 方案）
 ```
 
 ### 第 4 步：测试与验证（1 小时）
 
 ```
-crates/gateway/tests/e2e/   23 个 e2e 场景（common.rs 怎么起全栈；chain.rs 全链路；
-                            agents.rs 并发正确性 + 模型路由；admin.rs 管理 API + 错误语义；
-                            metrics.rs 指标；https.rs 公网 TLS + 隧道控制流 + 启动 fail-fast）
-crates/gateway/benches/     Criterion 微基准（帧编解码 + keystore argon2）
+crates/gateway/tests/e2e/   e2e 场景（common.rs 怎么起全栈；chain.rs 全链路；agents.rs 并发
+                            正确性 + 模型路由；admin.rs 管理 API + 错误语义；metrics.rs 指标；
+                            https.rs 公网 TLS + 隧道控制流 + 启动 fail-fast；head_timeout.rs 三条
+                            超时；stalls.rs 客户端停滞；entry_limits.rs 握手/请求头有界与连接额度；
+                            write_backpressure.rs 写帧背压；nofile.rs；lifecycle.rs 关闭语义；
+                            evict_close.rs 摘除宽限）
+crates/proto/benches/       Criterion 微基准（帧编解码；gateway 侧只剩 keystore argon2）
 scripts/bench-k6/           k6 宏观压测模板（SSE 长流 + QPS，含 429 分类断言）
 ```
 
@@ -121,7 +124,7 @@ web/src/components/   ← 布局/图表/UI（无依赖 SVG 图表）
 |---|---|
 | `crates/gateway/src/proxy/mod.rs` | 全链路的心脏（认证 → 路由 → 隧道） |
 | `crates/gateway/src/registry.rs` 的 `try_acquire` | 并发控制精髓（SlotGuard RAII 自动归还） |
-| `crates/agent/src/lib.rs` 的 `handle_stream` | 转发 + Cancel 的 `select!` 竞速 |
+| `crates/agent/src/stream.rs` 的 `handle_stream` | 转发 + Cancel 的 `select!` 竞速 |
 | `crates/proto/src/frame.rs` | 两端通信的契约 |
 | `crates/gateway/tests/e2e/common.rs` | 怎么在单进程内拉起完整测试栈 |
 
@@ -143,7 +146,7 @@ web/src/components/   ← 布局/图表/UI（无依赖 SVG 图表）
 ```bash
 make dev          # 一键起全栈（mock-llm + gateway + agent，日志在 .tmp/logs/）
 make stop         # 停全栈
-make check        # fmt + clippy + test + web build（CI 同等门槛）
+make check        # fmt + clippy + nextest + web build（CI 还会跑 `cargo deny`，见 `make deny`）
 make bench        # Criterion 微基准
 make bench-k6     # k6 宏观压测（KEY=sk-xxx 必传）
 cargo llvm-cov --workspace --summary-only   # 覆盖率（当前 95.87%）

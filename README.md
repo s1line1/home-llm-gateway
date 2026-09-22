@@ -23,7 +23,7 @@ edge-agent（LLM 所在机器）  主动拨号 + 心跳 + 断线重连，转发�
 
 - **QUIC 隧道 + mTLS**：边缘端主动向外拨长连接，天然穿透 NAT / 动态 IP；双向证书认证，未注册 agent 无法接入
 - **流式优先**：SSE 逐块透传（打字机效果）；客户端断开/超时自动 `Cancel` 上游，不白算 token；逐帧空闲超时，不误杀长流
-- **公网 HTTPS 原生支持**：rustls 直接监听 443，无需 nginx/caddy
+- **公网 HTTPS 原生支持**：rustls 直接监听 HTTPS 端口（示例配置 **8443**；QUIC 隧道另占 UDP **4433**），无需 nginx/caddy
 - **安全与治理**：API Key 认证（`sha256(token)` 索引定位 + argon2 校验，明文不落盘）、按 Key 令牌桶限流、按 agent 并发上限的 admission control（超限 429）
 - **多 edge 模型感知路由**：按请求 model 路由到能服务它的 edge（精确优先、`*` 兜底），同组最少负载均衡，失联 agent 不再参与路由；`/v1/models` 网关聚合
 - **可观测性**：`/metrics` Prometheus 指标、结构化请求日志（`request_id` / 状态码 / 耗时）、`/healthz` 探针
@@ -151,7 +151,7 @@ curl -N -H "Authorization: Bearer dev-key" \
 
 ```bash
 cargo test             # proto roundtrip + 端到端集成测试（内存生成证书，无需任何外部服务）
-cargo nextest run -w   # 同上，但用 nextest（CI 用的就是它，见下）
+cargo nextest run --workspace   # 同上，但用 nextest（CI 用的就是它，见下）
 ```
 
 > **CI 用 `cargo nextest`**（`cargo test` 仍然可用，两者都要能过）。换它的原因：nextest
@@ -293,7 +293,7 @@ max_concurrency: 4
 
 ### 超时与"隧道卡死"排障
 
-三条超时各管一段（详见 `DESIGN.md` §5.6），配置项都在 `gateway-config.yml`：
+三条超时各管一段（详见 `DESIGN.md` §5 的「三条超时」那一条），配置项都在 `gateway-config.yml`：
 
 | 配置 | 默认 | 覆盖范围 | 超时后 |
 |---|---|---|---|
@@ -610,7 +610,10 @@ agent 侧心跳超时→主动断开→重连握手超时（**已修**，见下�
 | 中位延迟 | 54.7 ms | 2.06 s |
 
 8 KB 那档日志里全是 `upstream head timeout; evicting agent`。折算施加速率：每迭代 ≈28 KB
-（请求 base64 后 body ≈11 KB + `/v1/echo` 把整包回吐 ≈15 KB + 流式端点 ≈2.5 KB）× 50 iters/s
+（请求 base64 后 body ≈11 KB + 回吐整包 ≈15 KB + 流式端点 ≈2.5 KB）× 50 iters/s
+> ⚠️ 原文这里写的是 `/v1/echo`——**mock-llm 从来没有这个端点**（只有 `/v1/models`、
+> `/v1/chat/completions`、`/v1/embeddings`、`/v1/slow`、`/v1/slow_body`、`/v1/flood`）。
+> 这段算术对应的是当时自建的压测上游，别拿 mock-llm 去复现它（记录 2026-09-22 校正）。
 ≈ **1.4 MB/s**——**按载荷折算的估算值，不是直接采 `data_sent`**；对 0.4 MB/s 的上限就是
 **超载约 3.5 倍**；16 B 那档 ≈150 KB/s，在上限之内。
 

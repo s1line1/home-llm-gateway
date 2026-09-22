@@ -1,7 +1,7 @@
 # 精确一次重试：协议级去重设计（提案）
 
 > 状态：**提案，未实现**。本文只描述设计、取舍与落地步骤，代码改动留待确认后再做。
-> 相关实现：`crates/gateway/src/proxy/mod.rs`（重试循环）、`crates/agent/src/stream.rs`（帧处理）、
+> 相关实现：`crates/gateway/src/proxy/routing.rs`（重试循环，`MAX_TUNNEL_ATTEMPTS`）、`crates/agent/src/stream.rs`（帧处理）、
 > `crates/proto/src/io.rs`（帧读写）。
 
 ## 1. 为什么要做

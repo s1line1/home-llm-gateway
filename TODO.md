@@ -92,8 +92,9 @@
       一条单调曲线——1 KB → **0.00%**、4 KB → 5.35%、8 KB → **48.16%**、16 KB → 76.53%、
       64 KB → **98.38%**；A/B 那一对是 16 B → **0.06%**、8 KB → **48.97%**（8 KB 档重复跑两次
       得 48.16% / 48.97%，属正常波动）。
-      折算一下为什么必然如此：8 KB 那档每迭代 ≈28 KB（请求 base64 后 body ≈11 KB + `/v1/echo`
-      把整包回吐 ≈15 KB + 流式端点 ≈2.5 KB）× 50 iters/s ≈ **1.4 MB/s**，对 0.4 MB/s 的上限
+      折算一下为什么必然如此：8 KB 那档每迭代 ≈28 KB（请求 base64 后 body ≈11 KB + 回吐整包
+      ≈15 KB + 流式端点 ≈2.5 KB）× 50 iters/s（⚠️ 原文写的是 `/v1/echo`——mock-llm 从来没有这个
+      端点，这里指的是当时自建的压测上游；2026-09-22 校正） ≈ **1.4 MB/s**，对 0.4 MB/s 的上限
       是**超载约 3.5 倍**（按载荷折算的估算，未直接采 `data_sent`）；16 B 那档 ≈150 KB/s 在上限内。
       同一窗口内 `upstream head timeout; evicting agent` 1 026 次、`registry-empty` +3 753。
       ⚠️ 期间 `hlmg_tunnel_open_timeouts_total` 恒为 **0** —— 也就是说开流路径完全正常，
@@ -430,9 +431,11 @@
       `completed`，被 axum 丢掉 body 时 +1）。上游侧可观测 ⇒ H5 的 e2e 判据落在这里
       （`lifecycle::e2e_shutdown_cancels_a_client_stalled_stream_without_waiting_for_the_stall`：
       先读完整条 flood 断言 `cancelled == 0` 作对照，再制造"客户端停读 + 关停"断言 >0）。
-- [ ] **公网入口 accept 出错即永久停服**：`gateway/src/lib.rs:175` 的 `listener.accept().await?`
-      用 `?` 结束整个循环，外层只有一句 `warn!("https server stopped")`。对比 QUIC 侧专门做了
-      `hlmg_quic_accepting` + `error!` 告警（`quic.rs:29-36`），HTTP 入口（唯一公网入口）反而没有
+- [x] **公网入口 accept 出错即永久停服（2026-09-22 已完成，见本节 H 条 / `PROJECT_SCAN` P2-10）
+      （指针已校正：原引用 `gateway/src/lib.rs:175` 早已失效——`lib.rs` 现在只剩模块声明，
+      循环在 `crates/gateway/src/http/entry.rs` 的 `serve_entry`）**：`listener.accept().await?`
+      用 `?` 结束整个循环，外层只有一句 `warn!("public entry stopped: {e}")`。对比 QUIC 侧专门做了
+      `hlmg_quic_accepting` + `error!` 告警（`quic.rs`），HTTP 入口（唯一公网入口）反而没有
       等价信号——瞬时错误（EMFILE 等）就能让网关"进程活着但不监听"。修法：accept 错误重试 + 计数指标。
 - [x] **Cancel→上游缺上游侧断言（2026-09-22 完成）**：见上一条——`mock-llm` 的 `GET /stats`
       暴露 `cancelled`（被中途丢弃的响应体数），不再只有"断开后 `/v1/models` 仍可用"这种间接覆盖。
@@ -908,6 +911,21 @@
         `sqlite3_busy_timeout(db, 5000)`，见 vendored `inner_connection.rs:118`），scan 的批次清单
         已标注，不再排期。
 
+
+- [x] **L. 文档漂移批（2026-09-22 完成）**（`PROJECT_SCAN` §5.1/§5.2 两张表）
+  - 修的（逐条先对着代码核过）：`README` 的 `cargo nextest run -w`（该 flag 不存在）→
+    `--workspace`；`DEPLOY.md` 的 agent 安装段补齐二进制/目录/证书名、网关证书不再放 `certs/`
+    子目录（示例配置的路径没有这一层）、两处看日志改成看落盘文件（`journalctl` 与
+    `docker compose logs` 里都没有应用日志）；`docker-compose.yml` 的 `9090:9090` → `8443:8443`；
+    `DESIGN`/`README`/`README.en` 的五处 443 → 示例配置的 UDP 4433 / TCP 8443；
+    `README` 的 `/v1/echo` 幻影端点、`DESIGN.md:258` 的"只统计 bytes"、`README.md` 引的
+    `DESIGN §5.6`、`README.en` 缺的"凭据边界"整行、`Makefile` 的 `deny`/`check` 注释、
+    `REBUILD`/`CODE_READING`/`EXACTLY_ONCE` 的失效指针、`state.rs` 的宽限注释。
+  - **复核后判定为"已过期结论"、无需改**：`README.md` 的 `flush_usage_on_shutdown`（README 早已
+    改对，只有 gitignore 的评估正文按旧名写）、`MODEL_ROUTING.md`/`OPTIMIZATION.md`/
+    `CODE_READING.md:59` 的 `http.rs` 引用（那些文件里已经没有该字样）。
+  - 方法：全部按**内容**定位（scan 的行号本身早已漂移），每处改前先 `grep`/读代码确认，改动用
+    带断言的脚本盖章（匹配不上就中止，不盲改）。
 
 - [x] **K. H8 复核：写帧超时不会导致双执行（2026-09-22 完成，结论=推翻）**（评估 H8）
       - 原担忧：`write_frame` 是非原子 `write_all`，若"整帧已送达而超时先到"，换 agent 重放就会
