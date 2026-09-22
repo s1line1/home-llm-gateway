@@ -678,3 +678,92 @@ async fn e2e_tunnel_request_id_is_unique_across_x_request_id_shapes() {
     responder.abort();
     gw.shutdown().await;
 }
+
+/// 规格（`PROJECT_SCAN` P1-2）：**带点段的路径不得被转发到上游**。
+///
+/// `uri.path()` 是**原样**的（HTTP/1.1 与 h2 都不做点段归一），而 agent 把它拼到上游 base
+/// 之后才交给 URL 解析器——WHATWG 归一那一刻 `/v1/../api/delete` 就成了 `/api/delete`，
+/// 持 key 者因此能驱动上游**任意端点**（Ollama 的 `/api/delete` 直接删模型）。
+///
+/// 必须用**裸 HTTP**：`reqwest` 在发送前就把 URL 归一了，`/v1/../api/delete` 会变成
+/// `/api/delete`（连 `/v1/{*rest}` 都匹配不上），那样根本测不到这条攻击面。
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn e2e_dot_segment_path_is_rejected_instead_of_forwarded() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    let (gw, agent, _base, key) = start_stack(4, |_| {}).await;
+
+    let raw_post = |path: &str| {
+        let body =
+            r#"{"model":"mock-llm","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+        format!(
+            "POST {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {key}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    };
+    let raw_delete = |path: &str| {
+        format!(
+            "DELETE {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {key}\r\n\
+             Connection: close\r\n\r\n"
+        )
+    };
+    let status_of = |resp: &[u8]| {
+        String::from_utf8_lossy(resp)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    // ① 对照：同一份 body 走正常路径 → 上游确实被调用（200）
+    let mut sock = tokio::net::TcpStream::connect(gw.http_addr).await.unwrap();
+    sock.write_all(raw_post("/v1/chat/completions").as_bytes())
+        .await
+        .unwrap();
+    let mut resp = Vec::new();
+    bounded("read the control response", sock.read_to_end(&mut resp))
+        .await
+        .unwrap();
+    let control = status_of(&resp);
+    assert!(
+        control.contains(" 200 "),
+        "对照请求应当被转发给上游，实际 {control:?}"
+    );
+
+    // ② 攻击面：路径里塞点段 → 必须由网关拒绝，而不是"归一之后转发"
+    let mut sock = tokio::net::TcpStream::connect(gw.http_addr).await.unwrap();
+    sock.write_all(raw_post("/v1/../api/delete").as_bytes())
+        .await
+        .unwrap();
+    let mut resp = Vec::new();
+    bounded("read the guarded response", sock.read_to_end(&mut resp))
+        .await
+        .unwrap();
+    let guarded = status_of(&resp);
+    assert!(
+        guarded.contains(" 400 "),
+        "点段路径必须被网关拒绝（P1-2）：被转发给上游就意味着持 key 者可越权访问任意端点，实际 {guarded:?}"
+    );
+
+    // ③ 记录在案的**原样 PoC**：`DELETE /v1/../api/delete`（无 body）也必须 400——
+    //    守卫在读 body 之前，所以这里不会先撞上"model is required"那条 400 而蒙混过关。
+    let mut sock = tokio::net::TcpStream::connect(gw.http_addr).await.unwrap();
+    sock.write_all(raw_delete("/v1/../api/delete").as_bytes())
+        .await
+        .unwrap();
+    let mut resp = Vec::new();
+    bounded("read the PoC response", sock.read_to_end(&mut resp))
+        .await
+        .unwrap();
+    let poc = status_of(&resp);
+    assert!(
+        poc.contains(" 400 "),
+        "记录里的 PoC（DELETE /v1/../api/delete）必须 400，实际 {poc:?}"
+    );
+
+    agent.shutdown().await;
+    gw.shutdown().await;
+}
