@@ -18,10 +18,12 @@ use crate::state::AppState;
 use tracing::warn;
 
 /// 已通过认证的调用方身份。
+///
+/// **不含明文 token**（评估记录 P2-19）：限流桶按 [`Self::key_id`] 作键，明文只在与
+/// keystore 校验的那一刻存在于栈上。把它留在这里等于给每个 handler 一个把凭据写进日志 /
+/// 指标标签 / 错误响应的机会，而 keystore 那边是"只存哈希、明文不落盘"的姿态。
 pub struct AuthenticatedKey {
-    /// 限流桶键：限流是 **per-key** 的（见 [`crate::ratelimit`]）。
-    pub token: String,
-    /// 用量计量的归属（`/admin/usage` 按它聚合）。
+    /// 用量计量的归属（`/admin/usage` 按它聚合），也是限流桶的键。
     pub key_id: String,
     pub key_name: String,
 }
@@ -66,7 +68,10 @@ pub async fn authenticate(
         return Err(AuthRejection::InvalidKey);
     };
     if let Some(rl) = &state.rate_limiter {
-        if !rl.try_acquire(&key.token) {
+        // 桶键是 key id，**不是明文 token**（P2-19）：限流器只增不减，拿明文作键等于把它
+        // 常驻进程内存（`/proc/<pid>/mem`、core dump 都带着它）。同一条身份对同一个桶
+        // 的映射不受影响——id 与 token 一一对应。
+        if !rl.try_acquire(&key.key_id) {
             return Err(AuthRejection::RateLimited);
         }
     }
@@ -77,12 +82,9 @@ async fn verify_api_key(state: &AppState, headers: &HeaderMap) -> Option<Authent
     let value = headers.get(axum::http::header::AUTHORIZATION)?;
     let token = value.to_str().ok()?.strip_prefix("Bearer ")?.to_string();
     let store = state.key_store.clone();
-    let token_for_verify = token.clone();
-    let record = match tokio::task::spawn_blocking(move || {
-        store.authorize_record(&token_for_verify)
-    })
-    .await
-    {
+    // 明文 token 移动进校验任务（不 clone）：它是这段代码里唯一持有明文的地方，
+    // 任务结束即释放。
+    let record = match tokio::task::spawn_blocking(move || store.authorize_record(&token)).await {
         Ok(rec) => rec?,
         Err(e) => {
             // 校验任务 panic/被取消：按认证失败处理，不放行
@@ -91,7 +93,6 @@ async fn verify_api_key(state: &AppState, headers: &HeaderMap) -> Option<Authent
         }
     };
     Some(AuthenticatedKey {
-        token,
         key_id: record.id,
         key_name: record.name,
     })
@@ -100,6 +101,55 @@ async fn verify_api_key(state: &AppState, headers: &HeaderMap) -> Option<Authent
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{metrics::Metrics, options::Options, registry::Registry, storage::KeyStore};
+
+    /// 规格（评估记录 P2-19）：限流桶必须按 **[`KeyRecord::id`]** 作键，**不能**按明文 token。
+    ///
+    /// 明文 key 只应活在认证那一刻的栈上：keystore 自己只留 sha256（索引）+ argon2（校验），
+    /// 而限流器的桶表是**长生命周期的内存状态**。按明文作键，等于把每一个用过的 key 常驻
+    /// 进程内存直到退出，并且随 key 轮换 / 吊销无上限增长——这与"明文不落盘"的姿态自相矛盾
+    /// （`/proc/<pid>/mem`、core dump、panic 报告都会带上它）。
+    ///
+    /// [`KeyRecord::id`]: crate::storage::KeyRecord
+    #[tokio::test]
+    async fn the_rate_limiter_keys_buckets_by_key_id_not_by_the_plaintext_token() {
+        let opts = Options {
+            rate_limit_per_min: 60,
+            ..Options::default()
+        };
+        let store = KeyStore::new(None);
+        let created = store.create("p2-19".into()).expect("建 key 应当成功");
+        let state = AppState::new(Registry::default(), store, Metrics::default(), &opts);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_str(&format!("Bearer {}", created.plaintext)).unwrap(),
+        );
+
+        let identity = authenticate(&state, &headers).await.expect("认证应当通过");
+        assert_eq!(
+            identity.key_id,
+            created.record.id(),
+            "前提：身份里的 key_id 来自 keystore"
+        );
+
+        let rl = state
+            .rate_limiter
+            .as_ref()
+            .expect("前提：60/min 应当建出限流器");
+        assert_eq!(
+            rl.bucket_keys(),
+            vec![created.record.id().to_string()],
+            "限流桶必须按 key id 作键"
+        );
+        assert!(
+            !rl.bucket_keys()
+                .iter()
+                .any(|k| k.contains(&created.plaintext)),
+            "明文 token 不得作为桶键常驻内存"
+        );
+    }
 
     /// 规格：两种拒绝的状态码 / `error.type` / `Retry-After` 必须与拆分前**逐字一致**。
     ///

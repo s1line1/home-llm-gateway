@@ -666,6 +666,25 @@
       - 注意：这些 client 与 `bounded` 共用同一个 `STEP_TIMEOUT`，所以窗口若调整（见 B 之后的
         讨论），全部一起变。
 
+- [x] **D. 限流桶：键改 `key_id` + 吊销回收 + 空闲清扫（2026-09-22 完成）**
+      （`PROJECT_SCAN` P2-19 / 评估 H3 的另一半；锁那半见上一条 A）
+      - 已做：① **桶键从明文 token 改成 `key_id`**（`auth.rs` 里 `try_acquire(&key.key_id)`），
+        `AuthenticatedKey` 随之不再持有明文 token（顺带删掉 `verify_api_key` 里那次
+        `token.clone()`）。keystore 那边是"只存 sha256 索引 + argon2 哈希、明文不落盘"，
+        而桶表是**长生命周期的内存状态**——拿明文作键等于把每个用过的 key 常驻到进程退出
+        （`/proc/<pid>/mem`、core dump、panic 报告都带着它），还随轮换/吊销无上限增长。
+        ② `RateLimiter::evict(key)`：`admin::delete_key` 吊销成功后立即回收该桶。
+        ③ 空闲清扫 `Buckets::sweep`：**只丢"已回满 + 空闲 ≥ `IDLE_BUCKET_TTL`(10 分钟)"的桶**，
+        每 `SWEEP_PERIOD`(60 秒) 至多一次全表 `retain`（取令牌保持 O(1)）。
+      - 两个容易写错的点（都写了注释）：判据里必须**先把令牌按 `elapsed` 补到 `now` 再比**——
+        补充是按需算的，只看存下来的 `tokens` 会让空闲桶永远停在"上次用完的样子"，
+        一个都回收不掉；而**没回满的桶不能丢**——丢了等于白送配额。
+      - 证据（先红）：`auth::tests::the_rate_limiter_keys_buckets_by_key_id_not_by_the_plaintext_token`
+        修复前直接观察到桶键就是 `sk-…`；`admin::tests::deleting_a_key_also_drops_its_rate_limit_bucket`
+        把那三行接线摘掉即红（`bucket_count` 1 ≠ 0）。另有 4 条：补速率（抽干→空闲 250ms→放行）、
+        双 key 隔离、吊销回收、清扫只丢满桶——前两条是**特性钉**，改前改后都绿，防顺手改坏。
+      - 明确不在本条：多实例各算各的（`DESIGN.md:240` 的登记项）、租户级总配额、Redis 外置配额。
+
 - [x] **D. registry 评估 §7 步骤 6 的可选清理（2026-09-21 处置完毕：两项落地、两项裁定不做）**
       - ✅ **`pick()` 抽成纯函数**（`registry::pick`）：次序（新鲜 → 排除 → 模型 → 精确优先 →
         负载轻 → 心跳新）与两个错误变体（`NoAgent` / `NoModel`）都在一处；新增

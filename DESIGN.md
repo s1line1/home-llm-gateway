@@ -116,7 +116,7 @@
 职责：
 1. **公网 HTTP(S) 入口**：监听 443（TLS），暴露 OpenAI 兼容路径 `/v1/models`、`/v1/chat/completions`、`/v1/embeddings` 等，**逐字**透传给隧道内的 agent——但转发前先过路径守卫（`proxy::safe_upstream_path`）：点段 / 反斜杠 / `%2e`·`%2f`·`%5c` 一类编码分隔符会让上游的 URL 归一（或解码）出 `/v1/` 之外的路径，持 key 者因此能越权访问上游任意端点（`PROJECT_SCAN` P1-2），这类请求直接 `400`。
 2. **认证**：Bearer API Key。鉴权分三步：`sha256(token)` 查已验证身份缓存 → 该记录 `enabled` 且 `cred_version` 与当前代次一致即放行（O(1)，**不跑 argon2**）；未命中才做 argon2 校验（全表遍历早已不存在）。恒定时间比较只用在 admin token 上。细节见下方「已验证身份缓存」。
-3. **限流**：token bucket 按 Key 限流；按 agent 并发上限 admission control（429）。
+3. **限流**：token bucket 按 Key 限流（桶键是 **`key_id`**，不是明文 token：明文只在认证那一刻的栈上，桶表是长生命周期内存，不能被凭据污染；吊销成功即回收该桶，空闲满桶按 10 分钟清扫）；按 agent 并发上限 admission control（429）。
 4. **Agent 路由**：维护 agent 注册表（agent_id → 当前 QUIC 连接 + 健康状态）；按请求 `model` 过滤候选（精确声明优先、`models: ["*"]` 通配兜底），同组内取在途最少者（见 `MODEL_ROUTING.md`）；无健康 agent → 503，有健康 agent 但无人能服务该模型 → 404。
 5. **QUIC Server**：接受边缘端连接，校验 mTLS 证书，处理 Register/Heartbeat，更新注册表，踢掉同一 agent_id 的旧连接（防重复拨号）。
 6. **请求转发**：HTTP → `ProxyRequest` 帧 → 等 `ProxyResponse*` 帧流式回写。三条超时各管一段，**不要混用**：
