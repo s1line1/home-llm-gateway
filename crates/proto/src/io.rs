@@ -37,19 +37,38 @@ where
 
 /// 读取一帧。流被对端干净关闭时返回 `Ok(None)`。
 ///
-/// ⚠️ **不可安全取消**：内部是 `read_exact`，在 `select!` 中落败会丢掉已读字节。
+/// "干净关闭"的判据是**一个字节都没读到**：长度前缀只收到一部分（1–3 字节）就 EOF
+/// 属于**截断**，返回 `UnexpectedEof`——与 [`FrameReader::next`] 的判据一致。
+/// （曾经这里把前缀 `read_exact` 的任何 `UnexpectedEof` 都当成干净关闭，于是半个帧头
+/// 被说成"对端正常收工"，协议违规在指标里变成对端的有序关闭。）
+///
+/// ⚠️ **不可安全取消**：在读满当前帧之前落败会丢掉已读字节。
 /// 凡是要在 `select!` 里一边等帧一边等别的东西（如同时监听 `Cancel`），
 /// 必须改用 [`FrameReader::next`]。
 pub async fn read_frame<R>(r: &mut R) -> io::Result<Option<Frame>>
 where
     R: AsyncRead + Unpin,
 {
+    // 前缀只能自己逐段读：`read_exact` 把"一字节没读到"和"读到一半"都报成
+    // `UnexpectedEof`，却不告诉你它填了几个字节。
     let mut len_buf = [0u8; 4];
-    if let Err(e) = r.read_exact(&mut len_buf).await {
-        if e.kind() == io::ErrorKind::UnexpectedEof {
-            return Ok(None);
+    let mut filled = 0;
+    while filled < len_buf.len() {
+        match r.read(&mut len_buf[filled..]).await {
+            Ok(0) => {
+                return if filled == 0 {
+                    Ok(None)
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "early eof: truncated frame header",
+                    ))
+                };
+            }
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
         }
-        return Err(e);
     }
     let len = u32::from_be_bytes(len_buf) as usize;
     if len > MAX_FRAME {
@@ -241,6 +260,34 @@ mod tests {
         buf.extend_from_slice(&10u32.to_be_bytes());
         buf.extend_from_slice(&[1, 2, 3]);
         let err = read_frame(&mut buf.as_slice()).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    /// 规格（记录 R4）：**半个长度前缀不算干净关闭**。
+    ///
+    /// 触发：对端只写出 1–3 字节的长度前缀就 FIN（写入中途被放弃、进程被杀、
+    /// 连接被掐）。以前 `read_frame` 把前缀 `read_exact` 的任何 `UnexpectedEof`
+    /// 都映射成 `Ok(None)`，于是这种截断被当成"对端有序收工"：`forward` 侧记成
+    /// `UpstreamClosed` 而不是读取错误，`quic` 侧记成"注册前就关了"。
+    /// 只有**一个字节都没读到**才是干净关闭。
+    #[tokio::test]
+    async fn a_truncated_length_prefix_is_not_a_clean_close() {
+        // 0 字节 = 干净关闭（对端开了流又什么都不发就关，是合法的）
+        let mut empty: &[u8] = &[];
+        assert!(read_frame(&mut empty).await.unwrap().is_none());
+
+        // 1–3 字节 = 截断
+        for n in 1..4usize {
+            let mut prefix: &[u8] = &vec![0u8; n];
+            let err = read_frame(&mut prefix)
+                .await
+                .expect_err("只给了前缀的一部分就 EOF，不该当成干净关闭");
+            assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof, "n={n}");
+        }
+
+        // 慢喂（每次 1 字节）下同样要认出来——不能依赖"一次 read 就能拿到整段前缀"
+        let mut dribble = DribbleReader::new(vec![0u8; 3]);
+        let err = read_frame(&mut dribble).await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 
@@ -473,6 +520,30 @@ mod tests {
         let mut reader = FrameReader::new(buf.as_slice());
         let err = reader.next().await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    /// 规格（记录 R4）：两个读取器对"半个长度前缀"必须给出**同一个**判断。
+    ///
+    /// 两个实现分叉过一次：`read_frame` 说那是干净关闭，`FrameReader` 说那是
+    /// `early eof`。同一条线上的同一段字节不该有两种解释。
+    #[tokio::test]
+    async fn both_readers_agree_that_a_half_header_is_truncation_not_eof() {
+        for n in 0..4usize {
+            let bytes = vec![0u8; n];
+            let plain = read_frame(&mut bytes.as_slice()).await;
+            let mut reader = FrameReader::new(bytes.as_slice());
+            let cancellable = reader.next().await;
+            match (&plain, &cancellable) {
+                (Ok(None), Ok(None)) => assert_eq!(n, 0, "只有 0 字节才算干净关闭"),
+                (Ok(None), _) | (_, Ok(None)) => {
+                    panic!(
+                        "n={n}: 两个读取器判断不一致——plain={plain:?} cancellable={cancellable:?}"
+                    )
+                }
+                (Err(a), Err(b)) => assert_eq!(a.kind(), b.kind(), "n={n}"),
+                _ => panic!("n={n}: plain={plain:?} cancellable={cancellable:?}"),
+            }
+        }
     }
 
     #[tokio::test]
