@@ -14,7 +14,7 @@ use axum::{
 use serde_json::json;
 
 /// OpenAI 兼容错误响应：`error.type` 按状态码映射（SDK 据此决定重试/报错语义），
-/// 429 自动带 `Retry-After`（秒）供退避。
+/// 429 自动带 `Retry-After`（秒）供退避，401 自动带 `WWW-Authenticate: Bearer`。
 ///
 /// 路由层的总并发中间件（`http::app` 的 metrics_middleware）用的也是同一个函数，
 /// 所以「网关自己产生的错误」格式全局一致。
@@ -28,6 +28,13 @@ pub fn error_response(status: StatusCode, message: impl Into<String>) -> Respons
     let mut builder = Response::builder().status(status);
     if status == StatusCode::TOO_MANY_REQUESTS {
         builder = builder.header(axum::http::header::RETRY_AFTER, "60");
+    }
+    if status == StatusCode::UNAUTHORIZED {
+        // RFC 9110 §15.5.2：401 **MUST** 带一个 `WWW-Authenticate` challenge，否则客户端
+        // 无从知道该用哪种凭据。本网关产生的 401 只有两种（`/v1` 的 API key 不对、
+        // `/admin` 的 admin token 不对），两条路径都认 `Authorization: Bearer`，
+        // 所以 challenge 固定是 Bearer；放在这里是为了让"以后新增 401"自动带上。
+        builder = builder.header(axum::http::header::WWW_AUTHENTICATE, "Bearer");
     }
     builder
         .body(body.into_response().into_body())

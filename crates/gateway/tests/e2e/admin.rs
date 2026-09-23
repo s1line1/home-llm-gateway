@@ -18,6 +18,13 @@ async fn e2e_admin_api_keys() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 401, "admin endpoints require admin token");
+    assert_eq!(
+        resp.headers()
+            .get(reqwest::header::WWW_AUTHENTICATE)
+            .and_then(|v| v.to_str().ok()),
+        Some("Bearer"),
+        "admin 401 必须带 WWW-Authenticate challenge"
+    );
     let resp = client
         .post(format!("{base}/admin/keys"))
         .header("Authorization", format!("Bearer {key}"))

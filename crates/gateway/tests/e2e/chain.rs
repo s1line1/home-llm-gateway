@@ -16,6 +16,13 @@ async fn e2e_chain_with_mock_llm() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 401, "missing api key must be rejected");
+    assert_eq!(
+        resp.headers()
+            .get(reqwest::header::WWW_AUTHENTICATE)
+            .and_then(|v| v.to_str().ok()),
+        Some("Bearer"),
+        "401 必须带 WWW-Authenticate challenge（RFC 9110 §15.5.2）"
+    );
 
     // healthz 无需认证
     let resp = client.get(format!("{base}/healthz")).send().await.unwrap();
@@ -48,6 +55,15 @@ async fn e2e_chain_with_mock_llm() {
     assert_eq!(resp.status(), 200);
     let models: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(models["data"][0]["id"], "mock-llm");
+
+    // P3-17：scheme 名大小写不敏感——小写 `bearer` 认同一把 key（端到端，不只是单测）
+    let resp = client
+        .get(format!("{base}/v1/models"))
+        .header("Authorization", format!("bearer {key}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "`bearer` 小写应当被接受");
 
     // chat completions 全链路（非流式）
     let resp = client
