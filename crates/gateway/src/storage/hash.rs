@@ -94,15 +94,26 @@ pub fn verify_argon2(token: &str, encoded: &str) -> bool {
         .is_ok()
 }
 
-/// 快速索引：sha256(明文 key) 的十六进制。
+/// 小写十六进制编码，**只分配一次**（结果字符串本身）。
+///
+/// SL-P3-14：原来是 `.map(|b| format!("{b:02x}")).collect()` —— sha256 的 32 个字节各分配一个
+/// `String` 再拼起来，而 `lookup_of` 在**每个**认证请求上都要跑（含无效 token，即凭据喷洒时
+/// 也一样）。这里用 nibble 表往一个预分配好的字符串里直接写。
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// 快速索引：sha256(明文 key) 的小写十六进制。
 pub fn lookup_of(token: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(token.as_bytes());
-    hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    hex_lower(&hasher.finalize())
 }
 
 pub fn generate_id_key() -> (String, String) {
@@ -111,13 +122,8 @@ pub fn generate_id_key() -> (String, String) {
     getrandom::fill(&mut id_buf).expect("os rng");
     getrandom::fill(&mut key_buf).expect("os rng");
     let id = format!("{:08x}", u32::from_be_bytes(id_buf));
-    let key = format!(
-        "sk-{}",
-        key_buf
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>()
-    );
+    // 同一个编码器（SL-P3-14）：这里以前也是"每字节一个 `String`"（24 次）。
+    let key = format!("sk-{}", hex_lower(&key_buf));
     (id, key)
 }
 
@@ -197,6 +203,19 @@ mod tests {
         assert_eq!(a, b);
         assert_ne!(a, c);
         assert!(a.len() == 64, "sha256 hex should be 64 chars");
+    }
+    /// 规格（SL-P3-14）：`lookup_of` 的输出是 **sha256 的小写十六进制**，逐字节比对。
+    ///
+    /// 为什么要写死摘要：既有的 `lookup_is_stable_hex` 只钉了"稳定 / 64 字符 / 不同输入不同"，
+    /// 而这几条对 **nibble 顺序写反**（或大小写写错）同样成立 —— 而 `lookup` 是认证索引的键，
+    /// 编码一变，所有已签发的 key 都会查不到。SL-P3-14 重写了这段编码（从"每字节一次
+    /// `format!` + collect"改成一次分配），所以顺手把契约钉死。
+    #[test]
+    fn lookup_of_is_lowercase_sha256_hex() {
+        assert_eq!(
+            lookup_of("sk-abc"),
+            "1460db1b6902f8b1fc2a40d9381a24d0fd22c3bc1b2c6f999c521da73776fbe0"
+        );
     }
 
     #[test]
