@@ -153,6 +153,8 @@ ui_dir: web                        # Web UI 目录（§4 上传的 web/dist；�
 
 > 网关**没有静态 key**——所有 API key 都通过 Admin API 运行时创建并存入 SQLite（首次启动先用 `admin_token` 创建第一个 key）。
 
+> **关闭信号**：`SIGTERM` / `SIGINT` / **`SIGHUP`** 走**同一条**优雅关闭路径（停接入 → 排空在途 → 有界强制落库），日志会先打一行 `shutdown signals armed (SIGINT/SIGTERM/SIGHUP)`。`SIGHUP` **不是**"重载配置"：本单元没有 `ExecReload`，配置热重载也不在范围内（`OPTIMIZATION.md` A4），`systemctl reload gateway` 会直接报不支持——想换配置就 `restart`。
+
 **运行时签发 API Key**（不用重启网关）：
 
 ```bash
@@ -220,6 +222,8 @@ sudo systemctl enable --now agent
 # 看到 connected to cloud gateway / registered with cloud gateway 即成功
 sudo tail -f /var/log/home-llm-gateway/agent.log
 ```
+
+> agent 侧的关闭信号与网关同款：`SIGTERM` / `SIGINT` / `SIGHUP` 都走 `agent.shutdown()`。
 
 ## 7. 端到端验证（从任意地点）
 

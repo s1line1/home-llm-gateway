@@ -14,5 +14,6 @@ mod https;
 mod lifecycle;
 mod metrics;
 mod nofile;
+mod signals;
 mod stalls;
 mod write_backpressure;
