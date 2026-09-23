@@ -81,7 +81,8 @@ bench: ## 基准测试（Criterion）：make bench BENCH="-p proto -p gateway"
 	cargo bench $(BENCH)
 
 bench-k6: ## k6 宏观压测（SSE 长流）：make bench-k6 KEY=sk-xxx GATEWAY_URL=http://IP:9090
-	k6 run -e GATEWAY_URL=$(GATEWAY_URL) -e GATEWAY_KEY=$(KEY) -e VUS=$(VUS) -e DURATION=$(DUR) scripts/bench-k6/sse.js
+	k6 run -e GATEWAY_URL=$(GATEWAY_URL) -e GATEWAY_KEY=$(KEY) -e VUS=$(VUS) -e DURATION=$(DUR) \
+		-e MODEL=$(MODEL) scripts/bench-k6/sse.js
 
 # ---------------------------------------------------------------------------
 # 出图接线（方案 1：把 k6 的 --summary-export 接到 report.py）——**故意注释掉**，

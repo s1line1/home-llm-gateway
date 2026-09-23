@@ -13,18 +13,27 @@ import { Rate, Counter } from 'k6/metrics';
 
 const BASE = __ENV.GATEWAY_URL || 'http://127.0.0.1:8080';
 const KEY = __ENV.GATEWAY_KEY || 'sk-missing';
+// 与 sse.js 同一套口径：MODEL 必须匹配 agent 声明；默认只断言"没有 5xx"（429 是设计行为），
+// 严格档用 STRICT=1（P3-24）。
+const MODEL = __ENV.MODEL || 'qwen2.5';
+const STRICT = __ENV.STRICT === '1';
 
 const qpsOk = new Rate('qps_success');
 // 状态码分布：报告中可直接看到 200 / 429 / 5xx 各占多少
 const statusCounts = new Counter('http_status_counts');
+const serverErr = new Rate('server_5xx');
 
 export const options = {
   vus: Number(__ENV.VUS || 50),
   duration: __ENV.DURATION || '30s',
   thresholds: {
-    http_req_failed: ['rate<0.01'],       // 断言：失败率 < 1%
+    // 默认只卡真故障：k6 把 429 计进 `http_req_failed`，所以它和 `qps_success` 一起放进
+    // STRICT 档（P3-24）。
+    server_5xx: ['rate<0.01'],
     http_req_duration: ['p(95)<2000'],    // 断言：p95 < 2s
-    'qps_success': ['rate>0.99'],
+    ...(STRICT
+      ? { http_req_failed: ['rate<0.01'], 'qps_success': ['rate>0.99'] }
+      : {}),
   },
 };
 
@@ -33,7 +42,7 @@ export default function () {
   const chat = http.post(
     `${BASE}/v1/chat/completions`,
     JSON.stringify({
-      model: 'qwen2.5',
+      model: MODEL,
       messages: [{ role: 'user', content: 'hi' }],
     }),
     { headers: { Authorization: `Bearer ${KEY}`, 'Content-Type': 'application/json' } },
@@ -44,6 +53,7 @@ export default function () {
   });
 
   qpsOk.add(chat.status === 200);
+  serverErr.add(chat.status >= 500);
   statusCounts.add(1, { code: String(chat.status) });
   check(chat, {
     'chat status 200': (r) => r.status === 200,

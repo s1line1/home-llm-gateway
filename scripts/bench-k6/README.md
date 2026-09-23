@@ -42,17 +42,28 @@ make bench-k6 KEY=$KEY VUS=20 DUR=30s
 | `VUS` | 20（qps.js 为 50） | 并发虚拟用户数 |
 | `DURATION` | 30s | 压测时长 |
 | `CONTENT_LEN` | 100 | SSE 提示词长度（字；mock 逐字 10ms） |
+| `MODEL` | `qwen2.5` | 请求的模型名。**必须匹配 agent 声明的 `models`**（网关按 model 路由）：本地自建栈常见 `mock-llm`/`mock-adm`，用 `-e MODEL=...`（`sweep.sh` / `make bench-k6` 都透传） |
+| `STRICT` | `0` | `1` = 连"每条流都完整（sse）/ 失败率 < 1%（qps）"一起卡死。**默认不卡**，因为 429 是 admission control 的设计行为（见下） |
 
 ## 断言（thresholds）
 
-- `sse.js`：成功率 > 99%、p95 整流耗时 < 5s
-- `qps.js`：失败率 < 1%、p95 < 2s
+默认（`STRICT=0`）只断言**没有 5xx / 没有脚本异常**，另有 p95 延迟上限：
+
+- `sse.js`：`server_5xx < 1%`、p95 整流耗时 < 5s
+- `qps.js`：`server_5xx < 1%`、p95 < 2s
+
+`STRICT=1` 时再加严格档：`sse.js` 成功率 > 99%；`qps.js` `http_req_failed < 1%` 且 `qps_success > 99%`。
+
+> 为什么默认不卡成功率：429 会被算进"失败"，而 agent `max_concurrency`（示例配置是 **2**）配
+> 高 VUS（快速开始是 20）时 **必然** 大量 429 —— 旧版把这套阈值预设成默认，于是 `k6 run` 在一套
+> 完全健康的栈上也会红（P3-24）。想压纯成功率就调大 agent 上限并加 `STRICT=1`。
 
 ## 关于 429
 
 网关按 agent `max_concurrency` 做 admission control（超限返回 429）。这是**设计行为**：
-- 想压 HTTP 层纯吞吐 → 调大 agent 并发上限
+- 想压 HTTP 层纯吞吐 → 调大 agent 并发上限（并考虑加 `STRICT=1`）
 - 想验证 admission 正确性 → 保持小上限，观察 429 比例（见 `cargo test` 的 e2e_admission_control）
+- **别把 429 当故障**：默认阈值口径就是"只有 5xx 才算失败"；429 的绝对量/占比本身就是被观测对象
 
 ## HTTP 层闸门验证（admission.js）
 
