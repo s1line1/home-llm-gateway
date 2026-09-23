@@ -286,12 +286,12 @@ impl Metrics {
     /// 永远报警）。守卫已经保证每 +1 恰好配一次 -1，这里是第二道保险——一处逻辑错误不该把
     /// 仪表盘彻底毁掉。
     fn agent_disconnected(&self) {
-        let _ =
-            self.inner
-                .quic_connections
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                    Some(n.saturating_sub(1))
-                });
+        let _ = self
+            .inner
+            .quic_connections
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_sub(1))
+            });
     }
 
     /// 渲染为 Prometheus 文本格式。
