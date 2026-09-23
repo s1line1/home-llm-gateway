@@ -297,6 +297,35 @@ mod tests {
         assert_eq!(body["error"]["message"], "invalid admin token");
     }
 
+    /// 规格（P3-6）：`/admin/*` 的响应必须带 `Cache-Control: no-store`。
+    ///
+    /// `POST /admin/keys` 的响应体里就是**一次性明文 API key**，列表/用量响应带 key 名与用量
+    /// ——这些都不该被任何共享缓存留存（即便按 RFC，带凭据的请求一般不会被缓存，这仍是
+    /// 显式声明）。401 那条路径也一并钉住：它是同一个 router 的响应。
+    #[tokio::test]
+    async fn admin_responses_are_never_stored_by_caches() {
+        use tower::ServiceExt;
+
+        for (label, auth) in [("带 token", Some("Bearer admin-token")), ("401", None)] {
+            let state = test_state(); // admin_token = Some("admin-token")
+            let mut req = axum::extract::Request::builder().uri("/admin/keys");
+            if let Some(a) = auth {
+                req = req.header(axum::http::header::AUTHORIZATION, a);
+            }
+            let resp = crate::http::app(state)
+                .oneshot(req.body(axum::body::Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.headers()
+                    .get(axum::http::header::CACHE_CONTROL)
+                    .and_then(|v| v.to_str().ok()),
+                Some("no-store"),
+                "{label} 的 admin 响应也必须 no-store"
+            );
+        }
+    }
+
     /// 规格（P3-17）：admin 鉴权与 `/v1` 认证必须共用同一套 Bearer 解析——小写 scheme 也放行。
     #[tokio::test]
     async fn admin_auth_accepts_a_lowercase_bearer_scheme() {
