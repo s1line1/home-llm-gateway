@@ -744,6 +744,8 @@ EIP 带宽抬上去）。
 | 1 MB | 8 | 88.6 rps = **93.0 / 93.0 MB/s** | 99 ms | 118 ms | 0 | 89 ms |
 | 1 MB | 32 | 83.7 rps = **87.8 / 87.8 MB/s**（平台） | 412 ms | 556 ms | 0 | 379 ms |
 | 2 MB | 4 | 43.9 rps = 92.1 / 92.1 MB/s | 98 ms | 111 ms | 0 | 90 ms |
+| 4 MB | 4 | 22.9 rps = **96.2 / 96.2 MB/s** | 189 ms | 209 ms | 0 | 173 ms |
+| 8 MB | 4 | 11.4 rps = **95.9 / 95.9 MB/s** | 384 ms | 417 ms | 0 | 346 ms |
 | 小请求 + **16 MB 流式响应**（`/v1/flood`） | 4 | 164 请求 = **180.9 MB/s**（仅下行） | 369 ms | 398 ms | 0 | 366 ms |
 | SSE（`stream:true`） | 64 | 2 044 rps（受 mock 每字符 10ms 的节奏限制） | 31.5 ms | 35.9 ms | 0 | 29.6 ms |
 
@@ -758,10 +760,11 @@ EIP 带宽抬上去）。
   大 body 能跑多快 / 有没有自伤性瓶颈"，**不能当线上容量**。
 - **`hlmg_forward_ends_total` 全程只有 `upstream_end`**（各档合计 165 万次）⇒ 这段路径没有出现
   截断/超时/协议违规，量的是干净的转发能力。
-- ⚠️ **`mock-llm` 自己有个 2 MB 的请求体上限**（axum `Json` 的默认 `DefaultBodyLimit`，mock 没
-  改），所以 >2 MB 的请求体在本地会拿到 mock 的 413（被 agent 原样转发）或写 body 时被 reset
-  （agent 回 502 `local upstream request failed`）——那是**测试上游**的限制，不是网关/agent 的。
-  要压更大的请求体，得先给 mock 放宽这个上限。
+- ⚠️ **`mock-llm` 曾经有个 2 MB 的请求体上限**（axum `Json` 的默认 `DefaultBodyLimit`）：>2 MB 的
+  请求体在本地会拿到 mock 的 413（被 agent 原样转发）或写 body 时被 reset（agent 回 502
+  `local upstream request failed`）——那是**测试上游**的限制，不是网关/agent 的，却会把"能不能扛
+  大 body"的测试卡在无关的地方。**2026-09-22 已放宽到 32 MiB**（`MOCK_MAX_REQUEST_BODY`，网关上限
+  的两倍），上面 4 MB / 8 MB 两行就是放宽之后的数。
 
 #### 768 并发档：心跳零余量与重连风暴（机制已定位，代码已修）
 
