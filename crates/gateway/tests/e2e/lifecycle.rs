@@ -541,7 +541,11 @@ async fn spawn_split_frame_agent(
     .await
     .unwrap();
     reg_send.finish().unwrap();
-    let _ = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut reg_recv)).await;
+    let _ = tokio::time::timeout(
+        Duration::from_secs(2),
+        FrameReader::new(&mut reg_recv).next(),
+    )
+    .await;
     wait_for_agents(gw, 1, Duration::from_secs(5)).await;
 
     let (half_tx, half_rx) = tokio::sync::oneshot::channel();
@@ -617,7 +621,7 @@ async fn spawn_split_frame_agent(
 /// 规格（记录 P3-26）：**关停的阶段变化不许吃掉已经读了一半的帧**。
 ///
 /// `forward_body` 的读帧 `select!` 里有三个分支，其中 `shutdown.changed()` 是 `continue`
-/// ——也就是**复用同一条流**。用不可取消的 `read_frame`（内部 `read_exact`）时，阶段变化恰好
+/// ——也就是**复用同一条流**。用当时那条不可取消的读路径（内部 `read_exact`）时，阶段变化恰好
 /// 落在帧中途会让被 drop 的 future 带走已读字节，下一轮按错误偏移解析长度前缀：帧错位，
 /// 客户端拿到的是读取错误而不是后半块。`docs/refactor-assessment.md:243` 早就写明"今天安全
 /// 只因为读侧只有一个任务，有人加第三分支就会静默丢半帧"——`c62df2b` 加的正是这个分支。
@@ -671,7 +675,7 @@ async fn e2e_a_frame_split_by_a_shutdown_phase_change_is_not_misparsed() {
     let resp = response.await.unwrap().unwrap();
     assert_eq!(resp.status(), 200, "响应头在关停前就已经发出去了");
     // 帧错位后网关只能中止响应体，客户端读到的是**破损的分块编码**而不是一句错误文案
-    // （实测退回 `read_frame` 时报 "unexpected EOF during chunk size line"）。
+    // （实测退回旧读路径时报 "unexpected EOF during chunk size line"）。
     let body = match resp.text().await {
         Ok(body) => body,
         Err(e) => panic!("响应体读到一半断了——帧错位后网关中止了响应体（P3-26 的红）：{e}"),

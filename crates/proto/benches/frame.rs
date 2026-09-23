@@ -4,7 +4,7 @@
 use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
-use proto::io::{read_frame, write_frame};
+use proto::io::{write_frame, FrameReader};
 use proto::Frame;
 
 fn frame_fixtures() -> Vec<Frame> {
@@ -69,8 +69,8 @@ fn bench_roundtrip(c: &mut Criterion) {
                     let mut buf = Vec::with_capacity(1024);
                     rt.block_on(async {
                         write_frame(&mut buf, &f).await.unwrap();
-                        let mut reader = buf.as_slice();
-                        black_box(read_frame(&mut reader).await.unwrap())
+                        let mut reader = FrameReader::new(buf.as_slice());
+                        black_box(reader.next().await.unwrap())
                     });
                     black_box(buf.len())
                 },

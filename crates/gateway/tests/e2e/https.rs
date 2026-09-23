@@ -157,7 +157,7 @@ async fn e2e_quic_control_stream_edge_frames() {
     .await
     .unwrap();
     rs.finish().unwrap();
-    let _ = bounded("read the register reply", read_frame(&mut rr)).await;
+    let _ = bounded("read the register reply", FrameReader::new(&mut rr).next()).await;
     assert_eq!(gw.agent_count(), 1);
 
     // 控制流上发非预期帧（Cancel）→ 服务端走 "unexpected frame" 分支，连接不受影响
@@ -169,7 +169,7 @@ async fn e2e_quic_control_stream_edge_frames() {
     send.finish().unwrap();
     let _ = bounded(
         "read until the unexpected-frame stream ends",
-        read_frame(&mut recv),
+        FrameReader::new(&mut recv).next(),
     )
     .await;
 
@@ -193,7 +193,7 @@ async fn e2e_quic_control_stream_edge_frames() {
     send3.finish().unwrap();
     let _ = bounded(
         "read until the ghost-heartbeat stream ends",
-        read_frame(&mut recv3),
+        FrameReader::new(&mut recv3).next(),
     )
     .await;
 
@@ -228,7 +228,11 @@ async fn e2e_quic_control_stream_edge_frames() {
     .await
     .unwrap();
     rs2.finish().unwrap();
-    let _ = bounded("read the second register reply", read_frame(&mut rr2)).await;
+    let _ = bounded(
+        "read the second register reply",
+        FrameReader::new(&mut rr2).next(),
+    )
+    .await;
     assert_eq!(gw.agent_count(), 1);
     conn2.close(0u32.into());
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -321,7 +325,11 @@ async fn e2e_proxy_protocol_edge_cases() {
     .await
     .unwrap();
     rs.finish().unwrap();
-    let _ = bounded("read the raw agent's register reply", read_frame(&mut rr)).await;
+    let _ = bounded(
+        "read the raw agent's register reply",
+        FrameReader::new(&mut rr).next(),
+    )
+    .await;
 
     // 应答循环：按场景序号对每个代理流给出不同的（异常）响应
     let client_task = tokio::spawn(async move {
@@ -333,7 +341,7 @@ async fn e2e_proxy_protocol_edge_cases() {
                 Err(_) => break,
             };
             let (mut recv, mut send) = stream.split();
-            let _ = read_frame(&mut recv).await; // 丢弃 ProxyRequest
+            let _ = FrameReader::new(&mut recv).next().await; // 丢弃 ProxyRequest
             match sc {
                 0 => {
                     // 直接回 Error 帧作为响应头

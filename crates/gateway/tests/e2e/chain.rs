@@ -462,13 +462,13 @@ async fn e2e_concurrent_cold_requests_hash_once() {
 /// 规格：**客户端断开后，agent 槽位必须立刻释放**，不能等到上游下次产出。
 ///
 /// 场景是"上游静默"：`/v1/slow_body` 立刻回响应头，之后 3s（`SLOW_BODY_STALL`）才吐第一块。
-/// 客户端拿到响应头就断开——此时网关正停在 `forward_body` 的 `read_frame` 上，`tx.send`
+/// 客户端拿到响应头就断开——此时网关正停在 `forward_body` 的读帧上，`tx.send`
 /// 根本不会被调用。
 ///
 /// 修复前：断开只能在 `tx.send()` 失败时被发现 → 要么等上游 3s 后吐帧，要么等满
 /// `idle_timeout`（本用例给 30s）才发 Cancel、才释放槽位。这就是 `REBUILD.md` §4.7 登记的
 /// 缺口，而"用户看到卡顿就取消"是最常见的交互形态。
-/// 修复后：`tx.closed()` 与 `read_frame` 在同一个 `select!` 里，断开即时可见。
+/// 修复后：`tx.closed()` 与读帧在同一个 `select!` 里，断开即时可见。
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn e2e_client_disconnect_while_upstream_is_silent_releases_the_slot() {
@@ -601,7 +601,7 @@ async fn e2e_tunnel_request_id_is_unique_across_x_request_id_shapes() {
     .await
     .unwrap();
     rs.finish().unwrap();
-    let _ = bounded("read the register reply", read_frame(&mut rr)).await;
+    let _ = bounded("read the register reply", FrameReader::new(&mut rr).next()).await;
     drop((rs, rr));
     wait_for_agents(&gw, 1, Duration::from_secs(10)).await;
 
@@ -613,7 +613,7 @@ async fn e2e_tunnel_request_id_is_unique_across_x_request_id_shapes() {
                 _ => break,
             };
             let (mut recv, mut send) = stream.split();
-            let request_id = match read_frame(&mut recv).await {
+            let request_id = match FrameReader::new(&mut recv).next().await {
                 Ok(Some(Frame::ProxyRequest { request_id, .. })) => request_id,
                 _ => continue,
             };
@@ -862,7 +862,7 @@ async fn e2e_an_oversized_response_chunk_is_refused() {
     reg_send.finish().unwrap();
     let _ = bounded(
         "read the oversized agent's register reply",
-        read_frame(&mut reg_recv),
+        FrameReader::new(&mut reg_recv).next(),
     )
     .await;
     wait_for_agents(&gw, 1, Duration::from_secs(5)).await;
@@ -871,7 +871,7 @@ async fn e2e_an_oversized_response_chunk_is_refused() {
         let _keep_alive = (client, reg_recv);
         while let Ok(Some(stream)) = conn.accept_bidirectional_stream().await {
             let (mut recv, mut send) = stream.split();
-            let _ = read_frame(&mut recv).await; // 丢弃 ProxyRequest
+            let _ = FrameReader::new(&mut recv).next().await; // 丢弃 ProxyRequest
             write_frame(
                 &mut send,
                 &Frame::ProxyResponseHead {

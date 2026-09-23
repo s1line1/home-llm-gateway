@@ -10,7 +10,7 @@ pub use std::{
 pub use agent::{Agent, AgentConfig};
 pub use gateway::{Gateway, GatewayConfig, Options, TlsPem, TunnelTls};
 pub use proto::{
-    io::{read_frame, write_frame},
+    io::{write_frame, FrameReader},
     Frame,
 };
 pub use rcgen::{
@@ -428,7 +428,11 @@ pub async fn spawn_raw_agent(
     .await
     .unwrap();
     reg_send.finish().unwrap();
-    let _ = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut reg_recv)).await;
+    let _ = tokio::time::timeout(
+        Duration::from_secs(2),
+        FrameReader::new(&mut reg_recv).next(),
+    )
+    .await;
     wait_for_agents(gw, 1, Duration::from_secs(5)).await;
 
     tokio::spawn(async move {

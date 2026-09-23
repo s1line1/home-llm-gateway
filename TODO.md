@@ -404,7 +404,7 @@
       1. 选型：**prost**（prost + prost-build + protoc，build.rs 编译期生成）；备选 rust-protobuf（免 protoc）
       2. Schema：`Frame { oneof kind { register=1 ... error=8 } }` + 各 message（字段编号见设计文档）；
          长度前缀 framing 不变（`[u32 大端长度][protobuf 字节]`）
-      3. **关键设计：内部 Frame 枚举保留，只换编解码层**——`io.rs` 的 write_frame/read_frame
+      3. **关键设计：内部 Frame 枚举保留，只换编解码层**——`io.rs` 的 write_frame / `FrameReader`
          签名不变，gateway/agent 调用方几乎零改动；tests 重写
       4. 迁移策略：一次性切换 + **版本校验**（版本号 0.2.0；Register.version 已存在，
          gateway 拒绝 <0.2.0 的 agent，避免双端不同步静默解析失败）；不做双协议共存
@@ -651,17 +651,24 @@
 - [ ] **R2 按帧类型分设长度上限**：`MAX_FRAME = 64 MiB` 硬编码，且按声明长度直接
       `vec![0u8; len]`（`crates/proto/src/io.rs:11,54-62`）——敌意前缀声明 64 MiB 就真分配 64 MiB。
       目标：上限按帧类型分设，分配量对声明值不敏感（计数型分配器断言）。
-- [ ] **R3 读路径合一（取消安全）**：现在有两条读路径——`read_frame`
-      （`crates/proto/src/io.rs:43`，`read_exact` 包装、不可取消）与 `FrameReader`
-      （`io.rs:100`，走 `DribbleReader`，`io.rs:287`，可取消）。目标：只留可取消的那条。
-      **2026-09-22 进展（P3-26）**：`forward.rs` 的读帧 `select!` 是唯一的**危险**调用点
-      （`shutdown.changed()` 分支 `continue` ⇒ 复用同一条流；阶段变化落在帧中途时
-      `read_frame` 会把已读字节带走 ⇒ 帧错位），现已换成循环外的 `FrameReader::new(recv)`
-      + `reader.next()`。剩下用 `read_frame` 的地方都**没有"落败后复用同一条流"**这回事：
-      `quic.rs` 控制流（每流只读一帧，读完就 `finish`）、`head.rs`（整段包在
-      `timeout(head_timeout, ..)` 里）、agent 侧注册/心跳回包（结果被忽略）、benches。
-      证据：e2e `lifecycle::e2e_a_frame_split_by_a_shutdown_phase_change_is_not_misparsed`
-      （先红：退回 `read_frame` 后客户端报 `unexpected EOF during chunk size line`）。
+- [x] **R3 读路径合一（取消安全）（2026-09-22 完成）**：原状是两条读路径——`read_frame`
+      （`read_exact` 包装、不可取消）与 `FrameReader`（可取消），而"在 `select!` 里必须用可取消
+      那条"只写在注释里。现在**全项目只剩 `FrameReader` 一条**（`read_frame` 已删除）：
+      1. **响应头/响应体共用一个 reader**：`proxy/mod.rs` 用 `FrameReader::new(recv)`（移动 `recv`）
+         建好，先交给 `await_head`，再把**同一个** reader 交给 `forward_body`。这条不只是为了取消
+         安全——`FrameReader` 会按 8KiB **预读**，用临时 reader 读头会把预读到的响应体字节一起丢掉。
+         相关单测相应改名：`a_body_after_the_head_stays_in_the_shared_reader`（判据从"还在流里"
+         改成"同一个 reader 还能读到"）。
+      2. **控制流**（`quic.rs`）改用即建即弃的 `FrameReader`：每条流只读一帧、读完丢流，预读余量
+         没有下一个消费者，行为与旧路径等价。
+      3. **删除 `proto::io::read_frame`**，并把 benches、e2e（14 处）、agent 单测（3 处）迁到
+         `FrameReader`；`proto` 的既有 FrameReader 测试套件（roundtrip / EOF / 截断 / 超大前缀 /
+         取消安全 / 缓冲容量）已覆盖被删用例的语义，另外把"invalid postcard 载荷"、"半个长度前缀"、
+         "非 EOF 读错误传播"三条改写为 FrameReader 版本（语义一字不改）。
+      **效果**：R4 那类"两个 reader 对同一段字节给出两种判断"的分叉在结构上不可能再出现；
+      `select!` 里也没有第二个选择可误用。**验证**：`cargo test --workspace` 全绿
+      （gateway lib 173、e2e 61、proto 24、agent 32、mock-llm 1+1）；e2e 里 `lifecycle` 那条
+      "阶段变化落在帧中途"的用例（P3-26 先红后绿的护栏）继续通过。
 - [x] **R4 EOF 四格分明（2026-09-22 完成）**：`read_frame` 读 4 字节前缀时**任何
       `UnexpectedEof` 都返回 `Ok(None)`**（`crates/proto/src/io.rs:47-53`）——1–3 字节的头部
       截断被当成干净关闭；`FrameReader` 那侧早就分清了（`io.rs:108-115`），于是同一条线上的

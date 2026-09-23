@@ -41,65 +41,17 @@ where
     Ok(())
 }
 
-/// 读取一帧。流被对端干净关闭时返回 `Ok(None)`。
-///
-/// "干净关闭"的判据是**一个字节都没读到**：长度前缀只收到一部分（1–3 字节）就 EOF
-/// 属于**截断**，返回 `UnexpectedEof`——与 [`FrameReader::next`] 的判据一致。
-/// （曾经这里把前缀 `read_exact` 的任何 `UnexpectedEof` 都当成干净关闭，于是半个帧头
-/// 被说成"对端正常收工"，协议违规在指标里变成对端的有序关闭。）
-///
-/// ⚠️ **不可安全取消**：在读满当前帧之前落败会丢掉已读字节。
-/// 凡是要在 `select!` 里一边等帧一边等别的东西（如同时监听 `Cancel`），
-/// 必须改用 [`FrameReader::next`]。
-pub async fn read_frame<R>(r: &mut R) -> io::Result<Option<Frame>>
-where
-    R: AsyncRead + Unpin,
-{
-    // 前缀只能自己逐段读：`read_exact` 把"一字节没读到"和"读到一半"都报成
-    // `UnexpectedEof`，却不告诉你它填了几个字节。
-    let mut len_buf = [0u8; 4];
-    let mut filled = 0;
-    while filled < len_buf.len() {
-        match r.read(&mut len_buf[filled..]).await {
-            Ok(0) => {
-                return if filled == 0 {
-                    Ok(None)
-                } else {
-                    Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "early eof: truncated frame header",
-                    ))
-                };
-            }
-            Ok(n) => filled += n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
-        }
-    }
-    let len = u32::from_be_bytes(len_buf) as usize;
-    if len > MAX_FRAME {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "frame too large",
-        ));
-    }
-    let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf).await?;
-    let frame =
-        postcard::from_bytes(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    Ok(Some(frame))
-}
-
 /// 可安全取消的帧读取器：把半读状态（已收字节 + 目标长度）保存在**自身**，
 /// 因此使用方在 `select!` 中落败（future 被 drop）时不会丢掉已读字节。
 ///
-/// 为什么必须有这个类型：`read_frame` 内部用 `read_exact`，tokio 明确标注它
-/// **not cancellation safe**——落败时"已读进局部缓冲的字节"随之消失，下一次读取
-/// 就会按错误偏移解析长度前缀（帧错位）。本类型唯一的 await 是
+/// 为什么需要这种形状（记录 R3 的前身）：早先另有一条"直接 `read_exact` 一帧"的读路径，
+/// tokio 明确标注 `read_exact` **not cancellation safe**——落败时"已读进局部缓冲的字节"
+/// 随之消失，下一次读取就会按错误偏移解析长度前缀（帧错位）。本类型唯一的 await 是
 /// `AsyncReadExt::read`（tokio 保证取消安全：落败时"没有读到任何数据"），
 /// 且解析进度全部落在字段上，所以任何 await 点被打断都可安全重入。
 ///
-/// 用法：凡是要在 `select!` 里同时等帧和等别的东西，都必须用它而不是 `read_frame`。
+/// **现在全项目只剩这一条读路径**（记录 R3）：`select!` 里、响应头/响应体跨阶段交接处
+/// （两者共用同一个 reader）、控制流一帧即弃处，用的都是它。
 pub struct FrameReader<R> {
     inner: R,
     /// 已收到、尚未组成完整帧的字节（长度前缀 + 载荷）。
@@ -196,139 +148,45 @@ mod tests {
     use bytes::Bytes;
 
     #[tokio::test]
-    async fn roundtrip_all_frame_types() {
-        let frames = vec![
-            Frame::Register {
-                agent_id: "home-1".into(),
-                models: vec!["mock-llm".into()],
-                max_concurrency: 4,
-                version: "0.1.0".into(),
-            },
-            Frame::Heartbeat {
-                agent_id: "home-1".into(),
-                inflight: 3,
-            },
-            Frame::ProxyRequest {
-                request_id: 42,
-                method: "POST".into(),
-                path: "/v1/chat/completions?stream=true".into(),
-                headers: vec![("content-type".into(), "application/json".into())],
-                body: Bytes::from_static(b"{\"model\":\"x\"}"),
-            },
-            Frame::ProxyResponseHead {
-                request_id: 42,
-                status: 200,
-                headers: vec![("content-type".into(), "text/event-stream".into())],
-            },
-            Frame::ProxyResponseBody {
-                request_id: 42,
-                chunk: Bytes::from_static(b"data: {...}\n\n"),
-            },
-            Frame::ProxyResponseEnd {
-                request_id: 42,
-                ok: true,
-            },
-            Frame::Cancel { request_id: 42 },
-            Frame::Error {
-                request_id: Some(42),
-                code: 502,
-                message: "upstream error".into(),
-            },
-        ];
-
-        let mut buf: Vec<u8> = Vec::new();
-        for f in &frames {
-            write_frame(&mut buf, f).await.unwrap();
-        }
-
-        let mut reader = buf.as_slice();
-        let mut out = Vec::new();
-        while let Some(f) = read_frame(&mut reader).await.unwrap() {
-            out.push(f);
-        }
-        assert_eq!(out, frames);
-    }
-
-    #[tokio::test]
-    async fn clean_eof_returns_none() {
-        let mut empty: &[u8] = &[];
-        assert!(read_frame(&mut empty).await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn oversized_len_prefix_rejected() {
-        // 长度前缀超过 MAX_FRAME → 直接拒绝，不分配大块内存
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&u32::MAX.to_be_bytes());
-        let err = read_frame(&mut buf.as_slice()).await.unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-        assert!(err.to_string().contains("too large"), "err: {err}");
-    }
-
-    #[tokio::test]
-    async fn invalid_postcard_payload_rejected() {
+    async fn frame_reader_invalid_postcard_payload_rejected() {
         // 长度合法但字节不是合法 postcard → 反序列化错误
         let mut buf = Vec::new();
         buf.extend_from_slice(&4u32.to_be_bytes());
         buf.extend_from_slice(&[0xff, 0xff, 0xff, 0xff]);
-        let err = read_frame(&mut buf.as_slice()).await.unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-    }
-
-    #[tokio::test]
-    async fn truncated_frame_errors_not_none() {
-        // 声明 10 字节只给了 3 字节：中途 EOF 应报错（区别于干净 EOF 的 None）
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&10u32.to_be_bytes());
-        buf.extend_from_slice(&[1, 2, 3]);
-        let err = read_frame(&mut buf.as_slice()).await.unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        let mut reader = FrameReader::new(buf.as_slice());
+        let err = reader.next().await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     /// 规格（记录 R4）：**半个长度前缀不算干净关闭**。
     ///
-    /// 触发：对端只写出 1–3 字节的长度前缀就 FIN（写入中途被放弃、进程被杀、
-    /// 连接被掐）。以前 `read_frame` 把前缀 `read_exact` 的任何 `UnexpectedEof`
-    /// 都映射成 `Ok(None)`，于是这种截断被当成"对端有序收工"：`forward` 侧记成
-    /// `UpstreamClosed` 而不是读取错误，`quic` 侧记成"注册前就关了"。
-    /// 只有**一个字节都没读到**才是干净关闭。
+    /// 触发：对端只写出 1–3 字节的长度前缀就 FIN（写入中途被放弃、进程被杀、连接被掐）。
+    /// 当年那条读路径把前缀 `read_exact` 的任何 `UnexpectedEof` 都映射成 `Ok(None)`，于是这种
+    /// 截断被当成"对端有序收工"：`forward` 侧记成 `UpstreamClosed` 而不是读取错误，`quic` 侧记成
+    /// "注册前就关了"。只有**一个字节都没读到**才是干净关闭。
+    ///
+    /// 记录 R3 之后全项目只剩 [`FrameReader`] 这一条读路径，所以这条规格现在只钉它一处。
     #[tokio::test]
-    async fn a_truncated_length_prefix_is_not_a_clean_close() {
+    async fn frame_reader_a_truncated_length_prefix_is_not_a_clean_close() {
         // 0 字节 = 干净关闭（对端开了流又什么都不发就关，是合法的）
-        let mut empty: &[u8] = &[];
-        assert!(read_frame(&mut empty).await.unwrap().is_none());
+        let mut empty = FrameReader::new(&[][..]);
+        assert!(empty.next().await.unwrap().is_none());
 
         // 1–3 字节 = 截断
         for n in 1..4usize {
             let mut prefix: &[u8] = &vec![0u8; n];
-            let err = read_frame(&mut prefix)
+            let mut reader = FrameReader::new(&mut prefix);
+            let err = reader
+                .next()
                 .await
                 .expect_err("只给了前缀的一部分就 EOF，不该当成干净关闭");
-            assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof, "n={n}");
+            assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "n={n}");
         }
 
         // 慢喂（每次 1 字节）下同样要认出来——不能依赖"一次 read 就能拿到整段前缀"
-        let mut dribble = DribbleReader::new(vec![0u8; 3]);
-        let err = read_frame(&mut dribble).await.unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
-    }
-
-    #[tokio::test]
-    async fn large_body_roundtrip() {
-        // 64KiB body 跨长度前缀正确编解码
-        let frame = Frame::ProxyResponseBody {
-            request_id: 7,
-            chunk: vec![0xabu8; 64 * 1024].into(),
-        };
-        let mut buf = Vec::new();
-        write_frame(&mut buf, &frame).await.unwrap();
-        assert!(
-            buf.len() > 64 * 1024,
-            "serialized size should exceed body size"
-        );
-        let mut reader = buf.as_slice();
-        let got = read_frame(&mut reader).await.unwrap().unwrap();
-        assert_eq!(got, frame);
+        let mut dribble = FrameReader::new(DribbleReader::new(vec![0u8; 3]));
+        let err = dribble.next().await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 
     /// 总是返回错误的读取器，用于触发非 EOF 的读错误分支。
@@ -345,11 +203,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_eof_read_error_propagates() {
+    async fn frame_reader_non_eof_read_error_propagates() {
         // 非 EOF 的底层读错误应直接向上传播（区别于干净 EOF 的 None）
-        let mut reader = ErrReader;
-        let err = read_frame(&mut reader).await.unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        let mut reader = FrameReader::new(ErrReader);
+        let err = reader.next().await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other);
         assert_eq!(err.to_string(), "boom");
     }
 
@@ -405,11 +263,11 @@ mod tests {
     /// 规格：帧读取**必须可安全取消**——在 `select!` 中落败（future 被 drop）后
     /// 不得丢失已读字节，下一次读取仍要拿到完整的帧。
     ///
-    /// 背景：`read_frame` 内部是 `read_exact`，tokio 明确标注它 **not cancellation
+    /// 背景：旧的那条读路径内部是 `read_exact`，tokio 明确标注它 **not cancellation
     /// safe**（落败时"some data may already have been read into buf"）。而 agent 的
     /// `handle_stream` 直接把它当作 `select!` 分支用：落败分支一赢就丢掉半读的帧，
     /// 后续按长度前缀错位解析——网关发来的 `Cancel` 被静默丢弃，取消传播失效、
-    /// 上游 token 继续白烧（与设计意图相反）。
+    /// 上游 token 继续白烧（与设计意图相反）。这条测试就是那次重写的护栏。
     #[tokio::test]
     async fn frame_reader_survives_cancel_mid_frame() {
         let body = Frame::ProxyResponseBody {
@@ -437,8 +295,8 @@ mod tests {
         assert_eq!(reader.next().await.unwrap(), Some(cancel));
     }
 
-    /// FrameReader 必须与 `read_frame` 保持完全相同的帧语义——本次为了取消安全性
-    /// 重写了长度前缀解析，以下四条是那次重写的护栏（EOF / 截断 / 超大前缀 / 全帧型）。
+    /// 帧语义护栏：这条读路径当年为了取消安全性重写了长度前缀解析，必须与旧读路径
+    /// **逐字节等价**。以下是那次重写的四条护栏（EOF / 截断 / 超大前缀 / 全帧型）。
     #[tokio::test]
     async fn frame_reader_roundtrip_all_frame_types() {
         let frames = vec![
@@ -487,7 +345,7 @@ mod tests {
         while let Some(f) = reader.next().await.unwrap() {
             out.push(f);
         }
-        assert_eq!(out, frames, "FrameReader 必须与 read_frame 解码结果一致");
+        assert_eq!(out, frames, "逐帧解码结果必须与写出去的一致");
 
         // 逐 2 字节慢喂的 reader：缓冲累积逻辑也必须正确（跨多次 poll 拼帧）
         let mut dribble = FrameReader::new(DribbleReader::new(wire));
@@ -542,30 +400,6 @@ mod tests {
         let mut reader = FrameReader::new(buf.as_slice());
         let err = reader.next().await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
-    }
-
-    /// 规格（记录 R4）：两个读取器对"半个长度前缀"必须给出**同一个**判断。
-    ///
-    /// 两个实现分叉过一次：`read_frame` 说那是干净关闭，`FrameReader` 说那是
-    /// `early eof`。同一条线上的同一段字节不该有两种解释。
-    #[tokio::test]
-    async fn both_readers_agree_that_a_half_header_is_truncation_not_eof() {
-        for n in 0..4usize {
-            let bytes = vec![0u8; n];
-            let plain = read_frame(&mut bytes.as_slice()).await;
-            let mut reader = FrameReader::new(bytes.as_slice());
-            let cancellable = reader.next().await;
-            match (&plain, &cancellable) {
-                (Ok(None), Ok(None)) => assert_eq!(n, 0, "只有 0 字节才算干净关闭"),
-                (Ok(None), _) | (_, Ok(None)) => {
-                    panic!(
-                        "n={n}: 两个读取器判断不一致——plain={plain:?} cancellable={cancellable:?}"
-                    )
-                }
-                (Err(a), Err(b)) => assert_eq!(a.kind(), b.kind(), "n={n}"),
-                _ => panic!("n={n}: plain={plain:?} cancellable={cancellable:?}"),
-            }
-        }
     }
 
     /// 规格（记录 P2-5）：**大帧读完之后，峰值容量必须还回去**。

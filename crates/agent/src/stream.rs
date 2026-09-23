@@ -1,3 +1,4 @@
+use anyhow::Context as _;
 use futures_util::StreamExt;
 use proto::{
     headers::{is_client_credential, is_hop_by_hop},
@@ -171,15 +172,20 @@ pub async fn handle_stream(
 
     let mut reader = FrameReader::new(recv);
 
+    let first = reader
+        .next()
+        .await
+        .context("reading the first frame of a proxy stream")?;
     let Some(Frame::ProxyRequest {
         request_id,
         method,
         path,
         headers,
         body,
-    }) = reader.next().await?
+    }) = first
     else {
-        anyhow::bail!("expect ProxyRequest frame");
+        // 记录 P2-2：这条以前是静默的（错误被 spawn 处的 `let _ =` 吞掉）
+        anyhow::bail!("first frame is not a ProxyRequest: {first:?}");
     };
 
     // 拼 URL 前的守卫（纵深防御第二道）：不合法就当场回 400，既不发上游、也不起监听任务。
@@ -207,13 +213,38 @@ pub async fn handle_stream(
         }
     });
 
-    let rb = http.request(reqwest::Method::from_bytes(method.as_bytes())?, url);
+    // 方法非法 = 客户端发来的请求本身有问题：回 400（和路径守卫同一口径），别让它变成
+    // 一条"上游关闭了"的通用 502（记录 P2-2：这条以前也是静默的）。
+    let Ok(method) = reqwest::Method::from_bytes(method.as_bytes()) else {
+        warn!(
+            request_id,
+            method = %method,
+            "rejecting request: invalid HTTP method"
+        );
+        let _ = write_frame(
+            &mut send,
+            &Frame::Error {
+                request_id: Some(request_id),
+                code: 400,
+                message: "invalid request method".into(),
+            },
+        )
+        .await;
+        // 带上与 `forward` 失败同款的上下文（记录 P2-2：accept 循环只打一行 `{e:#}`）
+        return Err(anyhow::anyhow!(
+            "invalid HTTP method in ProxyRequest: {method:?}"
+        ))
+        .with_context(|| format!("request_id={request_id} path={path}"));
+    };
+    let rb = http.request(method, url);
 
     // ③ 干活：只持有 send 半
     let result = forward(send, request_id, rb, headers, body, request_log, &cancel).await;
 
     listener.abort(); // 无论成败都收掉监听任务
-    result
+                      // 记录 P2-2：把"哪个请求、哪条路径"挂进错误链。调用方（`connect_once` 的 accept 循环）
+                      // 用 `{e:#}` 打一行，于是每条失败都有一条带上下文的 warn，而不是静默消失。
+    result.with_context(|| format!("request_id={request_id} path={path}"))
 }
 
 async fn forward(
@@ -242,7 +273,25 @@ async fn forward(
     let send_fut = rb.send();
     tokio::pin!(send_fut);
     let resp = tokio::select! {
-        r = &mut send_fut => r?,
+        r = &mut send_fut => match r {
+            Ok(resp) => resp,
+            Err(e) => {
+                // 记录 P2-2：本地上游连不上（LLM 没起、崩了、端口不对）是运维最常见的一类故障。
+                // 以前它表现成"客户端拿到通用 502 upstream closed before responding、agent 一行
+                // 日志都没有"。现在：客户端拿到一条**点名原因但不说内部拓扑**的 502，细节进日志。
+                let _ = write_frame(
+                    &mut send,
+                    &Frame::Error {
+                        request_id: Some(request_id),
+                        code: 502,
+                        // 故意不带 reqwest 的原文（里面有内网地址/端口）
+                        message: "local upstream request failed".into(),
+                    },
+                )
+                .await;
+                return Err(e).context("sending the request to the local upstream");
+            }
+        },
         _ = cancel.cancelled() => {
             return send_cancelled(&mut send, request_id).await;
         }

@@ -10,7 +10,7 @@
 //! 判定与记账在注册表，状态码与文案是外部契约，留在调用侧）。
 
 use axum::http::StatusCode;
-use proto::{io::read_frame, Frame};
+use proto::{io::FrameReader, Frame};
 use tracing::warn;
 
 use crate::registry::{Disposition, Entry, HeadSilence};
@@ -42,13 +42,17 @@ enum HeadOutcome {
 /// `Debug` 会连 `Bytes` 载荷一起打，一个坏 agent 发来的大帧就是一行巨大日志（见
 /// [`Frame::kind`]）。兼容性也要求容忍：新旧版本两端可能多出对方不认识的帧。
 ///
-/// 泛型只为可测：生产传 `s2n_quic::stream::ReceiveStream`，测试传一段线上字节。
-async fn read_head<R>(recv: &mut R, request_id: u64) -> anyhow::Result<HeadOutcome>
+/// 泛型只为可测：生产传 `FrameReader<ReceiveStream>`，测试传 `FrameReader<&[u8]>`。
+///
+/// 读的是**调用方持有的那个 reader**（记录 R3：全项目只剩这一条读路径）：`await_head` 与
+/// 其后的 `forward_body` 共用同一个 `FrameReader`，所以这里预读进 reader 缓冲的响应体字节
+/// 不会丢——换成"临时 reader 读头"就会丢掉那些字节（`FrameReader` 会按 8KiB 预读）。
+async fn read_head<R>(reader: &mut FrameReader<R>, request_id: u64) -> anyhow::Result<HeadOutcome>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
     loop {
-        match read_frame(recv).await? {
+        match reader.next().await? {
             Some(Frame::ProxyResponseHead {
                 status: s,
                 headers: h,
@@ -98,14 +102,17 @@ where
 /// 客户端早就超时断开，而网关还停在读上，连"客户端已断开"都发现不了
 /// （实测 40 并发 → 620MB 内存被钉住、日志停更）。也不能用 `tunnel_op_timeout`（2s）：
 /// 上游"思考"是合法的，本地模型 1–3s 很常见。
-pub(super) async fn await_head(
+pub(super) async fn await_head<R>(
     state: &AppState,
-    recv: &mut s2n_quic::stream::ReceiveStream,
+    reader: &mut FrameReader<R>,
     send: &mut s2n_quic::stream::SendStream,
     entry: &Entry,
     request_id: u64,
-) -> Result<(StatusCode, Vec<(String, String)>), RouteFailure> {
-    let head = tokio::time::timeout(state.head_timeout, read_head(recv, request_id)).await;
+) -> Result<(StatusCode, Vec<(String, String)>), RouteFailure>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let head = tokio::time::timeout(state.head_timeout, read_head(reader, request_id)).await;
     match head {
         Ok(Ok(HeadOutcome::Head(s, h))) => {
             // 对端真的回了响应头 = 这条隧道是活的 → 清掉连续超时计数。
@@ -226,7 +233,7 @@ mod tests {
             },
         ])
         .await;
-        let mut reader = bytes.as_slice();
+        let mut reader = FrameReader::new(bytes.as_slice());
 
         match read_head(&mut reader, 7).await.unwrap() {
             HeadOutcome::Head(status, headers) => {
@@ -236,9 +243,9 @@ mod tests {
             other => panic!("头之前的 body 按契约应被忽略，实际：{other:?}"),
         }
 
-        // 被忽略的那一块确实**读掉了**（不是留在流里再被当成别的帧）：下一帧应当就是"头之后"
-        // 的那块 hello——这条同时说明"忽略"的代价（数据真的没了），别把它当成无损操作。
-        let next = proto::io::read_frame(&mut reader).await.unwrap();
+        // 被忽略的那一块确实**读掉了**（不是留在 reader 里再被当成别的帧）：下一帧应当就是
+        // "头之后"的那块 hello——这条同时说明"忽略"的代价（数据真的没了），别当成无损操作。
+        let next = reader.next().await.unwrap();
         match next {
             Some(Frame::ProxyResponseBody { chunk, .. }) => {
                 assert_eq!(&chunk[..], b"hello\n", "被忽略的那一块不会补回来");
@@ -247,10 +254,11 @@ mod tests {
         }
     }
 
-    /// 对照：**头之后的**响应体不归本函数管（它由 `forward_body` 转发），本函数在拿到头时
-    /// 就必须返回，不能顺手把后面的块也读掉——否则那些字节就丢了。
+    /// 对照：**头之后的**响应体不归本函数管（它由 `forward_body` 转发）：本函数拿到头就返回，
+    /// 不能顺手把后面的块也读掉。改造后（记录 R3）"剩下的字节"待在**共享 reader 的缓冲**里，
+    /// 由下一阶段继续读——所以判据从"还在流里"变成"同一个 reader 还能读到"。
     #[tokio::test]
-    async fn a_body_after_the_head_is_left_in_the_stream() {
+    async fn a_body_after_the_head_stays_in_the_shared_reader() {
         let bytes = wire(&[
             head_200(),
             Frame::ProxyResponseBody {
@@ -259,7 +267,7 @@ mod tests {
             },
         ])
         .await;
-        let mut reader = bytes.as_slice();
+        let mut reader = FrameReader::new(bytes.as_slice());
 
         match read_head(&mut reader, 7).await.unwrap() {
             HeadOutcome::Head(status, headers) => {
@@ -269,11 +277,11 @@ mod tests {
             other => panic!("第一个帧就是响应头，应当直接返回，实际：{other:?}"),
         }
 
-        // 剩下的字节必须仍在流里：`read_frame` 一次只消费一帧（对比 `FrameReader` 会预读）
-        let next = proto::io::read_frame(&mut reader).await.unwrap();
+        // 响应体那一帧必须还能被**同一个 reader** 读到（预读的余量留在它自己的缓冲里）
+        let next = reader.next().await.unwrap();
         assert!(
             matches!(next, Some(Frame::ProxyResponseBody { .. })),
-            "响应头之后的块必须留在流里，实际：{next:?}"
+            "响应头之后的块必须留在共享 reader 里，实际：{next:?}"
         );
     }
 
@@ -290,7 +298,8 @@ mod tests {
         ])
         .await;
 
-        match read_head(&mut bytes.as_slice(), 7).await.unwrap() {
+        let mut reader = FrameReader::new(bytes.as_slice());
+        match read_head(&mut reader, 7).await.unwrap() {
             HeadOutcome::Head(status, _) => assert_eq!(status, 200),
             other => panic!("心跳应当被跳过、继续等响应头，实际：{other:?}"),
         }
@@ -300,7 +309,8 @@ mod tests {
     #[tokio::test]
     async fn closed_stream_and_error_frames_keep_their_own_outcomes() {
         // 一字节都没有 = 干净关闭
-        match read_head(&mut (&[][..]), 7).await.unwrap() {
+        let mut empty = FrameReader::new(&[][..]);
+        match read_head(&mut empty, 7).await.unwrap() {
             HeadOutcome::Error(502, message) => {
                 assert!(message.contains("closed before responding"), "{message}")
             }
@@ -314,7 +324,8 @@ mod tests {
             message: "slow down".into(),
         }])
         .await;
-        match read_head(&mut bytes.as_slice(), 7).await.unwrap() {
+        let mut reader = FrameReader::new(bytes.as_slice());
+        match read_head(&mut reader, 7).await.unwrap() {
             HeadOutcome::Error(429, message) => assert_eq!(message, "slow down"),
             other => panic!("错误帧应当原样透出，实际：{other:?}"),
         }
@@ -325,7 +336,8 @@ mod tests {
             ok: true,
         }])
         .await;
-        match read_head(&mut bytes.as_slice(), 7).await.unwrap() {
+        let mut reader = FrameReader::new(bytes.as_slice());
+        match read_head(&mut reader, 7).await.unwrap() {
             HeadOutcome::Error(502, message) => {
                 assert!(message.contains("empty upstream response"), "{message}")
             }
