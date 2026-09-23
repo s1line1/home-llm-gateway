@@ -1,7 +1,18 @@
 target
 .cargo-home
-dist
+# 前端构建产物（web/dist）与发布打包产物（dist/）都不进上下文：镜像只装三个 Rust
+# 二进制（Dockerfile 的 runtime 阶段只 COPY 那几个文件），前端产物根本不用。
+# **必须带 `**/`**：不带斜杠的 `dist` 只匹配**上下文根目录**下的 dist，`web/dist` 匹配不到
+# （dockerignore(5)：`temp?` 这类模式的作用域是 root 目录；`**` 可匹配零个目录，
+# 所以 `**/dist` 同时覆盖根的 dist/ 与 web/dist）。
+**/dist
 .git
+# 本地开发/基准的临时目录（本检出 ~98MB：日志、k6 CSV、pid、证书实验）：进上下文纯属浪费，
+# 而且每次 make dev / 基准都会动它 ⇒ 让下面的 `COPY . .`（源码层）缓存整体失效。
+.tmp
+# macOS 元数据（本检出根目录就有一个 .DS_Store）
+.DS_Store
+**/.DS_Store
 # 前端依赖：装完后 web/node_modules 有 100MB+，占仓库体积九成。镜像不用它，
 # 但每次构建都会把它当上下文传给 builder，还容易让清单层/源码层的缓存失效。
 **/node_modules
