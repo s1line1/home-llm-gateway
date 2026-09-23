@@ -225,7 +225,17 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
     }
     match builder.body(Body::from_stream(ReceiverStream::new(rx))) {
         Ok(resp) => resp,
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        // 防御性分支：`status` 与每个 header 都已经过校验（`relayable_response_header` 只放行
+        // 解析成功的名字/值），所以这里实际上到不了。**仍然**只回固定文案、细节进日志：
+        // 这是**公开端点**，文案全仓一致（对照 `:135` 的 "internal error while parsing the
+        // request body"），别把 `http::Error` 的原文当成对外契约（SL-P3-20 的同类）。
+        Err(e) => {
+            warn!(request_id, error = %e, "failed to build the response; returning 500");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error while building the response",
+            )
+        }
     }
 }
 
