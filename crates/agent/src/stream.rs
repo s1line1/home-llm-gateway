@@ -256,8 +256,15 @@ async fn forward(
         if is_hop_by_hop(name) {
             continue;
         }
-        if let Ok(v) = v.to_str() {
-            out_headers.push((name.to_string(), v.to_string()));
+        // 记录 P3-16：`to_str()` 只认可见 ASCII，中文响应头值会被整条丢掉。帧里装的是
+        // `String`，按 UTF-8 原样带走；真·非 UTF-8 的字节只能丢（并留一行日志，不伪造空值）。
+        match std::str::from_utf8(v.as_bytes()) {
+            Ok(value) => out_headers.push((name.to_string(), value.to_string())),
+            Err(_) => warn!(
+                header = name,
+                len = v.as_bytes().len(),
+                "dropping an upstream response header whose value is not valid UTF-8"
+            ),
         }
     }
     write_frame(

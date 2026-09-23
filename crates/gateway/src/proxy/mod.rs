@@ -209,16 +209,39 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
 
     let mut builder = Response::builder().status(status);
     for (k, v) in out_headers {
-        if let (Ok(name), Ok(value)) = (
-            HeaderName::from_bytes(k.as_bytes()),
-            HeaderValue::from_str(&v),
-        ) {
+        if let Some((name, value)) = relayable_response_header(&k, &v) {
             builder = builder.header(name, value);
         }
     }
     match builder.body(Body::from_stream(ReceiverStream::new(rx))) {
         Ok(resp) => resp,
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+/// 把隧道帧里的响应头装进对客户端的响应（记录 P3-16 的复核）。
+///
+/// **这里本来就没坏**：实测 `HeaderValue::from_str` 接受非 ASCII（中文 OK），真正只认可见
+/// ASCII 的是 `to_str()`——坑在另外两处（网关的 `filter_headers`、agent 的响应头回传），
+/// 都已改成按 UTF-8 取字节。抽成函数是为了把"非法名/非法值丢该头、不伪造值"这条行为用单测
+/// 钉住（含 CR/LF 仍被拒）。
+fn relayable_response_header(name: &str, value: &str) -> Option<(HeaderName, HeaderValue)> {
+    let name = match HeaderName::from_bytes(name.as_bytes()) {
+        Ok(n) => n,
+        Err(_) => {
+            warn!(
+                header = name,
+                "dropping a response header with an invalid name"
+            );
+            return None;
+        }
+    };
+    match HeaderValue::from_str(value) {
+        Ok(v) => Some((name, v)),
+        Err(_) => {
+            warn!(header = %name, "dropping a response header with an invalid value");
+            None
+        }
     }
 }
 
@@ -235,15 +258,29 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
 fn filter_headers(headers: &HeaderMap) -> Vec<(String, String)> {
     headers
         .iter()
-        .filter(|(k, _)| {
+        .filter_map(|(k, v)| {
             let name = k.as_str();
-            !proto::headers::is_hop_by_hop(name) && !proto::headers::is_client_credential(name)
-        })
-        .map(|(k, v)| {
-            (
-                k.as_str().to_string(),
-                v.to_str().unwrap_or_default().to_string(),
-            )
+            if proto::headers::is_hop_by_hop(name) || proto::headers::is_client_credential(name) {
+                return None;
+            }
+            // 记录 P3-16：**不能**用 `to_str()`——它只接受可见 ASCII，而 HTTP 允许 obs-text
+            // （0x80–0xFF），于是"UTF-8 头值"（中文名、中文文件名等很常见）会被判失败。
+            // 以前那句 `to_str().unwrap_or_default()` 把它变成**空串**：上游看到的是"有这个头、
+            // 值为空"，与"没有这个头"是两回事（可能让上游走错分支，签名类头更糟）。
+            // 帧里本来就是 `String`，UTF-8 完全装得下 ⇒ 按 UTF-8 原样透传。
+            match std::str::from_utf8(v.as_bytes()) {
+                Ok(value) => Some((name.to_string(), value.to_string())),
+                Err(_) => {
+                    // 真·非 UTF-8 的字节装不进 `String`（改线格式属冻结范围）⇒ 只能丢这个头。
+                    // 但**不伪造空值**。值本身可能是任意二进制，故只记头名与长度。
+                    warn!(
+                        header = name,
+                        len = v.as_bytes().len(),
+                        "dropping a header whose value is not valid UTF-8 (it cannot ride the frame's String)"
+                    );
+                    None
+                }
+            }
         })
         .collect()
 }
@@ -251,6 +288,58 @@ fn filter_headers(headers: &HeaderMap) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 规格（记录 P3-16）：**响应方向**也按 UTF-8 原样透传，且注入防线不变。
+    #[test]
+    fn relayable_response_header_keeps_utf8_values_and_still_rejects_injection() {
+        let (name, value) =
+            relayable_response_header("x-echo", "张三").expect("中文响应头值应当能装进响应");
+        assert_eq!(name.as_str(), "x-echo");
+        assert_eq!(value.as_bytes(), "张三".as_bytes());
+
+        assert!(
+            relayable_response_header("x-echo", "a\r\nX-Evil: 1").is_none(),
+            "CRLF 必须仍然被拒（注入防线不许因为放宽编码而失守）"
+        );
+        assert!(
+            relayable_response_header("bad name", "v").is_none(),
+            "非法头名仍要丢"
+        );
+    }
+
+    /// 规格（记录 P3-16）：**非 ASCII（中文 UTF-8）头值必须逐字透传**，不许被清成空串。
+    ///
+    /// hyper 的 `HeaderValue` 收得下这类值（HTTP 允许 obs-text 0x80–0xFF），
+    /// 但 `to_str()` 只认可见 ASCII —— 这就是原缺陷：值变 `""`、头还在。
+    #[test]
+    fn filter_headers_keeps_utf8_header_values_verbatim() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-user-name",
+            HeaderValue::from_bytes("张三".as_bytes()).unwrap(),
+        );
+        assert_eq!(
+            filter_headers(&headers),
+            vec![("x-user-name".to_string(), "张三".to_string())],
+            "UTF-8 头值必须原样透传（修好前这里会是空串）"
+        );
+    }
+
+    /// 规格（记录 P3-16 的另一半）：**真·非 UTF-8** 的值丢头，而不是伪造空值。
+    #[test]
+    fn filter_headers_drops_non_utf8_values_instead_of_emptying_them() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-binary", HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap());
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+
+        let out = filter_headers(&headers);
+        let names: Vec<&str> = out.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(
+            !names.contains(&"x-binary"),
+            "非 UTF-8 值必须丢头，不能留下空值：{out:?}"
+        );
+        assert!(names.contains(&"content-type"), "其它头照旧转发：{out:?}");
+    }
 
     #[test]
     fn filter_headers_strips_hop_by_hop() {
