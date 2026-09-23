@@ -139,7 +139,20 @@ impl UsageStore {
     }
 
     /// 是否有"内存值尚未落库"的 key（静默期返回 false，调用方可跳过整轮 flush）。
+    ///
+    /// **内存模式（没有 `keys_file`）恒为 false**（SL-P3-13）：那种部署没有库可写，`flush_once`
+    /// 会在"没有库"处提前返回、永不推进 `flushed`/`ever_flushed` 标记，于是这里会**永远**报
+    /// "有待落库" —— 1s 的 flush 任务每轮都白做一次 `spawn_blocking` 往返，并把每个 key 的用量
+    /// 快照克隆进 batch 后原样丢掉。
+    ///
+    /// 判据放在这里而不是让 `flush_once` 假装落过库：**"有没有库"是这个模块的静态事实**，让
+    /// `flushed` 标记去说谎会污染"库里已经是这个值"的语义（那是崩溃安全的关键不变量）。
     pub(crate) fn has_pending(&self) -> bool {
+        // 先读 `db` 的状态、再锁 `usage`（两把锁不嵌套；`flush_once` 也是先 usage 后 db，
+        // 顺序一致就不会有环）。
+        if lock_or_recover(&self.db).is_none() {
+            return false;
+        }
         read_or_recover(&self.usage)
             .values()
             .any(|r| !r.ever_flushed || r.current != r.flushed)
@@ -158,6 +171,11 @@ impl UsageStore {
     /// 返回本轮**已提交**的 key 数（任何一行失败 ⇒ 整批回滚 ⇒ 返回 0）；`force = true` 时
     /// 忽略"是否变化"（用于关闭前落库）。
     pub(crate) fn flush_once(&self, force: bool) -> usize {
+        // 内存模式没有库可写：**先**判断再建批，别把 O(keys) 的快照克隆出来又丢掉（SL-P3-13）。
+        // 周期任务现在会被 `has_pending` 挡住，但关闭路径仍会调到这里。
+        if lock_or_recover(&self.db).is_none() {
+            return 0;
+        }
         // 准备阶段只在内存锁内做，不碰 SQLite。
         let batch: Vec<(String, UsageSnapshot)> = {
             let usage = read_or_recover(&self.usage);
@@ -403,5 +421,61 @@ mod tests {
                 "内存账本不受落库失败影响（/admin/usage 仍要能读到）"
             );
         }
+    }
+
+    /// 规格（SL-P3-13）：**内存模式（没有 `keys_file`）永远不该报告"有待落库数据"。**
+    ///
+    /// 那种部署没有库可写：`flush_once` 在"没有库"处提前返回，`flushed`/`ever_flushed` 标记
+    /// 永不推进，于是 `has_pending()` 恒为 true —— 固定 1s 的 flush 任务便**永远**每轮都做一次
+    /// `spawn_blocking` 往返，并把每个 key 的用量快照克隆进 batch（`O(keys)` 分配）之后原样丢掉。
+    #[test]
+    fn a_memory_only_store_never_reports_pending_usage() {
+        let store = crate::storage::KeyStore::new(None);
+        let key = store.create("p3-13".into()).unwrap();
+        store.accumulate_usage(
+            &key.record.id,
+            "p3-13",
+            &UsageDelta {
+                prompt_tokens: 3,
+                completion_tokens: 4,
+                estimated: false,
+            },
+        );
+
+        assert_eq!(
+            store.usage_of(&key.record.id).unwrap().requests,
+            1,
+            "前提：内存计数照常累加（/admin/usage 要读得到）"
+        );
+        assert!(
+            !store.usage_has_pending(),
+            "内存模式没有库可写，不该让 1s 的 flush 任务永远认为有待落库数据（修好前这里是 true）"
+        );
+        assert_eq!(
+            store.flush_usage_once(false),
+            0,
+            "内存模式 flush 仍是空操作"
+        );
+    }
+
+    /// 对照：**有库时**累加后必须报告待落库 —— 防止上面那条被修成"永远 false"。
+    #[test]
+    fn a_file_backed_store_still_reports_pending_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::storage::KeyStore::new(Some(dir.path().join("keys.db")));
+        let key = store.create("p3-13-control".into()).unwrap();
+        store.accumulate_usage(
+            &key.record.id,
+            "p3-13-control",
+            &UsageDelta {
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                estimated: false,
+            },
+        );
+
+        assert!(store.usage_has_pending(), "有库时累加后必须报告待落库");
+        assert_eq!(store.flush_usage_once(false), 1);
+        assert!(!store.usage_has_pending(), "落库后不该再 pending");
     }
 }
