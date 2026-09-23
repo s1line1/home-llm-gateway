@@ -1545,4 +1545,99 @@ mod tests {
         drop(keep_recv);
         task.abort();
     }
+
+    /// 规格（记录 P3-16）：**非 ASCII（中文）响应头值必须原样回传给网关**。
+    ///
+    /// 修好前 agent 回传上游响应头用的是 `v.to_str()`——它只认可见 ASCII，中文值会被**整条丢掉**
+    /// （不是变空串，是直接消失），于是客户端永远看不到这个头。判据放在**隧道帧**上：
+    /// 假网关读回 `ProxyResponseHead`，断言里面就是 `x-echo: 张三`。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_utf8_response_header_survives_the_relay() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // 假上游：不管请求内容，回一个带中文响应头的 200
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let _ = sock.read(&mut buf).await;
+                let body = b"{}";
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Echo: 张三\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+
+        let (ca, srv_cert, srv_key, cli_cert, cli_key) = gen_pki();
+        let (addr, mut server_handles) = test_server(&ca, srv_cert, srv_key).await;
+        let cfg = test_agent_config(addr, ca.clone(), cli_cert, cli_key);
+        let cc = tls::rustls_client_tls(
+            &cfg.ca_cert,
+            cfg.client_cert.clone(),
+            cfg.client_key.clone_key(),
+        )
+        .unwrap();
+        let (_agent_handle, mut agent_acceptor) = connect_for_test_with_acceptor(&cfg, cc).await;
+        let mut gateway = tokio::time::timeout(Duration::from_secs(5), server_handles.recv())
+            .await
+            .expect("agent 应当连上")
+            .expect("假网关应当拿到句柄");
+
+        let gw_stream = gateway.open_bidirectional_stream().await.expect("开流");
+        let (gw_recv, gw_send) = gw_stream.split();
+        let mut gw_send = gw_send;
+        write_frame(
+            &mut gw_send,
+            &Frame::ProxyRequest {
+                request_id: 7,
+                method: "POST".into(),
+                path: "/v1/chat/completions".into(),
+                headers: vec![],
+                body: bytes::Bytes::from_static(br#"{"model":"m"}"#),
+            },
+        )
+        .await
+        .expect("写请求帧");
+
+        let agent_stream = tokio::time::timeout(
+            Duration::from_secs(5),
+            agent_acceptor.accept_bidirectional_stream(),
+        )
+        .await
+        .expect("5s 内应当收到流")
+        .expect("accept 不该失败")
+        .expect("应当是 Some(stream)");
+        let task = tokio::spawn(handle_stream(
+            agent_stream,
+            upstream_client().unwrap(),
+            upstream_url,
+            false,
+        ));
+
+        let mut reader = proto::io::FrameReader::new(gw_recv);
+        let head = loop {
+            match tokio::time::timeout(Duration::from_secs(5), reader.next())
+                .await
+                .expect("等响应头帧超时")
+                .expect("读帧失败")
+            {
+                Some(Frame::ProxyResponseHead { headers, .. }) => break headers,
+                Some(_) => continue,
+                None => panic!("流在给出响应头之前就结束了"),
+            }
+        };
+        assert!(
+            head.iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("x-echo") && v == "张三"),
+            "中文响应头必须原样回传，实际：{head:?}"
+        );
+
+        drop(gw_send);
+        task.abort();
+    }
 }
