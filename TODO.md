@@ -506,6 +506,9 @@
 - [ ] **A3 类型化错误收尾**（OPTIMIZATION.md 已改标 ⚠️ 部分）：`Agent::start`
       （`agent/src/lib.rs:40`）与 `tls::https_server_config`（`gateway/src/tls.rs:51-54`）仍返回 anyhow；
       `config_err`、`AgentError::Forward`、`GatewayError::Sqlite` 是从未被构造的死变体。
+      **2026-09-23 补充**：与之相邻的 P3-5（`Agent::start` 在**库**里 `std::process::exit(1)`）已单独修掉
+      —— 库现在把 run 循环的结局交给调用方（`AgentExit` + `Agent::wait_for_abnormal_exit`），退出决定在
+      `agent/src/main.rs`。所以本条的剩余范围缩小为"错误**类型**"，不涉及进程退出。
 - [x] **Makefile `deny` 目标 ≠ hook/CI（2026-09-22 完成）**：目标现在就是完整的
       `cargo deny check`（advisories/bans/licenses/sources 全跑，与 hook/CI 同一条命令），
       注释也改成"完整检查"而不是"由 hook 与 CI 执行"；`make check` 的说明补上"CI 还会跑

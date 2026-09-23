@@ -43,8 +43,38 @@ pub struct AgentConfig {
     pub request_log: bool,
 }
 
+/// `Agent` 的运行结局。
+///
+/// `run` 是无限重连循环，正常**永不结束**，所以"有结局"本身就是要上报的异常（`Cancelled`
+/// 除外 —— 那是我们自己关的）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentExit {
+    /// run 循环返回了（不该发生）。
+    LoopExited,
+    /// run 循环 panic 了。
+    Panicked,
+    /// run 循环被取消 —— 即 `Agent::shutdown`。
+    Cancelled,
+}
+
+impl AgentExit {
+    /// 只有 `Cancelled` 是我们自己关的，不算"异常结局"（调用方不必以非 0 退出）。
+    ///
+    /// 单独抽出来是为了能直接单测这条映射：它挂在 `Agent::wait_for_abnormal_exit` 上，而那条
+    /// 路径要"关掉之后还能问一次"，需要 `shutdown` 取 `&mut self`（会牵动 38 个 e2e 调用点），
+    /// 为 3 行映射不值当（P3-5）。
+    fn as_abnormal(self) -> Option<Self> {
+        match self {
+            Self::Cancelled => None,
+            abnormal => Some(abnormal),
+        }
+    }
+}
+
 pub struct Agent {
     task: tokio::task::JoinHandle<()>,
+    /// 守护任务给出的结局（`None` = 还没结束）。
+    outcome: tokio::sync::watch::Receiver<Option<AgentExit>>,
 }
 
 impl Agent {
@@ -55,27 +85,72 @@ impl Agent {
             cfg.client_cert.clone(),
             cfg.client_key.clone_key(),
         )?;
-        // 外层包一层守护：run 正常**永不返回**，一旦返回（panic / 被取消），进程就只是
-        // "看起来还在运行"——main 停在 shutdown_signal()，既不重连也不退出，日志里也
-        // 什么都没有。所以这里喊出来并让进程退出，交给外部守护重新拉起
-        // （deploy/agent.service 是 Restart=always / RestartSec=3）。静默的僵尸进程
-        // 比一次崩溃难查得多。
+        Ok(Self::supervise(
+            async move { run(cfg, client_config).await },
+        ))
+    }
+
+    /// 守护一个"应当永不结束"的 run future，并把它的结局交给调用方。
+    ///
+    /// 外层包一层守护的理由不变：run 正常**永不返回**，一旦返回（panic / 被取消），进程就只是
+    /// "看起来还在运行"——main 停在 `shutdown_signal()`，既不重连也不退出，日志里也什么都没有。
+    /// 静默的僵尸进程比一次崩溃难查得多。
+    ///
+    /// **但"退出进程"不在这里做**（P3-5）：那是进程级策略，属于二进制（`main.rs`）。库自己
+    /// `std::process::exit` 会让 agent crate 无法被嵌入，而且进程内构造 `Agent` 的测试在 run
+    /// 循环崩溃时会被把**整个测试二进制**带走。现在结局走一个 watch 通道，
+    /// 调用方用 [`Agent::wait_for_abnormal_exit`] 接住并按自己的策略处置。
+    fn supervise<F>(run_loop: F) -> Self
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let (tx, outcome) = tokio::sync::watch::channel(None);
         let task = tokio::spawn(async move {
-            let mut inner = AbortOnDrop(tokio::spawn(run(cfg, client_config)));
-            match (&mut inner.0).await {
-                Ok(()) => error!("agent run loop exited; exiting so the supervisor restarts us"),
-                Err(e) if e.is_panic() => {
-                    error!("agent run loop panicked: {e}; exiting so the supervisor restarts us")
+            let mut inner = AbortOnDrop(tokio::spawn(run_loop));
+            let exit = match (&mut inner.0).await {
+                Ok(()) => {
+                    error!(
+                        "agent run loop exited; the caller should exit so the supervisor restarts us"
+                    );
+                    AgentExit::LoopExited
                 }
-                Err(e) => warn!("agent run loop cancelled: {e}"),
-            }
-            std::process::exit(1);
+                Err(e) if e.is_panic() => {
+                    error!(
+                        "agent run loop panicked: {e}; the caller should exit so the supervisor restarts us"
+                    );
+                    AgentExit::Panicked
+                }
+                Err(e) => {
+                    warn!("agent run loop cancelled: {e}");
+                    AgentExit::Cancelled
+                }
+            };
+            let _ = tx.send(Some(exit));
         });
-        Ok(Self { task })
+        Self { task, outcome }
     }
 
     pub async fn shutdown(self) {
         self.task.abort();
+    }
+
+    /// 等这次运行**异常结束**。
+    ///
+    /// - `Some(LoopExited | Panicked)`：run 循环没了，进程"看起来还活着、什么都不做"。调用方
+    ///   应当打日志并以**非 0** 退出，交给外部守护（`deploy/agent.service` 是
+    ///   `Restart=always` / `RestartSec=3`）重新拉起。
+    /// - `None`：是我们自己 `shutdown()` 关的（正常退出）。
+    pub async fn wait_for_abnormal_exit(&mut self) -> Option<AgentExit> {
+        loop {
+            let seen = *self.outcome.borrow_and_update();
+            if let Some(exit) = seen {
+                return exit.as_abnormal();
+            }
+            if self.outcome.changed().await.is_err() {
+                // 发送端消失且没给出结局（守护任务被 abort）⇒ 我们自己关的
+                return None;
+            }
+        }
     }
 }
 
@@ -1223,6 +1298,61 @@ mod tests {
             }
         });
         (addr, rx)
+    }
+
+    /// 规格（P3-5）：**run 循环结束由调用方得知，库自己不再退出进程。**
+    ///
+    /// 这条测试在旧实现下**根本不可能存在**：守护任务末尾是 `std::process::exit(1)`，任何在进程内
+    /// 触发该路径的测试都会把整个测试二进制带走（报告丢失）。现在结局走一个 watch 通道。
+    #[tokio::test]
+    async fn a_finished_run_loop_is_reported_instead_of_exiting_the_process() {
+        let mut agent = Agent::supervise(async {});
+        assert_eq!(
+            agent.wait_for_abnormal_exit().await,
+            Some(AgentExit::LoopExited),
+            "run 循环返回必须被报成异常结局"
+        );
+    }
+
+    /// 同上，panic 那一支（`JoinError::is_panic`）。注意 panic 发生在 `tokio::spawn` 的任务里，
+    /// 所以它**只**通过 `JoinHandle` 传出来，不会让测试进程失败——这正是要钉住的语义。
+    #[tokio::test]
+    async fn a_panicking_run_loop_is_reported() {
+        let mut agent = Agent::supervise(async { panic!("run loop 炸了") });
+        assert_eq!(
+            agent.wait_for_abnormal_exit().await,
+            Some(AgentExit::Panicked),
+            "run 循环 panic 必须被报成异常结局"
+        );
+    }
+
+    /// 对照：**跑着的** agent 不该被误报（`run` 是无限重连循环，连不上网关也是活着）。
+    #[tokio::test]
+    async fn a_running_agent_reports_no_abnormal_exit() {
+        let (ca, srv_cert, srv_key, cli_cert, cli_key) = gen_pki();
+        let (addr, _server_handles) = test_server(&ca, srv_cert, srv_key).await;
+        let cfg = test_agent_config(addr, ca.clone(), cli_cert, cli_key);
+        let mut agent = Agent::start(cfg).expect("启动应当成功");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), agent.wait_for_abnormal_exit())
+                .await
+                .is_err(),
+            "跑着的 agent 不该报异常结局"
+        );
+        agent.shutdown().await;
+    }
+
+    /// 规格（P3-5）：`Cancelled`（我们自己 `shutdown()` 关的）**不算**异常结局 ⇒ 调用方不必
+    /// 以非 0 退出；另外两种必须算。
+    #[test]
+    fn only_a_self_inflicted_stop_is_not_an_abnormal_exit() {
+        assert_eq!(AgentExit::Cancelled.as_abnormal(), None);
+        assert_eq!(
+            AgentExit::LoopExited.as_abnormal(),
+            Some(AgentExit::LoopExited)
+        );
+        assert_eq!(AgentExit::Panicked.as_abnormal(), Some(AgentExit::Panicked));
     }
 
     /// 规格（记录 P2-4）：**上游的重定向不许被跟随**。
