@@ -2,7 +2,11 @@
 
 pub mod tls;
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use proto::{
     io::{write_frame, FrameReader},
@@ -11,6 +15,7 @@ use proto::{
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use s2n_quic::{client::Connect, provider::limits::Limits};
 use tokio::io::AsyncWriteExt;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, error, info, warn};
 
 use crate::stream::handle_stream;
@@ -178,6 +183,80 @@ fn upstream_client() -> anyhow::Result<reqwest::Client> {
         .build()?)
 }
 
+/// 排队超过这个时长才算"闸门真的在起作用"（避免把准入与在途之间的瞬时竞态也记成排队）。
+const SLOT_WAIT_LOG_AFTER: Duration = Duration::from_millis(100);
+/// 持续过载时的日志节流间隔：这个项目的日志单日 652MB（`TODO.md` 已登记），不能每请求一行。
+const SLOT_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+/// 本机并发闸门（记录 P2-3）：`max_concurrency` 不只是"告诉网关"，**本机也执行它**。
+///
+/// 为什么需要（纵深防御）：正常路径上网关按它对注册表的登记卡住并发
+/// （`try_acquire_excluding` 保证 `inflight < max_concurrency`），所以今天不出事。但只要
+/// 网关那侧不守约——最现实的一条是 agent 配 `max_concurrency: 0`（网关侧 `0` 的语义是
+/// **不限**）、其次是网关准入被改坏或被换成别的实现——本机就会把最多 **1000** 条并发流
+/// （QUIC 流额度）全压进一台只按 4 个并发配置的本地 LLM：显存打满、首字节从 1–3s 崩到
+/// 几十秒，而**两侧都不报错**，只是"变慢/超时"。
+///
+/// `max == 0` = **不限**（与网关侧语义一致）⇒ 不建闸门，此时唯一上限仍是 QUIC 流额度。
+struct ConcurrencyGate {
+    sem: Arc<Semaphore>,
+    max: u32,
+    /// 累计排队次数（只进日志，用来一行看出"防御持续生效了多久"）。
+    queued: u64,
+    /// 上次因排队打日志的时刻（节流用）。
+    last_log: Option<Instant>,
+}
+
+impl ConcurrencyGate {
+    /// `max == 0` = 不限 ⇒ `None`（没有闸门）。
+    fn new(max: u32) -> Option<Self> {
+        (max > 0).then(|| Self {
+            sem: Arc::new(Semaphore::new(max as usize)),
+            max,
+            queued: 0,
+            last_log: None,
+        })
+    }
+
+    /// 取一个并发许可；满了就**排队等**。
+    ///
+    /// 为什么不在这里回 `Frame::Error`：网关的准入计数与"实际在途"之间有微小竞态，
+    /// 瞬时超发一点点时排队就能救回来；回错误则变成**用户可见的假失败**（网关不会为这种
+    /// 帧错误换 agent 重试）。等待的上界由网关自己给（`head_timeout` 到了它会给客户端 504，
+    /// 而我们这边照旧把上游请求跑完/被 Cancel）。
+    async fn acquire(&mut self) -> OwnedSemaphorePermit {
+        let started = Instant::now();
+        let permit = self
+            .sem
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("semaphore 只在本结构里，且从不 close");
+        if started.elapsed() >= SLOT_WAIT_LOG_AFTER {
+            self.queued += 1;
+            if self
+                .last_log
+                .is_none_or(|t| t.elapsed() >= SLOT_LOG_INTERVAL)
+            {
+                self.last_log = Some(Instant::now());
+                warn!(
+                    max_concurrency = self.max,
+                    queued_total = self.queued,
+                    wait_ms = started.elapsed().as_millis(),
+                    "本机并发已达声明的 max_concurrency，请求在排队；网关侧的准入与实际在途不一致？"
+                );
+            }
+        }
+        permit
+    }
+
+    /// 供测试观察节流状态。
+    #[cfg(test)]
+    fn queued(&self) -> u64 {
+        self.queued
+    }
+}
+
 async fn connect_once(
     cfg: &AgentConfig,
     client_config: rustls::ClientConfig,
@@ -237,6 +316,8 @@ async fn connect_once(
     // 哪怕 QUIC 连接本身还开着，这条连接在网关眼里也已经死了 —— 表现是"agent 自认为
     // 连着、网关把所有请求判 503、两侧都没有日志、只能人工重启"的静默态。
     // 所以必须观察它：它一结束就结束这条连接，交回 run() 的重连循环。
+    // 本机并发闸门（记录 P2-3）：`max_concurrency > 0` 时才有闸门，"0 = 不限"与网关侧同理。
+    let mut gate = ConcurrencyGate::new(cfg.max_concurrency);
     loop {
         tokio::select! {
             r = &mut hb => {
@@ -250,12 +331,21 @@ async fn connect_once(
             }
             accepted = acceptor.accept_bidirectional_stream() => match accepted {
                 Ok(Some(stream)) => {
-                    tokio::spawn(handle_stream(
-                        stream,
-                        http.clone(),
-                        cfg.upstream_base.clone(),
-                        cfg.request_log,
-                    ));
+                    // 先拿许可**再**接手：闸门满了就停在这里不再 accept 下一条流——未接收的流
+                    // 留在 QUIC 层，流控自然形成背压，最终由网关自己的 `head_timeout` 收尾
+                    // （客户端看到 504）。许可随任务存活，本请求跑完才释放。
+                    let permit = match gate.as_mut() {
+                        Some(g) => Some(g.acquire().await),
+                        None => None,
+                    };
+                    let http = http.clone();
+                    let upstream_base = cfg.upstream_base.clone();
+                    let request_log = cfg.request_log;
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        // 注：这里仍丢弃 `Err`（记录 P2-2 未做），本次只加闸门，不改错误可见性。
+                        let _ = handle_stream(stream, http, upstream_base, request_log).await;
+                    });
                 }
                 Ok(None) => break, // 连接正常关闭
                 Err(e) => {
@@ -1201,5 +1291,258 @@ mod tests {
             proxy_rx.try_recv().is_err(),
             "prompt 不该出现在环境变量指定的代理上"
         );
+    }
+
+    /// 规格（记录 P2-3）：**闸门满了要排队**，而不是把请求放过去压垮本地 LLM。
+    #[tokio::test]
+    async fn the_concurrency_gate_queues_instead_of_admitting() {
+        let mut gate = ConcurrencyGate::new(1).expect("max=1 应当有闸门");
+        let held = gate.acquire().await; // 唯一许可，立刻拿到
+        let second = {
+            let fut = gate.acquire();
+            tokio::pin!(fut);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(150), &mut fut)
+                    .await
+                    .is_err(),
+                "持有唯一许可时，第二次 acquire 不许成功"
+            );
+            drop(held);
+            tokio::time::timeout(Duration::from_secs(1), &mut fut)
+                .await
+                .expect("释放后应当立刻拿到许可")
+        };
+        assert_eq!(gate.queued(), 1, "等超 SLOT_WAIT_LOG_AFTER 要记一次排队");
+        assert!(gate.last_log.is_some(), "排队要留下一条日志");
+        drop(second);
+    }
+
+    /// 规格：`max_concurrency = 0` = **不限**（与网关侧 `0` 的语义一致）⇒ 不建闸门。
+    ///
+    /// 这条钉的是"别把 0 当成 0 个许可"——那会让 agent 一个请求都不处理，比不设防更糟。
+    #[test]
+    fn a_zero_max_concurrency_builds_no_gate() {
+        assert!(ConcurrencyGate::new(0).is_none(), "0 = 不限 ⇒ 没有闸门");
+        assert!(ConcurrencyGate::new(4).is_some());
+    }
+
+    /// 规格：持续过载时**日志节流**（这个项目的日志单日 652MB），但排队计数照旧累加。
+    #[tokio::test]
+    async fn the_queue_log_is_throttled_while_the_counter_keeps_counting() {
+        let mut gate = ConcurrencyGate::new(1).unwrap();
+        let held = gate.acquire().await;
+        let first_permit = {
+            let fut = gate.acquire();
+            tokio::pin!(fut);
+            assert!(tokio::time::timeout(Duration::from_millis(150), &mut fut)
+                .await
+                .is_err());
+            drop(held);
+            tokio::time::timeout(Duration::from_secs(1), &mut fut)
+                .await
+                .expect("第一次排队应当拿到")
+        };
+        let first_log = gate.last_log.expect("第一次排队必须打日志");
+        let second_permit = {
+            let fut = gate.acquire();
+            tokio::pin!(fut);
+            assert!(tokio::time::timeout(Duration::from_millis(150), &mut fut)
+                .await
+                .is_err());
+            drop(first_permit);
+            tokio::time::timeout(Duration::from_secs(1), &mut fut)
+                .await
+                .expect("第二次排队应当拿到")
+        };
+        assert_eq!(gate.queued(), 2, "两次都超过阈值：计数要涨");
+        assert_eq!(
+            gate.last_log,
+            Some(first_log),
+            "同一个节流窗口内不得再打第二行"
+        );
+        drop(second_permit);
+    }
+
+    /// 假网关（比 `test_server` 完整）：接受连接后**服务控制流**（注册/心跳：每流读一帧就
+    /// `finish`，等价于真网关的"收到即 ack"），同时把 [`Handle`] 交给测试，于是测试能像真网关
+    /// 那样开请求流。
+    ///
+    /// 为什么不能直接用 `test_server`：它把 acceptor 丢掉了 ⇒ agent 的注册流永远等不到 EOF，
+    /// `register()` 会卡满 10s，测试根本走不到 accept 循环（实测 `served=0` 就是这个原因）。
+    async fn test_server_with_handle(
+        ca: &CertificateDer<'static>,
+        cert: CertificateDer<'static>,
+        key: PrivateKeyDer<'static>,
+    ) -> (SocketAddr, tokio::sync::mpsc::Receiver<Handle>) {
+        proto::crypto::provider();
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca.clone()).unwrap();
+        let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+            .build()
+            .unwrap();
+        let mut stls = rustls::ServerConfig::builder()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(vec![cert], key)
+            .unwrap();
+        stls.alpn_protocols = vec![ALPN.to_vec()];
+
+        let mut server = s2n_quic::Server::builder()
+            .with_tls(s2n_quic::provider::tls::rustls::Server::from(Arc::new(
+                stls,
+            )))
+            .unwrap()
+            .with_io("127.0.0.1:0")
+            .unwrap()
+            .start()
+            .unwrap();
+        let addr = server.local_addr().unwrap();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tokio::spawn(async move {
+            while let Some(conn) = server.accept().await {
+                let tx = tx.clone();
+                let (handle, mut acceptor) = conn.split();
+                let _ = tx.send(handle).await;
+                tokio::spawn(async move {
+                    while let Ok(Some(stream)) = acceptor.accept_bidirectional_stream().await {
+                        let (mut recv, mut send) = stream.split();
+                        let _ = proto::io::read_frame(&mut recv).await;
+                        let _ = send.finish();
+                    }
+                });
+            }
+        });
+        (addr, rx)
+    }
+
+    /// 计数用的假上游：每个请求睡 `sleep`，记录观察到的**最大同时在途数**。
+    ///
+    /// 返回 `(base_url, max_inflight, served)`。
+    async fn counting_upstream(
+        sleep: Duration,
+    ) -> (
+        String,
+        Arc<std::sync::atomic::AtomicU32>,
+        Arc<std::sync::atomic::AtomicU32>,
+    ) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let inflight = Arc::new(AtomicU32::new(0));
+        let max_inflight = Arc::new(AtomicU32::new(0));
+        let served = Arc::new(AtomicU32::new(0));
+        let (i2, m2, s2) = (inflight.clone(), max_inflight.clone(), served.clone());
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let (i, m, s) = (i2.clone(), m2.clone(), s2.clone());
+                tokio::spawn(async move {
+                    // 读掉请求（至少读到头结束）；reqwest 会带 Content-Length
+                    let mut buf = vec![0u8; 8192];
+                    let mut acc = Vec::new();
+                    while !acc.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => acc.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let now = i.fetch_add(1, Ordering::SeqCst) + 1;
+                    m.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(sleep).await;
+                    let body = br#"{"ok":true}"#;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(body).await;
+                    let _ = sock.shutdown().await;
+                    i.fetch_sub(1, Ordering::SeqCst);
+                    s.fetch_add(1, Ordering::SeqCst);
+                });
+            }
+        });
+        (url, max_inflight, served)
+    }
+
+    /// 规格（记录 P2-3，端到端）：**agent 自己执行它声明的 `max_concurrency`**。
+    ///
+    /// 判据在上游侧：同时只有 1 个请求到达假上游。去掉 accept 路径上那道闸门后
+    /// `max_inflight` 会是 2——那正是"网关不守约（如配成 `0` = 不限）时，最多 1000 条并发
+    /// 全压进本地 LLM"的形状。判据放在上游而不是 agent 自己的计数上：agent 自述不算证据，
+    /// **真的只打了一个上游请求**才算。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_agent_enforces_its_declared_max_concurrency_end_to_end() {
+        use std::sync::atomic::Ordering;
+        // 与 gateway 的 e2e 同一口径：让排队那条 WARN 在失败时看得见（rustls 的 debug 太吵）
+        let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+
+        let (upstream, max_inflight, served) = counting_upstream(Duration::from_millis(200)).await;
+        let (ca, srv_cert, srv_key, cli_cert, cli_key) = gen_pki();
+        let (addr, mut server_handles) = test_server_with_handle(&ca, srv_cert, srv_key).await;
+        let mut cfg = test_agent_config(addr, ca.clone(), cli_cert, cli_key);
+        cfg.max_concurrency = 1;
+        cfg.upstream_base = upstream;
+        // 心跳周期放大：本测试只活几百毫秒，别让"没人回心跳"把连接拆了（那是另一条测试的事）
+        cfg.heartbeat_interval = Duration::from_secs(30);
+        let cc = tls::rustls_client_tls(
+            &cfg.ca_cert,
+            cfg.client_cert.clone(),
+            cfg.client_key.clone_key(),
+        )
+        .unwrap();
+        let task = tokio::spawn(run(cfg, cc));
+
+        let mut gateway = tokio::time::timeout(Duration::from_secs(5), server_handles.recv())
+            .await
+            .expect("agent 应当连上")
+            .expect("假网关应当拿到连接句柄");
+
+        // 两条请求流几乎同时发：闸门只该放一条过去。
+        // 两个半边都必须**持有着**（第一版两个坑都踩了）：
+        // ① drop `recv` 会停掉该方向，agent 写响应时报 "The Stream ID which was referenced is
+        //    invalid"；
+        // ② drop `send` 会给对端发 FIN —— agent 那边把"流结束"当**取消**，于是根本不发上游请求
+        //    （`handle_stream` 直接 Ok 返回，而我们还在等下家服务）。
+        let mut keep_recv = Vec::new();
+        let mut keep_send = Vec::new();
+        for request_id in 0..2u64 {
+            let stream = gateway.open_bidirectional_stream().await.expect("开流");
+            let (recv, mut send) = stream.split();
+            keep_recv.push(recv);
+            write_frame(
+                &mut send,
+                &Frame::ProxyRequest {
+                    request_id,
+                    method: "POST".into(),
+                    path: "/v1/chat/completions".into(),
+                    headers: vec![],
+                    body: bytes::Bytes::from_static(br#"{"model":"m"}"#),
+                },
+            )
+            .await
+            .expect("写请求帧");
+            keep_send.push(send);
+        }
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while served.load(Ordering::SeqCst) < 2 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "两个请求没有都被服务：served={}",
+                served.load(Ordering::SeqCst)
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            max_inflight.load(Ordering::SeqCst),
+            1,
+            "agent 必须自己执行 max_concurrency=1（没有闸门时这里会是 2）"
+        );
+        drop(keep_send);
+        drop(keep_recv);
+        task.abort();
     }
 }
