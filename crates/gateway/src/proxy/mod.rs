@@ -12,7 +12,7 @@ use axum::{
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
     response::Response,
 };
-use proto::Frame;
+use proto::{io::FrameReader, Frame};
 
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -152,7 +152,7 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
         body,
     };
 
-    let (entry, slot, mut recv, mut send) =
+    let (entry, slot, recv, mut send) =
         match routing::open_and_send(&state, &model, &request, request_id).await {
             Ok(routed) => routed,
             Err(failure) => return error_response(failure.status, failure.message),
@@ -160,10 +160,16 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
 
     debug!(request_id, "proxying request to agent");
 
+    // **读路径只有一条**（记录 R3）：头与体共用同一个 `FrameReader`，且它**拥有** `recv`
+    // （`FrameReader::new(recv)` 是移动）。这样"读完响应头时已经预读进缓冲的体字节"会被
+    // 下一阶段继续消费，而不是随临时 reader 一起丢掉；同时它天生取消安全
+    // （见 `proto::io` 的 `FrameReader`），所以 `forward_body` 里的 `select!` 落败也不丢字节。
+    let mut reader = FrameReader::new(recv);
+
     // 读取响应头：超时窗口、慢/死判据的渲染、Cancel 与 finish 全在 `head` 模块里
     // （一处改动理由 = 上游响应头契约），这里只把失败渲染成响应。
     let (status, mut out_headers) =
-        match head::await_head(&state, &mut recv, &mut send, &entry, request_id).await {
+        match head::await_head(&state, &mut reader, &mut send, &entry, request_id).await {
             Ok(v) => v,
             Err(failure) => return error_response(failure.status, failure.message),
         };
@@ -187,7 +193,7 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
         .any(|(k, v)| k.eq_ignore_ascii_case("content-type") && v.contains("text/event-stream"));
     tokio::spawn(async move {
         let end = forward_body(
-            &mut recv,
+            &mut reader,
             &mut send,
             request_id,
             tx,

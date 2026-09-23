@@ -146,8 +146,8 @@ fn shutdown_terminating(rx: &watch::Receiver<ShutdownPhase>) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn forward_body(
-    recv: &mut s2n_quic::stream::ReceiveStream,
+pub(super) async fn forward_body<R>(
+    reader: &mut FrameReader<R>,
     send: &mut s2n_quic::stream::SendStream,
     request_id: u64,
     tx: mpsc::Sender<Result<Bytes, String>>,
@@ -162,27 +162,27 @@ pub(super) async fn forward_body(
     prompt_est: u64,
     is_stream: bool,
     mut shutdown: watch::Receiver<ShutdownPhase>,
-) -> ForwardEnd {
+) -> ForwardEnd
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
     let mut usage = UsageCollector::new(key_store, key_id, key_name, prompt_est, is_stream);
-    // 读帧必须走**可取消安全**的 `FrameReader`（记录 P3-26）：下面那个 `select!` 里
-    // `shutdown.changed()` 分支会 `continue`，也就是**复用同一条流**。用 `read_frame`
-    // （内部 `read_exact`）时，阶段变化恰好落在帧中途会让被 drop 的 future 带走已读字节，
-    // 之后按错误偏移解析长度前缀（帧错位：要么 "frame too large"，要么反序列化错误）——
-    // 而 `Draining` 阶段的承诺正是"在途响应照常跑完"。半读进度落在 reader 自己身上，
-    // 任何 await 点被打断都可安全重入，所以这里不会丢字节。
-    let mut reader = FrameReader::new(recv);
+    // reader 由调用方（`proxy::mod` 的响应编排）创建并**贯穿响应头与响应体两个阶段**
+    // （记录 R3）：所以下面这个 `select!` 里 `shutdown.changed()` 分支的 `continue`
+    // （复用同一条流）不会丢半帧，`Draining` 阶段"在途响应照常跑完"的承诺也靠它。
     loop {
         // 同时等"上游来帧"与"客户端走人"。
         //
         // 为什么必须 select：以前只在 `tx.send` 失败时才发现客户端断开——断开后上游若恰好
-        // 不产帧（LLM 正在思考、首 token 之前的静默期），任务就停在 `read_frame` 上，
+        // 不产帧（LLM 正在思考、首 token 之前的静默期），任务就停在读帧上，
         // `tx.send` 永不被调用 → Cancel 不发、agent 槽位要等满 `idle_timeout`（默认 120s）
         // 才释放。而"看到卡顿就取消"正是最常见的交互形态（登记见 REBUILD §4.7：
         // 后果是"上游明明空闲、新请求却 429 at capacity"）。
         //
-        // **取消安全性**：`read_frame` 不是可取消安全的（REBUILD §R3 登记过），但这条分支与
-        // 下面的空闲超时一样——取消后立刻 `finish()` 并彻底放弃这条流、不再读它，所以丢掉
-        // 半读的帧无害。
+        // **取消安全性**：读的是可取消安全的 `FrameReader`（记录 R3/P3-26）——而且是从响应头
+        // 阶段一路带过来的**同一个** reader，所以任何一条 `select!` 分支落败都不丢字节：
+        // `tx.closed()` / 关停分支放弃这条流时半读进度无所谓，`shutdown.changed()` 分支
+        // `continue` 复用同一条流时则**必须**靠它（这正是一次真实缺陷的形状）。
         // 网关进入 `Terminating`：给客户端一个明确事件，然后干净收尾。**不能**指望 abort 去切：
         // 实测 drop `s2n_quic::Server` 并不会掐断已建立的 agent 连接。
         if shutdown_terminating(&shutdown) {

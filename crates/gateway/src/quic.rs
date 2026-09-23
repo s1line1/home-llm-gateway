@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use proto::{io::read_frame, Frame};
+use proto::{io::FrameReader, Frame};
 use s2n_quic::Connection;
 use tracing::{debug, error, info, warn};
 
@@ -98,8 +98,10 @@ async fn handle_conn_inner(
     loop {
         match acceptor.accept_bidirectional_stream().await {
             Ok(Some(stream)) => {
-                let (mut recv, mut send) = stream.split();
-                match read_frame(&mut recv).await? {
+                let (recv, mut send) = stream.split();
+                // 控制流**每条流只读一帧**、读完就把流丢掉，所以即建即弃的 `FrameReader`
+                // 完全够用（它预读的余量没有下一个消费者）；全项目只有这一条读路径（记录 R3）。
+                match FrameReader::new(recv).next().await? {
                     Some(Frame::Register {
                         agent_id: id,
                         models,

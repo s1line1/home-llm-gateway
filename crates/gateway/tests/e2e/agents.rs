@@ -571,7 +571,11 @@ async fn e2e_dead_tunnel_fails_fast_instead_of_hanging() {
     .await
     .unwrap();
     reg_send.finish().unwrap();
-    let _ = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut reg_recv)).await;
+    let _ = tokio::time::timeout(
+        Duration::from_secs(2),
+        FrameReader::new(&mut reg_recv).next(),
+    )
+    .await;
     wait_for_agents(&gw, 1, Duration::from_secs(5)).await;
 
     let http = test_client();

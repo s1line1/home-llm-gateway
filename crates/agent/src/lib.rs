@@ -772,7 +772,7 @@ mod tests {
                     let (_handle, mut acceptor) = conn.split();
                     if let Ok(Some(stream)) = acceptor.accept_bidirectional_stream().await {
                         let (mut recv, mut send) = stream.split();
-                        let _ = proto::io::read_frame(&mut recv).await; // 注册帧
+                        let _ = proto::io::FrameReader::new(&mut recv).next().await; // 注册帧
                         let _ = send.finish(); // 让 agent 侧读到 EOF，注册成功
                     }
                     let _ = tx.send(()).await; // "这条连接已经注册完成"
@@ -839,7 +839,7 @@ mod tests {
                         };
                         tokio::spawn(async move {
                             let (mut recv, mut send) = stream.split();
-                            let _ = proto::io::read_frame(&mut recv).await;
+                            let _ = proto::io::FrameReader::new(&mut recv).next().await;
                             match delay_long {
                                 None => {}                                                 // 注册流：立刻回
                                 Some(true) => tokio::time::sleep(first_reply_delay).await, // 首次心跳：拖长
@@ -1407,7 +1407,7 @@ mod tests {
                 tokio::spawn(async move {
                     while let Ok(Some(stream)) = acceptor.accept_bidirectional_stream().await {
                         let (mut recv, mut send) = stream.split();
-                        let _ = proto::io::read_frame(&mut recv).await;
+                        let _ = proto::io::FrameReader::new(&mut recv).next().await;
                         let _ = send.finish();
                     }
                 });
