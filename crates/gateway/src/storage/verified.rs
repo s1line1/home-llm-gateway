@@ -29,8 +29,12 @@
 //!   `runtime` 表消失 → 直接 miss → 401，与版本号无关。
 //! - 唯一的语义变化：**同一凭据在被缓存的这段时间内不再重算 argon2**。若将来新增
 //!   "改 key 但不 bump 版本"的写路径，缓存会静默失效——所以 `KeyStore` 里每次
-//!   凭据变更都必须走 [`crate::storage::KeyStore`] 的版本自增（见 `bump`）。测试
-//!   `credential_version_bump_invalidates_cache`（`storage::verified_tests`）守住这条。
+//!   凭据变更都必须走 [`crate::storage::KeyStore`] 的版本自增（见
+//!   `bump_cred_generation`）。测试 `credential_version_bump_invalidates_cache`
+//!   （`storage::verified_tests`）守住这条。
+//!
+//!   注释里反引号包起来的名字都应当是**能直接 grep 到的真名**：本条曾经指向一个不存在的
+//!   测试名（`ae0a852` 只改了测试名，同句的 `bump` 漏了），见 `docs/PROJECT_SCAN.md` P3-10。
 
 use std::{
     collections::HashMap,

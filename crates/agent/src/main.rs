@@ -32,10 +32,26 @@ async fn run(args: Args) -> anyhow::Result<()> {
 
     let cfg = agent::config::from_path(&args.config)?;
 
-    let agent = Agent::start(cfg)?;
-    shutdown_signal().await;
-    tracing::info!("graceful shutdown: stopping agent");
-    agent.shutdown().await;
+    let mut agent = Agent::start(cfg)?;
+    let abnormal: Option<agent::AgentExit> = tokio::select! {
+        _ = shutdown_signal() => None,
+        exit = agent.wait_for_abnormal_exit() => exit,
+    };
+    match abnormal {
+        None => {
+            tracing::info!("graceful shutdown: stopping agent");
+            agent.shutdown().await;
+        }
+        Some(exit) => {
+            // `run` 正常**永不返回**（无限重连循环）：走到这里说明它返回或 panic 了。若继续停在
+            // 等信号上，进程就是一个"看起来活着、什么都不做"的僵尸，日志里也什么都没有——比一次
+            // 崩溃难查得多。返回 Err ⇒ 退出码 1 ⇒ `deploy/agent.service` 的 `Restart=always`
+            // 重新拉起。**退出决定在这里，不在库里**（P3-5）。
+            anyhow::bail!(
+                "agent run loop ended abnormally ({exit:?}); exiting so the supervisor restarts us"
+            );
+        }
+    }
     Ok(())
 }
 

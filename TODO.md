@@ -506,6 +506,9 @@
 - [ ] **A3 类型化错误收尾**（OPTIMIZATION.md 已改标 ⚠️ 部分）：`Agent::start`
       （`agent/src/lib.rs:40`）与 `tls::https_server_config`（`gateway/src/tls.rs:51-54`）仍返回 anyhow；
       `config_err`、`AgentError::Forward`、`GatewayError::Sqlite` 是从未被构造的死变体。
+      **2026-09-23 补充**：与之相邻的 P3-5（`Agent::start` 在**库**里 `std::process::exit(1)`）已单独修掉
+      —— 库现在把 run 循环的结局交给调用方（`AgentExit` + `Agent::wait_for_abnormal_exit`），退出决定在
+      `agent/src/main.rs`。所以本条的剩余范围缩小为"错误**类型**"，不涉及进程退出。
 - [x] **Makefile `deny` 目标 ≠ hook/CI（2026-09-22 完成）**：目标现在就是完整的
       `cargo deny check`（advisories/bans/licenses/sources 全跑，与 hook/CI 同一条命令），
       注释也改成"完整检查"而不是"由 hook 与 CI 执行"；`make check` 的说明补上"CI 还会跑
@@ -569,6 +572,18 @@
       "代理转发"三方矛盾。**两个选项都没选**：它没有搬进 `usage_meter.rs`（那会让"纯函数"
       那一格也不再成立），而是独立成 `proxy/usage.rs`——策略（何时提取/估算/结算）自己一格，
       纯函数在 `usage_meter`，落库在 `storage`，`proxy/mod.rs` 只剩转发编排。
+- [ ] **隧道 ALPN 借用了 `h3`（P3-1；2026-09-23 决策：先保留，改名方案待定）**：`proto/src/lib.rs` 的
+      `ALPN = b"h3"` 只是两端约定的**纯标签**——隧道是自定义帧协议跑在裸 QUIC 上
+      （`[u32 BE 长度][postcard]`，`proto/src/frame.rs`），项目里没有 H3 客户端、依赖里也没有 `h3`
+      crate，所以这个标签**不给任何客户端带来兼容性好处**；代价只是任何按 ALPN 判协议的工具/中间盒/
+      监控会把该 UDP 端口认成 HTTP/3（真 H3 客户端还会被隧道 mTLS 挡在握手外，见 `tls.rs` 的
+      `WebPkiClientVerifier`）。**要改就是兼容性变更**：rustls 对 QUIC 走严格 ALPN（RFC 9001，
+      `rustls/src/server/hs.rs` 注释直接引用），任一端配置/提供了 ALPN 而最终没协商出协议 ⇒ 握手
+      失败，所以"改名"与"不设 ALPN"都会让新旧网关/agent **不能混跑**。**待定的迁移方案**：三步重叠
+      改名（① agent 同时报 `[新值, h3]` ② 网关同时广告两者 ③ 全部升完后网关删 `h3`），跨两次发布；
+      是否值得（收益只有排障清晰度）尚未权衡 → **未决**。**已做**：`proto/src/lib.rs` 的注释与
+      `docs/PROJECT_SCAN.md` 的 P3-1 都写清了"有意借用 + 迁移约束"。若最终决定不改，把本条标成
+      "有意保留"并关掉即可。
 - [ ] **前端四份独立 `/metrics` 轮询**：`Layout.tsx:24`、`Overview.tsx:9`、`MetricsPage.tsx:10`、
       `Agents.tsx:61` 各实例化一个 `useMetricsHistory()`（各自 5s 轮询、各自一份历史）。抽 context 共享。
 - [ ] **小体积/常量类**：`Agents.tsx:72` 用 `error.message.includes("404")` 嗅探状态码

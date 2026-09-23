@@ -43,8 +43,38 @@ pub struct AgentConfig {
     pub request_log: bool,
 }
 
+/// `Agent` 的运行结局。
+///
+/// `run` 是无限重连循环，正常**永不结束**，所以"有结局"本身就是要上报的异常（`Cancelled`
+/// 除外 —— 那是我们自己关的）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentExit {
+    /// run 循环返回了（不该发生）。
+    LoopExited,
+    /// run 循环 panic 了。
+    Panicked,
+    /// run 循环被取消 —— 即 `Agent::shutdown`。
+    Cancelled,
+}
+
+impl AgentExit {
+    /// 只有 `Cancelled` 是我们自己关的，不算"异常结局"（调用方不必以非 0 退出）。
+    ///
+    /// 单独抽出来是为了能直接单测这条映射：它挂在 `Agent::wait_for_abnormal_exit` 上，而那条
+    /// 路径要"关掉之后还能问一次"，需要 `shutdown` 取 `&mut self`（会牵动 38 个 e2e 调用点），
+    /// 为 3 行映射不值当（P3-5）。
+    fn as_abnormal(self) -> Option<Self> {
+        match self {
+            Self::Cancelled => None,
+            abnormal => Some(abnormal),
+        }
+    }
+}
+
 pub struct Agent {
     task: tokio::task::JoinHandle<()>,
+    /// 守护任务给出的结局（`None` = 还没结束）。
+    outcome: tokio::sync::watch::Receiver<Option<AgentExit>>,
 }
 
 impl Agent {
@@ -55,27 +85,72 @@ impl Agent {
             cfg.client_cert.clone(),
             cfg.client_key.clone_key(),
         )?;
-        // 外层包一层守护：run 正常**永不返回**，一旦返回（panic / 被取消），进程就只是
-        // "看起来还在运行"——main 停在 shutdown_signal()，既不重连也不退出，日志里也
-        // 什么都没有。所以这里喊出来并让进程退出，交给外部守护重新拉起
-        // （deploy/agent.service 是 Restart=always / RestartSec=3）。静默的僵尸进程
-        // 比一次崩溃难查得多。
+        Ok(Self::supervise(
+            async move { run(cfg, client_config).await },
+        ))
+    }
+
+    /// 守护一个"应当永不结束"的 run future，并把它的结局交给调用方。
+    ///
+    /// 外层包一层守护的理由不变：run 正常**永不返回**，一旦返回（panic / 被取消），进程就只是
+    /// "看起来还在运行"——main 停在 `shutdown_signal()`，既不重连也不退出，日志里也什么都没有。
+    /// 静默的僵尸进程比一次崩溃难查得多。
+    ///
+    /// **但"退出进程"不在这里做**（P3-5）：那是进程级策略，属于二进制（`main.rs`）。库自己
+    /// `std::process::exit` 会让 agent crate 无法被嵌入，而且进程内构造 `Agent` 的测试在 run
+    /// 循环崩溃时会被把**整个测试二进制**带走。现在结局走一个 watch 通道，
+    /// 调用方用 [`Agent::wait_for_abnormal_exit`] 接住并按自己的策略处置。
+    fn supervise<F>(run_loop: F) -> Self
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let (tx, outcome) = tokio::sync::watch::channel(None);
         let task = tokio::spawn(async move {
-            let mut inner = AbortOnDrop(tokio::spawn(run(cfg, client_config)));
-            match (&mut inner.0).await {
-                Ok(()) => error!("agent run loop exited; exiting so the supervisor restarts us"),
-                Err(e) if e.is_panic() => {
-                    error!("agent run loop panicked: {e}; exiting so the supervisor restarts us")
+            let mut inner = AbortOnDrop(tokio::spawn(run_loop));
+            let exit = match (&mut inner.0).await {
+                Ok(()) => {
+                    error!(
+                        "agent run loop exited; the caller should exit so the supervisor restarts us"
+                    );
+                    AgentExit::LoopExited
                 }
-                Err(e) => warn!("agent run loop cancelled: {e}"),
-            }
-            std::process::exit(1);
+                Err(e) if e.is_panic() => {
+                    error!(
+                        "agent run loop panicked: {e}; the caller should exit so the supervisor restarts us"
+                    );
+                    AgentExit::Panicked
+                }
+                Err(e) => {
+                    warn!("agent run loop cancelled: {e}");
+                    AgentExit::Cancelled
+                }
+            };
+            let _ = tx.send(Some(exit));
         });
-        Ok(Self { task })
+        Self { task, outcome }
     }
 
     pub async fn shutdown(self) {
         self.task.abort();
+    }
+
+    /// 等这次运行**异常结束**。
+    ///
+    /// - `Some(LoopExited | Panicked)`：run 循环没了，进程"看起来还活着、什么都不做"。调用方
+    ///   应当打日志并以**非 0** 退出，交给外部守护（`deploy/agent.service` 是
+    ///   `Restart=always` / `RestartSec=3`）重新拉起。
+    /// - `None`：是我们自己 `shutdown()` 关的（正常退出）。
+    pub async fn wait_for_abnormal_exit(&mut self) -> Option<AgentExit> {
+        loop {
+            let seen = *self.outcome.borrow_and_update();
+            if let Some(exit) = seen {
+                return exit.as_abnormal();
+            }
+            if self.outcome.changed().await.is_err() {
+                // 发送端消失且没给出结局（守护任务被 abort）⇒ 我们自己关的
+                return None;
+            }
+        }
     }
 }
 
@@ -1225,6 +1300,61 @@ mod tests {
         (addr, rx)
     }
 
+    /// 规格（P3-5）：**run 循环结束由调用方得知，库自己不再退出进程。**
+    ///
+    /// 这条测试在旧实现下**根本不可能存在**：守护任务末尾是 `std::process::exit(1)`，任何在进程内
+    /// 触发该路径的测试都会把整个测试二进制带走（报告丢失）。现在结局走一个 watch 通道。
+    #[tokio::test]
+    async fn a_finished_run_loop_is_reported_instead_of_exiting_the_process() {
+        let mut agent = Agent::supervise(async {});
+        assert_eq!(
+            agent.wait_for_abnormal_exit().await,
+            Some(AgentExit::LoopExited),
+            "run 循环返回必须被报成异常结局"
+        );
+    }
+
+    /// 同上，panic 那一支（`JoinError::is_panic`）。注意 panic 发生在 `tokio::spawn` 的任务里，
+    /// 所以它**只**通过 `JoinHandle` 传出来，不会让测试进程失败——这正是要钉住的语义。
+    #[tokio::test]
+    async fn a_panicking_run_loop_is_reported() {
+        let mut agent = Agent::supervise(async { panic!("run loop 炸了") });
+        assert_eq!(
+            agent.wait_for_abnormal_exit().await,
+            Some(AgentExit::Panicked),
+            "run 循环 panic 必须被报成异常结局"
+        );
+    }
+
+    /// 对照：**跑着的** agent 不该被误报（`run` 是无限重连循环，连不上网关也是活着）。
+    #[tokio::test]
+    async fn a_running_agent_reports_no_abnormal_exit() {
+        let (ca, srv_cert, srv_key, cli_cert, cli_key) = gen_pki();
+        let (addr, _server_handles) = test_server(&ca, srv_cert, srv_key).await;
+        let cfg = test_agent_config(addr, ca.clone(), cli_cert, cli_key);
+        let mut agent = Agent::start(cfg).expect("启动应当成功");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), agent.wait_for_abnormal_exit())
+                .await
+                .is_err(),
+            "跑着的 agent 不该报异常结局"
+        );
+        agent.shutdown().await;
+    }
+
+    /// 规格（P3-5）：`Cancelled`（我们自己 `shutdown()` 关的）**不算**异常结局 ⇒ 调用方不必
+    /// 以非 0 退出；另外两种必须算。
+    #[test]
+    fn only_a_self_inflicted_stop_is_not_an_abnormal_exit() {
+        assert_eq!(AgentExit::Cancelled.as_abnormal(), None);
+        assert_eq!(
+            AgentExit::LoopExited.as_abnormal(),
+            Some(AgentExit::LoopExited)
+        );
+        assert_eq!(AgentExit::Panicked.as_abnormal(), Some(AgentExit::Panicked));
+    }
+
     /// 规格（记录 P2-4）：**上游的重定向不许被跟随**。
     ///
     /// 跟随的代价不是"多一跳"：307/308 会把方法与 **prompt 原样重发**到 `Location` 指定的地址
@@ -1809,6 +1939,392 @@ mod tests {
         }
         assert!(format!("{err:#}").contains("request_id=11"));
         drop(gw_send);
+    }
+
+    /// 规格（P3-2）：**方法非法这条 `Err` 路径不能把监听任务留在那儿**。
+    ///
+    /// 修复前，方法守卫排在 `tokio::spawn` 监听任务**之后**，而 `listener.abort()` 只在成功
+    /// 路径的末尾调用 ⇒ 这条 `return` 泄漏一个仍持有读半边的任务：它继续消费网关发来的帧
+    /// （于是下面这个探测里"网关再写帧"一直成功）。修复后读半边随作用域一起丢弃，QUIC 会回过
+    /// STOP_SENDING，网关这边的写就会失败。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_invalid_method_leaves_no_listener_holding_the_stream() {
+        let (ca, srv_cert, srv_key, cli_cert, cli_key) = gen_pki();
+        let (addr, mut server_handles) = test_server(&ca, srv_cert, srv_key).await;
+        let cfg = test_agent_config(addr, ca.clone(), cli_cert, cli_key);
+        let cc = tls::rustls_client_tls(
+            &cfg.ca_cert,
+            cfg.client_cert.clone(),
+            cfg.client_key.clone_key(),
+        )
+        .unwrap();
+        let (_agent_handle, mut agent_acceptor) = connect_for_test_with_acceptor(&cfg, cc).await;
+        let mut gateway = tokio::time::timeout(Duration::from_secs(5), server_handles.recv())
+            .await
+            .expect("agent 应当连上")
+            .expect("假网关应当拿到连接句柄");
+
+        let gw_stream = gateway.open_bidirectional_stream().await.expect("开流");
+        let (gw_recv, mut gw_send) = gw_stream.split();
+        write_frame(
+            &mut gw_send,
+            &Frame::ProxyRequest {
+                request_id: 12,
+                method: "BAD METHOD".into(), // 含空格 ⇒ Method::from_bytes 必失败
+                path: "/v1/chat/completions".into(),
+                headers: vec![],
+                body: bytes::Bytes::from_static(br#"{"model":"m"}"#),
+            },
+        )
+        .await
+        .expect("写请求帧");
+
+        let agent_stream = tokio::time::timeout(
+            Duration::from_secs(5),
+            agent_acceptor.accept_bidirectional_stream(),
+        )
+        .await
+        .expect("5s 内应当收到流")
+        .expect("accept 不该失败")
+        .expect("应当是 Some(stream)");
+        let err = handle_stream(
+            agent_stream,
+            upstream_client().unwrap(),
+            "http://127.0.0.1:1".into(),
+            false,
+        )
+        .await
+        .expect_err("非法方法必须是 Err");
+        assert!(format!("{err:#}").contains("request_id=12"));
+
+        // 先读掉那条 400（行为本身由上一个用例钉住），reader **留着不 drop**：免得"网关这半边
+        // 关掉读方向"变成干扰项。
+        let mut reader = proto::io::FrameReader::new(gw_recv);
+        let frame = tokio::time::timeout(Duration::from_secs(5), reader.next())
+            .await
+            .expect("等错误帧超时")
+            .expect("读帧失败")
+            .expect("应当有一条错误帧");
+        assert!(matches!(frame, Frame::Error { code: 400, .. }), "{frame:?}");
+
+        // 关键探测：故意挑一个**监听者会忽略**的帧型（Cancel/EOF 会让泄漏的监听任务自己退出，
+        // 那就测不出泄漏了）。修复前写会一直成功（对端还有人在收），修复后应当变成 Err。
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut stopped = false;
+        while tokio::time::Instant::now() < deadline {
+            let probe = write_frame(
+                &mut gw_send,
+                &Frame::Heartbeat {
+                    agent_id: "probe".into(),
+                    inflight: 0,
+                },
+            )
+            .await;
+            if probe.is_err() {
+                stopped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            stopped,
+            "非法方法返回后，agent 不该还留着持有读半边的监听任务（对端仍在收帧）"
+        );
+        drop(gw_send);
+    }
+
+    /// 规格（P3-2 的另一半）：**监听任务被 spawn 之后**的任何返回路径（这里是"上游连不上"，
+    /// 方法合法 ⇒ 走的是正常 spawn 分支）也必须把监听任务收掉。
+    ///
+    /// 这条是 `AbortOnDrop` 守卫的**使用点**证明：把守卫换成裸 `tokio::spawn` 而保留"方法守卫
+    /// 上移"，只有这条会红（前一条探针测不到，因为那条路径压根不再 spawn）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_forward_leaves_no_listener_holding_the_stream() {
+        let (ca, srv_cert, srv_key, cli_cert, cli_key) = gen_pki();
+        let (addr, mut server_handles) = test_server(&ca, srv_cert, srv_key).await;
+        let cfg = test_agent_config(addr, ca.clone(), cli_cert, cli_key);
+        let cc = tls::rustls_client_tls(
+            &cfg.ca_cert,
+            cfg.client_cert.clone(),
+            cfg.client_key.clone_key(),
+        )
+        .unwrap();
+        let (_agent_handle, mut agent_acceptor) = connect_for_test_with_acceptor(&cfg, cc).await;
+        let mut gateway = tokio::time::timeout(Duration::from_secs(5), server_handles.recv())
+            .await
+            .expect("agent 应当连上")
+            .expect("假网关应当拿到连接句柄");
+
+        let gw_stream = gateway.open_bidirectional_stream().await.expect("开流");
+        let (gw_recv, mut gw_send) = gw_stream.split();
+        write_frame(
+            &mut gw_send,
+            &Frame::ProxyRequest {
+                request_id: 13,
+                method: "POST".into(), // 合法 ⇒ 会走到 spawn 监听任务那一步
+                path: "/v1/chat/completions".into(),
+                headers: vec![],
+                body: bytes::Bytes::from_static(br#"{"model":"m"}"#),
+            },
+        )
+        .await
+        .expect("写请求帧");
+
+        let agent_stream = tokio::time::timeout(
+            Duration::from_secs(5),
+            agent_acceptor.accept_bidirectional_stream(),
+        )
+        .await
+        .expect("5s 内应当收到流")
+        .expect("accept 不该失败")
+        .expect("应当是 Some(stream)");
+        // 上游指向没人监听的端口 ⇒ forward 失败 ⇒ 返回 502 那条 Err
+        handle_stream(
+            agent_stream,
+            upstream_client().unwrap(),
+            "http://127.0.0.1:1".into(),
+            false,
+        )
+        .await
+        .expect_err("上游连不上必须是 Err");
+
+        let mut reader = proto::io::FrameReader::new(gw_recv);
+        let frame = tokio::time::timeout(Duration::from_secs(5), reader.next())
+            .await
+            .expect("等错误帧超时")
+            .expect("读帧失败")
+            .expect("应当有一条错误帧");
+        assert!(matches!(frame, Frame::Error { code: 502, .. }), "{frame:?}");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut stopped = false;
+        while tokio::time::Instant::now() < deadline {
+            if write_frame(
+                &mut gw_send,
+                &Frame::Heartbeat {
+                    agent_id: "probe".into(),
+                    inflight: 0,
+                },
+            )
+            .await
+            .is_err()
+            {
+                stopped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            stopped,
+            "转发失败返回后，agent 不该还留着持有读半边的监听任务（对端仍在收帧）"
+        );
+        drop(gw_send);
+    }
+
+    /// 规格（P3-3）：**"网关提前半关请求流"必须是可观测的**。
+    ///
+    /// 取消的契约是"网关显式发 `Frame::Cancel`"；而 agent 的监听任务把请求方向的**干净 EOF**
+    /// 也当成取消（兜底）。今天网关每条放弃在途请求的路径都先发 Cancel 再 `finish()`，所以 EOF
+    /// 兜底只在"响应还没开始"时被触发就意味着**契约被破坏**——这条测试就钉住"那一刻要留下 warn"。
+    ///
+    /// 用 `current_thread` runtime：日志捕获依赖 `set_default` 的线程局部性（见 `CapturedLogs`）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_gateway_half_close_before_the_response_leaves_a_warning() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_env_filter("info")
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // 一个"接了不答"的上游：agent 会停在等响应头上，于是下面的半关一定发生在响应之前。
+        let hang = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("绑本地端口");
+        let hang_addr = hang.local_addr().expect("取端口");
+        tokio::spawn(async move {
+            if let Ok((conn, _)) = hang.accept().await {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                drop(conn);
+            }
+        });
+
+        let (ca, srv_cert, srv_key, cli_cert, cli_key) = gen_pki();
+        let (addr, mut server_handles) = test_server(&ca, srv_cert, srv_key).await;
+        let cfg = test_agent_config(addr, ca.clone(), cli_cert, cli_key);
+        let cc = tls::rustls_client_tls(
+            &cfg.ca_cert,
+            cfg.client_cert.clone(),
+            cfg.client_key.clone_key(),
+        )
+        .unwrap();
+        let (_agent_handle, mut agent_acceptor) = connect_for_test_with_acceptor(&cfg, cc).await;
+        let mut gateway = tokio::time::timeout(Duration::from_secs(5), server_handles.recv())
+            .await
+            .expect("agent 应当连上")
+            .expect("假网关应当拿到连接句柄");
+
+        let gw_stream = gateway.open_bidirectional_stream().await.expect("开流");
+        let (gw_recv, mut gw_send) = gw_stream.split();
+        write_frame(
+            &mut gw_send,
+            &Frame::ProxyRequest {
+                request_id: 14,
+                method: "POST".into(),
+                path: "/v1/chat/completions".into(),
+                headers: vec![],
+                body: bytes::Bytes::from_static(br#"{"model":"m"}"#),
+            },
+        )
+        .await
+        .expect("写请求帧");
+        // **故意不发 Cancel 就半关写半边** —— 契约违背现场。
+        let _ = gw_recv;
+        tokio::io::AsyncWriteExt::shutdown(&mut gw_send)
+            .await
+            .expect("半关应当成功");
+
+        let agent_stream = tokio::time::timeout(
+            Duration::from_secs(5),
+            agent_acceptor.accept_bidirectional_stream(),
+        )
+        .await
+        .expect("5s 内应当收到流")
+        .expect("accept 不该失败")
+        .expect("应当是 Some(stream)");
+        // 让 handle_stream 去等那个不答的上游；监听任务同时看到 FIN。
+        let handle = tokio::spawn(async move {
+            handle_stream(
+                agent_stream,
+                upstream_client().unwrap(),
+                format!("http://{hang_addr}"),
+                false,
+            )
+            .await
+        });
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut text = String::new();
+        while tokio::time::Instant::now() < deadline {
+            text = logs.text();
+            if text.contains("before the response") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            text.contains("before the response"),
+            "网关在响应之前半关请求流 = 契约违背，必须留下 warn；捕获到的日志：\n{text}"
+        );
+
+        handle.abort();
+    }
+
+    /// 规格（P3-3 的对照）：**响应已经开始之后对端半关 = 合法收尾，不该报契约违背。**
+    ///
+    /// 与上一条互为对照：上一条钉"响应前 EOF ⇒ warn"，这条钉"响应后 EOF ⇒ 不 warn"；
+    /// 只满足一条的实现都是错的（永远 warn = 噪声，永远不 warn = 漏掉契约违背）。
+    /// 关键在时序：FIN 必须在**监听任务还活着**的时候到达（响应头已写出、响应体还在流），
+    /// 否则测试会因为"监听任务已被 AbortOnDrop 收掉"而假绿。
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_gateway_half_close_after_the_response_is_not_a_warning() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_env_filter("info")
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // 一个"只回响应头、不结束响应体"的上游：agent 会停在流式回传阶段。
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("绑本地端口");
+        let up_addr = upstream.local_addr().expect("取端口");
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            if let Ok((mut conn, _)) = upstream.accept().await {
+                let mut buf = [0u8; 2048];
+                let _ = conn.read(&mut buf).await;
+                // 没有 content-length ⇒ 流式；**先只发头**，连接保持打开
+                let _ = conn
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n")
+                    .await;
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            }
+        });
+
+        let (ca, srv_cert, srv_key, cli_cert, cli_key) = gen_pki();
+        let (addr, mut server_handles) = test_server(&ca, srv_cert, srv_key).await;
+        let cfg = test_agent_config(addr, ca.clone(), cli_cert, cli_key);
+        let cc = tls::rustls_client_tls(
+            &cfg.ca_cert,
+            cfg.client_cert.clone(),
+            cfg.client_key.clone_key(),
+        )
+        .unwrap();
+        let (_agent_handle, mut agent_acceptor) = connect_for_test_with_acceptor(&cfg, cc).await;
+        let mut gateway = tokio::time::timeout(Duration::from_secs(5), server_handles.recv())
+            .await
+            .expect("agent 应当连上")
+            .expect("假网关应当拿到连接句柄");
+
+        let gw_stream = gateway.open_bidirectional_stream().await.expect("开流");
+        let (gw_recv, mut gw_send) = gw_stream.split();
+        write_frame(
+            &mut gw_send,
+            &Frame::ProxyRequest {
+                request_id: 15,
+                method: "POST".into(),
+                path: "/v1/chat/completions".into(),
+                headers: vec![],
+                body: bytes::Bytes::from_static(br#"{"model":"m"}"#),
+            },
+        )
+        .await
+        .expect("写请求帧");
+
+        let agent_stream = tokio::time::timeout(
+            Duration::from_secs(5),
+            agent_acceptor.accept_bidirectional_stream(),
+        )
+        .await
+        .expect("5s 内应当收到流")
+        .expect("accept 不该失败")
+        .expect("应当是 Some(stream)");
+        let handle = tokio::spawn(async move {
+            handle_stream(
+                agent_stream,
+                upstream_client().unwrap(),
+                format!("http://{up_addr}"),
+                false,
+            )
+            .await
+        });
+
+        // 等 agent 把响应头写出来（= `response_started` 已置位），再半关。
+        let mut reader = proto::io::FrameReader::new(gw_recv);
+        let frame = tokio::time::timeout(Duration::from_secs(5), reader.next())
+            .await
+            .expect("等响应头超时")
+            .expect("读帧失败")
+            .expect("应当有一条帧");
+        assert!(
+            matches!(frame, Frame::ProxyResponseHead { .. }),
+            "先到的应当是响应头：{frame:?}"
+        );
+
+        tokio::io::AsyncWriteExt::shutdown(&mut gw_send)
+            .await
+            .expect("半关应当成功");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let text = logs.text();
+        assert!(
+            !text.contains("before the response"),
+            "响应之后的半关是合法收尾，不该报契约违背；捕获到的日志：\n{text}"
+        );
+
+        handle.abort();
     }
 
     /// 把 tracing 输出抓进内存的 `MakeWriter`（只为断言"某一行日志到底有没有打"）。

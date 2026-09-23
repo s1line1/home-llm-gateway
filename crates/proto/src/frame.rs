@@ -66,6 +66,11 @@ pub enum Frame {
     /// agent → cloud：响应结束。
     ProxyResponseEnd { request_id: u64, ok: bool },
     /// cloud → agent：客户端断开/超时，要求取消上游请求（避免白算 token）。
+    ///
+    /// **契约（P3-3）**：取消**只能**由这一帧表达。云端放弃一个还活着的请求时必须显式发它，
+    /// **不能**用半关请求流（`send.finish()`）代替：agent 的监听任务把请求方向的干净 EOF 也当
+    /// 取消，但那是异常情况的**兜底**——EOF 出现在响应之前时 agent 会打一条 warn 并把它当成契约
+    /// 违背（`agent/src/stream.rs`）。所以每一处 `finish()` 都应当紧跟一次 `tunnel_cancel`。
     Cancel { request_id: u64 },
     /// 双向：错误。
     Error {

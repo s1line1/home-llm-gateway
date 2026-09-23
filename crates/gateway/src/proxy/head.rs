@@ -179,6 +179,8 @@ where
                     "upstream head timeout while the agent is still answering; not evicting"
                 );
             }
+            // 先发取消、再半关：agent 那边**兜底**会把请求方向的 EOF 当取消，但契约要求显式
+            // `Cancel`（P3-3）——只靠半关会让"响应前 EOF"变成一条契约违背告警。
             tunnel_cancel(send, request_id, state.tunnel_op_timeout).await;
             let _ = send.finish();
             Err(RouteFailure {
