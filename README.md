@@ -835,6 +835,12 @@ QPS 压到一两个数量级以下。上面这些数字只在"把模型换快"�
   - `hlmg_tunnel_open_timeouts_total{class=...}`：开流超过 `tunnel_op_secs` 的次数，按判定分——
     `busy`（在途已顶到承载上限，**背压**，不摘除，改换 agent 或 429）/ `dead`（没到上限却开不出流，
     坏连接，摘除）。**`busy` 陡增 = 该扩容或调 agent 的 `max_concurrency`；`dead` 陡增才是隧道/网络故障**
+  - `hlmg_forward_ends_total{kind=...}`：**响应转发的退出原因**（`upstream_end` / `upstream_error` /
+    `upstream_closed` / `tunnel_error` / `idle_timeout` / `client_gone` / `client_stalled` /
+    `gateway_shutdown` / `protocol_violation`）。**这类失败大多发生在状态码 200 已经发给客户端之后**
+    （响应体半截、上游断流、逐帧空闲超时），访问日志只记状态码 ⇒ 不看这个指标，"客户端拿到半截回答"
+    在生产上完全不可观测。判据：`upstream_end` 之外任何 kind 的**增量**都值得看一眼；
+    `idle_timeout`/`tunnel_error` 陡增 = 隧道或上游出了问题，`client_*` 陡增 = 客户端侧在放弃
   - `hlmg_key_verify_hits_total` / `hlmg_key_verify_misses_total`：key 校验命中已验证缓存 / **真正跑了 argon2**的次数。misses 的**增量**就是内存与 CPU 的风险信号（一次 miss 峰值 +19MiB，见《并发上限与内存》），稳态下应接近 0；突然上涨说明凭据被吊销/新增，或缓存容量 `verified_cache_max` 不够。⚠️ **`verified_cache_max: 0` 时这两个计数器恒为 0**（走的是不走缓存的旧路径，两个数都不加）——看到 0 要先确认缓存是否被关掉，别当成"没有校验"
 - **结构化日志**：`tracing`，每个请求带 `request_id` / 状态码 / 耗时（`tower-http` TraceLayer）
 - **`/healthz`**：存活探针。**200 ⇔ 隧道入口仍在接受新 agent**（`hlmg_quic_accepting`），否则 `503` + `status: "degraded"` + `detail`（处置方式：重启网关）。body 是 JSON，同时报出诊断信息：

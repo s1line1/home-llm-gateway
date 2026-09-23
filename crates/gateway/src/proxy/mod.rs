@@ -201,7 +201,8 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
             state_client_stall,
             op_timeout,
             slot,
-            metrics,
+            // clone：下面还要用同一个 `Metrics` 记退出原因（记录 P2-14）
+            metrics.clone(),
             key_store,
             key.key_id,
             key.key_name,
@@ -210,6 +211,9 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
             shutdown,
         )
         .await;
+        // 记录 P2-14：这条 `debug!` 是**唯一**消费 ForwardEnd 的地方，于是七条以上的
+        // "状态码已是 200 的失败"在指标上完全不可见；现在每个出口都留一个计数。
+        metrics.record_forward_end(end.label());
         debug!(request_id, end = ?end, "response forwarding finished");
     });
 

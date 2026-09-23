@@ -78,6 +78,27 @@ pub(super) enum ForwardEnd {
     ProtocolViolation,
 }
 
+impl ForwardEnd {
+    /// 指标标签用的稳定名字（`hlmg_forward_ends_total{kind=...}`）。
+    ///
+    /// 为什么值得单独当指标（记录 P2-14）：这里面**大多数出口发生时状态码已经写出去了**
+    /// （200 已发给客户端，只是响应体半截/超时/被截断），访问日志只记状态码 ⇒ 这类失败在生产上
+    /// 本来完全不可观测。穷尽匹配：新增变体时编译器会在这里提醒。
+    pub(super) fn label(&self) -> &'static str {
+        match self {
+            ForwardEnd::UpstreamEnd => "upstream_end",
+            ForwardEnd::UpstreamError => "upstream_error",
+            ForwardEnd::UpstreamClosed => "upstream_closed",
+            ForwardEnd::TunnelError => "tunnel_error",
+            ForwardEnd::IdleTimeout => "idle_timeout",
+            ForwardEnd::ClientGone => "client_gone",
+            ForwardEnd::ClientStalled => "client_stalled",
+            ForwardEnd::GatewayShutdown => "gateway_shutdown",
+            ForwardEnd::ProtocolViolation => "protocol_violation",
+        }
+    }
+}
+
 /// 关闭时写给在途 SSE 的终止事件。
 ///
 /// **必须与正常完成可区分**：`data: [DONE]` 是 OpenAI 的"正常结束"标记，用它收尾等于
@@ -371,6 +392,36 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+
+    /// 规格（记录 P2-14）：**每条退出路径都要有自己的指标标签**，且互不相同。
+    ///
+    /// 标签就是 `hlmg_forward_ends_total{kind=...}` 的取值，混在一起就分不出"客户端走了"
+    /// 与"上游没发 End 就关了"——而这两者的处置完全相反。
+    #[test]
+    fn every_forward_end_has_its_own_label() {
+        let all = [
+            ForwardEnd::UpstreamEnd,
+            ForwardEnd::UpstreamError,
+            ForwardEnd::UpstreamClosed,
+            ForwardEnd::TunnelError,
+            ForwardEnd::IdleTimeout,
+            ForwardEnd::ClientGone,
+            ForwardEnd::ClientStalled,
+            ForwardEnd::GatewayShutdown,
+            ForwardEnd::ProtocolViolation,
+        ];
+        let labels: Vec<&str> = all.iter().map(|e| e.label()).collect();
+        assert!(
+            labels
+                .iter()
+                .all(|l| !l.is_empty() && l.chars().all(|c| c.is_ascii_lowercase() || c == '_')),
+            "标签应当是稳定的 snake_case（指标标签基数有界、可 grep）：{labels:?}"
+        );
+        let mut unique = labels.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), labels.len(), "标签必须互不相同：{labels:?}");
+    }
 
     /// 规格（并集报告 H5）：**`Terminating` 必须叫停卡在"客户端不读"上的发送**。
     ///
