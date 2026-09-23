@@ -609,6 +609,30 @@ async fn e2e_proxy_protocol_edge_cases() {
     assert_eq!(r.status(), 200);
     let _ = r.bytes().await.unwrap();
 
+    // 记录 P2-14：上面 5–9 号场景里，客户端拿到的**状态码都是 200**，失败只体现在"响应体读到一半
+    // 出错"——以前这类出口在指标上完全不可观测（唯一痕迹是一句 `debug!`）。现在每条出口都要在
+    // `hlmg_forward_ends_total{kind=...}` 上留下自己的计数，否则"半截回答"根本没法告警。
+    let text = client
+        .get(format!("http://{}/metrics", gw.http_addr))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    for kind in [
+        "upstream_end",    // 6 与 10：正常结束
+        "upstream_error",  // 5：上游发 Error 帧
+        "upstream_closed", // 7：上游没发 End 就关流
+        "tunnel_error",    // 8：畸形帧
+        "idle_timeout",    // 9：逐帧空闲超时
+    ] {
+        assert!(
+            text.contains(&format!("hlmg_forward_ends_total{{kind=\"{kind}\"}}")),
+            "缺少 {kind} 的计数（P2-14：这类失败的状态码已经是 200，只能靠它观测）：\n{text}"
+        );
+    }
+
     client_task.abort();
     gw.shutdown().await;
 }

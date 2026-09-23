@@ -78,9 +78,30 @@ pub async fn authenticate(
     Ok(key)
 }
 
+/// 从 `Authorization` 头里取出 Bearer 凭据（`/v1` 认证与 `/admin` 鉴权共用这一套解析）。
+///
+/// 规范（RFC 9110 §11.1）：scheme 名**大小写不敏感**，scheme 与凭据之间是 `1*SP`
+/// （一个或多个空格）。旧实现 `strip_prefix("Bearer ")` 是字节精确匹配，`bearer sk-…`
+/// 这种完全合法的请求会拿到 401——与"OpenAI 兼容"的目标相悖（P3-17）。
+///
+/// 放宽的只有"scheme 大小写"与"分隔空格"这两件事，**不**放宽 scheme 名本身：`Bearerx`
+/// 是另一个 token，`Token` / `Basic` 更不是 Bearer，一律 `None`。空凭据同样 `None`，
+/// 不会拿空串去和 keystore（或 admin token）比对。
+pub(crate) fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let value = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
+    let (scheme, credentials) = value.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let token = credentials.trim_start_matches(' ');
+    (!token.is_empty()).then_some(token)
+}
+
 async fn verify_api_key(state: &AppState, headers: &HeaderMap) -> Option<AuthenticatedKey> {
-    let value = headers.get(axum::http::header::AUTHORIZATION)?;
-    let token = value.to_str().ok()?.strip_prefix("Bearer ")?.to_string();
+    let token = bearer_token(headers)?.to_string();
     let store = state.key_store.clone();
     // 明文 token 移动进校验任务（不 clone）：它是这段代码里唯一持有明文的地方，
     // 任务结束即释放。
@@ -157,16 +178,18 @@ mod tests {
     /// 退避——这条把 `into_response` 这张映射表钉住，因为响应构造现在只在这一处。
     #[tokio::test]
     async fn rejection_maps_to_the_same_response_as_before() {
-        for (rejection, status, ty) in [
+        for (rejection, status, ty, challenge) in [
             (
                 AuthRejection::InvalidKey,
                 StatusCode::UNAUTHORIZED,
                 "authentication_error",
+                Some("Bearer"),
             ),
             (
                 AuthRejection::RateLimited,
                 StatusCode::TOO_MANY_REQUESTS,
                 "rate_limit_error",
+                None,
             ),
         ] {
             let resp = rejection.into_response();
@@ -176,9 +199,89 @@ mod tests {
                 status == StatusCode::TOO_MANY_REQUESTS,
                 "只有 429 带 Retry-After"
             );
+            assert_eq!(
+                resp.headers()
+                    .get(axum::http::header::WWW_AUTHENTICATE)
+                    .and_then(|v| v.to_str().ok()),
+                challenge,
+                "401 必须给出 authentication challenge（RFC 9110 §15.5.2）；429 不是认证失败，不带"
+            );
             let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
             let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(v["error"]["type"], ty);
+        }
+    }
+
+    /// 规格（P3-17）：`Authorization` 的 scheme 名**大小写不敏感**，且 scheme 与凭据之间
+    /// 允许**一个或多个空格**（RFC 9110 §11.1：`credentials = auth-scheme [ 1*SP ... ]`）。
+    ///
+    /// 旧实现 `strip_prefix("Bearer ")` 是字节精确匹配，下面除第一行外每一行都拿到 401；
+    /// 而 OpenAI 官方接口接受小写 scheme——"兼容"就该有这一条。
+    #[tokio::test]
+    async fn the_bearer_scheme_is_case_insensitive_and_spacing_tolerant() {
+        let store = KeyStore::new(None);
+        let created = store.create("p3-17".into()).expect("建 key 应当成功");
+        let state = AppState::new(
+            Registry::default(),
+            store,
+            Metrics::default(),
+            &Options::default(),
+        );
+
+        for header in [
+            format!("Bearer {}", created.plaintext),   // 现状：回归项
+            format!("bearer {}", created.plaintext),   // 小写
+            format!("BEARER {}", created.plaintext),   // 大写
+            format!("BeArEr {}", created.plaintext),   // 混合
+            format!("Bearer   {}", created.plaintext), // 1*SP：多空格
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::header::AUTHORIZATION,
+                axum::http::HeaderValue::from_str(&header).unwrap(),
+            );
+            let identity = authenticate(&state, &headers)
+                .await
+                .unwrap_or_else(|_| panic!("`{header}` 应当认证通过"));
+            assert_eq!(
+                identity.key_id,
+                created.record.id(),
+                "`{header}` 应当认出同一把 key"
+            );
+        }
+    }
+
+    /// 规格（P3-17）：放宽大小写**不等于**放宽 scheme。`Bearerx` 是另一个 token，`Token`
+    /// / `Basic` 更不是 Bearer；空凭据 / 缺凭据也不该走到 keystore 比较。
+    #[tokio::test]
+    async fn a_non_bearer_scheme_is_still_rejected() {
+        let store = KeyStore::new(None);
+        let created = store.create("p3-17-neg".into()).expect("建 key 应当成功");
+        let state = AppState::new(
+            Registry::default(),
+            store,
+            Metrics::default(),
+            &Options::default(),
+        );
+
+        for header in [
+            format!("Bearerx {}", created.plaintext),
+            format!("bearerx {}", created.plaintext),
+            format!("Token {}", created.plaintext),
+            format!("Basic {}", created.plaintext),
+            format!("Bearer{}", created.plaintext), // 没有分隔空格
+            "Bearer ".to_string(),                  // 空凭据
+            "Bearer".to_string(),                   // 只有 scheme
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::header::AUTHORIZATION,
+                axum::http::HeaderValue::from_str(&header).unwrap(),
+            );
+            assert!(
+                authenticate(&state, &headers).await.is_err(),
+                "`{header}` 不该通过认证"
+            );
         }
     }
 }

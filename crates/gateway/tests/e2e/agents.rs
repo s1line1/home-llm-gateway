@@ -6,10 +6,15 @@ use super::common::*;
 #[serial]
 async fn e2e_admission_control() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
-    // agent max_concurrency=1：两个并发慢请求，一个 200、一个 429；完成后槽位释放
-    let (gw, agent, base, key) = start_stack(1, |_| {}).await;
+    // agent max_concurrency=1：两个**确定重叠**的慢请求，一个 200、一个 429；完成后槽位释放。
+    //
+    // 记录 P2-18：原先用 `tokio::join!` 赌"两个请求一定重叠"（唯一保证是上游 800ms 的 sleep）。
+    // 现在改成"先发第一个 → 等 `/admin/agents` 显示槽位真被占上 → 再发第二个"，重叠是**构造**
+    // 出来的，不依赖调度时序。
+    let (gw, agent, base, key) =
+        start_stack(1, |o| o.admin_token = Some("admin-token".into())).await;
     let client = test_client();
-    let url = format!("{base}/v1/slow");
+    let url = format!("{base}/v1/slow?ms=1500");
     let req = || {
         client
             .post(&url)
@@ -17,22 +22,20 @@ async fn e2e_admission_control() {
             .json(&serde_json::json!({ "model": "mock-llm" }))
     };
 
-    let (a, b) = tokio::join!(req().send(), req().send());
-    let (ra, rb) = (a.unwrap(), b.unwrap());
-    let mut statuses = vec![ra.status(), rb.status()];
-    statuses.sort();
+    let first = tokio::spawn(req().send());
+    wait_for_any_agent_inflight(&base, 1).await;
+    let second = req().send().await.unwrap();
     assert_eq!(
-        statuses,
-        vec![
-            reqwest::StatusCode::OK,
-            reqwest::StatusCode::TOO_MANY_REQUESTS
-        ],
-        "with max_concurrency=1, exactly one concurrent request should be admitted"
+        second.status(),
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        "唯一槽位已被第一个请求占住，第二个必须 429"
     );
 
-    // 消费两个响应体，确保网关侧槽位已释放
-    let _ = ra.bytes().await;
-    let _ = rb.bytes().await;
+    // 消费两个响应体，确保网关侧槽位已释放（第一个要等它那 1500ms 跑完）
+    let first = first.await.unwrap().unwrap();
+    assert_eq!(first.status(), reqwest::StatusCode::OK);
+    let _ = first.bytes().await;
+    let _ = second.bytes().await;
 
     // 槽位释放后，新请求应成功
     let resp = req().send().await.unwrap();
@@ -52,14 +55,16 @@ async fn e2e_multi_agent_least_loaded() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
     let mock_a = start_mock_llm("mock-a").await;
     let mock_b = start_mock_llm("mock-b").await;
-    let TestGateway { gw, certs, key, .. } = start_gateway(|_| {}).await;
+    let TestGateway { gw, certs, key, .. } =
+        start_gateway(|o| o.admin_token = Some("admin-token".into())).await;
 
     let agent_a = certs.agent(&gw, "agent-a", &["mock-llm"], mock_a, 1, true);
     let agent_b = certs.agent(&gw, "agent-b", &["mock-llm"], mock_b, 1, true);
     wait_for_agents(&gw, 2, Duration::from_secs(10)).await;
 
     let client = test_client();
-    let url = format!("http://{}/v1/slow", gw.http_addr);
+    let base = format!("http://{}", gw.http_addr);
+    let url = format!("{base}/v1/slow?ms=1500");
     let req = || {
         client
             .post(&url)
@@ -67,24 +72,38 @@ async fn e2e_multi_agent_least_loaded() {
             .json(&serde_json::json!({ "model": "mock-llm" }))
     };
 
-    // 3 个并发慢请求：每个 agent 容量 1 → 应恰好占用两个不同 agent（2×200），第 3 个 429
-    let (ra, rb, rc) = tokio::join!(req().send(), req().send(), req().send());
-    let mut responses = vec![ra.unwrap(), rb.unwrap(), rc.unwrap()];
+    // 记录 P2-18：不赌"3 个 join! 一定重叠"。先发第 1 个 → 等它在途 → 第 2 个必然落到另一台
+    // （第一台容量 1 已满）→ 第 3 个才必然 429。每一步都有事实依据，不靠 sleep 窗口。
+    // 第 2 个也必须**先发出去、再等它占上**，不能在原地 `await send()`：`/v1/slow` 是"读完才回"，
+    // 那一下会阻塞到上游睡醒（≈1.5s），期间第 1 个已经收尾、槽位被释放，第 3 个就会拿到 200。
+    let first = tokio::spawn(req().send());
+    wait_for_any_agent_inflight(&base, 1).await;
+    let second = tokio::spawn(req().send());
+    wait_for_any_agent_inflight(&base, 2).await; // 两台各自容量 1，都已被占住
+    let third = req().send().await.unwrap();
+    assert_eq!(
+        third.status(),
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        "两台 agent 容量都是 1 且都已被占住，第 3 个请求必须 429"
+    );
+
     let mut servers = Vec::new();
-    for resp in responses.drain(..) {
-        match resp.status() {
-            reqwest::StatusCode::OK => {
-                let body: serde_json::Value = resp.json().await.unwrap();
-                servers.push(body["server"].as_str().unwrap().to_string());
-            }
-            reqwest::StatusCode::TOO_MANY_REQUESTS => {}
-            other => panic!("unexpected status: {other}"),
-        }
+    for (label, resp) in [
+        ("first", first.await.unwrap().unwrap()),
+        ("second", second.await.unwrap().unwrap()),
+    ] {
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::OK,
+            "{label} 应当是 200（有槽位时不该被拒）"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        servers.push(body["server"].as_str().unwrap().to_string());
     }
     assert_eq!(servers.len(), 2, "two requests should be admitted");
     assert_ne!(
         servers[0], servers[1],
-        "concurrent requests should be spread across agents"
+        "第一台已满时，第二个请求必须被分到另一台上"
     );
     assert!(
         servers.iter().all(|s| s == "mock-a" || s == "mock-b"),

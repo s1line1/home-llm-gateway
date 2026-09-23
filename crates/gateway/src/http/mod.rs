@@ -19,6 +19,20 @@ pub(crate) use entry::spawn_entry;
 use observability::request_id_middleware;
 use ui::{ui_fallback, ui_missing};
 
+/// `/admin/*` 的响应一律 `Cache-Control: no-store`（P3-6）。
+///
+/// `POST /admin/keys` 的响应体里是**一次性明文 API key**，列表/用量响应带 key 名与用量；按
+/// RFC，带凭据的 GET 一般不会被共享缓存留存，所以这是**显式声明**而非补漏洞。做成中间件而不是
+/// 逐个 handler 加头：新增 admin 路由时不会漏。
+async fn no_store(req: axum::extract::Request, next: middleware::Next) -> axum::response::Response {
+    let mut resp = next.run(req).await;
+    resp.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    resp
+}
+
 pub fn app(state: AppState) -> Router {
     let mut router = Router::new()
         .route("/healthz", get(healthz))
@@ -49,7 +63,10 @@ pub fn app(state: AppState) -> Router {
             .route_layer(middleware::from_fn_with_state(
                 state.clone(),
                 crate::admin::admin_auth,
-            ));
+            ))
+            // 放在 `route_layer` **之后** ⇒ 这个中间件在最外层，admin 鉴权自己产生的 401
+            // 也会带上这个头（见 `no_store`）。
+            .layer(middleware::from_fn(no_store));
         router = router.nest("/admin", admin);
     }
     // React UI 静态托管：存在时 `/` 返回 Dashboard，未命中的路径（SPA 前端路由，

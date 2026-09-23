@@ -13,6 +13,7 @@ use std::{
 use async_stream::stream;
 use axum::{
     body::{Body, Bytes},
+    extract::DefaultBodyLimit,
     extract::Query,
     extract::State,
     http::{
@@ -23,6 +24,15 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+
+/// mock 接受的请求体上限。
+///
+/// axum 的 `Json` 提取器**默认只收 2 MiB**，而被测的网关允许到 16 MiB
+/// （`gateway::body::MAX_REQUEST_BODY`）⇒ 本地压大请求体时，会先在 mock 这里撞 413、
+/// 或者写 body 时被 reset（agent 因此回 502 `local upstream request failed`），把
+/// "网关/agent 能不能扛大 body"的测试卡在一个与它们无关的地方（2026-09-22 实测踩到）。
+/// 放宽到 32 MiB：网关上限的两倍，留一倍余量。
+pub const MOCK_MAX_REQUEST_BODY: usize = 32 * 1024 * 1024;
 
 /// 持续产出 `chunks` 块、每块 `kb` KB（块间 `delay_ms` 毫秒，默认 0）。
 /// 上游会一直产到被取消为止——这正是"客户端不读时会不会永久占住槽位"要考的场景。
@@ -108,6 +118,8 @@ pub fn router(name: &str) -> Router {
         .route("/v1/flood", post(flood))
         // 观测面：`cancelled` = 上游看到的"中途取消"次数（供 e2e 断言"Cancel 真的到了上游"）
         .route("/stats", get(stats))
+        // 测试上游不该比被测系统更严：见 `MOCK_MAX_REQUEST_BODY`。
+        .layer(DefaultBodyLimit::max(MOCK_MAX_REQUEST_BODY))
         .with_state(AppState {
             name: Arc::from(name),
             cancelled: Arc::new(AtomicU64::new(0)),
@@ -295,6 +307,51 @@ mod tests {
             counter.load(Ordering::Relaxed),
             1,
             "被丢弃的流必须算成一次取消"
+        );
+    }
+
+    /// 规格（2026-09-22 实测踩到的坑）：**mock 必须收下比 axum 默认 2 MiB 更大的请求体**，
+    /// 否则本地大 body 测试会先在 mock 这里失败（413 或连接被 reset），把"网关/agent 能不能
+    /// 扛大 body"卡在与它们无关的地方。
+    ///
+    /// 起真服务器 + 裸 socket 直接发，不用额外的 HTTP 客户端依赖（mock-llm 没有 dev-deps）。
+    /// 请求体里用**被忽略的字段**填充，于是响应仍然很小。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_body_larger_than_axums_default_limit_is_accepted() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router("big-body").into_make_service()).await;
+        });
+
+        // 4 MiB：超过 axum 的 2 MiB 默认上限，但在 `MOCK_MAX_REQUEST_BODY` 之内
+        let pad = "a".repeat(4 * 1024 * 1024);
+        let body = format!(
+            r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}],"pad":"{pad}"}}"#
+        );
+        let head = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+
+        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        sock.write_all(head.as_bytes()).await.unwrap();
+        sock.write_all(body.as_bytes()).await.unwrap();
+
+        let mut response = Vec::new();
+        sock.read_to_end(&mut response).await.unwrap();
+        let text = String::from_utf8_lossy(&response);
+        let status = text.lines().next().unwrap_or_default();
+        assert!(
+            status.contains("200"),
+            "4 MiB 请求体必须被收下（axum 默认上限是 2 MiB，会回 413）：{status}"
+        );
+        assert!(
+            text.contains("mock(big-body) reply to: hi"),
+            "body 内容照旧要能解析出来：{}",
+            &text[..text.len().min(200)]
         );
     }
 }

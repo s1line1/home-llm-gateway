@@ -47,6 +47,13 @@ struct MetricsInner {
     agent_connections_total: AtomicU64,
     /// QUIC 隧道入口是否仍在接受新连接（1/0）。入口停止后进程照常运行，这是唯一的告警信号。
     quic_accepting: AtomicU64,
+    /// 响应转发的**退出原因**（kind → count，记录 P2-14）。
+    ///
+    /// 七条以上的出口里，大多数发生时**状态码已经写出去了**（200 已发给客户端，只是响应体
+    /// 半截/空闲超时/上游断流），访问日志只记状态码 ⇒ 这类"客户端拿到半截回答"的失败本来
+    /// 在生产上完全不可观测。kind 取自 `proxy::forward::ForwardEnd::label`（`&'static str`，
+    /// 基数有界）。
+    forward_ends: Mutex<HashMap<&'static str, u64>>,
     /// 因"挑不出可路由的 agent"而拒绝的请求数，按原因分（reason → count）。
     ///
     /// 与 HTTP 状态码计数是两件事：客户端只看到 503/404/429，而这里回答的是
@@ -184,6 +191,13 @@ impl Metrics {
             .or_insert(0) += 1;
     }
 
+    /// 记录一次响应转发的退出原因（`kind` 见 `proxy::forward::ForwardEnd::label`）。
+    pub fn record_forward_end(&self, kind: &'static str) {
+        *lock_or_recover(&self.inner.forward_ends)
+            .entry(kind)
+            .or_insert(0) += 1;
+    }
+
     /// 记录一次开流超时（`kind`：`busy` = 背压排队，`dead` = 坏连接）。
     pub fn record_tunnel_open_timeout(&self, kind: &'static str) {
         *lock_or_recover(&self.inner.tunnel_open_timeouts)
@@ -252,11 +266,6 @@ impl Metrics {
         self.inner.active.load(Ordering::Relaxed)
     }
 
-    /// 累计请求数。
-    pub fn request_count(&self) -> u64 {
-        self.inner.request_count.load(Ordering::Relaxed)
-    }
-
     /// agent 连接建立：累计 +1、当前在线 +1。
     pub fn mark_agent_connected(&self) -> AgentConnectionGuard {
         self.inner
@@ -272,12 +281,12 @@ impl Metrics {
     /// 永远报警）。守卫已经保证每 +1 恰好配一次 -1，这里是第二道保险——一处逻辑错误不该把
     /// 仪表盘彻底毁掉。
     fn agent_disconnected(&self) {
-        let _ =
-            self.inner
-                .quic_connections
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                    Some(n.saturating_sub(1))
-                });
+        let _ = self
+            .inner
+            .quic_connections
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_sub(1))
+            });
     }
 
     /// 渲染为 Prometheus 文本格式。
@@ -346,6 +355,21 @@ impl Metrics {
                     out.push_str(&format!(
                         "hlmg_agent_rejections_total{{reason=\"{r}\"}} {}\n",
                         rej[*r]
+                    ));
+                }
+            }
+        }
+        {
+            let fe = lock_or_recover(&inner.forward_ends);
+            if !fe.is_empty() {
+                out.push_str("# HELP hlmg_forward_ends_total Response forwarding exits by reason. Most of these happen after a 200 was already written to the client (truncated body, idle timeout, upstream closed), so the access log cannot show them; see ForwardEnd::label for the kinds.\n");
+                out.push_str("# TYPE hlmg_forward_ends_total counter\n");
+                let mut kinds: Vec<&&str> = fe.keys().collect();
+                kinds.sort_unstable();
+                for k in kinds {
+                    out.push_str(&format!(
+                        "hlmg_forward_ends_total{{kind=\"{k}\"}} {}\n",
+                        fe[*k]
                     ));
                 }
             }
@@ -495,12 +519,7 @@ pub struct Admission {
     start: Instant,
 }
 
-impl Admission {
-    /// 占位时刻（调用方据此计算 TTFB 等日志字段）。
-    pub fn started_at(&self) -> Instant {
-        self.start
-    }
-}
+impl Admission {}
 
 impl Drop for Admission {
     fn drop(&mut self) {
@@ -700,6 +719,37 @@ mod tests {
     /// 样本会让解析失败（整轮抓取报废）。本仓库真踩过这个坑——加 `hlmg_requests_aborted_total`
     /// 时把 HELP 插到了 `hlmg_request_count` 的 HELP 与 TYPE 之间。这条把它变成机器判据，
     /// 顺带保证新指标（`hlmg_http_accept_errors_total`）确实被渲染出来。
+    /// 规格（记录 P2-14）：**转发退出原因要真的渲染出来**，且 HELP/TYPE 成对、空家族不输出。
+    #[test]
+    fn forward_end_kinds_are_rendered_with_their_own_type_line() {
+        let m = Metrics::default();
+        assert!(
+            !m.render(0, 0, 0, 0).contains("hlmg_forward_ends_total"),
+            "没有记录过就不该输出这个家族（避免 HELP 后面没有样本）"
+        );
+
+        m.record_forward_end("upstream_closed");
+        m.record_forward_end("upstream_closed");
+        m.record_forward_end("idle_timeout");
+        let text = m.render(0, 0, 0, 0);
+        assert!(
+            text.contains("# HELP hlmg_forward_ends_total "),
+            "要有 HELP：\n{text}"
+        );
+        assert!(
+            text.contains("# TYPE hlmg_forward_ends_total counter"),
+            "要有 TYPE：\n{text}"
+        );
+        assert!(
+            text.contains("hlmg_forward_ends_total{kind=\"upstream_closed\"} 2"),
+            "计数要准：\n{text}"
+        );
+        assert!(
+            text.contains("hlmg_forward_ends_total{kind=\"idle_timeout\"} 1"),
+            "kind 要各算各的：\n{text}"
+        );
+    }
+
     #[test]
     fn every_help_line_is_immediately_followed_by_its_own_type_line() {
         let text = Metrics::default().render(0, 0, 0, 0);

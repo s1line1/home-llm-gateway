@@ -9,7 +9,7 @@ use reqwest::{header::HeaderValue, RequestBuilder};
 use s2n_quic::stream::{BidirectionalStream, SendStream};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tracing::{info, warn};
 
 // /// 单帧最大字节数（64 MiB）。
 // pub const MAX_FRAME: usize = 64 * 1024 * 1024;
@@ -188,6 +188,12 @@ pub async fn handle_stream(
         anyhow::bail!("first frame is not a ProxyRequest: {first:?}");
     };
 
+    // 记录 P2-2 的另一半：`request_log`（默认 true）以前是**空操作**——成功路径一行日志都没有。
+    // 现在按文档承诺打 received / responded / done / cancelled 四条 INFO。
+    if request_log {
+        info!(request_id, method = %method, path = %path, "proxy request received");
+    }
+
     // 拼 URL 前的守卫（纵深防御第二道）：不合法就当场回 400，既不发上游、也不起监听任务。
     let Some(url) = upstream_url(&upstream, &path) else {
         return reject_unsafe_path(&mut send, request_id, &path).await;
@@ -244,6 +250,10 @@ pub async fn handle_stream(
     listener.abort(); // 无论成败都收掉监听任务
                       // 记录 P2-2：把"哪个请求、哪条路径"挂进错误链。调用方（`connect_once` 的 accept 循环）
                       // 用 `{e:#}` 打一行，于是每条失败都有一条带上下文的 warn，而不是静默消失。
+    if request_log {
+        info!(request_id, ok = result.is_ok(), "proxy request done");
+    }
+    // 记录 P2-2：把"哪个请求、哪条路径"挂进错误链；调用方（accept 循环）用 `{e:#}` 打一行。
     result.with_context(|| format!("request_id={request_id} path={path}"))
 }
 
@@ -253,7 +263,7 @@ async fn forward(
     mut rb: RequestBuilder,
     headers: Vec<(String, String)>,
     body: bytes::Bytes,
-    _request_log: bool,
+    request_log: bool,
     cancel: &CancellationToken,
 ) -> anyhow::Result<()> {
     for (k, v) in headers {
@@ -293,7 +303,7 @@ async fn forward(
             }
         },
         _ = cancel.cancelled() => {
-            return send_cancelled(&mut send, request_id).await;
+            return send_cancelled(&mut send, request_id, request_log).await;
         }
     };
 
@@ -325,9 +335,9 @@ async fn forward(
         },
     )
     .await?;
-    // if request_log {
-    //     tracing::info!(request_id, status, "upstream responded");
-    // }
+    if request_log {
+        info!(request_id, status, "upstream responded");
+    }
 
     // ④ 流式回传：纯线性，无 select
     let mut body_stream = resp.bytes_stream();
@@ -340,7 +350,7 @@ async fn forward(
                 Some(Err(e)) => { warn!(request_id, "upstream stream error: {e}"); ok = false; break; }
                 None => break,
             },
-            _ = cancel.cancelled() => return send_cancelled(&mut send, request_id).await,
+            _ = cancel.cancelled() => return send_cancelled(&mut send, request_id, request_log).await,
         };
         // 切块后逐片回传：`MAX_RESPONSE_CHUNK` 是**网关侧的内存边界**（那边通道按条数有界，
         // 见该常量的文档 / 记录 R9）。`Bytes::split_to` 零拷贝：只动引用计数与偏移。
@@ -364,7 +374,14 @@ async fn forward(
     Ok(())
 }
 
-async fn send_cancelled(send: &mut SendStream, request_id: u64) -> anyhow::Result<()> {
+async fn send_cancelled(
+    send: &mut SendStream,
+    request_id: u64,
+    request_log: bool,
+) -> anyhow::Result<()> {
+    if request_log {
+        info!(request_id, "proxy request cancelled by client");
+    }
     let _ = write_frame(
         send,
         &Frame::Error {

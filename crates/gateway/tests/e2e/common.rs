@@ -191,6 +191,41 @@ pub fn seed_keys_db() -> (PathBuf, String) {
 }
 
 /// 读 `/metrics` 里的某个 gauge 值（测试用它断言"槽位是否归还"）。
+/// 等"至少一个 agent 的在途数 ≥ `want`"（读 `/admin/agents` 的实时视图；需要测试里配
+/// `admin_token = Some("admin-token")`）。
+///
+/// 为什么需要它（记录 P2-18）：并发 e2e 的断言——"恰好一个 200 + 一个 429"、"两个请求分散到
+/// 两台 agent"——只有在**两次请求真的重叠**时才成立。靠上游 `sleep` 的时长窗口去赌重叠是时序
+/// 赌博（调度一慢就串行化 ⇒ 两个都 200 ⇒ 断言失败）。这里改成"**等槽位真的被占上**，再发第二个
+/// 请求"，把重叠用事实构造出来。
+pub async fn wait_for_any_agent_inflight(base: &str, want: u64) {
+    let client = test_client();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let agents: serde_json::Value = client
+            .get(format!("{base}/admin/agents"))
+            .header("Authorization", "Bearer admin-token")
+            .send()
+            .await
+            .expect("/admin/agents 应当可查（测试里要配 admin_token）")
+            .json()
+            .await
+            .unwrap();
+        let total: u64 = agents
+            .as_array()
+            .map(|list| list.iter().filter_map(|e| e["inflight"].as_u64()).sum())
+            .unwrap_or(0);
+        if total >= want {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "等 agent 在途数 ≥{want} 超时；/admin/agents = {agents}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 pub async fn metric_gauge(base: &str, name: &str) -> u64 {
     let text = reqwest::get(format!("{base}/metrics"))
         .await

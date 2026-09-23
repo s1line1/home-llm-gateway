@@ -15,7 +15,6 @@ dependencies = [
  "rcgen",
  "reqwest",
  "rustls",
- "rustls-pemfile",
  "s2n-quic",
  "serde",
  "serde_yaml_ng",

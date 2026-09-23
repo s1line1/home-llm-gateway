@@ -65,7 +65,7 @@ deny.toml       cargo-deny 策略（依赖许可证 / 公告；CI 与 pre-commit
 > 以下用 `cargo run` 仅为本地开发方便（debug 构建）；**生产部署直接用编译好的 release 二进制**，服务器无需安装 Rust，见 [`DEPLOY.md`](DEPLOY.md)。
 
 > 💡 常用命令已收进 `Makefile`：`make help` 查看全部；`make setup`（证书+前端依赖）、
-> `make dev`（一键起 mock-llm+gateway+agent 全栈）、`make dev-ui`（先构建前端再起全栈）、
+> `make dev`（先编译 debug 二进制，再一键起 mock-llm+gateway+agent 全栈；**任一进程没起来就报错退出**并贴出该进程日志末尾）、`make dev-ui`（先构建前端再起全栈）、
 > `make stop`（停全栈）、`make test` / `make build` / `make release`。
 
 ### 环境
@@ -728,6 +728,44 @@ agent 侧心跳超时→主动断开→重连握手超时（**已修**，见下�
 所有吞吐数字的天花板；**网关与 agent 自身的容量在这条链路下测不出来**（要测就得上本机回环，或先把
 EIP 带宽抬上去）。
 
+#### 本机回环：栈自身能跑多少（2026-09-22，把上面那条天花板拿掉）
+
+同一套代码、同一批二进制，改成"本地 gateway + 本地 agent + 本地 mock-llm + 本地压测客户端"，
+全走 `127.0.0.1`（`.tmp/loop-cap.sh`，配置是 `.tmp/gw-loop.yml` / `.tmp/ag-loop.yml`）：
+
+| 负载 | 并发 | 吞吐 | p50 | p95 | 失败 | 网关侧服务均值 |
+|---|---|---|---|---|---|---|
+| 81 B 请求（非流式） | 8 | **10 678 rps** | 0.7 ms | 1.1 ms | 0 | 0.013 ms |
+| 81 B | 32 | **15 341 rps** | 2.0 ms | 3.3 ms | 0 | 0.82 ms |
+| 81 B | 128 | **17 241 rps** | 7.3 ms | 11.2 ms | 0 | 3.8 ms |
+| 81 B | 512 | **17 090 rps**（平台） | 30 ms | 43 ms | 0 | 10.5 ms |
+| 81 B，两个客户端进程各 256 | 512 | 18 663 rps（合计） | — | — | 0 | — |
+| 64 KB 请求体 | 8 | 1 358 rps = **89.5 / 89.2 MB/s**（下/上） | 5.8 ms | 8.8 ms | 0 | 5.0 ms |
+| 1 MB | 8 | 88.6 rps = **93.0 / 93.0 MB/s** | 99 ms | 118 ms | 0 | 89 ms |
+| 1 MB | 32 | 83.7 rps = **87.8 / 87.8 MB/s**（平台） | 412 ms | 556 ms | 0 | 379 ms |
+| 2 MB | 4 | 43.9 rps = 92.1 / 92.1 MB/s | 98 ms | 111 ms | 0 | 90 ms |
+| 4 MB | 4 | 22.9 rps = **96.2 / 96.2 MB/s** | 189 ms | 209 ms | 0 | 173 ms |
+| 8 MB | 4 | 11.4 rps = **95.9 / 95.9 MB/s** | 384 ms | 417 ms | 0 | 346 ms |
+| 小请求 + **16 MB 流式响应**（`/v1/flood`） | 4 | 164 请求 = **180.9 MB/s**（仅下行） | 369 ms | 398 ms | 0 | 366 ms |
+| SSE（`stream:true`） | 64 | 2 044 rps（受 mock 每字符 10ms 的节奏限制） | 31.5 ms | 35.9 ms | 0 | 29.6 ms |
+
+**怎么读**：
+
+- **小包平台 ≈ 17–19k rps**，而且把客户端拆成两个进程只多出 ~9%（18.7k）⇒ 瓶颈不在那个单线程
+  Python 客户端，而在"这台 8 核机上的整条链路"（客户端、网关、agent、mock 共用它，且当时机器
+  本身 load 5–9）。**能下的结论是量级**：栈自身比云端那条链路快 **约 8–9 倍**（小包）到
+  **约 430 倍**（16 MB 流式：181 MB/s vs 0.42 MB/s）——云端所有"吞吐"数字都是链路的数字，不是这套
+  代码的。
+- **纯回环是上界**：没有 RTT、没有丢包、没有流控压力，所以这些数只用来回答"每请求成本多大 /
+  大 body 能跑多快 / 有没有自伤性瓶颈"，**不能当线上容量**。
+- **`hlmg_forward_ends_total` 全程只有 `upstream_end`**（各档合计 165 万次）⇒ 这段路径没有出现
+  截断/超时/协议违规，量的是干净的转发能力。
+- ⚠️ **`mock-llm` 曾经有个 2 MB 的请求体上限**（axum `Json` 的默认 `DefaultBodyLimit`）：>2 MB 的
+  请求体在本地会拿到 mock 的 413（被 agent 原样转发）或写 body 时被 reset（agent 回 502
+  `local upstream request failed`）——那是**测试上游**的限制，不是网关/agent 的，却会把"能不能扛
+  大 body"的测试卡在无关的地方。**2026-09-22 已放宽到 32 MiB**（`MOCK_MAX_REQUEST_BODY`，网关上限
+  的两倍），上面 4 MB / 8 MB 两行就是放宽之后的数。
+
 #### 768 并发档：心跳零余量与重连风暴（机制已定位，代码已修）
 
 **修复前的机制**（2026-09-17 定位到代码）：`crates/agent/src/lib.rs` 的 `heartbeat_loop` 给心跳回包
@@ -835,6 +873,12 @@ QPS 压到一两个数量级以下。上面这些数字只在"把模型换快"�
   - `hlmg_tunnel_open_timeouts_total{class=...}`：开流超过 `tunnel_op_secs` 的次数，按判定分——
     `busy`（在途已顶到承载上限，**背压**，不摘除，改换 agent 或 429）/ `dead`（没到上限却开不出流，
     坏连接，摘除）。**`busy` 陡增 = 该扩容或调 agent 的 `max_concurrency`；`dead` 陡增才是隧道/网络故障**
+  - `hlmg_forward_ends_total{kind=...}`：**响应转发的退出原因**（`upstream_end` / `upstream_error` /
+    `upstream_closed` / `tunnel_error` / `idle_timeout` / `client_gone` / `client_stalled` /
+    `gateway_shutdown` / `protocol_violation`）。**这类失败大多发生在状态码 200 已经发给客户端之后**
+    （响应体半截、上游断流、逐帧空闲超时），访问日志只记状态码 ⇒ 不看这个指标，"客户端拿到半截回答"
+    在生产上完全不可观测。判据：`upstream_end` 之外任何 kind 的**增量**都值得看一眼；
+    `idle_timeout`/`tunnel_error` 陡增 = 隧道或上游出了问题，`client_*` 陡增 = 客户端侧在放弃
   - `hlmg_key_verify_hits_total` / `hlmg_key_verify_misses_total`：key 校验命中已验证缓存 / **真正跑了 argon2**的次数。misses 的**增量**就是内存与 CPU 的风险信号（一次 miss 峰值 +19MiB，见《并发上限与内存》），稳态下应接近 0；突然上涨说明凭据被吊销/新增，或缓存容量 `verified_cache_max` 不够。⚠️ **`verified_cache_max: 0` 时这两个计数器恒为 0**（走的是不走缓存的旧路径，两个数都不加）——看到 0 要先确认缓存是否被关掉，别当成"没有校验"
 - **结构化日志**：`tracing`，每个请求带 `request_id` / 状态码 / 耗时（`tower-http` TraceLayer）
 - **`/healthz`**：存活探针。**200 ⇔ 隧道入口仍在接受新 agent**（`hlmg_quic_accepting`），否则 `503` + `status: "degraded"` + `detail`（处置方式：重启网关）。body 是 JSON，同时报出诊断信息：

@@ -18,6 +18,13 @@ async fn e2e_admin_api_keys() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 401, "admin endpoints require admin token");
+    assert_eq!(
+        resp.headers()
+            .get(reqwest::header::WWW_AUTHENTICATE)
+            .and_then(|v| v.to_str().ok()),
+        Some("Bearer"),
+        "admin 401 必须带 WWW-Authenticate challenge"
+    );
     let resp = client
         .post(format!("{base}/admin/keys"))
         .header("Authorization", format!("Bearer {key}"))
@@ -40,6 +47,13 @@ async fn e2e_admin_api_keys() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 201);
+    assert_eq!(
+        resp.headers()
+            .get(reqwest::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store"),
+        "带一次性明文 key 的响应绝不能被缓存留存"
+    );
     let created: serde_json::Value = resp.json().await.unwrap();
     let new_key = created["key"].as_str().unwrap().to_string();
     let new_id = created["id"].as_str().unwrap().to_string();

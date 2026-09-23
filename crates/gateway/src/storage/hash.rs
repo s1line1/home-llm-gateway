@@ -68,35 +68,27 @@ pub fn hash_argon2(token: &str) -> String {
     let mut salt_bytes = [0u8; 16];
     getrandom::fill(&mut salt_bytes).expect("os rng");
     let salt = SaltString::encode_b64(&salt_bytes).expect("16-byte salt is valid b64");
-    let _in_flight = Argon2InFlight::enter();
     argon2_for_call()
         .hash_password(token.as_bytes(), &salt)
         .expect("argon2 hashing with default params cannot fail")
         .to_string()
 }
 
-/// RAII：标记"一次 argon2 正在运行"。
-///
-/// 保留它是因为它标出了并发校验的边界（argon2 内存硬，同时在跑几个 = 内存峰值）。
-/// **注意不要再用全局计数断言调用次数**：计数器是进程级的，会被同一测试进程里其他
-/// 测试的 argon2 调用污染（实测并行跑全量 lib 时，一个只应 1 次的断言被顶到 2 次）。
-/// 调用次数改由 `KeyStore` 各实例自己统计（`KeyStore::argon2_runs`）。
-#[derive(Default)]
-struct Argon2InFlight;
-
-impl Argon2InFlight {
-    fn enter() -> Self {
-        Self
-    }
-}
-
 /// 校验 token 是否匹配存储的 argon2 哈希（PHC 字符串内嵌参数，未来调参不影响旧记录）。
+///
+/// **成本参数取自 PHC 串**：argon2 crate 的文档写明 "hash params from `parsed_hash` are used
+/// instead of what is configured in the `Argon2` instance"，所以用便宜参数写进去的记录在任何
+/// 线程上校验都是便宜的（`CheapArgon2` 只影响本线程**新算**的哈希）。
+///
+/// 历史：这里曾有一个 `Argon2InFlight` 空标记，声称"标出并发校验的边界"，但它不计数、也没有
+/// 任何行为（2026-09-22 删除）。**调用次数不要再放回全局计数**：那会被同一测试进程里其他测试
+/// 的 argon2 调用污染（实测并行跑全量 lib 时，一个只应 1 次的断言被顶到 2 次）；次数由
+/// `KeyStore` 各实例自己统计（`KeyStore::argon2_runs`）。
 pub fn verify_argon2(token: &str, encoded: &str) -> bool {
     let parsed = match PasswordHash::new(encoded) {
         Ok(p) => p,
         Err(_) => return false,
     };
-    let _in_flight = Argon2InFlight::enter();
     argon2_for_call()
         .verify_password(token.as_bytes(), &parsed)
         .is_ok()

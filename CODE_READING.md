@@ -145,12 +145,12 @@ web/src/components/   ← 布局/图表/UI（无依赖 SVG 图表）
 ## 常用命令速查
 
 ```bash
-make dev          # 一键起全栈（mock-llm + gateway + agent，日志在 .tmp/logs/）
+make dev          # 先编译 debug 二进制，再一键起全栈（mock-llm + gateway + agent，日志在 .tmp/logs/）
 make stop         # 停全栈
-make check        # fmt + clippy + nextest + web build（CI 还会跑 `cargo deny`，见 `make deny`）
+make check        # = CI 的 Rust 门槛 + 前端构建 + 工具链一致性（fmt / clippy / deny / nextest / web-build / toolchain-check）
 make bench        # Criterion 微基准
 make bench-k6     # k6 宏观压测（KEY=sk-xxx 必传）
-cargo llvm-cov --workspace --summary-only   # 覆盖率（当前 95.87%）
+cargo llvm-cov --workspace --summary-only   # 覆盖率（**本地**跑；CI 不算覆盖率。2026-09-23 @ b12ee0d 实测：区域 95.0% / 行 95.0%）
 ```
 
 ## 排查链路问题的标准动作

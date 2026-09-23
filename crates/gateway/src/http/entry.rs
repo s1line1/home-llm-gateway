@@ -294,9 +294,9 @@ mod tests {
     impl AcceptSource for FlakyListener {
         async fn accept(&self) -> std::io::Result<(TcpStream, SocketAddr)> {
             // EMFILE = 24（Linux 与 macOS 同值）；`checked_sub` 到 0 后就不再加失败。
-            let injected =
-                self.failures_left
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+            let injected = self
+                .failures_left
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
             if injected.is_ok() {
                 return Err(std::io::Error::from_raw_os_error(24));
             }

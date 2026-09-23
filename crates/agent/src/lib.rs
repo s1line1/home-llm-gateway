@@ -1810,4 +1810,118 @@ mod tests {
         assert!(format!("{err:#}").contains("request_id=11"));
         drop(gw_send);
     }
+
+    /// 把 tracing 输出抓进内存的 `MakeWriter`（只为断言"某一行日志到底有没有打"）。
+    ///
+    /// 为什么要有它：`request_log` 的承诺就是"打不打这几条 INFO"，而仓库没有（也不打算为一条
+    /// 日志引入）tracing 捕获依赖——标准库 + `tracing-subscriber` 的 `MakeWriter` 就够。
+    /// ⚠️ 配合 `flavor = "current_thread"` 用：`set_default` 是**线程局部**的，多线程 runtime 里
+    /// 任务可能被调度到别的 worker 上，事件就抓不到了。
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogs;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// 跑完一次**成功**的代理请求（假网关 → agent → 假上游），返回时 agent 侧已经写完 done。
+    async fn run_one_proxied_request(request_log: bool) {
+        let (upstream, _max_inflight, _served) = counting_upstream(Duration::from_millis(1)).await;
+        let (ca, srv_cert, srv_key, cli_cert, cli_key) = gen_pki();
+        let (addr, mut server_handles) = test_server(&ca, srv_cert, srv_key).await;
+        let cfg = test_agent_config(addr, ca.clone(), cli_cert, cli_key);
+        let cc = tls::rustls_client_tls(
+            &cfg.ca_cert,
+            cfg.client_cert.clone(),
+            cfg.client_key.clone_key(),
+        )
+        .unwrap();
+        let (_agent_handle, mut agent_acceptor) = connect_for_test_with_acceptor(&cfg, cc).await;
+        let mut gateway = tokio::time::timeout(Duration::from_secs(5), server_handles.recv())
+            .await
+            .expect("agent 应当连上")
+            .expect("假网关应当拿到连接句柄");
+
+        let gw_stream = gateway.open_bidirectional_stream().await.expect("开流");
+        let (_gw_recv, mut gw_send) = gw_stream.split();
+        write_frame(
+            &mut gw_send,
+            &Frame::ProxyRequest {
+                request_id: 21,
+                method: "POST".into(),
+                path: "/v1/chat/completions".into(),
+                headers: vec![],
+                body: bytes::Bytes::from_static(br#"{"model":"m"}"#),
+            },
+        )
+        .await
+        .expect("写请求帧");
+
+        let agent_stream = tokio::time::timeout(
+            Duration::from_secs(5),
+            agent_acceptor.accept_bidirectional_stream(),
+        )
+        .await
+        .expect("5s 内应当收到流")
+        .expect("accept 不该失败")
+        .expect("应当是 Some(stream)");
+        handle_stream(
+            agent_stream,
+            upstream_client().unwrap(),
+            upstream,
+            request_log,
+        )
+        .await
+        .expect("这次请求应当成功（假上游会正常回 200）");
+        // `gw_recv`/`gw_send` 在这里 drop：请求已经跑完，不需要再读响应帧
+    }
+
+    /// 规格（记录 P2-2 的另一半）：**`request_log`（默认 true）不是空操作**——成功路径要按文档
+    /// 承诺打出 `received` / `responded` / `done`；关掉之后这三条一条都不许有。
+    ///
+    /// 用 `current_thread` runtime：捕获依赖 `set_default` 的线程局部性（见 `CapturedLogs`）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn request_log_controls_the_success_path_info_lines() {
+        for (enabled, want) in [(true, true), (false, false)] {
+            let logs = CapturedLogs::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_env_filter("info")
+                .finish();
+            let _guard = tracing::subscriber::set_default(subscriber);
+
+            run_one_proxied_request(enabled).await;
+            let text = logs.text();
+            for line in [
+                "proxy request received",
+                "upstream responded",
+                "proxy request done",
+            ] {
+                assert_eq!(
+                    text.contains(line),
+                    want,
+                    "request_log={enabled} 时 `{line}` 该不该出现不符；捕获到的日志：\n{text}"
+                );
+            }
+        }
+    }
 }

@@ -3,7 +3,7 @@
 
 use axum::{
     extract::{Path, State},
-    http::{header::AUTHORIZATION, StatusCode},
+    http::StatusCode,
     response::{IntoResponse, Response},
     Json,
 };
@@ -19,11 +19,9 @@ pub async fn admin_auth(
     next: axum::middleware::Next,
 ) -> Response {
     let expected = state.admin_token.as_deref().unwrap_or_default();
-    let ok = req
-        .headers()
-        .get(AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
+    // 与 `/v1` 认证共用同一套 Bearer 解析（P3-17：scheme 大小写不敏感、`1*SP` 分隔），
+    // 否则会出现"api key 认小写、admin token 不认"的半拉子状态。比较仍是恒定时间。
+    let ok = crate::auth::bearer_token(req.headers())
         .map(|t| constant_time_eq(expected.as_bytes(), t.as_bytes()))
         .unwrap_or(false);
     if ok {
@@ -284,12 +282,67 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::WWW_AUTHENTICATE)
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer"),
+            "admin 401 同样要给 challenge（RFC 9110 §15.5.2）"
+        );
         let body = body_json(resp).await;
         assert_eq!(
             body["error"]["type"], "authentication_error",
             "admin 401 的 type 与 proxy 的 401 必须一致"
         );
         assert_eq!(body["error"]["message"], "invalid admin token");
+    }
+
+    /// 规格（P3-6）：`/admin/*` 的响应必须带 `Cache-Control: no-store`。
+    ///
+    /// `POST /admin/keys` 的响应体里就是**一次性明文 API key**，列表/用量响应带 key 名与用量
+    /// ——这些都不该被任何共享缓存留存（即便按 RFC，带凭据的请求一般不会被缓存，这仍是
+    /// 显式声明）。401 那条路径也一并钉住：它是同一个 router 的响应。
+    #[tokio::test]
+    async fn admin_responses_are_never_stored_by_caches() {
+        use tower::ServiceExt;
+
+        for (label, auth) in [("带 token", Some("Bearer admin-token")), ("401", None)] {
+            let state = test_state(); // admin_token = Some("admin-token")
+            let mut req = axum::extract::Request::builder().uri("/admin/keys");
+            if let Some(a) = auth {
+                req = req.header(axum::http::header::AUTHORIZATION, a);
+            }
+            let resp = crate::http::app(state)
+                .oneshot(req.body(axum::body::Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.headers()
+                    .get(axum::http::header::CACHE_CONTROL)
+                    .and_then(|v| v.to_str().ok()),
+                Some("no-store"),
+                "{label} 的 admin 响应也必须 no-store"
+            );
+        }
+    }
+
+    /// 规格（P3-17）：admin 鉴权与 `/v1` 认证必须共用同一套 Bearer 解析——小写 scheme 也放行。
+    #[tokio::test]
+    async fn admin_auth_accepts_a_lowercase_bearer_scheme() {
+        use tower::ServiceExt;
+
+        let state = test_state(); // admin_token = Some("admin-token")
+        let resp = crate::http::app(state)
+            .oneshot(
+                axum::extract::Request::builder()
+                    .uri("/admin/keys")
+                    .header(axum::http::header::AUTHORIZATION, "bearer admin-token")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "`bearer` 小写应当被接受");
     }
 
     #[tokio::test]

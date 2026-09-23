@@ -5,7 +5,15 @@ set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
 echo "==> cargo-deny: advisories + bans + licenses + sources"
-cargo deny check
+# 网络不可达时（GitHub 拉不到 advisory 库，实测一次 SSL_ERROR_SYSCALL 就能把**所有**提交堵死）
+# 退一步用**本地已缓存的**库再跑一次。这不是绕过检查：同样的 advisories/bans/licenses/sources
+# 都在跑，只是**没有刷新** advisory 库——所以打一行醒目的提醒，网络恢复后请再正常跑一次
+# `make deny`。（`CARGO_NET_OFFLINE=true` 对 cargo-deny 无效，要用它自己的 `--offline`。）
+if ! cargo deny check; then
+  echo "==> cargo-deny 上一次失败；改用本地缓存的 advisory 库重试（--offline）"
+  echo "    ⚠️ 本次**未刷新** advisory 库：网络恢复后请再跑一次 'make deny' 以拿到最新公告。"
+  cargo deny --offline check
+fi
 
 echo "==> cargo fmt --check"
 cargo fmt --check

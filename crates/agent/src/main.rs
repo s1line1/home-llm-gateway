@@ -39,25 +39,40 @@ async fn run(args: Args) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 等待 SIGINT / SIGTERM，收到后干净退出（覆盖 systemd stop / Ctrl+C / job kill）。
+/// 等待 SIGINT / SIGTERM / SIGHUP，收到后干净退出（覆盖 systemd stop / Ctrl+C / job kill /
+/// 终端挂断）。
+///
+/// SIGHUP 也算**关闭请求**（P3-9）：agent 没有配置热重载（`deploy/agent.service` 里也没有
+/// `ExecReload`），保留默认动作只会让 `kill -HUP` 或终端挂断绕过 `agent.shutdown()` 直接
+/// 杀进程。日志里点名这一点，免得有人以为 HUP 会重载配置。
 async fn shutdown_signal() {
-    let ctrl_c = async {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        // 三个信号流**先**建好、再打日志：`signal()` 就是注册 handler 的那一刻，所以这行
+        // 日志可以承诺"从此刻起的 INT/TERM/HUP 都会被接住"。它同时是 e2e 的**确定性**就绪
+        // 判据——真进程只能靠日志，而在这之前发 HUP 会按默认动作直接杀掉进程（测试随机红）。
+        let mut interrupt =
+            signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
+        let mut terminate =
+            signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+        let mut hangup = signal(SignalKind::hangup()).expect("failed to install SIGHUP handler");
+        tracing::info!("shutdown signals armed (SIGINT/SIGTERM/SIGHUP)");
+        tokio::select! {
+            _ = interrupt.recv() => tracing::info!("received SIGINT"),
+            _ = terminate.recv() => tracing::info!("received SIGTERM"),
+            _ = hangup.recv() => {
+                tracing::info!("received SIGHUP (no config hot-reload; shutting down)")
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // 非 unix 上只有 Ctrl+C（Windows）。
         tokio::signal::ctrl_c()
             .await
             .expect("failed to install SIGINT handler");
-    };
-    #[cfg(unix)]
-    let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install SIGTERM handler")
-            .recv()
-            .await;
-    };
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-    tokio::select! {
-        _ = ctrl_c => tracing::info!("received SIGINT"),
-        _ = terminate => tracing::info!("received SIGTERM"),
+        tracing::info!("received SIGINT");
     }
 }
 
