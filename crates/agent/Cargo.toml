@@ -11,10 +11,8 @@ bytes = { workspace = true }
 clap = { workspace = true }
 futures-util = { workspace = true }
 proto = { path = "../proto" }
-postcard = { workspace = true }
 reqwest = { workspace = true }
 rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
 serde = { workspace = true }
 serde_yaml_ng = "0.10"
 s2n-quic = { workspace = true }
@@ -26,6 +24,11 @@ tracing-subscriber = { workspace = true }
 tokio-util = { workspace = true }
 
 [dev-dependencies]
+# postcard 只有测试用：`stream.rs` 里直接解帧来钉住线格式（用 proto 自己的解码器去验
+# proto 的编码器就成自指了）。**正常运行路径一次都不碰它**，所以它是 dev-dependency
+# 而不是依赖（P3-4）。同理，`rustls-pemfile` 曾在依赖里但 agent 从未引用——证书是
+# `proto::pem` 装载的（`config.rs`），一并删掉。
+postcard = { workspace = true }
 rcgen = { workspace = true }
 tempfile = "3"
 
