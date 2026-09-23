@@ -65,7 +65,7 @@ deny.toml       cargo-deny 策略（依赖许可证 / 公告；CI 与 pre-commit
 > 以下用 `cargo run` 仅为本地开发方便（debug 构建）；**生产部署直接用编译好的 release 二进制**，服务器无需安装 Rust，见 [`DEPLOY.md`](DEPLOY.md)。
 
 > 💡 常用命令已收进 `Makefile`：`make help` 查看全部；`make setup`（证书+前端依赖）、
-> `make dev`（一键起 mock-llm+gateway+agent 全栈）、`make dev-ui`（先构建前端再起全栈）、
+> `make dev`（先编译 debug 二进制，再一键起 mock-llm+gateway+agent 全栈；**任一进程没起来就报错退出**并贴出该进程日志末尾）、`make dev-ui`（先构建前端再起全栈）、
 > `make stop`（停全栈）、`make test` / `make build` / `make release`。
 
 ### 环境

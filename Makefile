@@ -19,7 +19,7 @@ DUR ?= 30s
 MODEL ?= qwen2.5
 LIMIT ?= 20
 
-.PHONY: help setup certs certs-required web-install web-build web-dev build fmt clippy check test bench bench-k6 \
+.PHONY: help setup certs certs-required web-install web-build web-dev build build-debug fmt clippy check test bench bench-k6 \
         bench-admission bench-admission-local release \
         run-gateway run-agent run-mock dev dev-ui logs stop clean
 
@@ -49,6 +49,13 @@ web-dev: ## 前端开发服务器（Vite :5173，代理到网关，需先起网�
 
 build: ## 编译 release 二进制（target/release/）
 	cargo build --release --bin gateway --bin agent --bin mock-llm
+
+# `make dev` 跑的是 target/debug/ 下的三个二进制。以前它**只依赖生成的配置**，不依赖构建：
+# 全新 clone、`cargo clean` 之后三条 nohup 全部 "No such file or directory"，但配方不检查存活，
+# 最后照样打印"✔ 全栈已启动"——一个静默的空栈（P2-20）。cargo 自己会跳过已最新的 crate，
+# 所以把它挂成 dev 的前置几乎不花时间。
+build-debug: ## 编译 debug 二进制（target/debug/，`make dev` 的前置）
+	cargo build --bin gateway --bin agent --bin mock-llm
 
 fmt: ## 检查代码格式（cargo fmt --check）
 	cargo fmt --check
@@ -133,7 +140,7 @@ run-mock: ## debug 运行 mock-llm（127.0.0.1:11435）
 run-agent: $(AGENT_CONFIG) ## debug 运行 edge-agent（连本地网关，转发到 mock-llm）
 	cargo run -p agent -- --config $(AGENT_CONFIG)
 
-dev: gateway-config.yml $(AGENT_CONFIG) ## 一键起全栈（mock-llm + gateway + agent，后台，日志在 .tmp/logs/）
+dev: build-debug gateway-config.yml $(AGENT_CONFIG) ## 一键起全栈（mock-llm + gateway + agent，后台，日志在 .tmp/logs/；会先编译）
 	@mkdir -p $(LOGDIR)
 	@echo "== 启动 mock-llm (11435) =="
 	@nohup $(MOCK_BIN) --addr 127.0.0.1:11435 --name mock-llm > $(LOGDIR)/mock-llm.log 2>&1 & echo $$! > .tmp/mock-llm.pid
@@ -144,6 +151,17 @@ dev: gateway-config.yml $(AGENT_CONFIG) ## 一键起全栈（mock-llm + gateway 
 	@echo "== 启动 agent =="
 	@nohup $(AGENT_BIN) --config $(AGENT_CONFIG) > $(LOGDIR)/agent.log 2>&1 & echo $$! > .tmp/agent.pid
 	@sleep 1
+	@# 存活检查（P2-20）：以前不管进程死没死都报"✔ 全栈已启动"，二进制缺失时就是一个静默空栈。
+	@# 现在任一进程没活下来就失败退出，并把该进程日志末尾贴出来，好让人一眼看到原因。
+	@for p in mock-llm gateway agent; do \
+		pid=$$(cat .tmp/$$p.pid 2>/dev/null); \
+		if [ -z "$$pid" ] || ! kill -0 "$$pid" 2>/dev/null; then \
+			echo "✘ $$p 没能起来（pid=$${pid}），$(LOGDIR)/$$p.log 末尾："; \
+			tail -n 20 $(LOGDIR)/$$p.log 2>/dev/null; \
+			echo "已起来的进程用 make stop 收掉。"; \
+			exit 1; \
+		fi; \
+	done
 	@echo "✔ 全栈已启动："
 	@echo "   管理面板 http://localhost:8080/   (admin_token: dev-admin)"
 	@echo "   API      http://localhost:8080/v1/chat/completions"

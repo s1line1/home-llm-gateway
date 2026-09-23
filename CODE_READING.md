@@ -145,7 +145,7 @@ web/src/components/   ← 布局/图表/UI（无依赖 SVG 图表）
 ## 常用命令速查
 
 ```bash
-make dev          # 一键起全栈（mock-llm + gateway + agent，日志在 .tmp/logs/）
+make dev          # 先编译 debug 二进制，再一键起全栈（mock-llm + gateway + agent，日志在 .tmp/logs/）
 make stop         # 停全栈
 make check        # = CI 的 Rust 门槛 + 前端构建 + 工具链一致性（fmt / clippy / deny / nextest / web-build / toolchain-check）
 make bench        # Criterion 微基准
