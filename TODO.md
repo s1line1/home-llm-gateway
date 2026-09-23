@@ -602,6 +602,15 @@
       **2026-09 已改**：`try_acquire_excluding` 里现在是 `try_update`（该处行号已随重构移动到
       `registry.rs` 的抢槽位分支内），并在原处留了"为什么用 `try_update`"的注释。
 
+### 前端工程化
+
+- [x] **构建产物泄漏守卫（2026-09-23 已做，零新依赖）**：`pnpm build` 现在最后一步跑
+      `web/scripts/check-bundle.mjs` —— 扫 `dist/` 里有没有 `P<级别>-<编号>` 这类**只该存在于
+      源码注释里**的审计标记。起因：我把 `//` 注释写在了 JSX **子节点位置**（那里它是文本），
+      整段说明被渲染到了总览页上，而 `tsc` 与 `vite build` 都不会报错（见 PROJECT_SCAN P3-19）。
+      它是启发式的（只抓这种标记），但把"这一类"变成了**构建即失败**；放进 `build` 脚本而不是
+      Makefile，是因为 CI 跑的是 `pnpm build`（`.github/workflows/ci.yml:90`），这样三处都覆盖。
+
 ### 前端工程化：待决（P3-21 的剩余部分，需要**新增依赖**，按顶部范围约定先不动）
 
 - [ ] **前端无 lint / formatter / 测试**：`web/` 目前只有 `tsc` + `vite build` 两道，
