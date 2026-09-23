@@ -11,98 +11,6 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-// /// 单帧最大字节数（64 MiB）。
-// pub const MAX_FRAME: usize = 64 * 1024 * 1024;
-
-// // 长度前缀只有 u32：MAX_FRAME 必须装得下，否则下面 `as u32` 会静默截断。
-// const _: () = assert!(MAX_FRAME <= u32::MAX as usize);
-
-// /// 帧级读写对象：next() 取消安全（半读状态在 self 上），send() 整帧写出。
-// pub struct FrameStream<S> {
-//     inner: S,
-//     rbuf: Vec<u8>, // 半读字节（= 现在 FrameReader 的状态）
-//     want: Option<usize>,
-// }
-
-// impl<S: AsyncRead + AsyncWrite + Unpin> FrameStream<S> {
-//     pub fn new(inner: S) -> Self {
-//         Self {
-//             inner,
-//             rbuf: Vec::new(),
-//             want: None,
-//         }
-//     }
-
-//     /// 写一帧（[u32 大端长度][postcard]，沿用现有 write_frame 的逻辑）
-//     pub async fn send(&mut self, frame: &Frame) -> io::Result<()> {
-//         /* write_all 一次写完 */
-//         let bytes = postcard::to_allocvec(frame)
-//             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-//         if bytes.len() > MAX_FRAME {
-//             return Err(io::Error::new(
-//                 io::ErrorKind::InvalidData,
-//                 "frame too large",
-//             ));
-//         }
-//         let len = bytes.len() as u32;
-//         let mut buf = Vec::with_capacity(4 + bytes.len());
-//         buf.extend_from_slice(&len.to_be_bytes());
-//         buf.extend_from_slice(&bytes);
-//         self.inner.write_all(&buf).await?;
-//         Ok(())
-//     }
-
-//     /// 读下一帧；落败可安全重入（= 现在 FrameReader::next 的逻辑原样搬进来）
-//     pub async fn next(&mut self) -> io::Result<Option<Frame>> {
-//         /* 单次 read + 增量拼帧 */
-//         loop {
-//             // 1) 先用已有字节试着凑一帧（这段不 await，不会被从中间打断）
-//             if let Some(frame) = self.take_frame()? {
-//                 return Ok(Some(frame));
-//             }
-//             // 2) 还差字节：进度都留在 self 上，故这里的 await 是取消安全的
-//             let mut chunk = [0u8; 8 * 1024];
-//             let n = self.inner.read(&mut chunk).await?;
-//             if n == 0 {
-//                 // EOF：正好落在帧边界 = 干净关闭；帧中途 = 截断
-//                 if self.rbuf.is_empty() && self.want.is_none() {
-//                     return Ok(None);
-//                 }
-//                 return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "early eof"));
-//             }
-//             self.rbuf.extend_from_slice(&chunk[..n]);
-//         }
-//     }
-
-//     /// 缓冲区里若已凑齐完整一帧则取出解码（不 await，故可安全地在中途调用）。
-//     fn take_frame(&mut self) -> io::Result<Option<Frame>> {
-//         if self.want.is_none() {
-//             if self.rbuf.len() < 4 {
-//                 return Ok(None);
-//             }
-//             let len =
-//                 u32::from_be_bytes(self.rbuf[..4].try_into().expect("4 bytes checked")) as usize;
-//             if len > MAX_FRAME {
-//                 return Err(io::Error::new(
-//                     io::ErrorKind::InvalidData,
-//                     "frame too large",
-//                 ));
-//             }
-//             self.want = Some(4 + len);
-//         }
-//         let total = self.want.expect("just set above");
-//         if self.rbuf.len() < total {
-//             return Ok(None);
-//         }
-//         let payload = self.rbuf[4..total].to_vec();
-//         self.rbuf.drain(..total);
-//         self.want = None;
-//         let frame = postcard::from_bytes(&payload)
-//             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-//         Ok(Some(frame))
-//     }
-// }
-
 /// 隧道帧的 `path` 字段是「路径[?query]」（见 [`Frame::ProxyRequest`]）；切出**路径部分**
 /// 单独过守卫。
 ///
@@ -158,6 +66,19 @@ where
     Ok(())
 }
 
+/// 监听任务的所有权守卫：**丢弃即 abort**（P3-2）。
+///
+/// 这条路径原来靠"函数末尾手写 `listener.abort()`"收尾，而中间任何一条提前 `return` 都会绕过它
+/// ——方法非法那条 `return` 就因此泄漏了一个仍持有读半边的任务（实测：返回后对端还能继续往这条流
+/// 写帧，直到流被关闭才恢复）。改成 RAII 之后，"忘了 abort"在结构上不再可能。
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// 处理一条代理流：读 ProxyRequest → 转发本地 LLM → 流式回传响应帧。
 /// `request_log` 控制每请求的 INFO 日志（received/responded/done/cancelled）。
 pub async fn handle_stream(
@@ -199,28 +120,10 @@ pub async fn handle_stream(
         return reject_unsafe_path(&mut send, request_id, &path).await;
     };
 
-    // 再把 reader 移交给监听任务：它只负责之后的 Cancel / EOF
-    let cancel = CancellationToken::new();
-    let c = cancel.clone();
-
-    let listener = tokio::spawn(async move {
-        loop {
-            match reader.next().await {
-                Ok(Some(Frame::Cancel { .. })) | Ok(None) => {
-                    c.cancel();
-                    break;
-                }
-                Ok(Some(_)) => {} // 别的帧忽略（协议上不该有）
-                Err(_) => {
-                    c.cancel();
-                    break;
-                } // 流坏 = 也当取消
-            }
-        }
-    });
-
-    // 方法非法 = 客户端发来的请求本身有问题：回 400（和路径守卫同一口径），别让它变成
-    // 一条"上游关闭了"的通用 502（记录 P2-2：这条以前也是静默的）。
+    // 方法非法的守卫**必须排在建监听任务之前**（P3-2）：以前它在 `tokio::spawn` 之后，
+    // 于是这条 `return` 绕过了末尾的 `abort()`，泄漏一个仍持有读半边的任务。回 400 的口径与
+    // 路径守卫一致（客户端发来的请求本身有问题），别让它变成一条"上游关闭了"的通用 502
+    // （记录 P2-2：这条以前也是静默的）。
     let Ok(method) = reqwest::Method::from_bytes(method.as_bytes()) else {
         warn!(
             request_id,
@@ -244,12 +147,31 @@ pub async fn handle_stream(
     };
     let rb = http.request(method, url);
 
+    // 校验都过了，才把 reader 移交给监听任务：它只负责之后的 Cancel / EOF。
+    let cancel = CancellationToken::new();
+    let c = cancel.clone();
+
+    let _listener = AbortOnDrop(tokio::spawn(async move {
+        loop {
+            match reader.next().await {
+                Ok(Some(Frame::Cancel { .. })) | Ok(None) => {
+                    c.cancel();
+                    break;
+                }
+                Ok(Some(_)) => {} // 别的帧忽略（协议上不该有）
+                Err(_) => {
+                    c.cancel();
+                    break;
+                } // 流坏 = 也当取消
+            }
+        }
+    }));
+
     // ③ 干活：只持有 send 半
     let result = forward(send, request_id, rb, headers, body, request_log, &cancel).await;
 
-    listener.abort(); // 无论成败都收掉监听任务
-                      // 记录 P2-2：把"哪个请求、哪条路径"挂进错误链。调用方（`connect_once` 的 accept 循环）
-                      // 用 `{e:#}` 打一行，于是每条失败都有一条带上下文的 warn，而不是静默消失。
+    // 记录 P2-2：把"哪个请求、哪条路径"挂进错误链。调用方（`connect_once` 的 accept 循环）
+    // 用 `{e:#}` 打一行，于是每条失败都有一条带上下文的 warn，而不是静默消失。
     if request_log {
         info!(request_id, ok = result.is_ok(), "proxy request done");
     }
@@ -522,5 +444,38 @@ mod tests {
             }
             other => panic!("拒绝应当写出 Error 帧，实际 {other:?}"),
         }
+    }
+
+    /// 规格（P3-2）：`AbortOnDrop` 被丢弃时必须 abort 掉它持有的任务。
+    ///
+    /// 为什么单独测这个：它是"以后在 `tokio::spawn` 与函数结尾之间再加提前 `return` 也不会再
+    /// 泄漏监听任务"的保险；而"守卫被删掉"这种改动，路径上的行为测试**抓不到**（那条泄漏只在
+    /// 流被长时间挂住时才显形）。
+    #[tokio::test]
+    async fn abort_on_drop_aborts_the_task() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        use std::time::Duration;
+
+        async fn delayed(flag: Arc<AtomicBool>) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            flag.store(true, Ordering::SeqCst);
+        }
+
+        // 对照：不包裹时任务会跑完——否则下面的断言可能只是"任务压根没起来"。
+        let control = Arc::new(AtomicBool::new(false));
+        tokio::spawn(delayed(control.clone())).await.unwrap();
+        assert!(control.load(Ordering::SeqCst), "对照：任务应当跑完");
+
+        // 包裹后丢弃 → 不得跑完（abort 是异步生效的，留 3 倍余量）
+        let ran = Arc::new(AtomicBool::new(false));
+        drop(AbortOnDrop(tokio::spawn(delayed(ran.clone()))));
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "丢弃 AbortOnDrop 必须 abort 它持有的任务"
+        );
     }
 }

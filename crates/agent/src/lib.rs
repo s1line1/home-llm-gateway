@@ -1811,6 +1811,186 @@ mod tests {
         drop(gw_send);
     }
 
+    /// 规格（P3-2）：**方法非法这条 `Err` 路径不能把监听任务留在那儿**。
+    ///
+    /// 修复前，方法守卫排在 `tokio::spawn` 监听任务**之后**，而 `listener.abort()` 只在成功
+    /// 路径的末尾调用 ⇒ 这条 `return` 泄漏一个仍持有读半边的任务：它继续消费网关发来的帧
+    /// （于是下面这个探测里"网关再写帧"一直成功）。修复后读半边随作用域一起丢弃，QUIC 会回过
+    /// STOP_SENDING，网关这边的写就会失败。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_invalid_method_leaves_no_listener_holding_the_stream() {
+        let (ca, srv_cert, srv_key, cli_cert, cli_key) = gen_pki();
+        let (addr, mut server_handles) = test_server(&ca, srv_cert, srv_key).await;
+        let cfg = test_agent_config(addr, ca.clone(), cli_cert, cli_key);
+        let cc = tls::rustls_client_tls(
+            &cfg.ca_cert,
+            cfg.client_cert.clone(),
+            cfg.client_key.clone_key(),
+        )
+        .unwrap();
+        let (_agent_handle, mut agent_acceptor) = connect_for_test_with_acceptor(&cfg, cc).await;
+        let mut gateway = tokio::time::timeout(Duration::from_secs(5), server_handles.recv())
+            .await
+            .expect("agent 应当连上")
+            .expect("假网关应当拿到连接句柄");
+
+        let gw_stream = gateway.open_bidirectional_stream().await.expect("开流");
+        let (gw_recv, mut gw_send) = gw_stream.split();
+        write_frame(
+            &mut gw_send,
+            &Frame::ProxyRequest {
+                request_id: 12,
+                method: "BAD METHOD".into(), // 含空格 ⇒ Method::from_bytes 必失败
+                path: "/v1/chat/completions".into(),
+                headers: vec![],
+                body: bytes::Bytes::from_static(br#"{"model":"m"}"#),
+            },
+        )
+        .await
+        .expect("写请求帧");
+
+        let agent_stream = tokio::time::timeout(
+            Duration::from_secs(5),
+            agent_acceptor.accept_bidirectional_stream(),
+        )
+        .await
+        .expect("5s 内应当收到流")
+        .expect("accept 不该失败")
+        .expect("应当是 Some(stream)");
+        let err = handle_stream(
+            agent_stream,
+            upstream_client().unwrap(),
+            "http://127.0.0.1:1".into(),
+            false,
+        )
+        .await
+        .expect_err("非法方法必须是 Err");
+        assert!(format!("{err:#}").contains("request_id=12"));
+
+        // 先读掉那条 400（行为本身由上一个用例钉住），reader **留着不 drop**：免得"网关这半边
+        // 关掉读方向"变成干扰项。
+        let mut reader = proto::io::FrameReader::new(gw_recv);
+        let frame = tokio::time::timeout(Duration::from_secs(5), reader.next())
+            .await
+            .expect("等错误帧超时")
+            .expect("读帧失败")
+            .expect("应当有一条错误帧");
+        assert!(matches!(frame, Frame::Error { code: 400, .. }), "{frame:?}");
+
+        // 关键探测：故意挑一个**监听者会忽略**的帧型（Cancel/EOF 会让泄漏的监听任务自己退出，
+        // 那就测不出泄漏了）。修复前写会一直成功（对端还有人在收），修复后应当变成 Err。
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut stopped = false;
+        while tokio::time::Instant::now() < deadline {
+            let probe = write_frame(
+                &mut gw_send,
+                &Frame::Heartbeat {
+                    agent_id: "probe".into(),
+                    inflight: 0,
+                },
+            )
+            .await;
+            if probe.is_err() {
+                stopped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            stopped,
+            "非法方法返回后，agent 不该还留着持有读半边的监听任务（对端仍在收帧）"
+        );
+        drop(gw_send);
+    }
+
+    /// 规格（P3-2 的另一半）：**监听任务被 spawn 之后**的任何返回路径（这里是"上游连不上"，
+    /// 方法合法 ⇒ 走的是正常 spawn 分支）也必须把监听任务收掉。
+    ///
+    /// 这条是 `AbortOnDrop` 守卫的**使用点**证明：把守卫换成裸 `tokio::spawn` 而保留"方法守卫
+    /// 上移"，只有这条会红（前一条探针测不到，因为那条路径压根不再 spawn）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_forward_leaves_no_listener_holding_the_stream() {
+        let (ca, srv_cert, srv_key, cli_cert, cli_key) = gen_pki();
+        let (addr, mut server_handles) = test_server(&ca, srv_cert, srv_key).await;
+        let cfg = test_agent_config(addr, ca.clone(), cli_cert, cli_key);
+        let cc = tls::rustls_client_tls(
+            &cfg.ca_cert,
+            cfg.client_cert.clone(),
+            cfg.client_key.clone_key(),
+        )
+        .unwrap();
+        let (_agent_handle, mut agent_acceptor) = connect_for_test_with_acceptor(&cfg, cc).await;
+        let mut gateway = tokio::time::timeout(Duration::from_secs(5), server_handles.recv())
+            .await
+            .expect("agent 应当连上")
+            .expect("假网关应当拿到连接句柄");
+
+        let gw_stream = gateway.open_bidirectional_stream().await.expect("开流");
+        let (gw_recv, mut gw_send) = gw_stream.split();
+        write_frame(
+            &mut gw_send,
+            &Frame::ProxyRequest {
+                request_id: 13,
+                method: "POST".into(), // 合法 ⇒ 会走到 spawn 监听任务那一步
+                path: "/v1/chat/completions".into(),
+                headers: vec![],
+                body: bytes::Bytes::from_static(br#"{"model":"m"}"#),
+            },
+        )
+        .await
+        .expect("写请求帧");
+
+        let agent_stream = tokio::time::timeout(
+            Duration::from_secs(5),
+            agent_acceptor.accept_bidirectional_stream(),
+        )
+        .await
+        .expect("5s 内应当收到流")
+        .expect("accept 不该失败")
+        .expect("应当是 Some(stream)");
+        // 上游指向没人监听的端口 ⇒ forward 失败 ⇒ 返回 502 那条 Err
+        handle_stream(
+            agent_stream,
+            upstream_client().unwrap(),
+            "http://127.0.0.1:1".into(),
+            false,
+        )
+        .await
+        .expect_err("上游连不上必须是 Err");
+
+        let mut reader = proto::io::FrameReader::new(gw_recv);
+        let frame = tokio::time::timeout(Duration::from_secs(5), reader.next())
+            .await
+            .expect("等错误帧超时")
+            .expect("读帧失败")
+            .expect("应当有一条错误帧");
+        assert!(matches!(frame, Frame::Error { code: 502, .. }), "{frame:?}");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut stopped = false;
+        while tokio::time::Instant::now() < deadline {
+            if write_frame(
+                &mut gw_send,
+                &Frame::Heartbeat {
+                    agent_id: "probe".into(),
+                    inflight: 0,
+                },
+            )
+            .await
+            .is_err()
+            {
+                stopped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            stopped,
+            "转发失败返回后，agent 不该还留着持有读半边的监听任务（对端仍在收帧）"
+        );
+        drop(gw_send);
+    }
+
     /// 把 tracing 输出抓进内存的 `MakeWriter`（只为断言"某一行日志到底有没有打"）。
     ///
     /// 为什么要有它：`request_log` 的承诺就是"打不打这几条 INFO"，而仓库没有（也不打算为一条
