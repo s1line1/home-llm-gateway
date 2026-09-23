@@ -47,7 +47,7 @@ export default function Layout() {
         </nav>
         <div className="space-y-1 px-4 py-4">
           <div className="text-[11px] leading-relaxed text-slate-500">
-            网关版本 0.1.0 · QUIC 隧道 + mTLS
+            网关版本 {__GATEWAY_VERSION__} · QUIC 隧道 + mTLS
           </div>
           {token && (
             <button
@@ -70,7 +70,7 @@ export default function Layout() {
             {error && <span className="text-xs text-amber-600" title={error}>数据拉取异常</span>}
             <StatusPill
               ok={reachable && latest !== null}
-              label={reachable && latest !== null ? `网关在线 · ${latest.agents} agents` : "网关不可达"}
+              label={reachable && latest !== null ? `网关在线 · ${latest.agents_healthy} agents` : "网关不可达"}
             />
           </div>
         </header>

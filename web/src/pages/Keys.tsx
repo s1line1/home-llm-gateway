@@ -121,6 +121,11 @@ export default function Keys() {
       </Card>
 
       <Card title="已有 Keys" subtitle="吊销立即生效，不可恢复">
+        {deleteMutation.isError && (
+          <p className="mb-2 text-xs text-rose-600">
+            吊销失败：{deleteMutation.error.message}（这条 Key 仍然有效）
+          </p>
+        )}
         {keysQuery.isPending ? (
           <EmptyState text="加载中…" />
         ) : keysQuery.isError ? (

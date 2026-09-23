@@ -68,6 +68,7 @@ export function parseMetrics(text: string): MetricsSnapshot {
     requests_by_status,
     active_requests: first(samples, "hlmg_active_requests") ?? 0,
     agents: first(samples, "hlmg_agents") ?? 0,
+    agents_healthy: first(samples, "hlmg_agents_healthy") ?? 0,
     bytes_out: first(samples, "hlmg_bytes_out") ?? 0,
     request_duration_ms: first(samples, "hlmg_request_duration_ms") ?? 0,
     request_count: first(samples, "hlmg_request_count") ?? 0,

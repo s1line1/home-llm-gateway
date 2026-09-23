@@ -4,6 +4,21 @@ import { useCallback, useSyncExternalStore } from "react";
 
 const STORAGE_KEY = "hlmg.admin.token";
 
+/**
+ * 清除 admin token（非 hook 版）。给 react-query 的全局 401 处理用：任何 `/admin/*` 拿到 401
+ * 都说明 token 已失效（被轮换/吊销/写错），必须清掉并让 `RequireAuth` 把用户送回登录页，
+ * 否则用户会卡在"已登录但每个页面都加载失败"（P3-18）。
+ */
+export function clearAdminToken(): void {
+  try {
+    localStorage.removeItem(STORAGE_KEY);
+  } catch {
+    // localStorage 不可用：本来也没存住
+  }
+  // 同页手动派发：`useSyncExternalStore` 靠它重新读取（storage 事件本身只在跨标签页时触发）
+  window.dispatchEvent(new Event("storage"));
+}
+
 function readToken(): string {
   try {
     return localStorage.getItem(STORAGE_KEY) ?? "";
