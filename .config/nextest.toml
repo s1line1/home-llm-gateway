@@ -7,10 +7,12 @@
 #    所以在 nextest 下必须用**它自己的 test-group** 把它限成"一次只跑一条"。
 #    语义与原来的 `#[serial]` 等价；`#[serial]` 标记**保留不删**，因为 `cargo test` 仍然需要它们。
 #
-#    为什么只给 e2e 配 test-group：`src/` 里另有一批 `#[serial]`（storage 单测），
-#    它们的理由是"这些测试要读**进程级**的 argon2 调用计数器、会互相污染"——nextest
-#    每条测试一个进程，这个污染源天然消失（它们用 tempdir()，也不争抢固定路径/端口），
-#    所以不需要额外分组；并行反而更快。
+#    为什么只给 e2e 配 test-group：`src/` 里的单测**不需要**串行——storage 那一组曾经标了
+#    `#[serial]`，理由是"要读进程级的 argon2 调用计数器、会互相污染"，但那早就不成立了
+#    （计数器已经搬进 `KeyStore`，是 per-store 的；`CheapArgon2` 是线程局部的；校验的成本参数
+#    取自 PHC 串），2026-09-22 复核后把那 9 个 `#[serial]` 删掉了（见 `storage/mod.rs` 的
+#    `verified_tests` 注释）。其余单测各自用自己的 store/tempdir，不争固定路径、不争端口，
+#    所以不需要分组；并行反而更快。
 #
 # ② 顺带修掉一个观测问题：`#[serial]` 的等锁时间会被 libtest 算进"这条测试跑了多久"，
 #    于是 CI 上会看到好几条 "has been running for over 60 seconds"，其实是在排队。

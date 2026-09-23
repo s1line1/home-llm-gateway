@@ -1245,11 +1245,17 @@ mod tests {
 mod verified_tests {
     use super::*;
     use crate::storage::hash::CheapArgon2;
-    use serial_test::serial;
     use std::sync::{Arc, Barrier};
 
-    // 这些测试都要读**进程级**的 argon2 调用计数器，彼此会互相污染 →
-    // 全部标 `#[serial]`（仓库 e2e 也是同一套约定）。
+    // 这一组**不需要** `#[serial]`（记录 P3-22 的复核）：
+    //   · 每条测试自己 `KeyStore::new(..)`，而"跑了几次 argon2"的计数器是**每个 store 一个**
+    //     （`KeyStore::argon2_runs` / `verified_counters`），不是进程级 ⇒ 没有跨测试污染；
+    //   · `CheapArgon2` 是**线程局部**的，只影响本线程新算的哈希；
+    //   · 校验的成本参数取自 **PHC 串**（argon2 crate 文档原话："hash params from `parsed_hash`
+    //     are used instead of what is configured in the `Argon2` instance"）⇒ 用便宜参数写进去的
+    //     记录，在**任何**线程上校验都是便宜的。
+    // 早年的注释写的是"这些测试都要读进程级的 argon2 调用计数器"——那是计数器搬进 `KeyStore`
+    // **之前**的事实（迁移记录见 `hash.rs` 里 `Argon2InFlight` 的注释），注释没跟着改。
 
     /// 并发压同一个 token；返回 (argon2 调用次数增量, 全部请求的结果)。
     /// `cache_max = 0` 时代表"关闭缓存"（旧行为）。
@@ -1278,7 +1284,6 @@ mod verified_tests {
     }
 
     #[test]
-    #[serial]
     fn concurrent_same_token_hashes_once() {
         let _cheap = CheapArgon2::install();
         // 这是把内存峰值从 `并发数 × 19MiB` 压到 `1 × 19MiB` 的核心契约
@@ -1290,7 +1295,6 @@ mod verified_tests {
     }
 
     #[test]
-    #[serial]
     fn warm_token_never_hashes_again() {
         let _cheap = CheapArgon2::install();
         let store = KeyStore::new(None);
@@ -1306,7 +1310,6 @@ mod verified_tests {
     }
 
     #[test]
-    #[serial]
     fn disabled_cache_keeps_old_behaviour() {
         let _cheap = CheapArgon2::install();
         // cache_max = 0 → 每个请求都完整校验（与改造前语义一致）
@@ -1343,7 +1346,6 @@ mod verified_tests {
     /// 既有单测 `authorize_rejects_unknown_lookup_without_argon2` 钉着这一点，所以那种负载
     /// 本来就不该被算成 argon2 次数。）
     #[test]
-    #[serial]
     fn counter_counts_argon2_runs_when_the_cache_is_disabled() {
         let _cheap = CheapArgon2::install();
         let store = KeyStore::with_verified(None, 0, DEFAULT_VERIFIED_TTL);
@@ -1360,7 +1362,6 @@ mod verified_tests {
     }
 
     #[test]
-    #[serial]
     fn revoke_takes_effect_immediately() {
         let _cheap = CheapArgon2::install();
         // 缓存**不得**延长吊销窗口：delete 后必须立刻 401
@@ -1376,7 +1377,6 @@ mod verified_tests {
     }
 
     #[test]
-    #[serial]
     fn credential_version_bump_invalidates_cache() {
         let _cheap = CheapArgon2::install();
         // 模拟"改 key 但不 bump 版本"以外的正确路径：bump 之后旧缓存条目必须失效
@@ -1406,7 +1406,6 @@ mod verified_tests {
     }
 
     #[test]
-    #[serial]
     fn expired_entry_is_revalidated() {
         let _cheap = CheapArgon2::install();
         // TTL 到期后重算（不改变"吊销即时"这条，只影响多久重付一次 argon2 的钱）
@@ -1420,7 +1419,6 @@ mod verified_tests {
     }
 
     #[test]
-    #[serial]
     fn cache_is_bounded_and_never_stores_plaintext() {
         let _cheap = CheapArgon2::install();
         let store = KeyStore::with_verified(None, 2, DEFAULT_VERIFIED_TTL);
@@ -1452,7 +1450,6 @@ mod verified_tests {
     }
 
     #[test]
-    #[serial]
     fn wrong_token_still_rejected_with_cache() {
         let _cheap = CheapArgon2::install();
         // 命中路径不得绕过校验：拿别人的 token 永远进不去
