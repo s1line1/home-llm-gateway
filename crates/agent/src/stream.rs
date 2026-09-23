@@ -7,9 +7,13 @@ use proto::{
 };
 use reqwest::{header::HeaderValue, RequestBuilder};
 use s2n_quic::stream::{BidirectionalStream, SendStream};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// 隧道帧的 `path` 字段是「路径[?query]」（见 [`Frame::ProxyRequest`]）；切出**路径部分**
 /// 单独过守卫。
@@ -77,6 +81,18 @@ impl Drop for AbortOnDrop {
     fn drop(&mut self) {
         self.0.abort();
     }
+}
+
+/// 一条请求的**跨任务信号**（转发任务与监听任务共享）。
+///
+/// - `cancel`：取消上游请求（显式 `Cancel` 帧 / 请求方向 EOF 兜底 / 流坏）；
+/// - `response_started`：响应头是否已经写出去 —— 监听任务用它分辨"EOF 是契约违背还是合法收尾"
+///   （P3-3）。打包成一个结构是因为 `forward` 的参数已经到 clippy 的上限了，而这两个信号确实是
+///   同一件事（"这条请求现在处于什么状态"）的两面。
+#[derive(Default)]
+struct RequestSignals {
+    cancel: CancellationToken,
+    response_started: AtomicBool,
 }
 
 /// 处理一条代理流：读 ProxyRequest → 转发本地 LLM → 流式回传响应帧。
@@ -148,19 +164,41 @@ pub async fn handle_stream(
     let rb = http.request(method, url);
 
     // 校验都过了，才把 reader 移交给监听任务：它只负责之后的 Cancel / EOF。
-    let cancel = CancellationToken::new();
-    let c = cancel.clone();
+    //
+    // **取消契约（P3-3）**：取消只由 `Frame::Cancel` 表达。但监听任务把请求方向的**干净 EOF**
+    // 也当取消（兜底）——今天网关每条"放弃一个还活着的请求"的路径都先 `tunnel_cancel` 再
+    // `finish()`（见 `proxy/{head,forward}.rs`），所以 EOF 兜底只在"对端什么都没说就半关了"
+    // 这种异常情况下才起作用。这个标志用来分辨响应是否已经开始：EOF 早于响应 = 契约被破坏，
+    // 必须留痕（否则只会表现成一条看不见原因的 cancelled）。
+    let signals = Arc::new(RequestSignals::default());
+    let listener_signals = signals.clone();
 
     let _listener = AbortOnDrop(tokio::spawn(async move {
         loop {
             match reader.next().await {
-                Ok(Some(Frame::Cancel { .. })) | Ok(None) => {
-                    c.cancel();
+                Ok(Some(Frame::Cancel { .. })) => {
+                    debug!(request_id, "gateway cancelled the request");
+                    listener_signals.cancel.cancel();
+                    break;
+                }
+                Ok(None) => {
+                    if listener_signals.response_started.load(Ordering::Relaxed) {
+                        debug!(
+                            request_id,
+                            "gateway closed the request stream after the response; nothing to cancel"
+                        );
+                    } else {
+                        warn!(
+                            request_id,
+                            "gateway closed the request stream before the response; treating it as a cancel (the gateway is expected to send Frame::Cancel first)"
+                        );
+                    }
+                    listener_signals.cancel.cancel();
                     break;
                 }
                 Ok(Some(_)) => {} // 别的帧忽略（协议上不该有）
                 Err(_) => {
-                    c.cancel();
+                    listener_signals.cancel.cancel();
                     break;
                 } // 流坏 = 也当取消
             }
@@ -168,7 +206,7 @@ pub async fn handle_stream(
     }));
 
     // ③ 干活：只持有 send 半
-    let result = forward(send, request_id, rb, headers, body, request_log, &cancel).await;
+    let result = forward(send, request_id, rb, headers, body, request_log, &signals).await;
 
     // 记录 P2-2：把"哪个请求、哪条路径"挂进错误链。调用方（`connect_once` 的 accept 循环）
     // 用 `{e:#}` 打一行，于是每条失败都有一条带上下文的 warn，而不是静默消失。
@@ -186,7 +224,7 @@ async fn forward(
     headers: Vec<(String, String)>,
     body: bytes::Bytes,
     request_log: bool,
-    cancel: &CancellationToken,
+    signals: &RequestSignals,
 ) -> anyhow::Result<()> {
     for (k, v) in headers {
         // 逐跳头 + 调用方凭据都不转发：凭据只属于「客户端 ↔ 网关」那一跳，不该到上游
@@ -224,7 +262,7 @@ async fn forward(
                 return Err(e).context("sending the request to the local upstream");
             }
         },
-        _ = cancel.cancelled() => {
+        _ = signals.cancel.cancelled() => {
             return send_cancelled(&mut send, request_id, request_log).await;
         }
     };
@@ -257,6 +295,9 @@ async fn forward(
         },
     )
     .await?;
+    // 响应头已经写出去 = 从这一刻起"对端半关写半边"是正常收尾而不是契约违背（见 `handle_stream`
+    // 里的监听任务）。顺序要紧：先写帧、再置位。
+    signals.response_started.store(true, Ordering::Relaxed);
     if request_log {
         info!(request_id, status, "upstream responded");
     }
@@ -272,7 +313,9 @@ async fn forward(
                 Some(Err(e)) => { warn!(request_id, "upstream stream error: {e}"); ok = false; break; }
                 None => break,
             },
-            _ = cancel.cancelled() => return send_cancelled(&mut send, request_id, request_log).await,
+            _ = signals.cancel.cancelled() => {
+                return send_cancelled(&mut send, request_id, request_log).await
+            }
         };
         // 切块后逐片回传：`MAX_RESPONSE_CHUNK` 是**网关侧的内存边界**（那边通道按条数有界，
         // 见该常量的文档 / 记录 R9）。`Bytes::split_to` 零拷贝：只动引用计数与偏移。

@@ -1991,6 +1991,212 @@ mod tests {
         drop(gw_send);
     }
 
+    /// 规格（P3-3）：**"网关提前半关请求流"必须是可观测的**。
+    ///
+    /// 取消的契约是"网关显式发 `Frame::Cancel`"；而 agent 的监听任务把请求方向的**干净 EOF**
+    /// 也当成取消（兜底）。今天网关每条放弃在途请求的路径都先发 Cancel 再 `finish()`，所以 EOF
+    /// 兜底只在"响应还没开始"时被触发就意味着**契约被破坏**——这条测试就钉住"那一刻要留下 warn"。
+    ///
+    /// 用 `current_thread` runtime：日志捕获依赖 `set_default` 的线程局部性（见 `CapturedLogs`）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_gateway_half_close_before_the_response_leaves_a_warning() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_env_filter("info")
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // 一个"接了不答"的上游：agent 会停在等响应头上，于是下面的半关一定发生在响应之前。
+        let hang = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("绑本地端口");
+        let hang_addr = hang.local_addr().expect("取端口");
+        tokio::spawn(async move {
+            if let Ok((conn, _)) = hang.accept().await {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                drop(conn);
+            }
+        });
+
+        let (ca, srv_cert, srv_key, cli_cert, cli_key) = gen_pki();
+        let (addr, mut server_handles) = test_server(&ca, srv_cert, srv_key).await;
+        let cfg = test_agent_config(addr, ca.clone(), cli_cert, cli_key);
+        let cc = tls::rustls_client_tls(
+            &cfg.ca_cert,
+            cfg.client_cert.clone(),
+            cfg.client_key.clone_key(),
+        )
+        .unwrap();
+        let (_agent_handle, mut agent_acceptor) = connect_for_test_with_acceptor(&cfg, cc).await;
+        let mut gateway = tokio::time::timeout(Duration::from_secs(5), server_handles.recv())
+            .await
+            .expect("agent 应当连上")
+            .expect("假网关应当拿到连接句柄");
+
+        let gw_stream = gateway.open_bidirectional_stream().await.expect("开流");
+        let (gw_recv, mut gw_send) = gw_stream.split();
+        write_frame(
+            &mut gw_send,
+            &Frame::ProxyRequest {
+                request_id: 14,
+                method: "POST".into(),
+                path: "/v1/chat/completions".into(),
+                headers: vec![],
+                body: bytes::Bytes::from_static(br#"{"model":"m"}"#),
+            },
+        )
+        .await
+        .expect("写请求帧");
+        // **故意不发 Cancel 就半关写半边** —— 契约违背现场。
+        let _ = gw_recv;
+        tokio::io::AsyncWriteExt::shutdown(&mut gw_send)
+            .await
+            .expect("半关应当成功");
+
+        let agent_stream = tokio::time::timeout(
+            Duration::from_secs(5),
+            agent_acceptor.accept_bidirectional_stream(),
+        )
+        .await
+        .expect("5s 内应当收到流")
+        .expect("accept 不该失败")
+        .expect("应当是 Some(stream)");
+        // 让 handle_stream 去等那个不答的上游；监听任务同时看到 FIN。
+        let handle = tokio::spawn(async move {
+            handle_stream(
+                agent_stream,
+                upstream_client().unwrap(),
+                format!("http://{hang_addr}"),
+                false,
+            )
+            .await
+        });
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut text = String::new();
+        while tokio::time::Instant::now() < deadline {
+            text = logs.text();
+            if text.contains("before the response") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            text.contains("before the response"),
+            "网关在响应之前半关请求流 = 契约违背，必须留下 warn；捕获到的日志：\n{text}"
+        );
+
+        handle.abort();
+    }
+
+    /// 规格（P3-3 的对照）：**响应已经开始之后对端半关 = 合法收尾，不该报契约违背。**
+    ///
+    /// 与上一条互为对照：上一条钉"响应前 EOF ⇒ warn"，这条钉"响应后 EOF ⇒ 不 warn"；
+    /// 只满足一条的实现都是错的（永远 warn = 噪声，永远不 warn = 漏掉契约违背）。
+    /// 关键在时序：FIN 必须在**监听任务还活着**的时候到达（响应头已写出、响应体还在流），
+    /// 否则测试会因为"监听任务已被 AbortOnDrop 收掉"而假绿。
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_gateway_half_close_after_the_response_is_not_a_warning() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_env_filter("info")
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // 一个"只回响应头、不结束响应体"的上游：agent 会停在流式回传阶段。
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("绑本地端口");
+        let up_addr = upstream.local_addr().expect("取端口");
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            if let Ok((mut conn, _)) = upstream.accept().await {
+                let mut buf = [0u8; 2048];
+                let _ = conn.read(&mut buf).await;
+                // 没有 content-length ⇒ 流式；**先只发头**，连接保持打开
+                let _ = conn
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n")
+                    .await;
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            }
+        });
+
+        let (ca, srv_cert, srv_key, cli_cert, cli_key) = gen_pki();
+        let (addr, mut server_handles) = test_server(&ca, srv_cert, srv_key).await;
+        let cfg = test_agent_config(addr, ca.clone(), cli_cert, cli_key);
+        let cc = tls::rustls_client_tls(
+            &cfg.ca_cert,
+            cfg.client_cert.clone(),
+            cfg.client_key.clone_key(),
+        )
+        .unwrap();
+        let (_agent_handle, mut agent_acceptor) = connect_for_test_with_acceptor(&cfg, cc).await;
+        let mut gateway = tokio::time::timeout(Duration::from_secs(5), server_handles.recv())
+            .await
+            .expect("agent 应当连上")
+            .expect("假网关应当拿到连接句柄");
+
+        let gw_stream = gateway.open_bidirectional_stream().await.expect("开流");
+        let (gw_recv, mut gw_send) = gw_stream.split();
+        write_frame(
+            &mut gw_send,
+            &Frame::ProxyRequest {
+                request_id: 15,
+                method: "POST".into(),
+                path: "/v1/chat/completions".into(),
+                headers: vec![],
+                body: bytes::Bytes::from_static(br#"{"model":"m"}"#),
+            },
+        )
+        .await
+        .expect("写请求帧");
+
+        let agent_stream = tokio::time::timeout(
+            Duration::from_secs(5),
+            agent_acceptor.accept_bidirectional_stream(),
+        )
+        .await
+        .expect("5s 内应当收到流")
+        .expect("accept 不该失败")
+        .expect("应当是 Some(stream)");
+        let handle = tokio::spawn(async move {
+            handle_stream(
+                agent_stream,
+                upstream_client().unwrap(),
+                format!("http://{up_addr}"),
+                false,
+            )
+            .await
+        });
+
+        // 等 agent 把响应头写出来（= `response_started` 已置位），再半关。
+        let mut reader = proto::io::FrameReader::new(gw_recv);
+        let frame = tokio::time::timeout(Duration::from_secs(5), reader.next())
+            .await
+            .expect("等响应头超时")
+            .expect("读帧失败")
+            .expect("应当有一条帧");
+        assert!(
+            matches!(frame, Frame::ProxyResponseHead { .. }),
+            "先到的应当是响应头：{frame:?}"
+        );
+
+        tokio::io::AsyncWriteExt::shutdown(&mut gw_send)
+            .await
+            .expect("半关应当成功");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let text = logs.text();
+        assert!(
+            !text.contains("before the response"),
+            "响应之后的半关是合法收尾，不该报契约违背；捕获到的日志：\n{text}"
+        );
+
+        handle.abort();
+    }
+
     /// 把 tracing 输出抓进内存的 `MakeWriter`（只为断言"某一行日志到底有没有打"）。
     ///
     /// 为什么要有它：`request_log` 的承诺就是"打不打这几条 INFO"，而仓库没有（也不打算为一条

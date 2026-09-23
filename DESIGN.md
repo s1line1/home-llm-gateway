@@ -85,7 +85,7 @@
 | `ProxyResponseHead` | agent → cloud | `{ request_id, status, headers }`（转发上游响应头，如 `content-type: text/event-stream`） |
 | `ProxyResponseBody` | agent → cloud | `{ request_id, chunk }`，body 分块流式传输（SSE chunk 直接透传） |
 | `ProxyResponseEnd` | agent → cloud | `{ request_id, ok }`，流结束 |
-| `Cancel` | cloud → agent | 客户端断开/超时，通知 agent 取消上游请求（**防止白算 token**） |
+| `Cancel` | cloud → agent | 客户端断开/超时，通知 agent 取消上游请求（**防止白算 token**）。**取消只能由这一帧表达**：云端放弃在途请求时必须显式发它，不能靠半关请求流代替——agent 把请求方向的 EOF 只当**兜底**，并且会在"响应之前 EOF"时告警（见 P3-3） |
 | `Error` | 双向 | 错误码 + 描述 |
 
 ### 4.3 流式转发语义
@@ -94,6 +94,8 @@
 - agent 收到后转发给本地 LLM，把上游响应逐块编码为 `ProxyResponseHead` + 若干 `ProxyResponseBody` 回传；
 - 云端收到 body 帧后**原样透传**给客户端（`chunked` / `text/event-stream`），不做 buffering；
 - 任一端关闭：客户端断开 → 云端发 `Cancel` → agent 取消上游 reqwest 请求；agent 崩溃 → 云端对客户端返回 502 并清理。
+  云端每一处"放弃在途请求"都要**先发 `Cancel` 再 `finish()`**：agent 侧把请求方向的干净 EOF 也当取消（兜底），
+  但契约是取消只能由 `Cancel` 帧表达，早于响应的 EOF 会被 agent 记为契约违背并打 warn。
 
 ### 4.4 多路复用与并发控制
 
