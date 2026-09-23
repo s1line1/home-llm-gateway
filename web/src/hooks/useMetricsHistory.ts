@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 
 import { fetchMetricsText } from "../api/client";
 import { parseMetrics } from "../api/metrics";
-import type { MetricsSnapshot } from "../api/types";
+import { HISTORY_LEN, type MetricsSnapshot } from "../api/types";
 
 const POLL_MS = 5000;
 
@@ -38,7 +38,9 @@ export function useMetricsHistory(intervalMs = POLL_MS): MetricsHistory {
         const snap = parseMetrics(text);
         setHistory((prev) => {
           const next = [...prev, snap];
-          return next.length > 60 ? next.slice(next.length - 60) : next;
+          return next.length > HISTORY_LEN
+            ? next.slice(next.length - HISTORY_LEN)
+            : next;
         });
         setRaw(text);
         setError(null);

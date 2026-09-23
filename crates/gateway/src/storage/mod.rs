@@ -1255,7 +1255,7 @@ mod verified_tests {
     //     are used instead of what is configured in the `Argon2` instance"）⇒ 用便宜参数写进去的
     //     记录，在**任何**线程上校验都是便宜的。
     // 早年的注释写的是"这些测试都要读进程级的 argon2 调用计数器"——那是计数器搬进 `KeyStore`
-    // **之前**的事实（迁移记录见 `hash.rs` 里 `Argon2InFlight` 的注释），注释没跟着改。
+    // **之前**的事实（迁移记录见 `hash.rs` 里 `verify_argon2` 的文档），注释没跟着改。
 
     /// 并发压同一个 token；返回 (argon2 调用次数增量, 全部请求的结果)。
     /// `cache_max = 0` 时代表"关闭缓存"（旧行为）。

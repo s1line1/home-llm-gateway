@@ -266,11 +266,6 @@ impl Metrics {
         self.inner.active.load(Ordering::Relaxed)
     }
 
-    /// 累计请求数。
-    pub fn request_count(&self) -> u64 {
-        self.inner.request_count.load(Ordering::Relaxed)
-    }
-
     /// agent 连接建立：累计 +1、当前在线 +1。
     pub fn mark_agent_connected(&self) -> AgentConnectionGuard {
         self.inner
@@ -524,12 +519,7 @@ pub struct Admission {
     start: Instant,
 }
 
-impl Admission {
-    /// 占位时刻（调用方据此计算 TTFB 等日志字段）。
-    pub fn started_at(&self) -> Instant {
-        self.start
-    }
-}
+impl Admission {}
 
 impl Drop for Admission {
     fn drop(&mut self) {
