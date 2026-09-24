@@ -274,7 +274,8 @@ async fn e2e_shutdown_cancels_a_client_stalled_stream_without_waiting_for_the_st
 
     // 对照（让后面的 `cancelled > 0` 有意义）：一条**读完**的 flood 请求不该被算成取消。
     // 少了这一步，即使计数器把"正常结束"也记进去，下面的断言也会假绿。
-    let full = reqwest::Client::new()
+    // 这条对照请求**本该读完**（下面断言 200 + 收满 3 KiB），所以用带总超时的 client（P2-17）
+    let full = test_client()
         .post(format!("{base}/v1/flood?chunks=3&kb=1&delay_ms=0"))
         .header("Authorization", format!("Bearer {key}"))
         .json(&serde_json::json!({ "model": "mock-llm" }))
@@ -650,7 +651,9 @@ async fn e2e_a_frame_split_by_a_shutdown_phase_change_is_not_misparsed() {
     let (half_written, resume, agent_done) =
         spawn_split_frame_agent(&gw, &certs, "split-frame").await;
 
-    let client = reqwest::Client::new();
+    // 响应在关停宽限之后才回来，但仍然是**本该完成**的一步（1.5 s 宽限 ≪ 30 s 总超时），
+    // 所以用带总超时的 client（P2-17）。
+    let client = test_client();
     let request = client
         .post(format!("{base}/v1/chat/completions"))
         .header("Authorization", format!("Bearer {key}"))

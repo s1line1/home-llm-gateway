@@ -43,6 +43,7 @@ async fn e2e_write_timeout_does_not_evict_the_agent() {
     assert_eq!(gw.agent_count(), 1, "agent 应已注册");
     let connections_before = metric_gauge(&base, "hlmg_agent_connections_total").await;
 
+    // e2e-bare-client: 要的就是"写背压把请求卡住直到网关写超时"，客户端不能自己先超时
     let client = reqwest::Client::new();
     let url = format!("{base}/v1/chat/completions");
     // 8 MiB 单帧：必须超过对端 QUIC 流控窗口，写才会 park 到超时（小 body 会被缓冲，测不到写路径）。
@@ -301,6 +302,7 @@ async fn e2e_a_write_that_times_out_mid_frame_never_reaches_the_agent_as_a_reque
     let (go, outcome) = spawn_half_reading_agent(&gw, &certs, "half-reader", 64).await;
 
     let big = "x".repeat(8 * 1024 * 1024);
+    // e2e-bare-client: client 本身不带超时，但整个请求被外层 `timeout(10s)` 包住（有界）
     let resp = tokio::time::timeout(
         Duration::from_secs(10),
         reqwest::Client::new()

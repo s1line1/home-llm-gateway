@@ -612,6 +612,141 @@ mod tests {
         );
     }
 
+    /// 规格（二轮审计发现的**接线**缺口）：`run()` 真的把 `session_alive` 交给了 `next_backoff`。
+    ///
+    /// 上面四条是纯函数单测，钉不住这一步：把 `run()` 末尾的
+    /// `backoff = next_backoff(backoff, session_alive)` 换成 `backoff = BACKOFF_BASE`，
+    /// 那四条**照样全绿**，而线上退回"每 ~500ms 重连一次"的互踢风暴。
+    ///
+    /// 判据用 `run()` 自己打的 `wait_ms`（`:218-219` 的不变量：日志里的值**就是**它接下来要睡的值）
+    /// + 真墙钟：连续两次连接失败之间，第三次的等待必须已经涨到 1s 量级（抖动 ±20% ⇒ ≥800ms），
+    /// 而固定基准最多 600ms。这条测试跑 ~2s（500ms + 1s 两次真实睡眠）。
+    ///
+    /// **夹具用 `test_server_that_only_serves_register`**（`dead_heartbeat_forces_a_reconnect`
+    /// 用的同一个，CI 上稳定）：注册流被服务后端 reset 心跳流 ⇒ 会话两三百毫秒就结束，重连是
+    /// 确定性的。**不要**图省事用"接上就立刻关连接"那版（第一版就是），它把首轮的失败押在
+    /// "关连接能让 `register()` 立刻报错"上——一旦那个 close 没赶上，`register()` 会走它自己的
+    /// **10s** 超时，而这条测试的等待上限也正好是 10s，于是日志一条都还没打出来就判定失败
+    /// （2026-09-24 全量 nextest 高负载下实测偶发）。现在每次重连都有注册信号可等，上限放宽到 30s。
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_run_loop_actually_grows_the_backoff_between_short_sessions() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_env_filter("info")
+            // 这份捕获是**当文本读**的（要 grep `wait_ms=`）。带 ANSI 时 `tracing-subscriber`
+            // 会把**字段名**画成斜体、`=` 画成暗色，于是字节里根本没有字面量 `wait_ms=`
+            // （终端里渲染出来一模一样）——而是否上色取决于环境：`Layer::default()` 的
+            // `cfg!(feature="ansi") && env::var("NO_COLOR")…`。本地设了 NO_COLOR（绿）、CI 没设
+            // （红），于是这条测试成了"只在 CI 失败"（2026-09-24 实测复现）。别赌运行环境的
+            // NO_COLOR：显式关掉颜色。
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let (ca, srv_cert, srv_key, cli_cert, cli_key) = gen_pki();
+        let (addr, mut registrations) =
+            test_server_that_only_serves_register(&ca, srv_cert, srv_key).await;
+        let cfg = test_agent_config(addr, ca.clone(), cli_cert, cli_key);
+        let cc = tls::rustls_client_tls(
+            &cfg.ca_cert,
+            cfg.client_cert.clone(),
+            cfg.client_key.clone_key(),
+        )
+        .unwrap();
+        let task = tokio::spawn(run(cfg, cc));
+
+        // 每次"注册成功 + 心跳被 reset"= 一次短命会话（`session_alive` ≈ 毫秒级），正是
+        // "同名 agent 互踢"的形状 ⇒ 退避必须逐次翻倍。三个阶段：等注册信号（墙钟锚点）→
+        // 等这次会话对应的那条 retry 日志（`run()` 先打日志、再照它睡）。
+        let mut stamps: Vec<(tokio::time::Instant, u64)> = Vec::new();
+        for attempt in 1..=3u32 {
+            tokio::time::timeout(Duration::from_secs(30), registrations.recv())
+                .await
+                .unwrap_or_else(|_| panic!("第 {attempt} 次注册超时：run loop 没在重连吗？"))
+                .expect("假网关应当收到连接");
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            let mut wait = None;
+            while tokio::time::Instant::now() < deadline {
+                if let Some(value) = parse_wait_ms(&logs.text()).get(attempt as usize - 1) {
+                    wait = Some(*value);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let wait = wait.unwrap_or_else(|| {
+                panic!(
+                    "第 {attempt} 次重连没有留下 `wait_ms` 日志：\n{}",
+                    logs.text()
+                )
+            });
+            stamps.push((tokio::time::Instant::now(), wait));
+        }
+        task.abort();
+
+        let (_, w0) = stamps[0];
+        let (_, w1) = stamps[1];
+        assert!(
+            (400..=650).contains(&w0),
+            "第一次等待应当是基准 500ms（±20% 抖动），实际 {w0}ms"
+        );
+        assert!(
+            (800..=1250).contains(&w1),
+            "第二次等待必须是翻倍后的 ~1s（固定基准的实现最多 600ms）：实际 {w1}ms —— \
+             接线 `backoff = next_backoff(backoff, session_alive)` 是否还在？"
+        );
+        // 墙钟复核：相邻两条日志之间隔着"上一条日志承诺的等待"（先打日志、随后才 sleep）。
+        // 计时只会被负载拉长、不会被压短，所以下界是硬判据。
+        let gap = stamps[2].0.duration_since(stamps[1].0);
+        assert!(
+            gap >= Duration::from_millis(700),
+            "日志里的 wait_ms 必须就是真正睡的值（`run()` 的既有不变量），实测间隔 {gap:?}"
+        );
+    }
+
+    /// 从捕获的日志里按出现顺序取出所有 `wait_ms=<n>`。
+    ///
+    /// 先剥掉 ANSI 转义序列再按字面量匹配：带 ANSI 时字段名是斜体、`=` 是暗色，字节里根本没有
+    /// `wait_ms=`（终端里渲染出来一模一样）。上面已经显式 `with_ansi(false)`，这里是第二道——
+    /// 万一有人删了那行，也不会再变成“只在 CI 红”。
+    ///
+    /// **不要用“跳过非数字字符”那种写法**：ANSI 序列自己就含数字（`\x1b[0m`、`\x1b[2m`），
+    /// 那样会解析出 `0, 2, 405…` 的垃圾（这版第一稿就是这么写的，实测把断言喂成了 `w0 == 0`）。
+    fn parse_wait_ms(text: &str) -> Vec<u64> {
+        let plain = strip_ansi(text);
+        plain
+            .match_indices("wait_ms=")
+            .filter_map(|(at, key)| {
+                let rest = &plain[at + key.len()..];
+                let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                digits.parse().ok()
+            })
+            .collect()
+    }
+
+    /// 去掉 CSI 转义序列（`ESC [ 参数字节… 终止字节`）——`tracing-subscriber` 的配色只用这一族。
+    fn strip_ansi(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c != '\x1b' {
+                out.push(c);
+                continue;
+            }
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                // 参数/中间字节是 0x20–0x3F，遇到 0x40–0x7E 即序列结束
+                for c in chars.by_ref() {
+                    if ('\x40'..='\x7e').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            // 其它 ESC 序列本测试用不到：丢掉这个 ESC 即可
+        }
+        out
+    }
+
     /// 规格：抖动必须在 ±20% 之内、**两端都能取到**（否则就是"加了抖动"的自述），
     /// 且封顶之后不许超过上限。
     #[test]
@@ -856,6 +991,65 @@ mod tests {
                     }
                     let _ = tx.send(()).await; // "这条连接已经注册完成"
                                                // 之后的心跳流：reset 掉，让 agent 的心跳任务立刻失败
+                    while let Ok(Some(stream)) = acceptor.accept_bidirectional_stream().await {
+                        let (_recv, mut send) = stream.split();
+                        let _ = send.reset(0u32.into());
+                    }
+                });
+            }
+        });
+        (addr, rx)
+    }
+
+    /// 假网关：服务注册流（读一帧 → finish，让 `register()` 拿到 EOF），**并把连接句柄交回测试**，
+    /// 好让测试自己开一条流写请求 —— 于是走的是**真的 accept 循环**（`connect_once` 里的
+    /// `handle_stream` + 那行 `warn!("proxy stream failed")`），而不是测试直接调 `handle_stream`。
+    ///
+    /// 之后的心跳流照 `test_server_that_only_serves_register` 的做法 reset 掉，避开 5s ack 超时。
+    async fn test_server_that_serves_register_and_returns_the_connection(
+        ca: &CertificateDer<'static>,
+        cert: CertificateDer<'static>,
+        key: PrivateKeyDer<'static>,
+    ) -> (SocketAddr, tokio::sync::mpsc::Receiver<Handle>) {
+        // 本测试直接构建 rustls 配置（绕过 tls 构造函数）→ 自己确保 provider 已装。
+        proto::crypto::provider();
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca.clone()).unwrap();
+        let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+            .build()
+            .unwrap();
+        let mut stls = rustls::ServerConfig::builder()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(vec![cert], key)
+            .unwrap();
+        stls.alpn_protocols = vec![ALPN.to_vec()];
+
+        let mut server = s2n_quic::Server::builder()
+            .with_tls(s2n_quic::provider::tls::rustls::Server::from(Arc::new(
+                stls,
+            )))
+            .unwrap()
+            .with_io("127.0.0.1:0")
+            .unwrap()
+            .start()
+            .unwrap();
+        let addr = server.local_addr().unwrap();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tokio::spawn(async move {
+            while let Some(conn) = server.accept().await {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let (handle, mut acceptor) = conn.split();
+                    // 第一条流 = 注册流：读一帧就 finish（agent 侧读到 EOF = 注册成功）
+                    if let Ok(Some(stream)) = acceptor.accept_bidirectional_stream().await {
+                        let (mut recv, mut send) = stream.split();
+                        let _ = proto::io::FrameReader::new(&mut recv).next().await;
+                        let _ = send.finish();
+                    }
+                    let _ = tx.send(handle).await;
+                    // 之后是 agent 自己开的心跳流：reset，别让它们拖成 5s 超时
                     while let Ok(Some(stream)) = acceptor.accept_bidirectional_stream().await {
                         let (_recv, mut send) = stream.split();
                         let _ = send.reset(0u32.into());
@@ -1939,6 +2133,200 @@ mod tests {
         }
         assert!(format!("{err:#}").contains("request_id=11"));
         drop(gw_send);
+    }
+
+    /// 规格（P2-2 的第二轮缺口）：**accept 循环那行 `warn!("proxy stream failed")` 必须真的打出来**。
+    ///
+    /// 既有两条（502 / 非法方法）都是**直接调 `handle_stream`**，于是只证明了"错误链带得上上下文"，
+    /// 而"调用方确实把它打了出来"这一步靠读码（`lib.rs` 里那行 warn）。这条走**真 accept 循环**：
+    /// 真跑 `run()`，让 `connect_once` 自己 accept 网关开的流、自己处理它的 Err。
+    ///
+    /// 判据三层：客户端仍拿到 400（行为不变）→ 日志里有 `proxy stream failed` → 那行里带着
+    /// `request_id=21` 与路径（"哪个请求失败了"必须能从日志里读出来，这是 P2-2 的全部意义）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_accept_loop_reports_a_failed_proxy_stream_with_its_context() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_env_filter("info")
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let (ca, srv_cert, srv_key, cli_cert, cli_key) = gen_pki();
+        let (addr, mut server_handles) =
+            test_server_that_serves_register_and_returns_the_connection(&ca, srv_cert, srv_key)
+                .await;
+        let cfg = test_agent_config(addr, ca.clone(), cli_cert, cli_key);
+        let cc = tls::rustls_client_tls(
+            &cfg.ca_cert,
+            cfg.client_cert.clone(),
+            cfg.client_key.clone_key(),
+        )
+        .unwrap();
+        let agent = tokio::spawn(run(cfg, cc));
+
+        let mut gateway = tokio::time::timeout(Duration::from_secs(5), server_handles.recv())
+            .await
+            .expect("agent 应当连上")
+            .expect("假网关应当拿到连接句柄");
+        let gw_stream = gateway.open_bidirectional_stream().await.expect("开流");
+        let (gw_recv, mut gw_send) = gw_stream.split();
+        // 含空格的方法名 ⇒ `Method::from_bytes` 必失败 ⇒ `handle_stream` 走 Err 分支（确定性，不碰上游）
+        write_frame(
+            &mut gw_send,
+            &Frame::ProxyRequest {
+                request_id: 21,
+                method: "BAD METHOD".into(),
+                path: "/v1/chat/completions".into(),
+                headers: vec![],
+                body: bytes::Bytes::from_static(br#"{"model":"m"}"#),
+            },
+        )
+        .await
+        .expect("写请求帧");
+
+        // 行为不变：客户端拿到的仍是 400
+        let reply = tokio::time::timeout(Duration::from_secs(5), FrameReader::new(gw_recv).next())
+            .await
+            .expect("等错误帧超时")
+            .expect("读帧失败")
+            .expect("应当有一条错误帧");
+        match reply {
+            Frame::Error { code, .. } => assert_eq!(code, 400, "非法方法仍是客户端问题"),
+            other => panic!("期望 Frame::Error，实际：{other:?}"),
+        }
+
+        // 关键断言：那行 warn 真的出现了，而且带得上"哪个请求、哪条路径"
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut text = String::new();
+        while tokio::time::Instant::now() < deadline {
+            text = logs.text();
+            if text.contains("proxy stream failed") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            text.contains("proxy stream failed"),
+            "accept 循环必须报告这条失败（P2-2 修的就是它以前被 `let _ =` 吞掉）：\n{text}"
+        );
+        assert!(
+            text.contains("request_id=21") && text.contains("/v1/chat/completions"),
+            "那行 warn 必须能说清是哪个请求、哪条路径：\n{text}"
+        );
+
+        agent.abort();
+    }
+
+    /// 规格（P2-2 的第二轮缺口）：**`cancelled` 这条 `request_log` 也要真的打出来**。
+    ///
+    /// 既有那条只覆盖成功路径的 received / responded / done。取消路径的判据有两半，缺一不可：
+    /// 客户端必须收到 `499 cancelled by client`（而不是通用 502），agent 侧必须留下
+    /// `proxy request cancelled by client` —— 否则"这个请求为什么没了"在两侧都查不出来。
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cancelled_request_logs_its_own_line_and_answers_499() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_env_filter("info")
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // 一个"接了不答"的上游：agent 停在等响应头上，取消正好落在**响应之前**那个 select 分支
+        let hang = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("绑本地端口");
+        let hang_addr = hang.local_addr().expect("取端口");
+        tokio::spawn(async move {
+            if let Ok((conn, _)) = hang.accept().await {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                drop(conn);
+            }
+        });
+
+        let (ca, srv_cert, srv_key, cli_cert, cli_key) = gen_pki();
+        let (addr, mut server_handles) = test_server(&ca, srv_cert, srv_key).await;
+        let cfg = test_agent_config(addr, ca.clone(), cli_cert, cli_key);
+        let cc = tls::rustls_client_tls(
+            &cfg.ca_cert,
+            cfg.client_cert.clone(),
+            cfg.client_key.clone_key(),
+        )
+        .unwrap();
+        let (_agent_handle, mut agent_acceptor) = connect_for_test_with_acceptor(&cfg, cc).await;
+        let mut gateway = tokio::time::timeout(Duration::from_secs(5), server_handles.recv())
+            .await
+            .expect("agent 应当连上")
+            .expect("假网关应当拿到连接句柄");
+        let gw_stream = gateway.open_bidirectional_stream().await.expect("开流");
+        let (gw_recv, mut gw_send) = gw_stream.split();
+        write_frame(
+            &mut gw_send,
+            &Frame::ProxyRequest {
+                request_id: 33,
+                method: "POST".into(),
+                path: "/v1/chat/completions".into(),
+                headers: vec![],
+                body: bytes::Bytes::from_static(br#"{"model":"m"}"#),
+            },
+        )
+        .await
+        .expect("写请求帧");
+        let agent_stream = tokio::time::timeout(
+            Duration::from_secs(5),
+            agent_acceptor.accept_bidirectional_stream(),
+        )
+        .await
+        .expect("5s 内应当收到流")
+        .expect("accept 不该失败")
+        .expect("应当是 Some(stream)");
+        // `request_log = true`：这条测试要看的就是那条 INFO
+        let task = tokio::spawn(handle_stream(
+            agent_stream,
+            upstream_client().unwrap(),
+            format!("http://{hang_addr}"),
+            true,
+        ));
+
+        // 先让请求真的打到上游，再发取消（否则测到的是别的路径）
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        write_frame(&mut gw_send, &Frame::Cancel { request_id: 33 })
+            .await
+            .expect("写取消帧");
+
+        let reply = tokio::time::timeout(Duration::from_secs(5), FrameReader::new(gw_recv).next())
+            .await
+            .expect("等取消回帧超时")
+            .expect("读帧失败")
+            .expect("应当有一条回帧");
+        match reply {
+            Frame::Error {
+                request_id,
+                code,
+                message,
+            } => {
+                assert_eq!(request_id, Some(33), "取消回帧要能对上请求");
+                assert_eq!(code, 499, "客户端取消不是服务端错误：{message}");
+                assert!(
+                    message.contains("cancelled by client"),
+                    "文案要说清是客户端取消的：{message}"
+                );
+            }
+            other => panic!("取消应当回 499 的 Frame::Error，实际：{other:?}"),
+        }
+        task.await
+            .expect("handle_stream 不该 panic")
+            .expect("取消是正常收尾，不该是 Err");
+
+        let text = logs.text();
+        assert!(
+            text.contains("proxy request received"),
+            "取消之前先要有 received：\n{text}"
+        );
+        assert!(
+            text.contains("proxy request cancelled by client"),
+            "取消路径必须留下它自己那条 INFO（P2-2；以前 request_log 是空操作）：\n{text}"
+        );
     }
 
     /// 规格（P3-2）：**方法非法这条 `Err` 路径不能把监听任务留在那儿**。

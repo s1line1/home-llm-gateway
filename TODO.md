@@ -216,6 +216,27 @@
       **2026-09-22 决定：本阶段先不做**（上面 ①/②/③ 三个候选与本轮补充的 ④"不给默认值、
       缺失即启动失败"都搁置）。要做时注意两点：网关侧语义**不要动**（见上一条注），
       且 185-193 行那两条回归测试**已随修法撤回、不在树中**，必须按那里的判据重写。
+- [ ] **一条已认证连接可以无界撑大注册表（SL-P2-10；2026-09-23 方案已定，按指示暂缓）**：
+      `registry::Registration` 只记住这条连接**最后一次**注册的 `(agent_id, stable_id)`（`registry.rs` 的
+      `agent: Option<(String, usize)>`），而 `quic::handle_conn_inner` 的控制流循环对 `Register` 帧数
+      **没有任何上限**。于是持有一张 CA 证书的连接（或一个被拿下的 edge 节点）可以注册 `a1..aN`，断开时
+      **只摘掉 `aN`**，其余连同 `models: Vec<String>`（单帧上限 `MAX_FRAME`=64 MiB）**永久**留在表里 ——
+      `hlmg_agents` 虚高、`/admin/agents` 出现幽灵条目，要重启才清（本仓库**没有 stale 清扫器**：
+      心跳过期只是不再可路由，条目本身不动）。
+      **已定修法（当时跑通过，含两处变异验证；按指示撤回、未提交）**：
+      ① `Registration.agent` 改成 `Vec<(String, usize)>`（**按 `agent_id` 去重**，同名只留最后一次的
+      `stable_id`），Drop 时逐个 `remove_if_same` ⇒ 断开摘掉**本连接注册的全部**；判据仍是 `stable_id`
+      比对，所以**只摘仍属于本连接的那些**（被新连接接管的 id 是 no-op，不会误删活条目）；
+      ② 内部常量 `MAX_REGISTRATIONS_PER_CONNECTION = 4`（**不是新配置旋钮**；正常部署一条连接只服务一个
+      agent 进程，4 是四倍余量）＋ `quic::handle_conn_inner` 在 **`register()` 之前**问
+      `registration.accepts(&id)`，超限即 `warn!` + `handle.close()`（顺序要紧：注册已插表之后再拒绝，
+      那条 `Entry` 就没人负责摘了）。
+      **重做时要补的测试**（当时写过、已随代码撤回）：`a_connection_removes_every_id_it_registered_when_it_drops`
+      （把 `note()` 变异回『只留最后一个』⇒ 红：`left: 2, right: 0`）、
+      `an_exit_never_removes_an_id_another_connection_took_over`、
+      `the_per_connection_cap_allows_refresh_but_rejects_new_ids`（把 `accepts()` 变异成恒 true ⇒ 红）。
+      **未做**：记录建议的第三条 —— 周期 stale 清扫器；它只能摘『连接已经不在』的条目（否则会摘掉活着但
+      心跳慢的 agent），需要单独设计，属兜底而非主要修复。
 - [x] **进程级优雅关闭（网关侧已补齐 drain）**：gateway/agent 注册 SIGTERM/SIGINT（`tokio::signal`），
       收到后打 INFO 日志 → 调用 `Gateway::shutdown()` / `Agent::shutdown()` 退出；
       覆盖 systemd stop、Ctrl+C、harness job_kill 场景（对应 OPTIMIZATION.md A1 ✅）。
