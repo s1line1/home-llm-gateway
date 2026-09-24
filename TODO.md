@@ -586,8 +586,9 @@
       "有意保留"并关掉即可。
 - [ ] **前端四份独立 `/metrics` 轮询**：`Layout.tsx:24`、`Overview.tsx:9`、`MetricsPage.tsx:10`、
       `Agents.tsx:61` 各实例化一个 `useMetricsHistory()`（各自 5s 轮询、各自一份历史）。抽 context 共享。
-- [ ] **小体积/常量类**：`Agents.tsx:72` 用 `error.message.includes("404")` 嗅探状态码
-      （`ApiError.status` 就在手边）；`Agents.tsx:28` 硬编码 `agent_stale_secs` 的默认值 `15`；
+- [ ] **小体积/常量类**：~~`Agents.tsx:72` 用 `error.message.includes("404")` 嗅探状态码~~
+      （**2026-09-23 已修**，见 P3-18：404 被 `fetchAgents` 折成 `null`，嗅探那段永远为假，
+      改成按 `data === null` 判）；`Agents.tsx:28` 硬编码 `agent_stale_secs` 的默认值 `15`；
       `registry.rs:124,151,158` 三处裸比较 `"*"`；`extract_model -> Result<String, ()>` 丢掉失败原因；
       `HeadOutcome::Error(u16, String)` 用裸状态码。
 - [ ] **死代码 / 死常量**：`KeyStore::authorize_id`（`storage/mod.rs:210`）、`Metrics::request_count`
@@ -600,6 +601,30 @@
       注意它现在只在 nightly 报警，稳定版 CI 不会提示（这也是"工具链没锁版本"那条的连带损失）。
       **2026-09 已改**：`try_acquire_excluding` 里现在是 `try_update`（该处行号已随重构移动到
       `registry.rs` 的抢槽位分支内），并在原处留了"为什么用 `try_update`"的注释。
+
+### 前端工程化
+
+- [x] **构建产物泄漏守卫（2026-09-23 已做，零新依赖）**：`pnpm build` 现在最后一步跑
+      `web/scripts/check-bundle.mjs` —— 扫 `dist/` 里有没有 `P<级别>-<编号>` 这类**只该存在于
+      源码注释里**的审计标记。起因：我把 `//` 注释写在了 JSX **子节点位置**（那里它是文本），
+      整段说明被渲染到了总览页上，而 `tsc` 与 `vite build` 都不会报错（见 PROJECT_SCAN P3-19）。
+      它是启发式的（只抓这种标记），但把"这一类"变成了**构建即失败**；放进 `build` 脚本而不是
+      Makefile，是因为 CI 跑的是 `pnpm build`（`.github/workflows/ci.yml:90`），这样三处都覆盖。
+
+### 前端工程化：待决（P3-21 的剩余部分，需要**新增依赖**，按顶部范围约定先不动）
+
+- [ ] **前端无 lint / formatter / 测试**：`web/` 目前只有 `tsc` + `vite build` 两道，
+      没有 eslint/prettier，也没有任何测试框架（`vitest` 之类）。**这三样都要新增 devDependencies**
+      —— 属于本阶段冻结的"新依赖"，所以先登记、不实施。真要上的话建议一次只加一件：
+      ① `prettier`（纯格式化，风险最低）；② `eslint` + `typescript-eslint`（会立刻产生一批
+      历史债务告警，需要先定规则集/是否 `--max-warnings 0`）；③ `vitest` + `@testing-library/react`
+      （给 `parseMetrics`、`handle/expectArray`、`RequireAuth` 这类纯逻辑/小组件写测试）。
+      注意 CI 的 node 是 22（`.github/workflows/ci.yml:82`），加依赖时别引入要求更高 node 的工具。
+- [x] **`@types/node` 与 CI 的 node 版本不一致**（**2026-09-23 已修**）：原为 `^26.4.0`（CI 跑 node 22），
+      已对齐到 `^22.20.4` 并 `pnpm install` 更新锁文件。
+- [x] **`typecheck` 脚本无人引用**（**2026-09-23 已修**）：`pnpm build` 本身就是 `tsc -b && vite build`，
+      所以类型检查在 CI/`make check` 里**已经**跑过，这个脚本的价值是"不起构建的快速检查"；
+      已在 `web/README.md` 写明用途，不再算死脚本。
 
 ### 本次一并修掉的文档漂移（无需再动代码）
 

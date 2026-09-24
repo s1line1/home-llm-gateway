@@ -10,7 +10,8 @@ export default function Overview() {
 
   const active = history.map((h) => h.active_requests);
   const agents = history.map((h) => h.agents);
-  const avgMs = latest && latest.request_count > 0 ? latest.request_duration_ms / latest.request_count : 0;
+  const avgMs =
+    latest && latest.request_count > 0 ? latest.request_duration_ms / latest.request_count : 0;
 
   return (
     <div className="space-y-6">
@@ -19,12 +20,14 @@ export default function Overview() {
         <p className="text-sm text-slate-500">网关实时状态与关键指标（每 5 秒采样）</p>
       </div>
 
+      {/* `hlmg_agents` 的 HELP 明说**含心跳过期者**，所以"在线"不能用它：可路由数要看
+          `hlmg_agents_healthy`（P3-19）。注册总数放到 hint 里，避免把"注册了但都失联"读成 0 台。 */}
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
         <StatCard
           label="在线 Agents"
-          value={latest ? latest.agents : "—"}
-          hint="已注册且未失联"
-          tone={latest && latest.agents > 0 ? "ok" : "warn"}
+          value={latest ? latest.agents_healthy : "—"}
+          hint={latest ? `可路由；已注册 ${latest.agents}（含心跳过期）` : "可路由"}
+          tone={latest && latest.agents_healthy > 0 ? "ok" : "warn"}
         />
         <StatCard
           label="在途请求"
@@ -34,7 +37,9 @@ export default function Overview() {
         <StatCard
           label="累计请求"
           value={latest ? latest.request_count.toLocaleString() : "—"}
-          hint={latest && latest.request_count > 0 ? `平均耗时 ${formatDuration(avgMs)}` : undefined}
+          hint={
+            latest && latest.request_count > 0 ? `平均耗时 ${formatDuration(avgMs)}` : undefined
+          }
         />
         <StatCard
           label="累计转发"
@@ -66,7 +71,10 @@ export default function Overview() {
             {Object.entries(latest.requests_by_status)
               .sort(([a], [b]) => Number(a) - Number(b))
               .map(([code, count]) => (
-                <div key={code} className="flex items-center justify-between rounded-lg bg-slate-50 px-3 py-2">
+                <div
+                  key={code}
+                  className="flex items-center justify-between rounded-lg bg-slate-50 px-3 py-2"
+                >
                   <span className="font-mono text-sm text-slate-600">{code}</span>
                   <span className="font-mono text-sm font-semibold tabular-nums">{count}</span>
                 </div>

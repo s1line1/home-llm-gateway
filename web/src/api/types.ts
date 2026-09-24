@@ -65,8 +65,10 @@ export interface MetricsSnapshot {
   requests_by_status: Record<number, number>;
   /** 当前在途请求数（gauge）。 */
   active_requests: number;
-  /** 当前在线（已注册）agent 数（gauge）。 */
+  /** 已注册 agent 数（gauge）——**含心跳过期者**（`hlmg_agents` 的 HELP 明说）。 */
   agents: number;
+  /** 其中**心跳未过期、真正可路由**的数量（gauge，`hlmg_agents_healthy`）。 */
+  agents_healthy: number;
   /** 累计转发给客户端的字节数（counter）。 */
   bytes_out: number;
   /** 累计请求耗时（毫秒，sum）。 */

@@ -32,6 +32,7 @@ VUSS="${VUSS:-1 5 20 40}"               # VUS 扫描的并发列表
 BASE_LEN="${BASE_LEN:-100}"             # VUS 扫描用的固定流长
 DUR="${DUR:-30s}"                       # VUS 扫描每轮时长
 DUR_N="${DUR_N:-30s}"                   # N 扫描每轮时长（VUS=1，样本数 = DUR/单条流耗时）
+MODEL="${MODEL:-qwen2.5}"                 # 请求的模型名（必须匹配 agent 声明的 models）
 OUTDIR="${OUTDIR:-.tmp/bench}"
 OUT="${OUT:-sse-bench-report.svg}"
 FORCE="${FORCE:-0}"                     # 1 = 跳过 /healthz 可达性检查
@@ -73,8 +74,11 @@ if [ "$FORCE" != "1" ] && [ "$SKIP_SWEEP" != "1" ]; then
   esac
 fi
 
-mkdir -p "$OUTDIR"
+# 顺序要紧（P3-23）：`OUTDIR`/`OUT` 是**相对路径**，而 README 承诺它们按仓库根解析
+# （"在任何目录调用都一样"）。先把 cwd 切到仓库根再建目录，否则从子目录调用会把
+# `.tmp/bench` 建在子目录里，而 k6 的 `--summary-export` 之后写向仓库根那个**不存在**的路径。
 cd "$ROOT"
+mkdir -p "$OUTDIR"
 
 run_one() { # run_one <label> <content_len> <vus> <dur> <outfile>
   local label="$1" len="$2" vus="$3" dur="$4" out="$5"
@@ -83,7 +87,7 @@ run_one() { # run_one <label> <content_len> <vus> <dur> <outfile>
   # 跑失败时 summary-export 仍会写出（趋势指标为空 → 0），配合日志排查。
   if ! k6 run --quiet --summary-export="$out" \
     -e GATEWAY_URL="$GATEWAY_URL" -e GATEWAY_KEY="$GATEWAY_KEY" \
-    -e VUS="$vus" -e DURATION="$dur" -e CONTENT_LEN="$len" \
+    -e VUS="$vus" -e DURATION="$dur" -e CONTENT_LEN="$len" -e MODEL="$MODEL" \
     "$K6_JS" >"${out%.json}.log" 2>&1; then
     warn "k6 退出非 0，见 ${out%.json}.log"
   fi

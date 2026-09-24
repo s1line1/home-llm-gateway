@@ -3,11 +3,25 @@
 # 专用端口与 keys.db），k6 阶梯加压，观察 /metrics 的 hlmg_active_requests 是否
 # 贴住闸门值、429 是否在预期并发点出现。
 #
-# 用法: bash .tmp/admission-test.sh [LIMIT] [VUS]
+# 用法: bash scripts/bench-admission-local.sh [LIMIT] [VUS]   （或 make bench-admission-local [LIMIT=..] [VUS=..]）
+#
+# 注意：这里以前写的是 `.tmp/admission-test.sh` —— 那是本脚本早期的 scratch 副本（.tmp/ 是
+# gitignored，干净 clone 里根本不存在）。用法行指向自己才对（P3-25）。
 #   LIMIT   gateway max_concurrent_requests（被测闸门，默认 20）
 #   VUS     k6 并发虚拟用户数（默认 100）
 set -euo pipefail
 cd "$(dirname "$0")/.."
+
+# 前置检查：本脚本要跑 k6，并且**假定三个 debug 二进制与开发证书已经就绪**。缺了就当场说清
+# 该跑哪条命令，而不是等 healthz 轮询超时后报一句看不出原因的"gateway 未就绪"（P3-25）。
+command -v k6 >/dev/null || { echo "找不到 k6（macOS: brew install k6）"; exit 1; }
+command -v python3 >/dev/null || { echo "找不到 python3"; exit 1; }
+for b in mock-llm gateway agent; do
+  [ -x "target/debug/$b" ] || { echo "缺少 target/debug/$b —— 先跑 make build-debug"; exit 1; }
+done
+for f in ca.crt server.crt server.key client.crt client.key; do
+  [ -f "certs/out/$f" ] || { echo "缺少 certs/out/$f —— 先跑 make certs"; exit 1; }
+done
 
 LIMIT="${1:-20}"
 VUS="${2:-100}"

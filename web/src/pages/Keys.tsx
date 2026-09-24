@@ -105,7 +105,9 @@ export default function Keys() {
           <div className="mt-3 rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-sm">
             <p className="font-medium text-emerald-800">创建成功——明文仅显示这一次：</p>
             <div className="mt-1.5 flex items-center gap-2">
-              <code className="flex-1 break-all rounded bg-white px-2 py-1 font-mono text-xs">{created.key}</code>
+              <code className="flex-1 break-all rounded bg-white px-2 py-1 font-mono text-xs">
+                {created.key}
+              </code>
               <Button
                 variant="secondary"
                 onClick={() => {
@@ -121,6 +123,11 @@ export default function Keys() {
       </Card>
 
       <Card title="已有 Keys" subtitle="吊销立即生效，不可恢复">
+        {deleteMutation.isError && (
+          <p className="mb-2 text-xs text-rose-600">
+            吊销失败：{deleteMutation.error.message}（这条 Key 仍然有效）
+          </p>
+        )}
         {keysQuery.isPending ? (
           <EmptyState text="加载中…" />
         ) : keysQuery.isError ? (
@@ -148,15 +155,15 @@ export default function Keys() {
                     <td className="py-2.5 pr-4 font-medium text-slate-800">{k.name}</td>
                     <td className="py-2.5 pr-4 font-mono text-xs text-slate-500">{k.id}</td>
                     <td className="py-2.5 pr-4 font-mono text-xs text-slate-500">{k.prefix}</td>
-                    <td className="py-2.5 pr-4 text-slate-600">
-                      {formatTokens(k.usage)}
-                    </td>
+                    <td className="py-2.5 pr-4 text-slate-600">{formatTokens(k.usage)}</td>
                     <td className="py-2.5 pr-4 text-slate-600">{k.usage.requests}</td>
                     <td className="py-2.5 pr-4 text-slate-600">
                       {new Date(k.created_at * 1000).toLocaleString()}
                     </td>
                     <td className="py-2.5 pr-4">
-                      <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${k.enabled ? "bg-emerald-50 text-emerald-700" : "bg-slate-100 text-slate-500"}`}>
+                      <span
+                        className={`rounded-full px-2 py-0.5 text-xs font-medium ${k.enabled ? "bg-emerald-50 text-emerald-700" : "bg-slate-100 text-slate-500"}`}
+                      >
                         {k.enabled ? "启用" : "禁用"}
                       </span>
                     </td>
@@ -187,9 +194,10 @@ export default function Keys() {
 /** 用量列展示：主显总 token（大数易读），prompt/completion 明细放悬停提示。 */
 function formatTokens(u: KeyUsage) {
   if (u.requests === 0) return <span className="text-slate-300">—</span>;
-  const est = u.estimated_requests > 0
-    ? `（其中 ${u.estimated_requests} 次请求上游未提供 usage，按估算降级）`
-    : "";
+  const est =
+    u.estimated_requests > 0
+      ? `（其中 ${u.estimated_requests} 次请求上游未提供 usage，按估算降级）`
+      : "";
   return (
     <span
       className="cursor-help"
@@ -197,7 +205,9 @@ function formatTokens(u: KeyUsage) {
     >
       {u.total_tokens.toLocaleString()}
       {u.estimated_requests > 0 && (
-        <span className="ml-1 text-amber-500" title="上游未提供 usage，按估算降级">~</span>
+        <span className="ml-1 text-amber-500" title="上游未提供 usage，按估算降级">
+          ~
+        </span>
       )}
     </span>
   );

@@ -28,8 +28,10 @@ use crate::state::AppState;
 /// - **agent 数不进状态码**（只在 body 里报）：没有 agent ≠ 进程不健康。把它塞进来会让
 ///   "刚启动、还没等到 agent 注册"变成探针失败 → LB 摘除 / 容器重启循环，而重启并不能让
 ///   agent 出现。要按 readiness 摘流的部署自己读 body 的 `agents.healthy`。
-/// - **落库可写性也不进**（`TODO.md` R12 的结转项）：唯一可靠的判据是"真写一次"，而 SQLite
-///   目前没有 `busy_timeout`（P2-7），探针的写入可能撞 `SQLITE_BUSY` 把健康实例判死。
+/// - **落库可写性也不进**（`TODO.md` R12 的结转项）：唯一可靠的判据是"真写一次"，而探针的写入
+///   可能撞 `SQLITE_BUSY` 把健康实例判死（rusqlite 在 `open` 时已设 5 s busy timeout，最坏是
+///   探针卡 5 s 再判死——结论不变，但**不是**"没有 busy_timeout"：那条记录 2026-09-23 已订正，
+///   见 P2-7 / SL-P2-5）。
 ///
 /// body 是 JSON（早期是纯文本 `ok`）；**状态码与 body 的 `status` 永远一致**，
 /// `agents.oldest_last_seen_secs_ago` 用来区分"没人注册"与"有人但全过期"（`null` = 注册表为空）。

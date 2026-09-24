@@ -42,6 +42,15 @@ web-install: ## 安装前端依赖（web/node_modules）
 web-build: ## 构建前端产物（web/dist，网关 / 即托管 Dashboard）
 	cd $(WEB_DIR) && pnpm build
 
+web-format: ## 检查前端格式（prettier，P3-21）
+	cd $(WEB_DIR) && pnpm format:check
+
+web-lint: ## 前端静态检查（oxlint，P3-21；warnings 也算失败）
+	cd $(WEB_DIR) && pnpm lint
+
+web-test: ## 前端单元/渲染测试（vitest，P3-21）
+	cd $(WEB_DIR) && pnpm test
+
 web-dev: ## 前端开发服务器（Vite :5173，代理到网关，需先起网关）
 	cd $(WEB_DIR) && pnpm dev
 
@@ -69,7 +78,7 @@ toolchain-check: ## 工具链三处一致（rust-toolchain.toml / Dockerfile / C
 deny: ##（advisories/bans/licenses/sources 全跑，与 pre-commit hook / CI 同一条命令；首次/无网时需要 advisory 库）
 	cargo deny check
 
-check: fmt clippy deny nextest web-build toolchain-check ## 一键全量验证（= CI 的 Rust 门槛 + 前端构建 + 工具链一致性：fmt / clippy / cargo deny / nextest / web-build / toolchain-check）
+check: fmt clippy deny nextest web-format web-lint web-test web-build toolchain-check ## 一键全量验证（= CI 的 Rust 门槛 + 前端格式/检查/测试/构建 + 工具链一致性：fmt / clippy / cargo deny / nextest / web-format / web-lint / web-test / web-build / toolchain-check）
 
 test: ## 运行全部 Rust 测试（cargo 原生 runner，含 e2e；串行靠测试里的 #[serial]）
 	cargo test
@@ -81,7 +90,8 @@ bench: ## 基准测试（Criterion）：make bench BENCH="-p proto -p gateway"
 	cargo bench $(BENCH)
 
 bench-k6: ## k6 宏观压测（SSE 长流）：make bench-k6 KEY=sk-xxx GATEWAY_URL=http://IP:9090
-	k6 run -e GATEWAY_URL=$(GATEWAY_URL) -e GATEWAY_KEY=$(KEY) -e VUS=$(VUS) -e DURATION=$(DUR) scripts/bench-k6/sse.js
+	k6 run -e GATEWAY_URL=$(GATEWAY_URL) -e GATEWAY_KEY=$(KEY) -e VUS=$(VUS) -e DURATION=$(DUR) \
+		-e MODEL=$(MODEL) scripts/bench-k6/sse.js
 
 # ---------------------------------------------------------------------------
 # 出图接线（方案 1：把 k6 的 --summary-export 接到 report.py）——**故意注释掉**，

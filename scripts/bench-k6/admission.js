@@ -1,5 +1,5 @@
 // HTTP admission 闸门验证（max_concurrent_requests）
-// 前置：由 .tmp/admission-test.sh 起栈（agent max_concurrency 调大，排除 agent 层干扰）
+// 前置：由 scripts/bench-admission-local.sh 起栈（agent max_concurrency 调大，排除 agent 层干扰）
 // 用法：k6 run -e GATEWAY_URL=... -e GATEWAY_KEY=... -e VUS=100 \
 //         -e DURATION=20s scripts/bench-k6/admission.js
 //

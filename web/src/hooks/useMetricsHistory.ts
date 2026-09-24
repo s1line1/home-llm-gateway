@@ -38,9 +38,7 @@ export function useMetricsHistory(intervalMs = POLL_MS): MetricsHistory {
         const snap = parseMetrics(text);
         setHistory((prev) => {
           const next = [...prev, snap];
-          return next.length > HISTORY_LEN
-            ? next.slice(next.length - HISTORY_LEN)
-            : next;
+          return next.length > HISTORY_LEN ? next.slice(next.length - HISTORY_LEN) : next;
         });
         setRaw(text);
         setError(null);
@@ -60,6 +58,10 @@ export function useMetricsHistory(intervalMs = POLL_MS): MetricsHistory {
       cancelled = true;
       if (timer) clearTimeout(timer);
     };
+    // `intervalMs` 就在本 effect 内被用（`finally` 里 `setTimeout(tick, intervalMs)`），而
+    // oxlint 1.85 追踪不到那次引用 —— 这条是误报。注意抑制指令必须**紧贴**目标行，中间
+    // 再夹一行说明就失效，所以说明写在上面、指令单独一行。
+    // oxlint-disable-next-line react/exhaustive-effect-dependencies
   }, [intervalMs]);
 
   return {

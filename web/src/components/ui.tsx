@@ -96,7 +96,12 @@ export function Button({
     ghost: "text-slate-500 hover:bg-slate-100 hover:text-slate-800",
   };
   return (
-    <button type={type} onClick={onClick} disabled={disabled} className={`${base} ${variants[variant]} ${className}`}>
+    <button
+      type={type}
+      onClick={onClick}
+      disabled={disabled}
+      className={`${base} ${variants[variant]} ${className}`}
+    >
       {children}
     </button>
   );

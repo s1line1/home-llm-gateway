@@ -27,7 +27,9 @@ export default function MetricsPage() {
         <div>
           <h2 className="text-lg font-semibold">指标</h2>
           <p className="text-sm text-slate-500">
-            每 5 秒轮询 <code className="rounded bg-slate-100 px-1 font-mono text-xs">/metrics</code>，保留最近 60 个采样点
+            每 5 秒轮询{" "}
+            <code className="rounded bg-slate-100 px-1 font-mono text-xs">/metrics</code>，保留最近
+            60 个采样点
           </p>
         </div>
         <Button variant="secondary" onClick={() => setShowRaw((v) => !v)}>
@@ -69,12 +71,20 @@ export default function MetricsPage() {
             <dl className="space-y-2 text-sm">
               {[
                 ["累计请求数", latest.request_count.toLocaleString()],
-                ["平均耗时", latest.request_count > 0 ? formatDuration(latest.request_duration_ms / latest.request_count) : "—"],
+                [
+                  "平均耗时",
+                  latest.request_count > 0
+                    ? formatDuration(latest.request_duration_ms / latest.request_count)
+                    : "—",
+                ],
                 ["累计耗时", formatDuration(latest.request_duration_ms)],
                 ["累计转发", formatBytes(latest.bytes_out)],
                 ["在线 Agents", String(latest.agents)],
               ].map(([k, v]) => (
-                <div key={k} className="flex items-center justify-between border-b border-slate-50 pb-1.5 last:border-0">
+                <div
+                  key={k}
+                  className="flex items-center justify-between border-b border-slate-50 pb-1.5 last:border-0"
+                >
                   <dt className="text-slate-500">{k}</dt>
                   <dd className="font-mono font-medium tabular-nums text-slate-800">{v}</dd>
                 </div>

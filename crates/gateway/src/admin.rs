@@ -3,14 +3,32 @@
 
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
 use serde_json::json;
+use tracing::error;
 
 use crate::state::AppState;
 use crate::storage::hash::constant_time_eq;
+
+/// admin 500 的**细节进日志、响应体只留固定文案**（SL-P3-20）。
+///
+/// 响应体是给调用方的稳定契约（`openai::error_response` 的文案全仓一致；公开路径连内网地址都
+/// 不带），而 `{e}` 里可能是 rusqlite/io 的原文（常含 keys.db 路径）或 `JoinError` 的 panic
+/// 载荷。**细节不能丢**：它原来只存在于响应体里，所以这里必须补一条日志 —— 否则就成了"把
+/// 诊断信息从唯一的出口拿掉"（`admin.rs` 在这之前一行 log 都没有）。
+///
+/// `request_id` 取自入站头：`request_id_middleware` 已把规范化后的 id 写回 headers，所以这条
+/// 日志能与访问日志对账。
+fn log_admin_failure(headers: &HeaderMap, error: &dyn std::fmt::Display, what: &str) {
+    let request_id = headers
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-");
+    error!(request_id, error = %error, "{what}");
+}
 
 /// Admin 鉴权中间件：仅放行持有 admin token 的请求。
 pub async fn admin_auth(
@@ -93,6 +111,7 @@ pub async fn usage_route(State(state): State<AppState>) -> Json<serde_json::Valu
 /// 创建 key，返回明文（仅此一次展示；此后只存 argon2 哈希）。
 pub async fn create_key(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
     let name = body
@@ -109,15 +128,17 @@ pub async fn create_key(
         Ok(Ok(c)) => c,
         // 落库失败：**什么都没创建**（key 也没发出去），必须让运维看到失败而不是 201。
         Ok(Err(e)) => {
+            log_admin_failure(&headers, &e, "admin key creation failed (store error)");
             return crate::openai::error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("key creation failed; no key was created: {e}"),
+                "key creation failed; no key was created",
             );
         }
         Err(e) => {
+            log_admin_failure(&headers, &e, "admin key creation failed (task error)");
             return crate::openai::error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("key creation failed: {e}"),
+                "key creation failed",
             );
         }
     };
@@ -144,7 +165,11 @@ pub async fn create_key(
 }
 
 /// 吊销 key。
-pub async fn delete_key(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+pub async fn delete_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
     // 桶键就是 key id（`ratelimit.rs`）：吊销成功后要把桶一并丢掉，否则一个再也不会被
     // 取用的桶要留到空闲清扫为止（P2-19）。
     let bucket_key = id.clone();
@@ -154,15 +179,17 @@ pub async fn delete_key(State(state): State<AppState>, Path(id): Path<String>) -
         // 落库失败：**吊销没有生效**，那把 key 仍然可用——文案要说清这一点，
         // 否则运维看到 500 会以为"至少内存里删掉了"（评估 §5 H2 / 记录 P1-4）。
         Ok(Err(e)) => {
+            log_admin_failure(&headers, &e, "admin key deletion failed (store error)");
             return crate::openai::error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("key deletion failed; the key is still valid: {e}"),
+                "key deletion failed; the key is still valid",
             );
         }
         Err(e) => {
+            log_admin_failure(&headers, &e, "admin key deletion failed (task error)");
             return crate::openai::error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("key deletion failed: {e}"),
+                "key deletion failed",
             );
         }
     };
@@ -184,6 +211,7 @@ pub async fn list_agents(State(state): State<AppState>) -> Json<Vec<crate::regis
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use std::time::Duration;
 
     use crate::{
@@ -202,6 +230,167 @@ mod tests {
             Metrics::default(),
             &opts,
         )
+    }
+
+    /// 文件库版的 state（SL-P3-20 要造"落库真失败"）：另外给出库路径，好让测试挂触发器。
+    fn file_backed_state() -> (AppState, tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keys.db");
+        let opts = Options {
+            admin_token: Some("admin-token".into()),
+            head_timeout: Duration::from_secs(5),
+            ..Options::default()
+        };
+        let state = AppState::new(
+            Registry::default(),
+            KeyStore::new(Some(path.clone())),
+            Metrics::default(),
+            &opts,
+        );
+        (state, dir, path)
+    }
+
+    /// 用一个**独立连接**装触发器：让下一次写入必然 `RAISE(ABORT)`，从而真造出 500。
+    fn install_trigger(path: &std::path::Path, sql: &str) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(sql).unwrap();
+    }
+
+    /// tracing 输出抓到内存里（该 crate 里第一处需要断言"某行日志到底有没有打"的测试）。
+    ///
+    /// ⚠️ 配合 `flavor = "current_thread"` 用：`set_default` 是**线程局部**的，多线程 runtime
+    /// 里任务可能被调度到别的 worker 上，事件就抓不到了。
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogs;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// 规格（SL-P3-20）：admin 500 的响应体**只留固定文案**，内部错误原文进日志。
+    ///
+    /// 真因是造出来的：给 `api_keys` 挂一个必然 ABORT 的插入触发器 ⇒ `store.create` 真的返回
+    /// `GatewayError::Sqlite("… debug: forced insert failure …")`。修好前这段原文就出现在
+    /// `error.message` 里；修好后响应体只有固定文案，而原文**必须能在日志里看到** ——
+    /// `admin.rs` 之前一行 log 都没有，所以"从响应体拿掉"必须同时"加进日志"，否则就是把
+    /// 诊断信息从唯一的出口拿掉了。
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_create_keeps_internals_out_of_the_body_and_in_the_log() {
+        use tower::ServiceExt;
+
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_env_filter("info")
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let (state, _dir, path) = file_backed_state();
+        install_trigger(
+            &path,
+            "CREATE TRIGGER dbg_fail_insert BEFORE INSERT ON api_keys
+             BEGIN SELECT RAISE(ABORT, 'debug: forced insert failure'); END;",
+        );
+
+        let resp = crate::http::app(state)
+            .oneshot(
+                axum::extract::Request::builder()
+                    .method("POST")
+                    .uri("/admin/keys")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer admin-token")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(r#"{"name":"p3-20"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = body_json(resp).await;
+        let message = body["error"]["message"].as_str().unwrap();
+        assert_eq!(
+            message, "key creation failed; no key was created",
+            "响应体必须是固定文案（语义子句留着，运维据此判断要不要重试）"
+        );
+        assert!(
+            !message.contains("forced insert failure") && !message.contains("SQLite"),
+            "内部错误原文/类别不得出现在响应体：{message}"
+        );
+        assert!(
+            logs.text().contains("debug: forced insert failure"),
+            "细节必须进日志（这是它唯一的出口）：{}",
+            logs.text()
+        );
+    }
+
+    /// 同上，吊销那一支：文案要保住"那把 key 仍然有效"这个语义（评估 §5 H2 / 记录 P1-4）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_delete_keeps_internals_out_of_the_body_and_in_the_log() {
+        use tower::ServiceExt;
+
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_env_filter("info")
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let (state, _dir, path) = file_backed_state();
+        let created = state.key_store.create("p3-20".into()).unwrap();
+        let id = created.record.id().to_string();
+        install_trigger(
+            &path,
+            "CREATE TRIGGER dbg_fail_delete BEFORE DELETE ON api_keys
+             BEGIN SELECT RAISE(ABORT, 'debug: forced delete failure'); END;",
+        );
+
+        let resp = crate::http::app(state)
+            .oneshot(
+                axum::extract::Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/admin/keys/{id}"))
+                    .header(axum::http::header::AUTHORIZATION, "Bearer admin-token")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = body_json(resp).await;
+        let message = body["error"]["message"].as_str().unwrap();
+        assert_eq!(
+            message, "key deletion failed; the key is still valid",
+            "响应体必须是固定文案，且要说清那把 key 仍然有效"
+        );
+        assert!(
+            !message.contains("forced delete failure") && !message.contains("SQLite"),
+            "内部错误原文/类别不得出现在响应体：{message}"
+        );
+        assert!(
+            logs.text().contains("debug: forced delete failure"),
+            "细节必须进日志：{}",
+            logs.text()
+        );
     }
 
     async fn body_json(resp: Response) -> serde_json::Value {
@@ -240,7 +429,7 @@ mod tests {
         assert!(rl.try_acquire(&id), "前提：先让这个 key 建出一个桶");
         assert_eq!(rl.bucket_count(), 1);
 
-        let resp = delete_key(State(state), Path(id)).await;
+        let resp = delete_key(State(state), HeaderMap::new(), Path(id)).await;
         assert_eq!(resp.status(), StatusCode::NO_CONTENT, "吊销应当成功");
 
         assert_eq!(rl.bucket_count(), 0, "吊销后应立即可回收桶，不等空闲清扫");
@@ -251,6 +440,7 @@ mod tests {
         let state = test_state();
         let resp = create_key(
             State(state),
+            HeaderMap::new(),
             Json(serde_json::json!({ "name": "x".repeat(65) })),
         )
         .await;
@@ -350,6 +540,7 @@ mod tests {
         let state = test_state();
         let resp = create_key(
             State(state.clone()),
+            HeaderMap::new(),
             Json(serde_json::json!({ "name": "my-key" })),
         )
         .await;

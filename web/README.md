@@ -26,6 +26,10 @@ GATEWAY_PROXY=http://<网关地址>:8080 pnpm dev
 ## 构建
 
 ```bash
+pnpm typecheck    # 只做类型检查（tsc -b --noEmit），比完整构建快；`pnpm build` 也会先跑 tsc
+pnpm format       # prettier 写回格式；`pnpm format:check` 只检查（CI 跑这条）
+pnpm lint         # oxlint 静态检查（warnings 也算失败）
+pnpm test         # vitest 单元 + 渲染测试（`pnpm test:watch` 交互式）
 pnpm build        # 产物在 dist/
 pnpm preview      # 本地预览构建产物
 ```
