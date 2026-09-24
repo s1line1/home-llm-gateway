@@ -84,8 +84,10 @@ async fn e2e_stalled_request_body_releases_the_admission_slot() {
         "停滞的请求结束后不得再有在途请求占着准入槽位"
     );
 
-    // 最锐利的判据：max_concurrent_requests = 1，槽位若泄漏则这里必然 429
-    let resp = reqwest::Client::new()
+    // 最锐利的判据：max_concurrent_requests = 1，槽位若泄漏则这里必然 429。
+    // 这是**收尾探针、本该完成**（真正"要卡住"的是上面那个裸 TCP socket），所以用带总超时的
+    // client —— 否则网关一旦卡住，`cargo test` 下整个 e2e 套件会无限期挂住（P2-17）。
+    let resp = test_client()
         .post(format!("{base}/v1/chat/completions"))
         .header("Authorization", format!("Bearer {key}"))
         .json(&serde_json::json!({ "model": "mock-llm", "messages": [{"role":"user","content":"hi"}] }))
@@ -172,7 +174,8 @@ async fn e2e_client_that_stops_reading_the_body_releases_the_admission_slot() {
         "客户端停止消费响应体后，在途槽位必须被释放（修好前会永久占住）"
     );
 
-    let resp = reqwest::Client::new()
+    // 同上：收尾探针本该完成 → 带总超时（真正的"僵住"发生在上面那个裸 socket 上）
+    let resp = test_client()
         .post(format!("{base}/v1/chat/completions"))
         .header("Authorization", format!("Bearer {key}"))
         .json(&serde_json::json!({ "model": "mock-llm", "messages": [{"role":"user","content":"hi"}] }))

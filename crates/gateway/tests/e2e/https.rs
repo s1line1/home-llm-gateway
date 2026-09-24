@@ -545,6 +545,7 @@ async fn e2e_proxy_protocol_edge_cases() {
     // **刻意用裸 client**（不走 `test_client()`）：下面好几个断言要的是"响应体读到
     // 一半出错/提前结束"（`r.bytes().await.is_err()`）。若给整条请求加总超时，它们会
     // 变成"超时才出错"——断言照样通过，但验的已经不是帧协议边界那一件事了。
+    // e2e-bare-client: 要的就是"读到一半失败"而不是"超时失败"
     let client = reqwest::Client::new();
     let url = |p: &str| format!("http://{}{}", gw.http_addr, p);
     // 注意：/v1/models 已被网关聚合接管（不走代理），帧协议边界场景必须走

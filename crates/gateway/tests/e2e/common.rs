@@ -569,6 +569,7 @@ mod step_guard_tests {
         let url = format!("http://{addr}/healthz");
 
         // ① 裸 client：500ms 的外层窗口内不会返回（这就是缺陷）
+        // e2e-bare-client: 哨兵本身要证明"裸 client 对黑洞连接不会自己放弃"，必须不加超时
         let bare = reqwest::Client::new();
         let hung = tokio::time::timeout(Duration::from_millis(500), bare.get(&url).send()).await;
         assert!(
@@ -587,6 +588,54 @@ mod step_guard_tests {
             t0.elapsed() < Duration::from_millis(400),
             "应在超时量级返回，实际 {:?}",
             t0.elapsed()
+        );
+    }
+
+    /// 规格（P2-17 的**机械守卫**）：e2e 里每一个裸 reqwest client（`Client::new()`）都必须带
+    /// `e2e-bare-client:` 标记说明理由。
+    ///
+    /// 为什么值得一条守卫：这条不变量原本只靠代码评审维持 —— 2026-09-23 的审计正是这样发现
+    /// `lifecycle.rs`/`stalls.rs` 里又冒出裸 client 的（记录写完之后才加进来的提交），而 e2e 是
+    /// `#[serial]`、**`cargo test` 没有 per-test 超时**，一处卡住 = 整个套件无限期挂起
+    /// （nextest 只是被 `slow-timeout` 兜住，180 s 后才杀）。"本该完成"的一步请用
+    /// [`test_client()`]；确实要卡住的，加标记并把理由写清。
+    #[test]
+    fn bare_reqwest_clients_carry_a_reason_marker() {
+        // 拆开拼，免得守卫在**自己的源码里**匹配到自己。
+        let needle = format!("{}{}", "reqwest::Client::", "new()");
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/e2e");
+        let mut marked = 0usize;
+        let mut offenders: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir(&dir).expect("read tests/e2e") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("read source");
+            let lines: Vec<&str> = text.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                if !line.contains(&needle) {
+                    continue;
+                }
+                let from = i.saturating_sub(3);
+                if lines[from..=i]
+                    .iter()
+                    .any(|l| l.contains("e2e-bare-client:"))
+                {
+                    marked += 1;
+                } else {
+                    offenders.push(format!("{}:{}", path.display(), i + 1));
+                }
+            }
+        }
+        assert!(
+            marked >= 4,
+            "前提：刻意保持裸的 client 至少 4 处（现在只标了 {marked} 处）——守卫别被改瞎"
+        );
+        assert!(
+            offenders.is_empty(),
+            "这些裸 client 没说理由：{offenders:#?}\n\
+             「本该完成」的一步用 `test_client()`；确实要卡住的加 `// e2e-bare-client: <理由>`"
         );
     }
 }
