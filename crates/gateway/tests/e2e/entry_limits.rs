@@ -69,6 +69,43 @@ async fn a_client_that_stalls_mid_request_head_is_dropped() {
     t.gw.shutdown().await;
 }
 
+/// 慢、但**仍在窗口内**发完请求头 → 必须被正常服务。
+///
+/// 这条专门让"`.timer()` 缺失"可被**单独观测**（2026-09-24 二轮审计）：`header_read_timeout`
+/// 配了值却没有 timer 时，hyper 在 `serve_connection` 首次 poll 就 panic（`Dur::Configured`
+/// 要求 timer），连接随之立刻关闭 —— 上面那条只看"最终被断开"的用例对这种情况**照样绿**
+/// （RST/EOF 都算"断开了"），所以 `.timer()` 此前只被其余 HTTP e2e 间接兜住。这里的判据相反：
+/// 客户端停 300ms（窗口 1s 的 30%）再补完请求头，必须拿到 200 —— 缺 timer ⇒ 提前关闭 ⇒ 拿不到；
+/// 顺带钉住超时用的是**配置的那个时长**（若被写成 0 或远小于 300ms，这条同样红）。
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_request_head_that_finishes_within_the_window_is_still_served() {
+    let t = start_gateway(|o| o.client_stall = Duration::from_secs(1)).await;
+
+    let mut raw = tokio::net::TcpStream::connect(t.gw.http_addr)
+        .await
+        .unwrap();
+    // 先发一半（不结束头），停到窗口的三成，再补完
+    raw.write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n")
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    raw.write_all(b"Connection: close\r\n\r\n").await.unwrap();
+
+    let mut buf = Vec::new();
+    let read = tokio::time::timeout(Duration::from_secs(3), raw.read_to_end(&mut buf))
+        .await
+        .expect("窗口内完成的请求头必须被服务（被提前关掉 = header_read_timeout 的 timer 没搭对）");
+    read.expect("读响应不该失败");
+    let text = String::from_utf8_lossy(&buf);
+    assert!(
+        text.contains("200 OK"),
+        "应当拿到 /healthz 的 200，实际收到：{text:?}"
+    );
+
+    t.gw.shutdown().await;
+}
+
 /// 额度用满之后：新连接**留在 backlog 里排队**（而不是被收进来），有连接结束就立刻轮到它。
 ///
 /// 这条同时钉住两件事：上限真的生效（否则 fd 仍可被半开连接吃光），以及"满额 = 排队"

@@ -431,9 +431,17 @@ mod tests {
             "缩容不得弄丢同一批到达的后续帧"
         );
         assert!(reader.buf.is_empty(), "两帧都取走后缓冲应当为空");
+        // **写死一个独立的上限**，不拿被测常量当阈值：`BUFFER_RETAINED_CAPACITY` 本身就是要守的
+        // 规格，用它当阈值等于自指——把它抬到 1MiB，这条测试照样绿（2026-09-24 二轮审计发现；
+        // 同类自指在 P3-14 的 `MAX_NON_STREAM_BUFFER` 上已订正过，这条当时漏了）。
+        const EXPECTED_CAP: usize = 64 * 1024;
+        assert_eq!(
+            BUFFER_RETAINED_CAPACITY, EXPECTED_CAP,
+            "保留容量被改动了：动它之前先确认这条规格（以及为什么是 64KiB）仍然成立"
+        );
         assert!(
-            reader.buf.capacity() <= BUFFER_RETAINED_CAPACITY,
-            "1MiB 帧读完后容量必须还回去：实际 {} 字节（上限 {BUFFER_RETAINED_CAPACITY}）",
+            reader.buf.capacity() <= EXPECTED_CAP,
+            "1MiB 帧读完后容量必须还回去：实际 {} 字节（上限 {EXPECTED_CAP}）",
             reader.buf.capacity()
         );
         assert!(reader.next().await.unwrap().is_none());

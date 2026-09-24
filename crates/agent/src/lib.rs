@@ -612,6 +612,89 @@ mod tests {
         );
     }
 
+    /// 规格（二轮审计发现的**接线**缺口）：`run()` 真的把 `session_alive` 交给了 `next_backoff`。
+    ///
+    /// 上面四条是纯函数单测，钉不住这一步：把 `run()` 末尾的
+    /// `backoff = next_backoff(backoff, session_alive)` 换成 `backoff = BACKOFF_BASE`，
+    /// 那四条**照样全绿**，而线上退回"每 ~500ms 重连一次"的互踢风暴。
+    ///
+    /// 判据用 `run()` 自己打的 `wait_ms`（`:218-219` 的不变量：日志里的值**就是**它接下来要睡的值）
+    /// + 真墙钟：连续两次连接失败之间，第三次的等待必须已经涨到 1s 量级（抖动 ±20% ⇒ ≥800ms），
+    /// 而固定基准最多 600ms。这条测试跑 ~1.5s（500ms + 1s 两次真实睡眠）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_run_loop_actually_grows_the_backoff_between_short_sessions() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_env_filter("info")
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let (ca, srv_cert, srv_key, cli_cert, cli_key) = gen_pki();
+        let (addr, mut server_handles) = test_server(&ca, srv_cert, srv_key).await;
+        let cfg = test_agent_config(addr, ca.clone(), cli_cert, cli_key);
+        let cc = tls::rustls_client_tls(
+            &cfg.ca_cert,
+            cfg.client_cert.clone(),
+            cfg.client_key.clone_key(),
+        )
+        .unwrap();
+        // 假网关：**每次接上就立刻关** ⇒ 每次会话都短命（`session_alive` ≈ 毫秒级），
+        // 正是"同名 agent 互踢"的形状 ⇒ 退避必须逐次翻倍。
+        // （不能图省事用"没人监听的端口"：QUIC 的握手失败要等 s2n-quic 自己的超时，
+        //   10s 内连第一条重试日志都出不来——第一版就是这么挂的。）
+        tokio::spawn(async move {
+            while let Some(handle) = server_handles.recv().await {
+                handle.close(0u32.into());
+            }
+        });
+        let task = tokio::spawn(run(cfg, cc));
+
+        // 等到第 3 条 retry 日志出现：此时 run() 已经睡过 500ms 与 1s 各一次。
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut stamps: Vec<(tokio::time::Instant, u64)> = Vec::new();
+        while tokio::time::Instant::now() < deadline && stamps.len() < 3 {
+            let waits = parse_wait_ms(&logs.text());
+            if waits.len() > stamps.len() {
+                for wait in &waits[stamps.len()..] {
+                    stamps.push((tokio::time::Instant::now(), *wait));
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        task.abort();
+
+        assert_eq!(stamps.len(), 3, "10s 内应当看到三次退避重连：{stamps:?}");
+        let (_, w0) = stamps[0];
+        let (_, w1) = stamps[1];
+        assert!(
+            (400..=650).contains(&w0),
+            "第一次等待应当是基准 500ms（±20% 抖动），实际 {w0}ms"
+        );
+        assert!(
+            (800..=1250).contains(&w1),
+            "第二次等待必须是翻倍后的 ~1s（固定基准的实现最多 600ms）：实际 {w1}ms —— \
+             接线 `backoff = next_backoff(backoff, session_alive)` 是否还在？"
+        );
+        // 墙钟复核：第 2→3 条日志之间隔着"第 2 次等待"（日志先打、随后才 sleep），必须真的是 1s 量级
+        let gap = stamps[2].0.duration_since(stamps[1].0);
+        assert!(
+            gap >= Duration::from_millis(700),
+            "日志里的 wait_ms 必须就是真正睡的值（`run()` 的既有不变量），实测间隔 {gap:?}"
+        );
+    }
+
+    /// 从捕获的日志里按出现顺序取出所有 `wait_ms=NNN`。
+    fn parse_wait_ms(text: &str) -> Vec<u64> {
+        text.match_indices("wait_ms=")
+            .filter_map(|(at, key)| {
+                let rest = &text[at + key.len()..];
+                let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                digits.parse().ok()
+            })
+            .collect()
+    }
+
     /// 规格：抖动必须在 ±20% 之内、**两端都能取到**（否则就是"加了抖动"的自述），
     /// 且封顶之后不许超过上限。
     #[test]

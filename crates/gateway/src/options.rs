@@ -319,7 +319,72 @@ impl Default for Options {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+
+    /// tracing 输出抓到内存里（与 `admin.rs` 测试里那份同形；两份各只服务本模块一条断言）。
+    ///
+    /// ⚠️ 配合 `flavor = "current_thread"` 用：`set_default` 是**线程局部**的。
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogs;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// 契约（SL-P2-6 ①）：**过大的 `verified_cache_max` 只提示、不拒绝**。
+    ///
+    /// 原 finding 要求给它设上界，落地时权衡成 warn（运维可能是故意配大，但没有理由不吵一声）。
+    /// 这个折中本身有风险：把 warn 改成 Err、或者删掉 warn 分支，都不会让原先那批 `validate()`
+    /// 测试变红——所以这条把**两半**都钉住：`Ok`（拦下来会打断合法配置）+ 日志里确实吵了一声
+    /// （静默放行等于没做这件事）。
+    #[test]
+    fn a_large_verified_cache_is_warned_about_but_not_rejected() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_env_filter("info")
+            .finish();
+
+        // `set_default` 是线程局部的；普通 `#[test]` 就跑在同一个测试线程上，正合适。
+        let guard = tracing::subscriber::set_default(subscriber);
+        let verdict = Options {
+            verified_cache_max: 100_000_000, // 约 10GB 的上限：按每条约 100 字节估
+            ..Options::default()
+        }
+        .validate();
+        let text = logs.text();
+        drop(guard);
+
+        assert!(
+            verdict.is_ok(),
+            "只提示不拒绝：拒绝会打断一份（可能是有意的）配置，实际：{verdict:?}"
+        );
+        assert!(
+            text.contains("verified_cache_max is large"),
+            "过大的值必须留下 warn（否则这条折中等于静默）；捕获到的日志：\n{text}"
+        );
+    }
 
     /// 契约：**摘除宽限不得短于 `head_timeout`**。
     ///
