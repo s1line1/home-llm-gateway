@@ -15,9 +15,7 @@ export function Sparkline({
 }) {
   if (data.length < 2) {
     return (
-      <div className="flex h-full items-center justify-center text-xs text-slate-400">
-        采样中…
-      </div>
+      <div className="flex h-full items-center justify-center text-xs text-slate-400">采样中…</div>
     );
   }
   const min = Math.min(...data);
@@ -33,7 +31,13 @@ export function Sparkline({
   const gid = `spark-${stroke.replace(/[^a-zA-Z0-9]/g, "")}`;
 
   return (
-    <svg viewBox={`0 0 ${width} ${height}`} width="100%" height={height} preserveAspectRatio="none" aria-hidden>
+    <svg
+      viewBox={`0 0 ${width} ${height}`}
+      width="100%"
+      height={height}
+      preserveAspectRatio="none"
+      aria-hidden
+    >
       <defs>
         <linearGradient id={gid} x1="0" y1="0" x2="0" y2="1">
           <stop offset="0%" stopColor={stroke} stopOpacity="0.25" />
@@ -41,7 +45,14 @@ export function Sparkline({
         </linearGradient>
       </defs>
       {fill && <path d={area} fill={`url(#${gid})`} />}
-      <polyline points={points.join(" ")} fill="none" stroke={stroke} strokeWidth="1.5" strokeLinejoin="round" strokeLinecap="round" />
+      <polyline
+        points={points.join(" ")}
+        fill="none"
+        stroke={stroke}
+        strokeWidth="1.5"
+        strokeLinejoin="round"
+        strokeLinecap="round"
+      />
     </svg>
   );
 }
@@ -61,7 +72,9 @@ export function BarList({ items }: { items: { label: string; value: number; colo
               title={`${it.label}: ${it.value}`}
             />
           </div>
-          <span className="w-14 shrink-0 text-right font-mono tabular-nums text-slate-600">{it.value}</span>
+          <span className="w-14 shrink-0 text-right font-mono tabular-nums text-slate-600">
+            {it.value}
+          </span>
         </div>
       ))}
     </div>

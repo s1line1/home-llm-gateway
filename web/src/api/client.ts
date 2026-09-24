@@ -61,7 +61,7 @@ async function handle<T>(resp: Response): Promise<T> {
 export async function fetchHealth(): Promise<HealthStatus> {
   try {
     const resp = await fetch("/healthz", { cache: "no-store" });
-    return { ok: resp.ok, text: resp.ok ? (await resp.text()) : `HTTP ${resp.status}` };
+    return { ok: resp.ok, text: resp.ok ? await resp.text() : `HTTP ${resp.status}` };
   } catch (e) {
     return { ok: false, text: e instanceof Error ? e.message : String(e) };
   }

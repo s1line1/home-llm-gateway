@@ -75,8 +75,9 @@ export default function Login() {
         </form>
 
         <p className="mt-6 text-xs leading-relaxed text-slate-400">
-          token 保存在本浏览器（localStorage），仅用于调用 /admin/* 管理接口；
-          部署时在 gateway-config.yml 中配置，可用 <code className="rounded bg-slate-100 px-1">openssl rand -hex 32</code> 生成。
+          token 保存在本浏览器（localStorage），仅用于调用 /admin/* 管理接口； 部署时在
+          gateway-config.yml 中配置，可用{" "}
+          <code className="rounded bg-slate-100 px-1">openssl rand -hex 32</code> 生成。
         </p>
       </div>
     </div>

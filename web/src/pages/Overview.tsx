@@ -10,7 +10,8 @@ export default function Overview() {
 
   const active = history.map((h) => h.active_requests);
   const agents = history.map((h) => h.agents);
-  const avgMs = latest && latest.request_count > 0 ? latest.request_duration_ms / latest.request_count : 0;
+  const avgMs =
+    latest && latest.request_count > 0 ? latest.request_duration_ms / latest.request_count : 0;
 
   return (
     <div className="space-y-6">
@@ -36,7 +37,9 @@ export default function Overview() {
         <StatCard
           label="累计请求"
           value={latest ? latest.request_count.toLocaleString() : "—"}
-          hint={latest && latest.request_count > 0 ? `平均耗时 ${formatDuration(avgMs)}` : undefined}
+          hint={
+            latest && latest.request_count > 0 ? `平均耗时 ${formatDuration(avgMs)}` : undefined
+          }
         />
         <StatCard
           label="累计转发"
@@ -68,7 +71,10 @@ export default function Overview() {
             {Object.entries(latest.requests_by_status)
               .sort(([a], [b]) => Number(a) - Number(b))
               .map(([code, count]) => (
-                <div key={code} className="flex items-center justify-between rounded-lg bg-slate-50 px-3 py-2">
+                <div
+                  key={code}
+                  className="flex items-center justify-between rounded-lg bg-slate-50 px-3 py-2"
+                >
                   <span className="font-mono text-sm text-slate-600">{code}</span>
                   <span className="font-mono text-sm font-semibold tabular-nums">{count}</span>
                 </div>

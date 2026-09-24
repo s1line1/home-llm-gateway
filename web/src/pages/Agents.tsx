@@ -29,10 +29,10 @@ function AgentTable({ agents }: { agents: NonNullable<Awaited<ReturnType<typeof 
             const full = a.inflight >= (a.max_concurrency || Number.POSITIVE_INFINITY);
             return (
               <tr key={a.agent_id} className="border-b border-slate-50 last:border-0">
-                <td className="py-2.5 pr-4 font-mono text-xs font-medium text-slate-800">{a.agent_id}</td>
-                <td className="py-2.5 pr-4 text-xs text-slate-600">
-                  {a.models.join(", ") || "—"}
+                <td className="py-2.5 pr-4 font-mono text-xs font-medium text-slate-800">
+                  {a.agent_id}
                 </td>
+                <td className="py-2.5 pr-4 text-xs text-slate-600">{a.models.join(", ") || "—"}</td>
                 <td className="py-2.5 pr-4 tabular-nums text-slate-600">
                   {a.max_concurrency === 0 ? "不限" : a.max_concurrency}
                 </td>
@@ -90,7 +90,9 @@ export default function Agents() {
           </div>
         </Card>
         <Card title="在途请求" subtitle="所有 agent 合计">
-          <div className="text-2xl font-semibold tabular-nums">{latest ? latest.active_requests : "—"}</div>
+          <div className="text-2xl font-semibold tabular-nums">
+            {latest ? latest.active_requests : "—"}
+          </div>
         </Card>
         <Card title="并发上限" subtitle="agent 声明值合计，用于 admission control">
           <div className="text-2xl font-semibold tabular-nums">
@@ -117,7 +119,8 @@ export default function Agents() {
           <div className="space-y-3">
             <p className="text-sm text-slate-500">
               <code className="rounded bg-slate-100 px-1 font-mono text-xs">GET /admin/agents</code>{" "}
-              返回 404：网关版本较旧，或该部署没有配置 <code className="rounded bg-slate-100 px-1 font-mono text-xs">admin_token</code>
+              返回 404：网关版本较旧，或该部署没有配置{" "}
+              <code className="rounded bg-slate-100 px-1 font-mono text-xs">admin_token</code>
               （`/admin/*` 未挂载）。在线总数见上方卡片。
             </p>
           </div>

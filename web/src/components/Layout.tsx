@@ -63,14 +63,21 @@ export default function Layout() {
       <div className="flex min-w-0 flex-1 flex-col">
         <header className="flex items-center justify-between border-b border-slate-200 bg-white px-6 py-3">
           <div className="text-sm text-slate-500">
-            公网入口{" "}
-            <span className="font-mono text-slate-700">/v1/*（OpenAI 兼容）</span>
+            公网入口 <span className="font-mono text-slate-700">/v1/*（OpenAI 兼容）</span>
           </div>
           <div className="flex items-center gap-3">
-            {error && <span className="text-xs text-amber-600" title={error}>数据拉取异常</span>}
+            {error && (
+              <span className="text-xs text-amber-600" title={error}>
+                数据拉取异常
+              </span>
+            )}
             <StatusPill
               ok={reachable && latest !== null}
-              label={reachable && latest !== null ? `网关在线 · ${latest.agents_healthy} agents` : "网关不可达"}
+              label={
+                reachable && latest !== null
+                  ? `网关在线 · ${latest.agents_healthy} agents`
+                  : "网关不可达"
+              }
             />
           </div>
         </header>
