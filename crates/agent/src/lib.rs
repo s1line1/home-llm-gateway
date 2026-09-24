@@ -634,6 +634,13 @@ mod tests {
         let subscriber = tracing_subscriber::fmt()
             .with_writer(logs.clone())
             .with_env_filter("info")
+            // 这份捕获是**当文本读**的（要 grep `wait_ms=`）。带 ANSI 时 `tracing-subscriber`
+            // 会把**字段名**画成斜体、`=` 画成暗色，于是字节里根本没有字面量 `wait_ms=`
+            // （终端里渲染出来一模一样）——而是否上色取决于环境：`Layer::default()` 的
+            // `cfg!(feature="ansi") && env::var("NO_COLOR")…`。本地设了 NO_COLOR（绿）、CI 没设
+            // （红），于是这条测试成了"只在 CI 失败"（2026-09-24 实测复现）。别赌运行环境的
+            // NO_COLOR：显式关掉颜色。
+            .with_ansi(false)
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
 
@@ -697,15 +704,47 @@ mod tests {
         );
     }
 
-    /// 从捕获的日志里按出现顺序取出所有 `wait_ms=NNN`。
+    /// 从捕获的日志里按出现顺序取出所有 `wait_ms=<n>`。
+    ///
+    /// 先剥掉 ANSI 转义序列再按字面量匹配：带 ANSI 时字段名是斜体、`=` 是暗色，字节里根本没有
+    /// `wait_ms=`（终端里渲染出来一模一样）。上面已经显式 `with_ansi(false)`，这里是第二道——
+    /// 万一有人删了那行，也不会再变成“只在 CI 红”。
+    ///
+    /// **不要用“跳过非数字字符”那种写法**：ANSI 序列自己就含数字（`\x1b[0m`、`\x1b[2m`），
+    /// 那样会解析出 `0, 2, 405…` 的垃圾（这版第一稿就是这么写的，实测把断言喂成了 `w0 == 0`）。
     fn parse_wait_ms(text: &str) -> Vec<u64> {
-        text.match_indices("wait_ms=")
+        let plain = strip_ansi(text);
+        plain
+            .match_indices("wait_ms=")
             .filter_map(|(at, key)| {
-                let rest = &text[at + key.len()..];
+                let rest = &plain[at + key.len()..];
                 let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
                 digits.parse().ok()
             })
             .collect()
+    }
+
+    /// 去掉 CSI 转义序列（`ESC [ 参数字节… 终止字节`）——`tracing-subscriber` 的配色只用这一族。
+    fn strip_ansi(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c != '\x1b' {
+                out.push(c);
+                continue;
+            }
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                // 参数/中间字节是 0x20–0x3F，遇到 0x40–0x7E 即序列结束
+                for c in chars.by_ref() {
+                    if ('\x40'..='\x7e').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            // 其它 ESC 序列本测试用不到：丢掉这个 ESC 即可
+        }
+        out
     }
 
     /// 规格：抖动必须在 ±20% 之内、**两端都能取到**（否则就是"加了抖动"的自述），
