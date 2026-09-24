@@ -256,6 +256,25 @@ impl Options {
             }
         }
 
+        // `admin_token: ""`（YAML 里写了空串）是**配了却用不了**：`http/mod.rs` 见 `is_some()`
+        // 就把 `/admin/*` 挂上，而 admin 鉴权把空串当期望值 —— 可 `bearer_token` 对空凭据一律
+        // 返回 `None`（P3-17），于是每个管理请求都是 401，运维从现象看不出来哪里配错了。
+        // 按"配了却用不了 ⇒ 启动失败"的既有口径拒掉它，并点名字段。
+        //
+        // **`None`（不写这一项）必须继续放行**：那表示不挂载 `/admin/*`，是合法配置（内存模式
+        // 同样的口径，见 `storage::KeyStore::persistence_state`）。
+        if self
+            .admin_token
+            .as_deref()
+            .is_some_and(|token| token.trim().is_empty())
+        {
+            return Err(
+                "admin_token = \"\"：/admin/* 会被挂载，但空凭据一律被拒 —— 每个管理请求都会 401；\
+                 想启用就填一个非空串，不想启用就删掉这一项"
+                    .into(),
+            );
+        }
+
         // 上界**只提示不拒绝**：`verified_cache_max` 按每条约 100 字节算（见 `storage::verified`），
         // 10^8 就是 GB 级内存。运维可能是故意配大，但没有理由不吵一声。
         const VERIFIED_CACHE_WARN_ABOVE: usize = 100_000;
@@ -344,6 +363,41 @@ mod tests {
                 "报错必须点名 YAML 键 {yaml_key}，实际：{err}"
             );
         }
+    }
+
+    /// 规格（SL-P2-9）：`admin_token: ""` 是**配了却用不了** —— `http/mod.rs` 见 `is_some()` 就把
+    /// `/admin/*` 挂上，而 admin 鉴权拿空串当期望值，可 `bearer_token` 对空凭据一律返回 `None`
+    /// （P3-17），于是每个管理请求都是 401，运维从现象看不出哪里配错了。启动即失败、点名字段。
+    ///
+    /// 注意 `None`（不写这一项）= 不挂载 `/admin/*`，是**合法**配置，必须继续放行。
+    #[test]
+    fn an_empty_admin_token_is_rejected_while_absent_stays_legal() {
+        let mut opts = Options {
+            admin_token: Some(String::new()),
+            ..Options::default()
+        };
+        let err = opts.validate().expect_err(
+            "空 admin_token 必须被拒（修好前这里是 Ok，网关会带着用不了的管理接口起来）",
+        );
+        assert!(
+            err.contains("admin_token"),
+            "错误信息要点名字段，便于对着配置改：{err}"
+        );
+
+        // 空白串同理
+        opts.admin_token = Some("   ".into());
+        assert!(opts.validate().is_err(), "纯空白同样用不了");
+
+        // 不配置 = 不挂载 /admin/*，合法
+        opts.admin_token = None;
+        assert!(
+            opts.validate().is_ok(),
+            "None 是合法配置（不启用 admin API）"
+        );
+
+        // 正常 token 当然也要放行
+        opts.admin_token = Some("dev-admin".into());
+        assert!(opts.validate().is_ok());
     }
 
     /// 规格（P2-8 的另一半）：**文档化的合法零值一个都不能被误拒**。
