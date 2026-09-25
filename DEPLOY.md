@@ -310,8 +310,19 @@ curl -s localhost:8080/metrics | grep -E 'hlmg_key_verify_(hits|misses)_total'
 ## 11. Docker 部署（可选）
 
 §4–§6 的 systemd 路径是默认方案；本节只讲**容器化时路径与端口怎么映射**，以及三个会让人卡住的坑。
-仓库里已有 `Dockerfile`（多阶段：Rust 阶段产出 gateway / agent / mock-llm 三个二进制，前端阶段
-把 Dashboard 编进镜像）和 `docker-compose.yml`（网关；agent 的模板注释在文件末尾）。
+部署用的镜像是 **`crates/gateway/Dockerfile`**（多阶段：Rust 阶段只产出 gateway，前端阶段把
+Dashboard 编进镜像），**上下文必须是仓库根**：
+
+```bash
+docker build -f crates/gateway/Dockerfile -t home-llm-gateway .
+# 或者在 crate 目录里（等价，上下文仍然是仓库根）：
+#   cd crates/gateway && docker build -f Dockerfile -t home-llm-gateway ../..
+# 或直接 compose（仓库里只有这一份 compose）：
+#   docker compose -f crates/gateway/docker-compose.yml build
+```
+
+镜像里**只有 gateway + Dashboard**（没有 agent / mock-llm）。agent 按 §6 用 systemd +
+`deploy/agent.service` 部署；要容器化 agent 得另写一份 Dockerfile（本仓库不再提供 agent 镜像）。
 
 ### 11.1 一条硬规则：配置里的路径按「进程 CWD」解析
 
@@ -341,8 +352,10 @@ curl -s localhost:8080/metrics | grep -E 'hlmg_key_verify_(hits|misses)_total'
 1. **命令行里不要再写 `gateway` / `agent`**：镜像的 ENTRYPOINT 已经是 gateway 二进制，而 CLI
    只接受 `--config`（没有子命令、没有位置参数）。多写那一个词会被 clap 判成
    `unexpected argument 'gateway' found` 并以**退出码 2** 立刻退出，配 `restart` 就是崩溃重启循环。
-2. **同一个镜像跑 agent 必须切 entrypoint**：加 `--entrypoint /usr/local/bin/agent`
-   （mock-llm 同理），否则跑起来的仍然是网关。
+2. **部署镜像里没有 agent**：`crates/gateway/Dockerfile` 只 `--bin gateway`，所以
+   `entrypoint: ["/usr/local/bin/agent"]` 会直接 "no such file or directory"。agent 按 §6 用
+   systemd + `deploy/agent.service` 部署；确实要容器化就另写一份 Dockerfile（照该文件的结构，
+   多一个 `--bin agent` 与一次 COPY）——本仓库不再提供 agent 镜像。
 3. **`keys.db` 是 SQLite WAL 模式**：会额外生成 `keys.db-wal` / `keys.db-shm`，所以必须挂
    **目录**（不能只挂那个文件），而且**目录**要可写；SELinux 主机上可能还要加 `:z` / `:Z`。
    三个文件的权限由网关启动时收紧为 `0600`（`-wal`/`-shm` 跟随主库）。
@@ -362,7 +375,8 @@ curl -s localhost:8080/metrics | grep -E 'hlmg_key_verify_(hits|misses)_total'
 
 - **配置不支持环境变量展开**（`config.rs` 里没有任何 env 取值），所以 `admin_token` 只能写在
   `gateway-config.yml` 里。该文件因此属于密钥：`chmod 600`、不要 `COPY` 进镜像、用只读挂载。
-- ~~镜像里没有 `web/dist`~~ **2026-09-24 已补**：Dashboard 由 `Dockerfile` 的 `web-builder` 阶段
+- ~~镜像里没有 `web/dist`~~ **2026-09-24 已补**：Dashboard 由 `crates/gateway/Dockerfile` 的
+  `web-builder` 阶段
   **在镜像内构建**（`pnpm install --frozen-lockfile` + `pnpm build`，末尾照样跑
   `scripts/check-bundle.mjs` 那道产物泄漏守卫——它红了整次构建就失败），产物在
   `/usr/local/share/home-llm-gateway/web`；运行镜像里**不带 Node**，只多一份静态产物。
@@ -384,16 +398,17 @@ curl -s localhost:8080/metrics | grep -E 'hlmg_key_verify_(hits|misses)_total'
 ### 11.6 用 docker compose
 
 ```bash
-docker compose build              # 会先编 Rust（release）再编前端，然后打包运行镜像
-docker compose config -q          # 只校验配置，不起容器
-docker compose up -d gateway
+# compose 文件在 crates/gateway/ 下 ⇒ 用 -f 指它（或先 cd 进去，两条等价）
+docker compose -f crates/gateway/docker-compose.yml build   # 先编 Rust（release）再编前端，然后打包运行镜像
+docker compose -f crates/gateway/docker-compose.yml config -q   # 只校验配置，不起容器
+docker compose -f crates/gateway/docker-compose.yml up -d gateway
 # 日志：compose 的 command 把 stdout 重定向到了 /var/log/home-llm-gateway/gateway.log，
 # 所以 `docker compose logs -f gateway` 是**空的**（容器 stdout 没有内容）——直接看那个文件：
 sudo tail -f /var/log/home-llm-gateway/gateway.log
 ```
 
-前端阶段的可调 build-arg（都有默认值，见 `Dockerfile`）：`NPM_MIRROR`（默认 npmmirror，
-`--build-arg NPM_MIRROR=` 则用官方源）、`PNPM_VERSION`（默认 `10`，与 CI 的
+前端阶段的可调 build-arg（都有默认值，见 `crates/gateway/Dockerfile`）：`NPM_MIRROR`（默认
+npmmirror，`--build-arg NPM_MIRROR=` 则用官方源）、`PNPM_VERSION`（默认 `10`，与 CI 的
 `pnpm/action-setup` 同一主版本——`--frozen-lockfile` 要求 pnpm 原样接受这份锁文件，跟随 CI
 就等于跟着一个有持续验证的组合）。基础镜像是 `node:22-bookworm-slim`（同样对齐 CI 的
 `setup-node node-version: 22`）。

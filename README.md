@@ -43,8 +43,8 @@ gateway_config.example.yml  网关配置模板（所有参数，YAML）
 agent_config.example.yml    edge-agent 配置模板（所有参数，YAML）
 deploy/         systemd 单元（gateway.service / agent.service）
 scripts/        多平台 release 打包脚本 + git pre-commit hook（cargo deny + fmt）
-Dockerfile      多阶段容器构建（gateway / agent / mock-llm 三个二进制，用法见文件头注释）
-docker-compose.yml  容器部署示例（网关；agent 模板在文件末尾，路径映射见 DEPLOY.md §11）
+crates/gateway/Dockerfile  **网关部署镜像**（只有 gateway + Dashboard；上下文必须是仓库根，用法见文件头）
+crates/gateway/docker-compose.yml  容器部署入口（网关；构建走上面的 Dockerfile，路径映射见 DEPLOY.md §11）
 deny.toml       cargo-deny 策略（依赖许可证 / 公告；CI 与 pre-commit hook 执行）
 ```
 
@@ -63,8 +63,8 @@ fallback，单进程单端口，无需 nginx）。`ui_dir` **不写时的默认�
 降级**，网关照常启动。开发时也可 `cd web && pnpm dev` 用 Vite 代理联调
 （`GATEWAY_PROXY` 可覆盖网关地址）。
 
-**容器部署不用自己构建、也不用写 `ui_dir`**：`Dockerfile` 的 `web-builder` 阶段把 Dashboard
-编进镜像（运行镜像里不带 Node），产物在 `/usr/local/share/home-llm-gateway/web`，而它就是
+**容器部署不用自己构建、也不用写 `ui_dir`**：`crates/gateway/Dockerfile` 的 `web-builder` 阶段把
+Dashboard 编进镜像（运行镜像里不带 Node），产物在 `/usr/local/share/home-llm-gateway/web`，而它就是
 `ui_dir` 不写时的默认值；**也不需要挂载宿主机的 `web/dist`**（见 `DEPLOY.md` §11.5）。
 
 ## 快速开始（全部本机即可跑通，无需真实 LLM）

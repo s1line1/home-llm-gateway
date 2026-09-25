@@ -165,7 +165,7 @@
       修法：用 `socket2` 建 socket → `listen(4096)` → `TcpListener::from_std`。
       属**次要因素**（accept 被上面那条 EMFILE 卡住时才会放大），故排在 fd 之后。
 - [ ] **网关日志无轮转、体量失控**（**2026-09-22 补充现状**：`deploy/logrotate.example` 与
-      `docker-compose.yml` 的注释都已给出规则；缺的是"部署步骤里真的装上"——`DEPLOY.md` 只提了一句，
+      `crates/gateway/docker-compose.yml` 的注释都已给出规则；缺的是"部署步骤里真的装上"——`DEPLOY.md` 只提了一句，
       没有安装命令/检查项）：`StandardOutput=append:/var/log/home-llm-gateway/gateway.log`，
       每请求至少一行 INFO，实测单日 **652MB**（`tail -c 6000000` 只覆盖约 20 秒，
       排查时按时间 grep 会误以为"日志里什么都没有"）。修法：`logrotate` + 降级为
@@ -320,8 +320,10 @@
       （admin_token 配置文件明文）；考虑"首次启动自动建默认 key"或引导提示
 - [ ] **usage 数据保留策略（B 档，可选）**：`key_usage` 无限累积（reset 是待定项）——
       长时间运行表会涨；建议与 reset 一并设计保留窗口/归档
-- [x] **镜像不含 `web/dist`（C 档，可选）—— 2026-09-24 已做（采纳"打进镜像"这条）**：`Dockerfile`
-      新增 `web-builder` 阶段（`node:22-bookworm-slim` + `npm install -g pnpm@10` +
+- [x] **镜像不含 `web/dist`（C 档，可选）—— 2026-09-24 已做（采纳"打进镜像"这条）**：
+      **部署镜像改为 `crates/gateway/Dockerfile`**（2026-09-25，只产出 gateway + Dashboard；
+      上下文必须是仓库根：`docker build -f crates/gateway/Dockerfile .`，compose 已照此写好）。
+      该文件新增 `web-builder` 阶段（`node:22-bookworm-slim` + `npm install -g pnpm@10` +
       `pnpm install --frozen-lockfile` + `pnpm build`，末尾照样过 `scripts/check-bundle.mjs` 那道
       泄漏守卫，它红了整次构建就失败）——**基础镜像与 pnpm 主版本都对齐 CI**（`ci.yml` 的
       `setup-node node-version: 22` / `pnpm/action-setup version: 10`），不照抄本机的 24/11
@@ -339,7 +341,24 @@
       `docker build`、以及镜像内 `/` 的真实响应都**没有跑过**；CI 目前也不构建镜像（P2-23）。
       已做的替代验证：① `pnpm build` 与阶段里两条命令逐字一致，本机通过；② 用真网关 + 绝对
       `ui_dir` 指到 `web/dist`，`/` 返回构建产物（证明"绝对路径、CWD 之外"这条语义成立，
-      这正是镜像里那个路径所依赖的）。
+      这正是镜像里那个路径所依赖的）；③ `cargo build --release --bin gateway` 本机通过
+      （镜像里那条编译命令逐字一致）；④ **清单层等价实验**（临时目录只放四份清单 + 骨架，
+      跑 `cargo fetch --locked --offline`）：照现在的写法 exit 0；缺任一 member 清单 / 缺某个
+      member 的 target 文件 / 缺两个 `[[bench]]` 之一，分别报 `failed to load manifest for
+      workspace member` / `no targets specified in the manifest` / `can't find 'frame' bench`——
+      所以那 5 个骨架动作与 `crates/agent|mock-llm/Cargo.toml` 两次拷贝**都是承重的**
+      （原注释只说"覆盖自动发现的 target"，不足以拦住"顺手清理"）。
+      **镜像瘦身（2026-09-25）**：部署镜像只 `--bin gateway` + COPY Dashboard，**不含 agent /
+      mock-llm**（agent 按 `DEPLOY.md` §6 用 systemd 部署；要容器化 agent 就用仓库根那份完整
+      `Dockerfile`）。连带改动：compose 的 `build` 指向 `crates/gateway/Dockerfile`（并删掉那段
+      "切 entrypoint 跑 agent"的模板——镜像里已经没有 agent 了）、`scripts/check-toolchain.sh`
+      改成**逐份**校验（清单写法，不存在的路径跳过），且有反例自检：把 `ARG RUST_TOOLCHAIN`
+      改错，脚本会指名报错。
+      **收尾（2026-09-25）**：仓库根那份完整 `Dockerfile` 与根 `docker-compose.yml` 已删除，
+      现在**只有一对**（`crates/gateway/Dockerfile` + `crates/gateway/docker-compose.yml`）——
+      上一轮"两套都留"的重复问题因此消失，"前端钉版一致性 / 两份 compose 等价性"这两个守卫也就
+      不需要了。agent 镜像不再由本仓库提供（agent 按 `DEPLOY.md` §6 用 systemd 部署；
+      要容器化就另写一份 Dockerfile）。
 - [ ] **⛔ 结构化访问日志 JSONL（新输出格式——按顶部范围约定先不做）**：tracing 文本日志给人看；如需审计
       "谁何时调了什么"可加 JSON 行落盘
 - [ ] **keys.db 迁移规模化**：当前自动迁移（`storage/mod.rs::migrate_legacy_keys`）同步执行、
@@ -566,6 +585,8 @@
       ③ `Dockerfile` 对齐到 `FROM rust:1.97.1-bookworm` + `ARG RUST_TOOLCHAIN=1.97.1`（镜像里预装的
       就是它，构建不碰网络；原来钉 1.95、文件写 stable 的组合会让 rustup 去下载整套工具链而挂住），
       并修掉那段自相矛盾的注释（原文说"rust:1.95 现在是 trixie"，而标签是 `-bookworm`）；
+      *（注：这里说的 `Dockerfile` 当时在仓库根；2026-09-25 起部署镜像是 `crates/gateway/Dockerfile`，
+      钉版内容在它里面，校验脚本没变。）*
       ④ `Cargo.toml` 补 `rust-version = "1.97"`（MSRV，只到 minor）并在四个成员里继承——它回答的是
       "最低能编译什么"，与"用什么编译"是两个问题，所以只比前缀；
       ⑤ 新增 `scripts/check-toolchain.sh`：逐处比对这四处（channel 必须是 x.y.z、Dockerfile 的

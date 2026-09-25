@@ -1,4 +1,13 @@
-# home-llm-gateway 容器部署示例（网关；agent 模板在文件末尾，默认注释掉）
+# home-llm-gateway 容器部署示例（网关）
+#
+# ⚠️ 本文件在 `crates/gateway/` 下，compose 的相对路径按**本文件所在目录**解析，
+#    所以 `context` 必须写 `../..`（仓库根）——`crates/gateway/Dockerfile` 要 COPY 工作区根的
+#    `Cargo.toml` / `crates/*` / `web/`，上下文不是仓库根就一定构建失败。
+#    用法：`docker compose -f crates/gateway/docker-compose.yml up -d`
+#    不用 compose 时等价的一条命令（**在这里**就能敲，不用回仓库根）：
+#      cd crates/gateway && docker build -f Dockerfile -t home-llm-gateway ../..
+#    （`..` 不能省：上下文必须是仓库根；写成 `docker build .` 必然失败——见 Dockerfile 文件头）
+#    （仓库里**只有这一份** compose；项目名显式钉成 `home-llm-gateway`，与本文件所在目录名无关。）
 #
 # 为什么要这样写，四条都踩过或验过（详见 DEPLOY.md §11）：
 #   ① 镜像的 ENTRYPOINT 是 gateway 二进制 → command 里**不要**再写一个 "gateway"，
@@ -13,9 +22,17 @@
 #      **删容器即删日志**，且默认不轮转）。本文件把它重定向到**固定路径**
 #      `/var/log/home-llm-gateway/gateway.log`，代价是 `docker logs` 变空——取舍见 DEPLOY.md §11。
 
+# 项目名显式钉住：不写时 compose 按**目录名**推（这里是 `gateway`，仓库根那份是
+# `home-llm-gateway`），两份文件就会算成两个 project ⇒ `docker compose down` 找错对象。
+name: home-llm-gateway
+
 services:
   gateway:
-    build: .
+    # 上下文必须是**仓库根**（本文件在 crates/gateway/ 下 ⇒ 相对本文件就是 `../..`）；
+    # `dockerfile` 是相对 **context** 解析的，所以这里写仓库根视角的路径。
+    build:
+      context: ../..
+      dockerfile: crates/gateway/Dockerfile
     image: home-llm-gateway
     container_name: gateway
     restart: unless-stopped
@@ -85,17 +102,8 @@ services:
     #    只有想换成别的目录（例如你自己挂进去的一份产物）才需要写 `ui_dir:` 覆盖它。
     #    老部署升级：删掉配置里指向宿主 `web/dist` 的那一行，再删掉宿主上的 `web/` 目录。
 
-# agent 通常跑在 LLM 所在的机器（edge 节点），不在网关这台云服务器上。
-# 真要在这台机器上跑，取消下面注释——注意 **entrypoint 必须切换**，否则跑起来的是网关：
-#
-#  agent:
-#    image: home-llm-gateway
-#    container_name: agent
-#    restart: always
-#    entrypoint: ["/usr/local/bin/agent"]
-#    command: ["--config", "/etc/home-llm-gateway/agent-config.yml"]
-#    working_dir: /etc/home-llm-gateway
-#    # host 网络：agent 要连本机 LLM（如 http://127.0.0.1:8000），且出站 UDP 4433 不受限
-#    network_mode: host
-#    volumes:
-#      - /etc/home-llm-gateway:/etc/home-llm-gateway
+# agent 跑在 LLM 所在的机器（edge 节点），不在网关这台云服务器上。
+# ⚠️ 本镜像里**只有 gateway + Dashboard**，没有 agent 二进制（`docker build --bin gateway`），
+#    所以别再写 `entrypoint: ["/usr/local/bin/agent"]` —— 那会 "no such file or directory"。
+#    按 `DEPLOY.md` §6 用 systemd + `deploy/agent.service` 部署 agent（二进制来自 `make build`
+#    或 release 包）；确实要容器化 agent 的话，给它一个自己的 Dockerfile（多 COPY 一个 `--bin agent`）。
