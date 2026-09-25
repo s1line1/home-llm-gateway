@@ -20,7 +20,7 @@ MODEL ?= qwen2.5
 LIMIT ?= 20
 
 .PHONY: help setup certs certs-required web-install web-build web-dev build build-debug fmt clippy check test bench bench-k6 \
-        bench-admission bench-admission-local release \
+        bench-admission bench-admission-local release check-records \
         run-gateway run-agent run-mock dev dev-ui logs stop clean
 
 help: ## 显示所有命令
@@ -78,7 +78,10 @@ toolchain-check: ## 工具链三处一致（rust-toolchain.toml / Dockerfile / C
 deny: ##（advisories/bans/licenses/sources 全跑，与 pre-commit hook / CI 同一条命令；首次/无网时需要 advisory 库）
 	cargo deny check
 
-check: fmt clippy deny nextest web-format web-lint web-test web-build toolchain-check ## 一键全量验证（= CI 的 Rust 门槛 + 前端格式/检查/测试/构建 + 工具链一致性：fmt / clippy / cargo deny / nextest / web-format / web-lint / web-test / web-build / toolchain-check）
+check-records: ## 记录↔代码漂移（指针越界 / 提交号不实；扫的是工作树里的 docs/，那两份记录不在仓库里）
+	python3 scripts/check-records.py
+
+check: fmt clippy deny nextest web-format web-lint web-test web-build toolchain-check check-records ## 一键全量验证（= CI 的 Rust 门槛 + 前端格式/检查/测试/构建 + 工具链一致性 + 记录漂移：fmt / clippy / cargo deny / nextest / web-format / web-lint / web-test / web-build / toolchain-check / check-records）
 
 test: ## 运行全部 Rust 测试（cargo 原生 runner，含 e2e；串行靠测试里的 #[serial]）
 	cargo test

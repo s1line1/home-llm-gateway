@@ -15,9 +15,15 @@
 这个脚本也**不判断"是否真的修好了"**（那要人读代码），而且只扫下面 `DOCS` 里那两份登记表——
 审计报告、`TODO.md` 不在范围内。所以它是审计的第一道筛子，不是替代品。
 
+**谁在跑它**（重扫 H1-5 补齐）：`make check-records`（已挂进 `make check` 的前置）与
+`.git/hooks/pre-commit`。**CI 上没有它**，因为那两份记录**不在仓库里**（`.gitignore` 的
+`/docs/*`）——CI 的新检出里脚本只会打印"跳过（不存在）"然后 exit 0，加进去是假绿。
+它真正生效的地方是**维护者的工作树**；没有 python3 时 hook 会明确打印"跳过"而不是静默通过。
+
 用法：
     python3 scripts/check-records.py            # 检查并打印摘要；有漂移则 exit 1
     python3 scripts/check-records.py --verbose  # 列出每一条漂移
+    make check-records                          # 同上（门禁里的那一步）
 """
 from __future__ import annotations
 
