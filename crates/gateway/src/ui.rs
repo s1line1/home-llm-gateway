@@ -173,7 +173,8 @@ pub fn resolve_ui(configured: Option<&Path>) -> (Option<PathBuf>, Option<String>
         }
         UiDirCheck::SourceEntry => {
             let msg = format!(
-                "ui_dir 指向的是前端**源码**目录，不是构建产物（默认 web/dist）：{}",
+                "ui_dir 指向的是前端**源码**目录，不是构建产物（应指向打包产物目录，\
+                 例如原生部署的 web/dist；容器镜像里的那份在默认值里）：{}",
                 p.display()
             );
             error!(path = %p.display(), "{msg}；浏览器只会白屏，GET / 已改显示本提示页");

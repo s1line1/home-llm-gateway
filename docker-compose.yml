@@ -79,8 +79,11 @@ services:
     #      ③ `logging: { driver: journald }` → 进宿主机 journald，`journalctl -t gateway` 可查，
     #         删容器不丢；同样 `docker logs` 为空。
     #  · 日志时间戳由程序固定为东八区，`TZ=` 不会改变它。
-    #  · 镜像里**不含 web/dist**，容器内访问 `/` 会看到"UI 未构建"的提示页；
-    #    要用面板就把 `web/dist` 挂进来，并把配置的 ui_dir 指向它。
+    #  · 镜像里**已经内置 Dashboard**（`Dockerfile` 的 `web-builder` 阶段在镜像内构建，产物在
+    #    `/usr/local/share/home-llm-gateway/web`）⇒ 既不用本地构建、也不用挂 `web/dist`、
+    #    **也不用写 `ui_dir`**：不写时的默认值就是那个镜像内路径（`config.rs::default_ui_dir()`）。
+    #    只有想换成别的目录（例如你自己挂进去的一份产物）才需要写 `ui_dir:` 覆盖它。
+    #    老部署升级：删掉配置里指向宿主 `web/dist` 的那一行，再删掉宿主上的 `web/` 目录。
 
 # agent 通常跑在 LLM 所在的机器（edge 节点），不在网关这台云服务器上。
 # 真要在这台机器上跑，取消下面注释——注意 **entrypoint 必须切换**，否则跑起来的是网关：

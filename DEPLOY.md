@@ -111,9 +111,14 @@ sudo cp target/release/gateway /usr/local/bin/gateway
 # 否则示例配置"零改动"启动时读不到证书）
 sudo cp server.crt server.key ca.crt /etc/home-llm-gateway/
 sudo chmod 600 /etc/home-llm-gateway/server.key
-# Web UI（可选）：本机构建后把产物整个上传（含 index.html + assets/）
+# Web UI（可选）：本机构建后把产物整个上传（含 index.html + assets/）。
+# ⚠️ **层次要和配置里的 ui_dir 对齐**：下面保持 `web/dist/` 这一层，对应 ui_dir: web/dist
 #   cd web && pnpm install && pnpm build
-#   scp -r web/dist <服务器>:/etc/home-llm-gateway/web
+#   ssh <服务器> 'sudo mkdir -p /etc/home-llm-gateway/web/dist'
+#   scp -r web/dist/* <服务器>:/etc/home-llm-gateway/web/dist/
+# （另一种常见写法是 `scp -r web/dist <服务器>:/etc/home-llm-gateway/web` —— scp 会把目录**改名**
+#   成 `web`，产物落在 `…/web/` 下少一层，那时 `ui_dir` 要写 `web` 而不是 `web/dist`。
+#   两种都由你定，但**配置必须和实际层次一致**，否则 `/` 只显示"UI 未构建"的占位页。）
 ```
 
 ## 5. 部署网关（中转服务器）
@@ -147,8 +152,11 @@ cert / key / ca                    # QUIC 隧道证书（同 server 证书 + ca.
 admin_token: <强随机串>             # Admin API 口令（必配；用它创建第一个 API key）
 keys_file: /etc/home-llm-gateway/keys.db   # 动态 key 持久化数据库（SQLite，默认 keys.db）
 rate_limit_per_min: 60             # 每个 Key 每分钟上限
-ui_dir: web                        # Web UI 目录（§4 上传的 web/dist；相对 WorkingDirectory，
-                                   # 省略 = `/` 显示构建提示页，API 不受影响）
+ui_dir: web/dist                   # Web UI 目录（§4 上传的产物；相对 WorkingDirectory，
+                                   # 所以要带 `web/dist` 这一层——层次必须与实际目录一致）
+                                   # ⚠️ 原生部署**必须显式写**：不写时的默认值是**镜像内**的
+                                   # /usr/local/share/home-llm-gateway/web（给容器用的绝对路径）。
+                                   # 目录里没有可用产物时 `/` 显示构建提示页，API 不受影响
 ```
 
 > 网关**没有静态 key**——所有 API key 都通过 Admin API 运行时创建并存入 SQLite（首次启动先用 `admin_token` 创建第一个 key）。
@@ -254,7 +262,7 @@ curl -N -k -H "Authorization: Bearer <你的key>" \
 | curl 返回 503 | 网关没注册到健康 agent（看网关/agent 日志） |
 | curl 返回 429 | 限流超了（等下一分钟）或 agent 并发占满 |
 | **大请求体（≥1 MB）或大响应吞吐上不去、成片 504** | **云服务器的出口带宽上限**：实测该 ECS 出口 ≈0.40 MB/s（3.2 Mbps），`QPS × (请求字节+响应字节)` 超了就排队；并发大请求还会按 `1/N` 摊薄每条可用速率，于是 15 s 的 `head_timeout` 先到 ⇒ 504（日志是 `… still answering; not evicting`）。**这不是网关缺陷**：先按字节预算设计负载，或把带宽调上去；判据与实测表见 `README.md`《云出口带宽上限》《请求体阶梯复测》 |
-| 浏览器打开 8443 显示"尚未构建"提示页 | 未上传 web/dist（§4）或 gateway-config.yml 未配 `ui_dir`；API 不受影响，可后补 UI 再 `systemctl restart gateway` |
+| 浏览器打开 8443 显示"尚未构建"提示页 | **systemd/原生部署**：`ui_dir` 指向的目录里没有可用产物——没构建、没上传（§4）、只上传了源码目录，或者**根本没写 `ui_dir`**（此时默认值是镜像内路径 `/usr/local/share/home-llm-gateway/web`，宿主上不存在 ⇒ 原生部署必须显式写）；**容器部署**：镜像自带产物、默认就能用，出现本页说明产物不在镜像里，或配置把 `ui_dir` 覆盖成了宿主路径（§11.5）。两种情况都是**非致命降级**，API 不受影响，改完重启即可（容器 `docker compose up -d`） |
 | edge 侧 IP 变了连不上 | 用域名 SAN 证书 + `server_name` 填域名，配 DDNS 指向新 IP |
 
 ## 9. 部署后安全清单（必做）
@@ -302,8 +310,8 @@ curl -s localhost:8080/metrics | grep -E 'hlmg_key_verify_(hits|misses)_total'
 ## 11. Docker 部署（可选）
 
 §4–§6 的 systemd 路径是默认方案；本节只讲**容器化时路径与端口怎么映射**，以及三个会让人卡住的坑。
-仓库里已有 `Dockerfile`（多阶段，产出 gateway / agent / mock-llm 三个二进制）和
-`docker-compose.yml`（网关；agent 的模板注释在文件末尾）。
+仓库里已有 `Dockerfile`（多阶段：Rust 阶段产出 gateway / agent / mock-llm 三个二进制，前端阶段
+把 Dashboard 编进镜像）和 `docker-compose.yml`（网关；agent 的模板注释在文件末尾）。
 
 ### 11.1 一条硬规则：配置里的路径按「进程 CWD」解析
 
@@ -322,7 +330,7 @@ curl -s localhost:8080/metrics | grep -E 'hlmg_key_verify_(hits|misses)_total'
 
 | 方案 | 挂载 | 配置文件 |
 |---|---|---|
-| **A. 同路径挂载**（推荐） | `-v /etc/home-llm-gateway:/etc/home-llm-gateway` | **零改动**，示例配置原样可用 |
+| **A. 同路径挂载**（推荐） | `-v /etc/home-llm-gateway:/etc/home-llm-gateway` | **零改动**，示例配置原样可用（`ui_dir` 是唯一例外，见 §11.5） |
 | **B. 挂到 `/config`** | `-v /etc/home-llm-gateway:/config` | 必须把 cert/key/ca 改成 `/config/...`、`keys_file` 改成 `/config/keys.db` |
 
 ⚠️ 两者混用是最常见的启动失败：容器内会报读不到证书/密钥（`cert/key/ca paths are required`
@@ -350,19 +358,42 @@ curl -s localhost:8080/metrics | grep -E 'hlmg_key_verify_(hits|misses)_total'
 - 云安全组要放行 **UDP 4433**（只放 TCP 是常见错误），见 §2；
 - 网关不需要 `--network host`，发布端口即可；agent 那一侧常配 host 网络（它要连本机 LLM）。
 
-### 11.5 容器化的两个能力缺口
+### 11.5 容器化的两个注意点（其一的缺口已补）
 
 - **配置不支持环境变量展开**（`config.rs` 里没有任何 env 取值），所以 `admin_token` 只能写在
   `gateway-config.yml` 里。该文件因此属于密钥：`chmod 600`、不要 `COPY` 进镜像、用只读挂载。
-- **镜像里没有 `web/dist`**：容器内访问 `/` 只会看到"UI 未构建"的提示页。要用管理面板，就在构建
-  镜像时把前端一并打进去，或在 compose 里把 `web/dist` 挂进去并调整 `ui_dir`。已登记在 `TODO.md`。
+- ~~镜像里没有 `web/dist`~~ **2026-09-24 已补**：Dashboard 由 `Dockerfile` 的 `web-builder` 阶段
+  **在镜像内构建**（`pnpm install --frozen-lockfile` + `pnpm build`，末尾照样跑
+  `scripts/check-bundle.mjs` 那道产物泄漏守卫——它红了整次构建就失败），产物在
+  `/usr/local/share/home-llm-gateway/web`；运行镜像里**不带 Node**，只多一份静态产物。
+
+  **容器部署什么都不用配**：`ui_dir` 不写时的默认值就是上面那个镜像内路径
+  （`config.rs` 的 `default_ui_dir()`）——不构建、不挂载、不加配置项，起来就有 Dashboard。
+  有配置就用配置（例如你想换成自己挂进去的一套产物，照常写 `ui_dir:` 覆盖）。
+
+  **从老部署升级**：`docker compose build && docker compose up -d`，然后**删掉配置里的
+  `ui_dir` 那一行**（如果它指向宿主上那份 `web/dist` —— 现在镜像自带、且更省事），
+  再把宿主上的 `web/` 目录删掉。不删配置也能跑，只是还在用你挂的那份。
+
+  为什么默认值必须是**绝对路径**、而且不能放在 `/etc/home-llm-gateway/web`：容器里 `ui_dir`
+  的相对路径按**进程 CWD**（`/etc/home-llm-gateway`，见 §11.1）解析，而那是配置/证书/`keys.db`
+  的挂载点 —— 镜像里放那儿的东西会被宿主目录**遮住**，`/` 照样是"UI 未构建"（`ui.rs` 的启动期
+  判定会打 warn，浏览器看到占位页）。所以产物放挂载点之外，默认值也指向那里；代价是**原生部署
+  必须显式写 `ui_dir`**（默认值是给镜像用的）。
 
 ### 11.6 用 docker compose
 
 ```bash
+docker compose build              # 会先编 Rust（release）再编前端，然后打包运行镜像
 docker compose config -q          # 只校验配置，不起容器
 docker compose up -d gateway
 # 日志：compose 的 command 把 stdout 重定向到了 /var/log/home-llm-gateway/gateway.log，
 # 所以 `docker compose logs -f gateway` 是**空的**（容器 stdout 没有内容）——直接看那个文件：
 sudo tail -f /var/log/home-llm-gateway/gateway.log
 ```
+
+前端阶段的可调 build-arg（都有默认值，见 `Dockerfile`）：`NPM_MIRROR`（默认 npmmirror，
+`--build-arg NPM_MIRROR=` 则用官方源）、`PNPM_VERSION`（默认 `10`，与 CI 的
+`pnpm/action-setup` 同一主版本——`--frozen-lockfile` 要求 pnpm 原样接受这份锁文件，跟随 CI
+就等于跟着一个有持续验证的组合）。基础镜像是 `node:22-bookworm-slim`（同样对齐 CI 的
+`setup-node node-version: 22`）。
