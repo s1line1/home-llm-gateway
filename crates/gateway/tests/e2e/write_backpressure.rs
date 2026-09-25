@@ -120,7 +120,10 @@ async fn e2e_write_timeout_does_not_evict_the_agent() {
         backpressure >= 3,
         "三次写超时应记入 backpressure，实际 {backpressure}"
     );
-    let text = reqwest::get(format!("{base}/metrics"))
+    // 有界客户端（重扫 F2）：以前这里是 `reqwest::get`，它内部的 client 默认无超时
+    let text = test_client()
+        .get(format!("{base}/metrics"))
+        .send()
         .await
         .unwrap()
         .text()

@@ -289,7 +289,11 @@ async fn e2e_shutdown_cancels_a_client_stalled_stream_without_waiting_for_the_st
         "应当读完整个 flood 响应：{}",
         whole.len()
     );
-    let stats: serde_json::Value = reqwest::get(format!("http://{mock_addr}/stats"))
+    // 有界客户端（重扫 F2）：以前这里是 `reqwest::get`（内部 client 默认无超时）——
+    // 这一步查的是假上游的 /stats，"本该完成"，卡住同样会挂死整套。
+    let stats: serde_json::Value = test_client()
+        .get(format!("http://{mock_addr}/stats"))
+        .send()
         .await
         .unwrap()
         .json()
@@ -353,10 +357,12 @@ async fn e2e_shutdown_cancels_a_client_stalled_stream_without_waiting_for_the_st
 
     // 上游必须在**很短**的时间内看到这次取消（修复前要等满 30s 的停滞上限）
     let stats_url = format!("http://{mock_addr}/stats");
+    // 轮询用的客户端建在循环外（重扫 F2：以前每次迭代都 `reqwest::get`，内部 client 无超时）
+    let probe = test_client();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let mut cancelled = 0;
     while tokio::time::Instant::now() < deadline {
-        if let Ok(resp) = reqwest::get(&stats_url).await {
+        if let Ok(resp) = probe.get(&stats_url).send().await {
             if let Ok(v) = resp.json::<serde_json::Value>().await {
                 cancelled = v["cancelled"].as_u64().unwrap_or(0);
                 if cancelled > 0 {
