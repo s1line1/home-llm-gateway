@@ -1,13 +1,26 @@
 # syntax=docker/dockerfile:1
-# home-llm-gateway 多阶段构建镜像
+# home-llm-gateway **网关**镜像（gateway 二进制 + Dashboard 静态产物）
 #
-# 构建：
-#   docker build -t home-llm-gateway .
-#   Apple Silicon Mac 给 x86 服务器出镜像：docker build --platform linux/amd64 ...
+# 构建（⚠️ 上下文必须是**仓库根**：本文件要 COPY 工作区根的 `Cargo.toml` / `crates/*` / `web/`）：
+#   在仓库根：       docker build -f crates/gateway/Dockerfile -t home-llm-gateway .
+#   在 crate 目录里：cd crates/gateway && docker build -f Dockerfile -t home-llm-gateway ../..
+#     （两条完全等价：上下文都是仓库根，而 Dockerfile 也在上下文内 ⇒ 合法。
+#      **不能**写成 `docker build .`：那会把上下文取成 `crates/gateway/`，里面既没有工作区清单
+#      （`Cargo.toml` 用了 `workspace = true` 继承与 `proto = { path = "../proto" }`），也没有
+#      `web/`；而 `COPY ../...` 是 Docker 明令禁止的。想换镜像名就改 `-t`。）
+#   Apple Silicon Mac 给 x86 服务器出镜像：再加 --platform linux/amd64
+#   （仓库里**只有这一份** Dockerfile，`crates/gateway/docker-compose.yml` 已写好
+#     `context: ../..` + 本文件，`docker compose -f crates/gateway/docker-compose.yml build` 等价）
+#
+# **镜像里只有 gateway 与 Dashboard**，不含 agent / mock-llm：
+#   · agent 跑在 LLM 那台 edge 机器上，按 `DEPLOY.md` §6 用 systemd + `deploy/agent.service` 部署
+#     （二进制来自 `make build` / release 包）。仓库**不再提供** agent 镜像；确实要容器化 agent
+#     的话，另写一份 Dockerfile（照本文件的结构，多一个 `--bin agent` + 多 COPY 一个二进制）。
+#   · mock-llm 只是本地开发用的假上游，不进任何发布镜像。
 #
 # 墙内构建**不要**关掉下面的镜像源：实测同一台阿里云 ECS 上，crates 包体走阿里云
 # 1.17 MB/s、直连 static.crates.io 只有 21 KB/s（本项目要下 338 个 crate ≈ 74 MB）。
-# 想回到官方源：--build-arg CRATES_MIRROR= --build-arg APT_MIRROR=
+# 想回到官方源：--build-arg CRATES_MIRROR= --build-arg APT_MIRROR= --build-arg NPM_MIRROR=
 #
 # 运行网关（云服务器）：
 #   ⚠️ ENTRYPOINT 已经是 gateway 二进制，命令行里**不要再写一个 "gateway"**——那会被 clap
@@ -21,24 +34,18 @@
 #     -p 8443:8443 -p 4433:4433/udp \
 #     home-llm-gateway --config /etc/home-llm-gateway/gateway-config.yml
 #
-# 运行 agent（LLM 机器）：镜像里虽然也有 agent / mock-llm，但 ENTRYPOINT 固定是 gateway，
-# 所以**必须用 --entrypoint 切换**，否则跑起来的还是网关：
-#   docker run -d --name agent --restart always --network host \
-#     --entrypoint /usr/local/bin/agent \
-#     -v /etc/home-llm-gateway:/etc/home-llm-gateway \
-#     home-llm-gateway --config /etc/home-llm-gateway/agent-config.yml
-#
-# 镜像内含 gateway / agent / mock-llm 三个二进制**以及编好的 Dashboard**：
-# 容器内既不用挂载宿主机的 `web/dist`，也**不用写 `ui_dir`** —— `config.rs::default_ui_dir()`
-# 的默认值就是下面那个 COPY 目标 `/usr/local/share/home-llm-gateway/web`（见 DEPLOY.md §11.5）。
-# 也可以直接用仓库根的 `docker-compose.yml`（网关 + 可选 agent）。
+# Dashboard 已经编进镜像：容器内既不用挂载宿主机的 `web/dist`，也**不用写 `ui_dir`** ——
+# `config.rs::default_ui_dir()` 的默认值就是下面那个 COPY 目标
+# `/usr/local/share/home-llm-gateway/web`（见 DEPLOY.md §11.5）。
+# 也可以直接用仓库根的 `docker-compose.yml`。
 
 # 构建基底**必须与运行阶段的发行版对齐**：运行阶段是 `debian:bookworm-slim`（Debian 12，
 # glibc 2.36），所以构建基底也用 `-bookworm` 变体。若换成 Debian 13（trixie，glibc 2.41）的基底，
-# 链出来的 gateway / agent 在 bookworm 里根本起不来：
+# 链出来的 gateway 在 bookworm 里根本起不来：
 #   /usr/local/bin/gateway: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.38' not found
-# 症状很隐蔽：**镜像能构建成功**，`mock-llm --version` 也正常（它依赖少），只有 gateway/agent
-# 一启动就死。（另一条路是把运行阶段换成 `debian:trixie-slim`，但那样产物就要求 glibc ≥ 2.38。）
+# 症状很隐蔽：**镜像能构建成功**，只有启动那一刻才死（这条是实测踩出来的：当时镜像里还有依赖少
+# 的 mock-llm，它 `--version` 一切正常，于是第一眼会以为镜像没问题）。
+# （另一条路是把运行阶段换成 `debian:trixie-slim`，但那样产物就要求 glibc ≥ 2.38。）
 #
 # 版本**必须与仓库 `rust-toolchain.toml` 的 channel 一致**（`scripts/check-toolchain.sh` 会校验）：
 # 镜像里预装的就是这个版本的工具链，于是构建完全不碰网络。曾经这里钉 1.95、而仓库文件写
@@ -69,10 +76,19 @@ RUN if [ -n "$CRATES_MIRROR" ]; then \
 
 WORKDIR /build
 
-# ① 清单层：只拷 Cargo.toml/Cargo.lock 并造最小骨架，**这一层只负责下载依赖**。
+# ① 清单层：只拷**四份清单** + Cargo.lock 并造最小骨架，**这一层只负责下载依赖**。
 #    这样改源码不会让它失效——依赖不必重下（原来 74 MB 每次重下，是构建最慢的一段）。
-#    骨架必须覆盖所有“自动发现”的 target：每个 bin 的 src/main.rs、proto 的 src/lib.rs，
-#    以及两个 [[bench]]（proto/benches/frame.rs、gateway/benches/keystore.rs，无显式 path）。
+#
+#    ⚠️ 下面每一条拷贝 / 每一个骨架文件都是**承重的**，别"顺手清理"——三条失败模式都实测过
+#    （本机等价实验：临时目录里只放清单 + 骨架，跑 `cargo fetch --locked --offline`）：
+#      1) 缺任一 member 的清单 ⇒ `failed to load manifest for workspace member`（根 `Cargo.toml`
+#         的 members 是**显式四个路径**，不是 glob）；agent / mock-llm 因此也要拷清单，
+#         尽管它们**不参与编译**（下面只 `--bin gateway`）。
+#      2) member 没有 target 文件（`src/lib.rs` 或 `src/main.rs`）⇒ `no targets specified in the
+#         manifest`——所以三个 bin 的 `main.rs` 与 proto 的 `lib.rs` 都要造出来。
+#      3) 显式声明的 `[[bench]]` 缺文件 ⇒ `can't find 'frame' bench at benches/frame.rs`
+#         （proto 的 `frame`、gateway 的 `keystore`，两者都无显式 path）——**只删这两个 bench
+#         骨架就会让这一层失败**（这曾经是我的直觉误判，被实测否掉）。
 COPY Cargo.toml Cargo.lock ./
 COPY crates/proto/Cargo.toml crates/proto/
 COPY crates/gateway/Cargo.toml crates/gateway/
@@ -88,9 +104,9 @@ RUN set -eux; \
     for b in gateway agent mock-llm; do printf 'fn main() {}\n' > "crates/$b/src/main.rs"; done; \
     cargo fetch --locked
 
-# ② 源码层：依赖已在上一层缓存，这里只编译
+# ② 源码层：依赖已在上一层缓存，这里只编译**网关**这一个二进制
 COPY . .
-RUN cargo build --release --bin gateway --bin agent --bin mock-llm
+RUN cargo build --release --bin gateway
 
 # ===== 前端（Dashboard）构建阶段 =====
 #
@@ -151,8 +167,6 @@ RUN printf 'Acquire::ForceIPv4 "true";\n' > /etc/apt/apt.conf.d/99force-ipv4 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/gateway /usr/local/bin/gateway
-COPY --from=builder /build/target/release/agent /usr/local/bin/agent
-COPY --from=builder /build/target/release/mock-llm /usr/local/bin/mock-llm
 
 # Dashboard 静态产物（`web-builder` 阶段构建）。**位置必须在挂载点之外**：容器里相对路径按
 # **进程 CWD**（`/etc/home-llm-gateway`，见 DEPLOY.md §11.1）解析，而那个目录是配置 + 证书 +
