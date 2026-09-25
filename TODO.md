@@ -320,10 +320,26 @@
       （admin_token 配置文件明文）；考虑"首次启动自动建默认 key"或引导提示
 - [ ] **usage 数据保留策略（B 档，可选）**：`key_usage` 无限累积（reset 是待定项）——
       长时间运行表会涨；建议与 reset 一并设计保留窗口/归档
-- [ ] **镜像不含 `web/dist`（C 档，可选）**：`Dockerfile` 与 `docker-compose.yml` 均已就绪
-      （容器化的路径映射、ENTRYPOINT 与 UDP 端口三个坑见 `DEPLOY.md` §11），**仅剩**容器内没有
-      管理面板：访问 `/` 只得到"UI 未构建"的提示页。要做就在多阶段构建里加一个 pnpm 阶段把
-      `web/dist` 打进去，或在 compose 里挂载 `web/dist` 并把 `ui_dir` 指过去。
+- [x] **镜像不含 `web/dist`（C 档，可选）—— 2026-09-24 已做（采纳"打进镜像"这条）**：`Dockerfile`
+      新增 `web-builder` 阶段（`node:22-bookworm-slim` + `npm install -g pnpm@10` +
+      `pnpm install --frozen-lockfile` + `pnpm build`，末尾照样过 `scripts/check-bundle.mjs` 那道
+      泄漏守卫，它红了整次构建就失败）——**基础镜像与 pnpm 主版本都对齐 CI**（`ci.yml` 的
+      `setup-node node-version: 22` / `pnpm/action-setup version: 10`），不照抄本机的 24/11
+      （那会造出"只有镜像里才有、没人验过"的组合）；pnpm 用 npm 装而非 corepack（corepack 不认
+      npm registry 镜像配置，墙内会卡）。运行阶段
+      `COPY --from=web-builder /build/web/dist /usr/local/share/home-llm-gateway/web`
+      —— 运行镜像里**不带 Node**，容器不再需要宿主机挂 `web/dist`。产物**不能**放
+      `/etc/home-llm-gateway/web`（那是配置/证书/keys.db 的挂载点，会被挂载遮住），所以放在
+      `/usr/local/share/home-llm-gateway/web`，并且
+      **`config.rs::default_ui_dir()` 的部署默认值也改成同一个绝对路径**
+      （`crates/gateway/src/config.rs`，`config.rs` 里那条断言钉住它）：容器**不写 `ui_dir`
+      也有 Dashboard**，有配置则用配置；代价是**原生部署必须显式写 `ui_dir`**（默认值给镜像用）。
+      "在 compose 里挂载 `web/dist`"那条没采纳（那还是外部路径映射）。
+      **⚠️ 未实测**：本机没有 docker daemon（`~/.docker/run/docker.sock` 不存在），所以
+      `docker build`、以及镜像内 `/` 的真实响应都**没有跑过**；CI 目前也不构建镜像（P2-23）。
+      已做的替代验证：① `pnpm build` 与阶段里两条命令逐字一致，本机通过；② 用真网关 + 绝对
+      `ui_dir` 指到 `web/dist`，`/` 返回构建产物（证明"绝对路径、CWD 之外"这条语义成立，
+      这正是镜像里那个路径所依赖的）。
 - [ ] **⛔ 结构化访问日志 JSONL（新输出格式——按顶部范围约定先不做）**：tracing 文本日志给人看；如需审计
       "谁何时调了什么"可加 JSON 行落盘
 - [ ] **keys.db 迁移规模化**：当前自动迁移（`storage/mod.rs::migrate_legacy_keys`）同步执行、

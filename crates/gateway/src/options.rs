@@ -20,9 +20,9 @@ use crate::{storage::KeyStore, tls::TlsPem};
 /// 既有调用点用 `..Options::default()`（FRU）一行都不用动。
 ///
 /// [`Default`] 是**库 / 测试默认**：只绑本机临时端口、不碰任何文件。部署默认
-/// （`0.0.0.0:8080` / `0.0.0.0:4433` / `keys.db` / `web/dist`）留在 `config::ConfigFile`
-/// 的 serde 默认里——一个 `Default` 顺手把公网端口暴露出去是设计缺陷，不是便利。
-/// 两者**刻意不保持 parity**：`config::from_file` 总是显式设置它们。
+/// （`0.0.0.0:8080` / `0.0.0.0:4433` / `keys.db` / `/usr/local/share/home-llm-gateway/web`）
+/// 留在 `config::ConfigFile` 的 serde 默认里——一个 `Default` 顺手把公网端口暴露出去是设计缺陷，
+/// 不是便利。两者**刻意不保持 parity**：`config::from_file` 总是显式设置它们。
 #[derive(Debug)]
 pub struct Options {
     // ── 监听 ──

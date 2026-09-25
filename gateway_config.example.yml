@@ -156,6 +156,18 @@ max_open_tunnel_streams: 1024
 # tls_key: /etc/home-llm-gateway/server.key
 
 # React Web UI 静态目录（含 index.html；浏览器打开网关地址 `/` 即管理面板）。
-# 默认 web/dist（相对工作目录）；目录不存在时 `/` 显示构建提示页。
+# **不写这一项 = 默认 `/usr/local/share/home-llm-gateway/web`**（`config.rs` 的
+# `default_ui_dir()`）——那正是本仓库镜像把前端产物 COPY 进去的位置 ⇒ **容器部署不必写这一行**，
+# 开箱即用；有配置就用配置。
+# 反过来，**原生（systemd）部署要显式写**：默认值是给镜像用的绝对路径，宿主机上并不存在。
+# 目录里没有**可用产物**时（没构建 / 路径写错 / 指向前端源码目录），`/` 显示构建提示页并说明
+# 原因，进程照常启动（非致命降级）。
 # 构建前端：cd web && pnpm install && pnpm build
+#
+# 下面给的是原生部署的写法，注意**相对路径按进程 CWD 解析**（`WorkingDirectory`），
+# 所以要与实际目录层次一致：
+#   · 产物落在 `<CWD>/web/dist/` ⇒ 写 `web/dist`（本文件这一行；DEPLOY.md §4 的上传方式）
+#   · 产物落在 `<CWD>/web/`（例如 `scp -r web/dist <服务器>:/etc/home-llm-gateway/web`
+#     这种**会把目录改名**的上传）⇒ 写 `web`
+# 写错层次不会报错，只会静默降级成占位页（日志里那行 warn 会点名它实际找的路径）。
 ui_dir: web/dist

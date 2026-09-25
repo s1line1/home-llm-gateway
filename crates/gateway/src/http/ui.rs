@@ -197,7 +197,8 @@ mod tests {
 
     #[test]
     fn placeholder_page_shows_the_reason() {
-        let reason = "ui_dir 指向的是前端**源码**目录，不是构建产物（默认 web/dist）：web";
+        // 与 `ui.rs::resolve_ui` 里那条真实原因同形（这里只是要一段含路径的文字）
+        let reason = "ui_dir 指向的是前端**源码**目录，不是构建产物（应指向打包产物目录）：web";
         let html = render_ui_missing(Some(reason));
         assert!(html.contains(reason), "占位页必须写出具体原因");
         // 没原因时保持通用文案，且不残留占位符

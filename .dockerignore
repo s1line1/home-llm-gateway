@@ -1,7 +1,8 @@
 target
 .cargo-home
-# 前端构建产物（web/dist）与发布打包产物（dist/）都不进上下文：镜像只装三个 Rust
-# 二进制（Dockerfile 的 runtime 阶段只 COPY 那几个文件），前端产物根本不用。
+# 前端构建产物（web/dist）与发布打包产物（dist/）都不进上下文：Dashboard 现在由 Dockerfile 的
+# `web-builder` 阶段**在镜像里现场构建**（源在 `web/` 里），宿主机上那份既有产物只会白白增大
+# 上下文、并让 Rust 的源码层缓存失效。
 # **必须带 `**/`**：不带斜杠的 `dist` 只匹配**上下文根目录**下的 dist，`web/dist` 匹配不到
 # （dockerignore(5)：`temp?` 这类模式的作用域是 root 目录；`**` 可匹配零个目录，
 # 所以 `**/dist` 同时覆盖根的 dist/ 与 web/dist）。

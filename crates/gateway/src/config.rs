@@ -144,7 +144,12 @@ pub struct ConfigFile {
     /// 公网入口 HTTPS 私钥 PEM（与 tls_cert 成对）
     #[serde(default)]
     tls_key: Option<PathBuf>,
-    /// React UI 静态目录（含 index.html；默认 web/dist，不存在时 `/` 显示构建提示页）
+    /// React UI 静态目录（含 index.html）。
+    ///
+    /// **不写这一项 = 用 [`default_ui_dir`] 的镜像内路径**（`/usr/local/share/home-llm-gateway/web`），
+    /// 那是 `Dockerfile` 把前端产物 COPY 进去的位置 ⇒ 容器部署开箱即用，配置里不需要这一行。
+    /// 原生（systemd）部署要显式写自己的目录（例如 `web/dist`，相对 `WorkingDirectory`）。
+    /// 目录里没有可用产物时是**非致命降级**：`/` 显示构建提示页，进程照常启动。
     #[serde(default = "default_ui_dir")]
     ui_dir: Option<PathBuf>,
 }
@@ -158,8 +163,16 @@ fn default_quic_addr() -> String {
 fn default_keys_file() -> Option<PathBuf> {
     Some(PathBuf::from("keys.db"))
 }
+/// 部署默认的 UI 目录：**镜像内那个绝对路径**（`Dockerfile` 的
+/// `COPY --from=web-builder … /usr/local/share/home-llm-gateway/web`）。
+///
+/// 为什么是绝对路径而不是曾经的 `web/dist`：容器里 `ui_dir` 通常不写（镜像是自包含的），
+/// 而相对路径按**进程 CWD** 解析 —— 镜像的 CWD 是 `/etc/home-llm-gateway`，正是配置/证书/
+/// `keys.db` 的**挂载点**，镜像里放那儿的东西会被宿主目录遮住 ⇒ 曾经的默认值在容器里必然
+/// 降级成"UI 未构建"。换成绝对路径后：**有配置用配置，没配置就用镜像内这份**。
+/// （原生部署因此要显式写自己的目录，`gateway_config.example.yml` 里给的就是那种写法。）
 fn default_ui_dir() -> Option<PathBuf> {
-    Some(PathBuf::from("web/dist"))
+    Some(PathBuf::from("/usr/local/share/home-llm-gateway/web"))
 }
 fn default_timeout_secs() -> u64 {
     Options::DEFAULT_REQUEST_TIMEOUT.as_secs()
@@ -608,7 +621,16 @@ rate_limit_per_min: 60
         // 刻意不同：库默认密闭（内核分配端口、不读不写任何文件），部署默认面向公网
         assert_ne!(opts.http_bind, d.http_bind, "库默认不绑公网端口");
         assert_ne!(opts.keys_file, d.keys_file, "库默认不碰 keys.db");
-        assert!(opts.ui_dir.is_some(), "部署默认托管 web/dist");
+        // 部署的 UI 默认必须**钉死成镜像内那个绝对路径**：容器里配置通常不写 `ui_dir`
+        // （镜像是自包含的），所以这个默认值就是容器唯一的 UI 入口 —— 写成相对路径
+        // （曾经的 `web/dist`）会落在挂载点 `/etc/home-llm-gateway` 里、被宿主目录遮住。
+        assert_eq!(
+            opts.ui_dir,
+            Some(std::path::PathBuf::from(
+                "/usr/local/share/home-llm-gateway/web"
+            )),
+            "部署默认 UI 目录 = 镜像内路径（Dockerfile 的 COPY 目标）"
+        );
         assert!(d.ui_dir.is_none(), "库默认不读 UI 目录");
     }
 }

@@ -55,10 +55,17 @@ deny.toml       cargo-deny 策略（依赖许可证 / 公告；CI 与 pre-commit
 
 `web/` 是独立前端工程（Vite + React + Tailwind），提供总览、API Keys、Agents、指标四个页面。
 **网关内置静态托管**：构建前端（`cd web && pnpm install && pnpm build`）后，网关配置
-`ui_dir`（默认 `web/dist`）指向产物即可，**启动 gateway 浏览器打开 `/` 就是 Dashboard**
-（前端路由自动 fallback，单进程单端口，无需 nginx）。`ui_dir` 缺失时 `/` 显示构建提示页
-（网关不再内嵌管理页）。开发时也可 `cd web && pnpm dev` 用 Vite 代理联调
+`ui_dir` 指向产物即可，**启动 gateway 浏览器打开 `/` 就是 Dashboard**（前端路由自动
+fallback，单进程单端口，无需 nginx）。`ui_dir` **不写时的默认值是镜像内路径**
+`/usr/local/share/home-llm-gateway/web`（容器部署开箱即用，宿主上不存在），原生部署请显式写成
+自己的产物目录（如 `web/dist`）。`ui_dir` 指向的目录**没有可用产物**时（没构建 / 路径写错 /
+只上传了源码目录），`/` 显示构建提示页并说明原因（网关不再内嵌管理页）——注意它是**非致命
+降级**，网关照常启动。开发时也可 `cd web && pnpm dev` 用 Vite 代理联调
 （`GATEWAY_PROXY` 可覆盖网关地址）。
+
+**容器部署不用自己构建、也不用写 `ui_dir`**：`Dockerfile` 的 `web-builder` 阶段把 Dashboard
+编进镜像（运行镜像里不带 Node），产物在 `/usr/local/share/home-llm-gateway/web`，而它就是
+`ui_dir` 不写时的默认值；**也不需要挂载宿主机的 `web/dist`**（见 `DEPLOY.md` §11.5）。
 
 ## 快速开始（全部本机即可跑通，无需真实 LLM）
 
