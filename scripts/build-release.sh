@@ -19,16 +19,36 @@ TARGETS=(
   aarch64-apple-darwin                   # edge 节点 Mac（Apple Silicon）
 )
 
+# 失败要**记下来继续**，不能裸跑 `cargo build`：`set -e` 会让第一个失败的目标结束整个
+# 脚本，排在后面的目标（尤其是 edge 机器真正要用的 aarch64-apple-darwin）连试都不会试。
+# 跨平台构建本来就常常只装得上其中几个——照脚本头的提示 rustup target add 之后，
+# macOS 上缺交叉链接器的那一刻就会在这里断掉。所以逐个跑完，最后统一汇总退出码。
+failed=()
+built=()
 for target in "${TARGETS[@]}"; do
   if ! rustup target list --installed | grep -qx "$target"; then
     echo "==> skip ${target}（未安装，可执行 rustup target add ${target}）"
     continue
   fi
   echo "==> build ${target} (release)"
-  cargo build --release --target "$target" --bin gateway --bin agent --bin mock-llm
+  if ! cargo build --release --target "$target" --bin gateway --bin agent --bin mock-llm; then
+    echo "!!! build ${target} 失败，继续后面的目标" >&2
+    failed+=("$target")
+    continue
+  fi
   tarball="${DIST}/home-llm-gateway-${VERSION}-${target}.tar.gz"
-  tar -C "target/${target}/release" -czf "$tarball" gateway agent mock-llm
-  echo "    -> ${tarball}"
+  if tar -C "target/${target}/release" -czf "$tarball" gateway agent mock-llm; then
+    echo "    -> ${tarball}"
+    built+=("$target")
+  else
+    echo "!!! 打包 ${target} 失败，继续后面的目标" >&2
+    failed+=("$target")
+  fi
 done
 
-echo "完成，产物在 ${DIST}/"
+if [ "${#failed[@]}" -gt 0 ]; then
+  echo "完成（有失败）：成功 ${#built[@]} 个目标，失败 ${#failed[@]} 个：${failed[*]}" >&2
+  exit 1
+fi
+
+echo "完成（${#built[@]} 个目标），产物在 ${DIST}/"

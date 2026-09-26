@@ -96,6 +96,8 @@ cargo build --release            # 产出 target/release/{gateway,agent,mock-llm
 
 ```bash
 ./scripts/build-release.sh       # 已安装的 target 会构建；未安装的按提示 rustup target add
+# 某个目标构建/打包失败**不会**中断后面的目标（跨平台常常只装得上其中几个）：
+# 脚本逐个跑完再汇总，有失败时列出失败的 target 并以非 0 退出
 # macOS → Linux 需要交叉链接器，见脚本头部注释；推荐 musl 目标出静态二进制
 # 产物：dist/home-llm-gateway-<版本>-<平台>.tar.gz
 ```
