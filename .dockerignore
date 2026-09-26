@@ -25,3 +25,9 @@ agent-config.yml
 **/config.yml
 **/gateway-config.yml
 **/agent-config.yml
+# 开发证书（**含私钥**）：`certs/out/` 是 `certs/gen-dev.sh` 生成的，`.gitignore` 挡住了它们，
+# 但 **Docker 不读 `.gitignore`** —— 而构建上下文是仓库根，`COPY . .`（源码层）会把整个上下文
+# 拷进 builder。运行阶段只 COPY 二进制与 dist，所以**最终镜像里没有**它们；但 builder 层、
+# daemon 的构建缓存、`--target builder` 与上下文 tar 里都会留着私钥（重扫 H1-1）。
+# 只排 `out/`：`certs/gen-dev.sh` 是源码，留着无妨（也免得以后有人以为证书目录整个不能用）。
+certs/out

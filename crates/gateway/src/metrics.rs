@@ -11,6 +11,25 @@ use std::{
 
 use crate::sync::lock_or_recover;
 
+/// 准入域（复扫 A3）：**豁免路径不得消耗受限路径的预算**。
+///
+/// 为什么需要"域"这个概念：先前用 `limit == 0` 表达"豁免"（`/healthz`），而 `0` 的语义只是
+/// "不判上限"——领票、计数一样不少，加的还恰好是**受限路径用来比较的同一个计数器**。于是豁免
+/// 路径实际在花受限预算：对着无认证的 `/healthz` 打一轮就能把 `/v1` 顶到 429，而 LB 因为探针
+/// 仍返回 200 而认为实例健康（"整机正常、谁都调不通"）。
+///
+/// 域把"能不能被拒"与"记在谁的账上"分开：每个域有自己的在途计数与自己的上限，互不干扰；
+/// **总数**（[`Metrics::active_count`]）仍然统计全部在途票，所以 `hlmg_active_requests` 与
+/// `drain()` 的语义一个都没变。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionDomain {
+    /// 受 `max_concurrent_requests` 约束的常规路径（`/v1/*`、UI、admin…）。
+    Gated,
+    /// 探针（`/healthz`）：自己不占受限额度，但有一个**独立的、宽松的**上限，免得这条无认证
+    /// 路径被洪水无界消耗（取值与理由见 `http::admission::MAX_CONCURRENT_PROBES`）。
+    Probe,
+}
+
 #[derive(Clone, Default)]
 pub struct Metrics {
     inner: Arc<MetricsInner>,
@@ -22,6 +41,14 @@ struct MetricsInner {
     status_counts: Mutex<HashMap<u16, u64>>,
     /// 当前在途请求数。
     active: AtomicU64,
+    /// **受限域**在途数：只有 [`AdmissionDomain::Gated`] 的票据增减它，`max_concurrent_requests`
+    /// 也只与它比较。
+    ///
+    /// 为什么不复用 `active`（复扫 A3）：`/healthz` 是**无认证**的豁免路径，却同样领票；探针
+    /// （或对它的洪水）会把 `active` 抬到受限上限之上，让 `/v1` 全线 429，而探针自己仍是 200。
+    active_gated: AtomicU64,
+    /// **探针域**在途数：只有 [`AdmissionDomain::Probe`] 的票据增减它。
+    active_probe: AtomicU64,
     /// 转发给客户端的字节数。
     bytes_out: AtomicU64,
     /// 累计请求耗时（毫秒）。
@@ -132,16 +159,23 @@ impl Metrics {
     /// `active_count()` **恒等于**已发出的票数（顺带让 `hlmg_active_requests` 不再有瞬时尖峰，
     /// 排空判据 `drain()` 读的也是它）。
     ///
-    /// `limit == 0` = 不限：直接占位（仍然计数，票据照常负责 `request_count` 与时长记账）。
-    pub fn try_enter(&self, limit: u32) -> Option<Admission> {
+    /// `limit == 0` = **本域不限**：直接占位（仍然计数，票据照常负责 `request_count` 与时长记账）。
+    ///
+    /// `domain` 决定这笔在途记进哪个域（见 [`AdmissionDomain`]）：受限路径只与受限域的计数比较，
+    /// 所以豁免路径在途多少都不会减少别人能用的额度。
+    pub fn try_enter(&self, limit: u32, domain: AdmissionDomain) -> Option<Admission> {
+        let domain_counter = match domain {
+            AdmissionDomain::Gated => &self.inner.active_gated,
+            AdmissionDomain::Probe => &self.inner.active_probe,
+        };
         if limit > 0 {
             let limit = u64::from(limit);
-            let mut current = self.inner.active.load(Ordering::Relaxed);
+            let mut current = domain_counter.load(Ordering::Relaxed);
             loop {
                 if current >= limit {
                     return None;
                 }
-                match self.inner.active.compare_exchange_weak(
+                match domain_counter.compare_exchange_weak(
                     current,
                     current + 1,
                     Ordering::Relaxed,
@@ -153,12 +187,16 @@ impl Metrics {
                 }
             }
         } else {
-            self.inner.active.fetch_add(1, Ordering::Relaxed);
+            domain_counter.fetch_add(1, Ordering::Relaxed);
         }
+        // 总数（`hlmg_active_requests` 与 `drain()` 读它）：**只在本域确实占到票之后**才加，
+        // 所以它仍然恒等于已发出的票数、不会留下幽灵占位（R8）。
+        self.inner.active.fetch_add(1, Ordering::Relaxed);
         self.inner.request_count.fetch_add(1, Ordering::Relaxed);
         Some(Admission {
             metrics: self.clone(),
             start: Instant::now(),
+            domain,
         })
     }
 
@@ -260,9 +298,21 @@ impl Metrics {
         self.inner.bytes_out.fetch_add(n as u64, Ordering::Relaxed);
     }
 
-    /// 当前在途请求数（admission 判定用）。
+    /// 当前在途请求数（**全部域**；`hlmg_active_requests` 与 `drain()` 读它）。
+    ///
+    /// 注意它**不再是准入门槛**——判据在 [`Self::try_enter`] 里按域取（复扫 A3）。
     pub fn active_count(&self) -> u64 {
         self.inner.active.load(Ordering::Relaxed)
+    }
+
+    /// **受限域**在途数：准入门槛、拒绝日志与测试读它。
+    pub fn active_gated_count(&self) -> u64 {
+        self.inner.active_gated.load(Ordering::Relaxed)
+    }
+
+    /// **探针域**在途数（`/healthz`）：拒绝日志与测试读它。
+    pub fn active_probe_count(&self) -> u64 {
+        self.inner.active_probe.load(Ordering::Relaxed)
     }
 
     /// agent 连接建立：累计 +1、当前在线 +1。
@@ -513,15 +563,23 @@ impl Metrics {
 ///
 /// 因此：票据要么被正常作用域 drop，要么随请求 future 被丢弃而 drop，两条路都归还槽位。
 /// 注意不可 `Clone`/`Copy`（会导致重复释放）。
+///
+/// 票据记着自己是哪个域的（复扫 A3），否则 Drop 不知道该把票还给受限域还是探针域。
 pub struct Admission {
     metrics: Metrics,
     start: Instant,
+    domain: AdmissionDomain,
 }
 
 impl Admission {}
 
 impl Drop for Admission {
     fn drop(&mut self) {
+        match self.domain {
+            AdmissionDomain::Gated => &self.metrics.inner.active_gated,
+            AdmissionDomain::Probe => &self.metrics.inner.active_probe,
+        }
+        .fetch_sub(1, Ordering::Relaxed);
         self.metrics.inner.active.fetch_sub(1, Ordering::Relaxed);
         self.metrics
             .inner
@@ -556,7 +614,7 @@ impl Drop for AgentConnectionGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::Metrics;
+    use super::{AdmissionDomain, Metrics};
 
     /// 规格（评估 §7 步骤 6 的结转项 A / `PROJECT_SCAN` P2-12）：**计数锁中毒后
     /// `/metrics` 不能跟着挂**。
@@ -610,11 +668,12 @@ mod tests {
                 let (m, b, stop) = (metrics.clone(), barrier.clone(), stop.clone());
                 std::thread::spawn(move || {
                     b.wait();
-                    let mut worst = 0u64;
+                    let (mut worst, mut worst_gated) = (0u64, 0u64);
                     while !stop.load(Ordering::Relaxed) {
                         worst = worst.max(m.active_count());
+                        worst_gated = worst_gated.max(m.active_gated_count());
                     }
-                    worst
+                    (worst, worst_gated)
                 })
             };
             let workers: Vec<_> = (0..threads)
@@ -623,7 +682,7 @@ mod tests {
                     std::thread::spawn(move || {
                         b.wait();
                         // 抢到就立刻放：制造"持票者释放"与"别人正在占位"重叠的窗口
-                        if let Some(ticket) = m.try_enter(1) {
+                        if let Some(ticket) = m.try_enter(1, AdmissionDomain::Gated) {
                             drop(ticket);
                         }
                     })
@@ -633,10 +692,10 @@ mod tests {
                 w.join().unwrap();
             }
             stop.store(true, Ordering::Relaxed);
-            let worst = sampler.join().unwrap();
+            let (worst, worst_gated) = sampler.join().unwrap();
             assert!(
-                worst <= 1,
-                "第 {round} 轮采样到 active={worst} > limit=1：存在幽灵占位 ⇒ 会误拒（R8）"
+                worst <= 1 && worst_gated <= 1,
+                "第 {round} 轮采样到 active={worst} / gated={worst_gated} > limit=1：                 存在幽灵占位 ⇒ 会误拒（R8）"
             );
         }
     }
@@ -645,9 +704,16 @@ mod tests {
     #[test]
     fn try_enter_accounts_exactly_and_treats_zero_as_unlimited() {
         let m = Metrics::default();
-        let a = m.try_enter(2).expect("第 1 个应当放行");
-        let b = m.try_enter(2).expect("第 2 个应当放行");
-        assert!(m.try_enter(2).is_none(), "第 3 个必须被拒");
+        let a = m
+            .try_enter(2, AdmissionDomain::Gated)
+            .expect("第 1 个应当放行");
+        let b = m
+            .try_enter(2, AdmissionDomain::Gated)
+            .expect("第 2 个应当放行");
+        assert!(
+            m.try_enter(2, AdmissionDomain::Gated).is_none(),
+            "第 3 个必须被拒"
+        );
         assert_eq!(
             m.active_count(),
             2,
@@ -656,20 +722,94 @@ mod tests {
 
         drop(a);
         assert_eq!(m.active_count(), 1);
-        let c = m.try_enter(2).expect("释放一个之后必须能再进");
+        let c = m
+            .try_enter(2, AdmissionDomain::Gated)
+            .expect("释放一个之后必须能再进");
         assert_eq!(m.active_count(), 2);
         drop((b, c));
         assert_eq!(m.active_count(), 0);
 
         // `0` = 不限：一直放行，但仍然计数
         let m2 = Metrics::default();
-        let t1 = m2.try_enter(0).expect("limit=0 无条件放行");
-        let t2 = m2.try_enter(0).expect("limit=0 无条件放行");
+        let t1 = m2
+            .try_enter(0, AdmissionDomain::Gated)
+            .expect("limit=0 无条件放行");
+        let t2 = m2
+            .try_enter(0, AdmissionDomain::Gated)
+            .expect("limit=0 无条件放行");
         assert_eq!(m2.active_count(), 2);
         drop(t1);
         assert_eq!(m2.active_count(), 1);
         drop(t2);
         assert_eq!(m2.active_count(), 0);
+    }
+
+    /// 规格（复扫 A3）：**探针域的票据不得消耗受限域的预算**。
+    ///
+    /// `/healthz` 是**无认证**的豁免路径（鉴权只包 `/admin`），先前用 `limit = 0` 表达"不能被拒"。
+    /// 但它照样领票、照样加 `active`，而 `/v1/*` 判的是**同一个** `active` ⇒ 对着 `/healthz` 打
+    /// 一轮就能把 `/v1` 顶到 429，而 LB 看到探针仍 200、认为实例健康：探针把闸门占满了，对外
+    /// 却表现为"整机正常、谁都调不通"。
+    ///
+    /// 域把"能不能被拒"与"记在谁的账上"分开。这条同时钉住三件事：①探针在途不影响受限余量；
+    /// ②探针域有自己的上限；③**总数**仍统计全部在途（`hlmg_active_requests` 与 `drain()` 的
+    /// 语义不变）。
+    #[test]
+    fn a_probe_ticket_does_not_consume_the_gated_budget() {
+        let m = Metrics::default();
+        let g1 = m
+            .try_enter(2, AdmissionDomain::Gated)
+            .expect("第 1 个受限请求");
+        let g2 = m
+            .try_enter(2, AdmissionDomain::Gated)
+            .expect("第 2 个受限请求");
+        assert!(
+            m.try_enter(2, AdmissionDomain::Gated).is_none(),
+            "前提：受限域已满"
+        );
+
+        // 探针域有**自己**的预算（这里用 2 演示；生产取值见 `MAX_CONCURRENT_PROBES`）。
+        let p1 = m
+            .try_enter(2, AdmissionDomain::Probe)
+            .expect("探针有自己的预算");
+        let p2 = m
+            .try_enter(2, AdmissionDomain::Probe)
+            .expect("探针有自己的预算");
+        assert_eq!(
+            m.active_gated_count(),
+            2,
+            "探针在途不得推动受限计数（修复前这里是 4）"
+        );
+        assert_eq!(
+            m.active_count(),
+            4,
+            "总数仍统计全部在途：指标与 drain 的语义不变"
+        );
+
+        // ① 受限域释放一个 → 立刻能再进，哪怕探针还在途
+        drop(g1);
+        let g3 = m
+            .try_enter(2, AdmissionDomain::Gated)
+            .expect("探针在途不该占受限余量（修复前这里是 None）");
+
+        // ② 探针域自己的上限独立生效
+        assert!(
+            m.try_enter(2, AdmissionDomain::Probe).is_none(),
+            "探针预算满了也要拒（无认证路径不能无界消耗）"
+        );
+        assert_eq!(m.active_probe_count(), 2);
+
+        // ③ 借与还都必须精确回到 0
+        drop((g2, g3, p1, p2));
+        assert_eq!(
+            (
+                m.active_count(),
+                m.active_gated_count(),
+                m.active_probe_count()
+            ),
+            (0, 0, 0),
+            "票据 Drop 必须把三个计数都还干净"
+        );
     }
 
     /// 规格（P2-11）：**连接任务的 panic 必须把 `hlmg_quic_connections` 降回去**。

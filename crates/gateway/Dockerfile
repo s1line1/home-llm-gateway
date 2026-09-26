@@ -37,7 +37,7 @@
 # Dashboard 已经编进镜像：容器内既不用挂载宿主机的 `web/dist`，也**不用写 `ui_dir`** ——
 # `config.rs::default_ui_dir()` 的默认值就是下面那个 COPY 目标
 # `/usr/local/share/home-llm-gateway/web`（见 DEPLOY.md §11.5）。
-# 也可以直接用仓库根的 `docker-compose.yml`。
+# 也可以用配套的 `crates/gateway/docker-compose.yml` 起（compose 入口，见 DEPLOY.md §11.6）。
 
 # 构建基底**必须与运行阶段的发行版对齐**：运行阶段是 `debian:bookworm-slim`（Debian 12，
 # glibc 2.36），所以构建基底也用 `-bookworm` 变体。若换成 Debian 13（trixie，glibc 2.41）的基底，

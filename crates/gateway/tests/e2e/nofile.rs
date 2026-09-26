@@ -25,8 +25,19 @@ async fn e2e_startup_raises_the_nofile_soft_limit_in_the_real_process() {
 
     let (original_soft, hard) = rlimit::getrlimit(rlimit::Resource::NOFILE).unwrap();
     let target = hard.min(gateway::nofile::TARGET_SOFT_LIMIT);
-    // 环境太紧（hard 本身就很小）时只跑通用断言，别把环境影响当成失败
-    let lowered = target > 1024 && rlimit::setrlimit(rlimit::Resource::NOFILE, 1024, hard).is_ok();
+    // 能不能**构造**出"启动前被压到 1024"这个场景。`target <= 1024` 时压根没什么可抬的（目标
+    // 没超过 systemd 的默认值）——那是**逻辑上**不适用，不是环境问题。
+    let can_reproduce = target > 1024;
+    if can_reproduce {
+        // 复扫 F4：这里以前写作 `can_reproduce && setrlimit(..).is_ok()`，把"压不下去"吞成
+        // `false`，于是**最严格的那条断言（`soft == target`）被静默跳过**、用例照样报绿。
+        // 既然 `target > 1024`，就有 hard ≥ target > 1024，而把 soft 降到 1024 在任何 unix 上
+        // 都该被允许——压不下去说明环境有额外限制，那就该响，而不是装作跑过了。
+        assert!(
+            rlimit::setrlimit(rlimit::Resource::NOFILE, 1024, hard).is_ok(),
+            "hard={hard} ≥ target={target} > 1024：把 soft 压到 1024 在任何 unix 上都该被允许；             失败会让最严格的那条断言被静默跳过（复扫 F4）"
+        );
+    }
     let soft_before = rlimit::getrlimit(rlimit::Resource::NOFILE).unwrap().0;
 
     let (gw, agent, _base, _key) = start_stack(4, |_| {}).await;
@@ -56,7 +67,7 @@ async fn e2e_startup_raises_the_nofile_soft_limit_in_the_real_process() {
             soft >= target,
             "/proc 里实际生效的 soft 是 {soft}，低于目标 {target} —— 说明 install 没真正生效"
         );
-        if lowered {
+        if can_reproduce {
             assert_eq!(
                 soft, target,
                 "复现了 systemd 的 1024 之后，必须正好抬到 min(hard, TARGET)"
@@ -89,12 +100,22 @@ async fn a_failed_start_leaves_the_process_nofile_limit_untouched() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
 
     let (original_soft, hard) = rlimit::getrlimit(rlimit::Resource::NOFILE).unwrap();
-    // 把 soft 压到 1024（复现 systemd 未设 LimitNOFILE 时的默认），这样"有没有被抬过"
-    // 才是可观测的；环境不允许改限额时**跳过**而不是假通过。
-    if hard < 1024 || rlimit::setrlimit(rlimit::Resource::NOFILE, 1024, hard).is_err() {
-        eprintln!("skipped: 本环境不允许把 NOFILE soft 压到 1024");
-        return;
-    }
+    // 把 soft 压到 1024（复现 systemd 未设 LimitNOFILE 时的默认），这样"有没有被抬过"才是
+    // 可观测的。
+    //
+    // 复扫 F4：这里以前是 `eprintln!("skipped…"); return;` —— 那条路径下这条用例**零断言通过**，
+    // 与"真的跑过并通过"在 gate/CI 眼里完全一样（`return` 不是 `#[ignore]`，报告里都算 ok）。
+    // 前提不成立时唯一诚实的做法是**响**：这条用例在这里证明不了任何东西，就不该报绿。
+    assert!(
+        hard >= 1024,
+        "本环境 NOFILE hard={hard} < 1024，构造不出\"启动前被压到 1024\"的场景 ⇒ 这条用例在这里\
+         等于没跑（复扫 F4）。请换一个 hard ≥ 1024 的环境，别让它静默通过"
+    );
+    assert!(
+        rlimit::setrlimit(rlimit::Resource::NOFILE, 1024, hard).is_ok(),
+        "hard={hard} ≥ 1024：把 soft 压到 1024 在任何 unix 上都该被允许；失败说明环境有额外限制\
+         ⇒ 这条用例在此处等于没跑（复扫 F4）"
+    );
     let soft_before = rlimit::getrlimit(rlimit::Resource::NOFILE).unwrap().0;
 
     // 隧道材料合法、只有 HTTPS 材料是垃圾 → 失败点必然在 TLS 构建阶段，早于 install()

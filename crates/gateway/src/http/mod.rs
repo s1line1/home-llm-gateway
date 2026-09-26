@@ -1,6 +1,6 @@
 //! 公网 HTTP 入口：认证 → 路由 → 编码为隧道帧转发。
 
-use axum::{extract::DefaultBodyLimit, middleware, routing::get, Router};
+use axum::{extract::DefaultBodyLimit, middleware, response::Response, routing::get, Router};
 use tracing::info;
 
 use crate::state::AppState;
@@ -29,6 +29,20 @@ async fn no_store(req: axum::extract::Request, next: middleware::Next) -> axum::
     resp.headers_mut().insert(
         axum::http::header::CACHE_CONTROL,
         axum::http::HeaderValue::from_static("no-store"),
+    );
+    resp
+}
+
+/// 给响应打上 `Vary: Accept`（复扫 A5）。
+///
+/// **同一条 URI 按 `Accept` 返回不同表示时，这是义务**：缓存默认只按 URI 作键，于是
+/// "浏览器导航 `/metrics`（`Accept: text/html`）拿到的 SPA 页面"会被存下来，随后 Dashboard 的
+/// `fetch('/metrics')`（`Accept: */*`）就可能拿到那份 HTML —— 前端的解析器把 HTML 解析成
+/// "全 0"，与"网关真的空闲"不可区分（G3）。`Vary` 让同一 URI 的不同表示各占一个缓存条目。
+pub(super) fn vary_on_accept(mut resp: Response) -> Response {
+    resp.headers_mut().insert(
+        axum::http::header::VARY,
+        axum::http::HeaderValue::from_static("Accept"),
     );
     resp
 }

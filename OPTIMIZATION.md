@@ -43,7 +43,7 @@
 | # | 优化项 | 现状 | 方案 | 优先级/工作量 |
 |---|---|---|---|---|
 | E1 ✅ | CI | ~~无~~ → `.github/workflows/ci.yml`：rust job（fmt/clippy -D warnings/test）+ web job（pnpm build） | 高 / 低 |
-| E2 ⚠️ 名义 | 工具链锁定 | → `rust-toolchain.toml`（stable + rustfmt/clippy）。**但 `channel = "stable"` 是浮动 channel，没钉版本；CI 用 `dtolnay/rust-toolchain@stable`（不读该文件），`Cargo.toml` 也无 `rust-version` 兜底** → 本地与 CI 各按"当时的 stable"跑，lint 会漂移（实测：`clippy::result_large_err` 只在 CI 报）。根因与修法见 `TODO.md`「工具链没真的锁版本」 | 中 / 低 |
+| E2 ✅ | 工具链锁定 | → `rust-toolchain.toml` 的 `channel = "1.97.1"`（**具体补丁版本，唯一来源**；不再浮动）+ `Cargo.toml` 的 `rust-version = "1.97"`（MSRV）+ `crates/gateway/Dockerfile` 的 `FROM rust:1.97.1-*` / `ARG RUST_TOOLCHAIN`；CI 直接读该文件（不再是 `dtolnay/rust-toolchain@stable`），`scripts/check-toolchain.sh` 自动发现所有 Rust Dockerfile 逐处比对，CI 与 `make check` 都跑 → 漂移会红，"本地全绿 → CI 红"（`clippy::result_large_err`）不再出现 | 中 / 低 |
 | E3 ✅ | workspace lints | → `[workspace.lints]`（unsafe_code=deny、dbg_macro/todo=deny），各 crate 继承；现有 clippy 警告全部清零 | 中 / 低 |
 | E4 | 版本与 changelog | 0.1.0 未动 | 0.2.0 + CHANGELOG（配合 P3 协议迁移约定） | 低 / 低 |
 

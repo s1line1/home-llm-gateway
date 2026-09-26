@@ -96,6 +96,8 @@ cargo build --release            # 产出 target/release/{gateway,agent,mock-llm
 
 ```bash
 ./scripts/build-release.sh       # 已安装的 target 会构建；未安装的按提示 rustup target add
+# 某个目标构建/打包失败**不会**中断后面的目标（跨平台常常只装得上其中几个）：
+# 脚本逐个跑完再汇总，有失败时列出失败的 target 并以非 0 退出
 # macOS → Linux 需要交叉链接器，见脚本头部注释；推荐 musl 目标出静态二进制
 # 产物：dist/home-llm-gateway-<版本>-<平台>.tar.gz
 ```
@@ -257,6 +259,7 @@ curl -N -k -H "Authorization: Bearer <你的key>" \
 | agent 日志：连接失败 / 一直重试 | ① 安全组 UDP 4433 是否放行；② edge 侧网络是否封出站 UDP（少见）；③ `nc -u -vz <IP> 4433` 测连通 |
 | agent：TLS 握手失败 | 配置项 `server_name` 与网关 server 证书 SAN 不匹配；确认填的是 SAN 里的域名或公网 IP |
 | 网关日志：agent connected 但很快消失 | agent 心跳被断（网络不稳）；检查 UDP 丢包；`agent_stale_secs`（网关配置）适当调大 |
+| **周期性 503/404，但两侧进程都活着、注册表看着正常** | 心跳与失联窗口**没配成对**：`agent_stale_secs`（网关）必须明显大于 `heartbeat_secs`（agent），窗口里至少容得下**两次**心跳。两侧启动时都会为这种情况打一条 WARN，先去看日志（agent 侧说 `heartbeat_secs is slow…`，网关侧说 `agent_stale_secs is tight…`） |
 | **请求大面积 502/超时，`/admin/agents` 恒显示 1 个 agent，`hlmg_agent_connections_total` 飞涨** | **两台机器 `agent_id` 撞车**（见 §6 警告）：改配置里任一方的 `agent_id` 为唯一值后重启该 agent |
 | curl 返回 401 | API Key 不对或没带 `Authorization: Bearer` |
 | curl 返回 503 | 网关没注册到健康 agent（看网关/agent 日志） |
@@ -358,7 +361,9 @@ docker build -f crates/gateway/Dockerfile -t home-llm-gateway .
    多一个 `--bin agent` 与一次 COPY）——本仓库不再提供 agent 镜像。
 3. **`keys.db` 是 SQLite WAL 模式**：会额外生成 `keys.db-wal` / `keys.db-shm`，所以必须挂
    **目录**（不能只挂那个文件），而且**目录**要可写；SELinux 主机上可能还要加 `:z` / `:Z`。
-   三个文件的权限由网关启动时收紧为 `0600`（`-wal`/`-shm` 跟随主库）。
+   三个文件的权限由网关启动时收紧为 `0600`：主库与**已经存在**的 `-wal`/`-shm` 都会被显式
+   `chmod`（侧车平时是 0600 只是继承主库的 mode，所以拷贝/迁移来的旧库要专门收一遍；本次
+   复扫 C2-1 正是漏在这里）。
 
 ### 11.4 端口与安全组
 
@@ -385,7 +390,9 @@ docker build -f crates/gateway/Dockerfile -t home-llm-gateway .
   （`config.rs` 的 `default_ui_dir()`）——不构建、不挂载、不加配置项，起来就有 Dashboard。
   有配置就用配置（例如你想换成自己挂进去的一套产物，照常写 `ui_dir:` 覆盖）。
 
-  **从老部署升级**：`docker compose build && docker compose up -d`，然后**删掉配置里的
+  **从老部署升级**：`docker compose -f crates/gateway/docker-compose.yml build && docker compose
+  -f crates/gateway/docker-compose.yml up -d`（`-f` 不能省，仓库根已经没有 compose 文件了：裸
+  `docker compose build` 会报 `no configuration file provided`；见 §11.6），然后**删掉配置里的
   `ui_dir` 那一行**（如果它指向宿主上那份 `web/dist` —— 现在镜像自带、且更省事），
   再把宿主上的 `web/` 目录删掉。不删配置也能跑，只是还在用你挂的那份。
 

@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
-# git pre-commit hook：提交前质量门（许可证 + 格式）。
+# git pre-commit hook：提交前质量门（许可证 + 格式 + 记录漂移）。
+#
 # 启用：git config core.hooksPath scripts/git-hooks
+#
+# 为什么记录漂移放在这里而不是 CI：`docs/PROJECT_SCAN.md` / `docs/SUPPORT_LAYER_RAW_FINDINGS.md`
+# **不在仓库里**（`.gitignore` 的 `/docs/*`），CI 上那份脚本只会打印"跳过（不存在）"。它真正
+# 能生效的地方是**维护者的工作树**——每次提交都在，成本约 0.1s（重扫 H1-5：在此之前它自称
+# "审计的第一道筛子"，却没有任何门禁在跑它）。
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
@@ -17,3 +23,11 @@ fi
 
 echo "==> cargo fmt --check"
 cargo fmt --check
+
+echo "==> check-records: 记录里的指针与提交声明"
+if command -v python3 >/dev/null 2>&1; then
+  python3 scripts/check-records.py
+else
+  # 明确跳过（而不是静默通过）：没有 python3 就查不了，别让人以为这项跑过了。
+  echo "    ⚠️ 本机没有 python3，**跳过**记录漂移检查（这一项这次没查）"
+fi

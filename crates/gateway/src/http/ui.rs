@@ -17,7 +17,7 @@ use tower_http::services::{ServeDir, ServeFile};
 use crate::state::AppState;
 
 /// SPA fallback：浏览器导航（Accept: text/html）→ index.html；静态资源
-/// （带扩展名路径，如 /assets/*.js）→ 文件；其余（API 类未注册路径）→ 404。
+/// （带扩展名路径，如 /assets/*.js）→ 文件，**未命中就是 404**；其余（API 类未注册路径）→ 404。
 pub(super) async fn ui_fallback(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -41,17 +41,48 @@ pub(super) async fn ui_fallback(
         .unwrap_or(false);
     if !wants_html && !has_extension {
         // 统一错误格式：以前这里手搓的是 `type: "not_found"`，与 proxy 的
-        // `not_found_error` 不是同一个语义名（同一个网关两种 404）
-        return crate::openai::error_response(StatusCode::NOT_FOUND, "not found");
+        // `not_found_error` 不是同一个语义名（同一个网关两种 404）。
+        //
+        // `Vary: Accept`（复扫 A5）：**同一个 URI** 带了 `Accept: text/html` 就会拿到 200 的
+        // SPA 页面（下面那个分支），而这个 404 只对非导航请求成立 ⇒ 缓存必须按 Accept 分条，
+        // 否则一份被缓存的 404（或一份被缓存的 HTML）会喂给另一类请求。
+        return super::vary_on_accept(crate::openai::error_response(
+            StatusCode::NOT_FOUND,
+            "not found",
+        ));
     }
-    let req = axum::extract::Request::builder()
-        .uri(uri)
-        .body(axum::body::Body::empty())
-        .unwrap();
+    let req = || {
+        axum::extract::Request::builder()
+            .uri(uri.clone())
+            .body(axum::body::Body::empty())
+            .unwrap()
+    };
+
+    // **带扩展名 = 资源请求**：只认磁盘上的文件，**不能挂 SPA fallback** ——
+    // `ServeDir` 的 fallback 在文件缺失时会被调用、且它返回的状态码不会被改写，于是
+    // `/assets/missing.js` 会拿到 `200 + text/html` 的 index.html（浏览器把 HTML 当 JS/CSS
+    // 解析：语法错误 + 一份看似成功、可缓存的 200），`/data.json` 这类带点号的未注册路径
+    // 也拿不到真 404（重扫 A2，实测修复前两者都是 200 + text/html）。
+    // SPA fallback 只服务"浏览器导航"（无扩展名 + Accept: text/html）那一种情形。
+    if has_extension {
+        let service = ServeDir::new(dir).append_index_html_on_directories(true);
+        return match service.oneshot(req()).await {
+            // 缺失资源也用全局唯一的错误形状（与上面 API 路径的 404 一致）
+            Ok(resp) if resp.status() == StatusCode::NOT_FOUND => {
+                crate::openai::error_response(StatusCode::NOT_FOUND, "not found")
+            }
+            Ok(resp) => {
+                let (parts, body) = resp.into_parts();
+                Response::from_parts(parts, axum::body::Body::new(body))
+            }
+            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+    }
+
     let service = ServeDir::new(dir)
         .append_index_html_on_directories(true)
         .fallback(ServeFile::new(dir.join("index.html")));
-    match service.oneshot(req).await {
+    match service.oneshot(req()).await {
         Ok(resp) => {
             // 直接流式转发，不再先 collect 成 Bytes。
             //
@@ -64,7 +95,9 @@ pub(super) async fn ui_fallback(
             // parts 原样保留，故 content-type / content-length / last-modified 等
             // 由 tower-http 决定的头不变。
             let (parts, body) = resp.into_parts();
-            Response::from_parts(parts, axum::body::Body::new(body))
+            // 这是 SPA 页面（只有 `Accept: text/html` 会走到这里）⇒ 必须 `Vary: Accept`（A5）。
+            // 资源分支（带扩展名）不在此列：它与 Accept 无关，同一个 URI 只有一种表示。
+            super::vary_on_accept(Response::from_parts(parts, axum::body::Body::new(body)))
         }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
@@ -124,6 +157,13 @@ mod tests {
     use crate::http::app;
     use crate::http::test_util::{body_str, test_state};
 
+    /// 取响应的 `Vary`（没有就是 None）。
+    fn vary(resp: &Response) -> Option<&str> {
+        resp.headers()
+            .get(axum::http::header::VARY)
+            .and_then(|v| v.to_str().ok())
+    }
+
     /// 构造 ui_fallback 的请求并返回响应。
     async fn call_ui_fallback(state: AppState, path: &str, accept: Option<&str>) -> Response {
         let mut builder = axum::extract::Request::builder().uri(path);
@@ -149,6 +189,11 @@ mod tests {
         // 浏览器导航（Accept: text/html）→ SPA index.html
         let resp = call_ui_fallback(state.clone(), "/keys", Some("text/html")).await;
         assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            vary(&resp),
+            Some("Accept"),
+            "同一个 URI 只对导航请求给 SPA ⇒ 必须声明按 Accept 协商（复扫 A5）"
+        );
         assert!(body_str(resp).await.contains("id=\"root\""));
 
         // 静态资源（带扩展名，Accept: */*）→ 文件
@@ -159,12 +204,67 @@ mod tests {
         // API 类未注册路径（Accept: */*、无扩展名）→ 404，绝不能返回 index.html
         let resp = call_ui_fallback(state.clone(), "/admin/agents", Some("*/*")).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            vary(&resp),
+            Some("Accept"),
+            "同一条路径带 text/html 会拿到 200 的 SPA ⇒ 这个 404 也必须 Vary（复扫 A5）"
+        );
         // 错误体走 openai::error_response：type 是 `not_found_error`
         // （以前这里手搓 `not_found`，与 proxy 的 404 不是同一个语义名）
         let body = body_str(resp).await;
         let v: serde_json::Value = serde_json::from_str(&body).expect("404 body is JSON");
         assert_eq!(v["error"]["type"], "not_found_error");
         assert!(!body.contains("id=\"root\""), "API paths must not get SPA");
+    }
+
+    /// 规格（重扫 A2）：**不存在的资源必须是 404，不能被 SPA fallback 顶成 `200 + index.html`**。
+    ///
+    /// 修复前两个分支共用同一个挂了 `.fallback(ServeFile(index.html))` 的 `ServeDir`，而
+    /// tower-http 在文件 NotFound 时会调用 fallback 并**原样返回它的状态码** ⇒
+    /// `/assets/missing.js`、`/data.json` 都拿到 `200 + text/html` 的 index.html：
+    /// 浏览器把 HTML 当 JS/CSS 解析（语法错误），而且这份 200 还可能被缓存；带点号的未注册
+    /// 路径也拿不到真 404，与模块头声明的边界相反。
+    ///
+    /// 判据同时钉住**错误形状**：404 走 `openai::error_response`（全局唯一的错误形状），
+    /// 而不是 tower-http 的空体 404 —— 静态缺失也要能被同一套客户端逻辑识别。
+    #[tokio::test]
+    async fn ui_fallback_returns_404_for_missing_assets_instead_of_index_html() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "<div id=\"root\">ui</div>").unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+        std::fs::write(dir.path().join("assets/app.js"), "console.log(1)").unwrap();
+        let state = test_state(Some(dir.path().to_path_buf()));
+
+        // 缺失的静态资源：浏览器可能带 `*/*`，也可能因为地址栏直接打开而带 `text/html`
+        for accept in ["*/*", "text/html"] {
+            let resp = call_ui_fallback(state.clone(), "/assets/missing.js", Some(accept)).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "缺失资源必须 404（Accept: {accept}），绝不能拿 index.html 顶替"
+            );
+            let body = body_str(resp).await;
+            assert!(
+                !body.contains("id=\"root\""),
+                "不能把 index.html 当资源返回"
+            );
+            let v: serde_json::Value = serde_json::from_str(&body).expect("404 body is JSON");
+            assert_eq!(v["error"]["type"], "not_found_error");
+        }
+
+        // 带点号但未注册的路径同理（以前也是 200 + HTML）
+        let resp = call_ui_fallback(state.clone(), "/data.json", Some("text/html")).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // 对照组一：真实存在的资源照旧按文件返回
+        let resp = call_ui_fallback(state.clone(), "/assets/app.js", Some("*/*")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(body_str(resp).await.contains("console.log"));
+
+        // 对照组二：浏览器导航（无扩展名 + text/html）照旧拿到 SPA
+        let resp = call_ui_fallback(state, "/keys", Some("text/html")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(body_str(resp).await.contains("id=\"root\""));
     }
 
     /// 大资源：body 现在是**流式**转发（不再 collect 成 Bytes），本用例锁住"改流式没把

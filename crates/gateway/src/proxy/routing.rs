@@ -71,15 +71,13 @@ pub(super) async fn open_and_send(
             // 503/404/429 不足以区分。尤其"NoAgent"有两种成因——注册表空，或注册表里
             // 有人但全部心跳超时（stale）——只看状态码会把后者误判成"agent 掉了"。
             Err(
-                reason @ (AcquireError::NoAgent | AcquireError::NoModel | AcquireError::AtCapacity),
+                reason @ (AcquireError::NoAgent
+                | AcquireError::NoModel
+                | AcquireError::AtCapacity
+                | AcquireError::AllExcluded),
             ) => {
                 let st = state.registry.status(state.agent_stale_after);
-                let why = match reason {
-                    AcquireError::NoAgent if st.registered == 0 => "registry-empty",
-                    AcquireError::NoAgent => "all-candidates-stale",
-                    AcquireError::NoModel => "no-agent-serves-model",
-                    _ => "all-candidates-at-capacity",
-                };
+                let (why, status, message) = rejection_response(reason, st.registered);
                 state.metrics.record_agent_rejection(why);
                 warn!(
                     model = %model,
@@ -99,15 +97,6 @@ pub(super) async fn open_and_send(
                         message: format!("{err}; no other agent available to retry"),
                     });
                 }
-                let (status, message) = match reason {
-                    AcquireError::NoAgent => (StatusCode::SERVICE_UNAVAILABLE, "no edge available"),
-                    AcquireError::NoModel => {
-                        (StatusCode::NOT_FOUND, "model not found on any agent")
-                    }
-                    AcquireError::AtCapacity => {
-                        (StatusCode::TOO_MANY_REQUESTS, "agent at capacity")
-                    }
-                };
                 return Err(RouteFailure {
                     status,
                     message: message.to_string(),
@@ -132,6 +121,11 @@ pub(super) async fn open_and_send(
                 //
                 // 这条判据（忙/死）由注册表给出，本模块只把结果映射成**对外契约**：
                 // 指标标签、状态码、文案、以及要不要换连接重试。
+                //
+                // 注意"忙"这一支在测试里不好到达（踩过一次，缺口与正确做法登记在 `TODO.md`
+                // 的「2026-09-25 复扫：回归测试缺口」）：`entry.open_stream()` 只在**对端**广告的
+                // 流额度用尽时才真的阻塞，而探针若用 `.send().await` 取到状态码就丢掉响应，
+                // 隧道流只活几百微秒、额度永远不会被排满。
                 let disposition = match &failure {
                     OpenFailure::TimedOut => state.registry.report_open_timeout(
                         &entry,
@@ -226,10 +220,13 @@ pub(super) async fn open_and_send(
                 state.metrics.record_tunnel_retry("failed");
                 // 为什么这里保持 502，而不像开流臂的 busy 那样给 429：写超时**没有**"容量已满"
                 // 的正面证据——连接级背压由共享发送缓冲/UDP socket 决定，一条流也能把它填满，
-                // 在途流数不是有效代理（这正是本臂不复用 open_timeout_is_fatal 的原因）。
-                // 429 还会带上 `Retry-After: 60` 与 `error.type=rate_limit_error`，等于把
-                // "服务端这次刷不出去"说成"客户端发太多"，并让客户端白等一分钟。
+                // 在途流数不是有效代理（这正是本臂不复用 `open_timeout_is_fatal` 的原因）。
+                // 429 的语义是"客户端发太多 / 容量已满"，这里给不出这个判断。
                 // 背压与坏连接的区分由 `hlmg_tunnel_write_failures_total{class=…}` 与日志承担。
+                //
+                // （2026-09-26 复扫 A4 之后：429 不再自带一个写死的 `Retry-After: 60`，只有
+                // 算得出真实重试时间的来源才带它——所以那条"让客户端白等一分钟"的旁证不再成立，
+                // 但上面那个状态码语义的理由本身就足够。）
                 return Err(RouteFailure {
                     status: StatusCode::BAD_GATEWAY,
                     message: e,
@@ -252,4 +249,86 @@ pub(super) async fn open_and_send(
         break (entry, slot, recv, send);
     };
     Ok((entry, slot, recv, send))
+}
+
+/// 选不出 agent 时的对外契约：`(指标标签, 状态码, 文案)`。
+///
+/// 抽成纯函数是为了能**直接**钉住这张表（复扫 B1）——其中"忙必须是 429"这条在 e2e 里要靠
+/// 压满对端的流额度才会触发，代价高且依赖时序；而它恰恰是最容易被写错的一条：`NoAgent` 与
+/// `AllExcluded` 长得像，混在一起就会把"唯一的 agent 正忙"报成 503 `no edge available`，
+/// 还把原因记成 `all-candidates-stale`（"有人但心跳全过期"），两处都与事实相反。
+///
+/// `registered` = 注册表里的条目数（含失联未关的），用来把 `NoAgent` 分成"真没人"与"全 stale"。
+fn rejection_response(
+    reason: AcquireError,
+    registered: usize,
+) -> (&'static str, StatusCode, &'static str) {
+    let why = match reason {
+        AcquireError::NoAgent if registered == 0 => "registry-empty",
+        AcquireError::NoAgent => "all-candidates-stale",
+        AcquireError::NoModel => "no-agent-serves-model",
+        // `AllExcluded` 与 `AtCapacity` 对运维是同一件事：候选都在、都顶到承载上限。区别只在
+        // "谁发现的"——前者是重试把所有候选试过了一遍，后者是一次就占不到位。
+        AcquireError::AtCapacity | AcquireError::AllExcluded => "all-candidates-at-capacity",
+    };
+    let (status, message) = match reason {
+        AcquireError::NoAgent => (StatusCode::SERVICE_UNAVAILABLE, "no edge available"),
+        AcquireError::NoModel => (StatusCode::NOT_FOUND, "model not found on any agent"),
+        // "忙"走到底：调用方只在 `last_failure` 为空时走到这里，而"忙"刻意不写
+        // `last_failure`（见上面 `if !busy { last_failure = ... }`）——所以这里必须回 429。
+        AcquireError::AtCapacity | AcquireError::AllExcluded => {
+            (StatusCode::TOO_MANY_REQUESTS, "agent at capacity")
+        }
+    };
+    (why, status, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 规格（2026-09-25 复扫 B1）：**唯一 agent 忙到底 = 429 容量不足**，不是 503。
+    ///
+    /// `AllExcluded`（本轮把候选都试过一遍）与 `NoAgent`（注册表里没人/全 stale）必须给出
+    /// 完全不同的状态码与标签；把两者混起来正是 `pick()` 原来的写法，那是本次修的缺陷。
+    #[test]
+    fn at_capacity_is_429_and_not_confused_with_no_agent() {
+        assert_eq!(
+            rejection_response(AcquireError::AllExcluded, 1),
+            (
+                "all-candidates-at-capacity",
+                StatusCode::TOO_MANY_REQUESTS,
+                "agent at capacity"
+            ),
+            "候选都在、都在忙 ⇒ 429 容量不足（修复前这里是 503 no edge available）"
+        );
+        assert_eq!(
+            rejection_response(AcquireError::AtCapacity, 1),
+            rejection_response(AcquireError::AllExcluded, 1),
+            "两种'忙'对客户端必须是同一件事"
+        );
+
+        // 对照：真没人 / 全 stale / 没模型，各自仍然走自己那条。
+        assert_eq!(
+            rejection_response(AcquireError::NoAgent, 0),
+            (
+                "registry-empty",
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no edge available"
+            )
+        );
+        assert_eq!(
+            rejection_response(AcquireError::NoAgent, 3).0,
+            "all-candidates-stale",
+            "有人但都 stale 仍要分开记"
+        );
+        assert_eq!(
+            rejection_response(AcquireError::NoModel, 3),
+            (
+                "no-agent-serves-model",
+                StatusCode::NOT_FOUND,
+                "model not found on any agent"
+            )
+        );
+    }
 }

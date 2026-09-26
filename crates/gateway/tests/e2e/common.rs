@@ -227,7 +227,12 @@ pub async fn wait_for_any_agent_inflight(base: &str, want: u64) {
 }
 
 pub async fn metric_gauge(base: &str, name: &str) -> u64 {
-    let text = reqwest::get(format!("{base}/metrics"))
+    // 用有界客户端（重扫 F2）：`reqwest::get` 内部是**默认无超时**的 client，而本函数被
+    // `head_timeout`/`write_backpressure`/`stalls` 多条 e2e 当作"读一个指标"的一步调用 ——
+    // `/metrics` 一旦卡住，`cargo test` 下整套会无限期挂起。
+    let text = test_client()
+        .get(format!("{base}/metrics"))
+        .send()
         .await
         .unwrap()
         .text()
@@ -591,18 +596,25 @@ mod step_guard_tests {
         );
     }
 
-    /// 规格（P2-17 的**机械守卫**）：e2e 里每一个裸 reqwest client（`Client::new()`）都必须带
-    /// `e2e-bare-client:` 标记说明理由。
+    /// 规格（P2-17 的**机械守卫**）：e2e 里每一个裸 reqwest client（`Client::new()`，
+    /// 以及内部就是默认 client 的 `reqwest::get`）都必须带 `e2e-bare-client:` 标记说明理由。
     ///
     /// 为什么值得一条守卫：这条不变量原本只靠代码评审维持 —— 2026-09-23 的审计正是这样发现
     /// `lifecycle.rs`/`stalls.rs` 里又冒出裸 client 的（记录写完之后才加进来的提交），而 e2e 是
     /// `#[serial]`、**`cargo test` 没有 per-test 超时**，一处卡住 = 整个套件无限期挂起
     /// （nextest 只是被 `slow-timeout` 兜住，180 s 后才杀）。"本该完成"的一步请用
     /// [`test_client()`]；确实要卡住的，加标记并把理由写清。
+    ///
+    /// **两条 needle**（重扫 F2）：第一版只盯 `Client::new()`，于是 `reqwest::get` 这条更隐蔽的
+    /// 路（一行就能写出无界等待，内部同样是默认无超时的 client）整类漏了过去 —— 它当时就藏在
+    /// 共享 helper `metric_gauge` 里，被 `head_timeout`/`write_backpressure`/`stalls` 多条 e2e 调用。
     #[test]
     fn bare_reqwest_clients_carry_a_reason_marker() {
-        // 拆开拼，免得守卫在**自己的源码里**匹配到自己。
-        let needle = format!("{}{}", "reqwest::Client::", "new()");
+        // 拆开拼，免得守卫在**自己的源码里**匹配到自己（两个 needle 都由片段拼出来）。
+        let needles = [
+            format!("{}{}", "reqwest::Client::", "new()"),
+            format!("{}{}", "reqwest::", "get("),
+        ];
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/e2e");
         let mut marked = 0usize;
         let mut offenders: Vec<String> = Vec::new();
@@ -614,7 +626,7 @@ mod step_guard_tests {
             let text = std::fs::read_to_string(&path).expect("read source");
             let lines: Vec<&str> = text.lines().collect();
             for (i, line) in lines.iter().enumerate() {
-                if !line.contains(&needle) {
+                if !needles.iter().any(|needle| line.contains(needle)) {
                     continue;
                 }
                 let from = i.saturating_sub(3);

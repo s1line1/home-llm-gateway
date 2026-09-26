@@ -88,25 +88,43 @@ pub struct UsageDelta {
 pub(crate) struct UsageStore {
     usage: RwLock<HashMap<String, UsageRecord>>,
     db: Arc<Mutex<Option<Connection>>>,
+    /// 库是否可用。**构造时定死**：`db` 里的 `Option` 一旦建成就不再变（打不开的库降级成
+    /// `None`，而 `None` 不会被重新填上），所以"有没有库"是这个模块的**静态事实**。
+    /// 缓存它让 [`Self::has_pending`] 不必去抢那把同步 `db` 锁——见那里的说明（复扫 C2-2）。
+    has_db: bool,
+    /// [`Self::flush_once`] 的串行化闸门（复扫 C1）。
+    ///
+    /// 周期任务与关闭路径可以**并发**进来，而 `flush_once` 在拿 `db` 锁之前就取快照 ⇒
+    /// "先取快照、后拿到 `db` 锁"的那次会用**旧值覆盖新值**。闸门把"取快照 → 提交 → 回写
+    /// `flushed` 标记"整段串起来，于是后到的 flush 一定看到最新的快照。
+    flush_gate: Mutex<()>,
 }
 
 impl UsageStore {
     /// 建实例：库可用则从 `key_usage` 载入（失败只告警、按空账本继续，与凭据存储同风格），
     /// 库不可用（`None`）则纯内存记账。
     pub(crate) fn new(db: Arc<Mutex<Option<Connection>>>) -> Self {
-        let usage = match lock_or_recover(&db).as_ref() {
-            Some(conn) => match load_usage(conn) {
-                Ok(map) => map,
-                Err(e) => {
-                    tracing::warn!("usage db load failed: {e}; using empty usage store");
-                    HashMap::new()
+        let (usage, has_db) = {
+            let guard = lock_or_recover(&db);
+            match guard.as_ref() {
+                Some(conn) => {
+                    let usage = match load_usage(conn) {
+                        Ok(map) => map,
+                        Err(e) => {
+                            tracing::warn!("usage db load failed: {e}; using empty usage store");
+                            HashMap::new()
+                        }
+                    };
+                    (usage, true)
                 }
-            },
-            None => HashMap::new(),
+                None => (HashMap::new(), false),
+            }
         };
         Self {
             usage: RwLock::new(usage),
             db,
+            has_db,
+            flush_gate: Mutex::new(()),
         }
     }
 
@@ -148,9 +166,13 @@ impl UsageStore {
     /// 判据放在这里而不是让 `flush_once` 假装落过库：**"有没有库"是这个模块的静态事实**，让
     /// `flushed` 标记去说谎会污染"库里已经是这个值"的语义（那是崩溃安全的关键不变量）。
     pub(crate) fn has_pending(&self) -> bool {
-        // 先读 `db` 的状态、再锁 `usage`（两把锁不嵌套；`flush_once` 也是先 usage 后 db，
-        // 顺序一致就不会有环）。
-        if lock_or_recover(&self.db).is_none() {
+        // **不碰 `db` 互斥锁**（复扫 C2-2）：本函数跑在 **async worker** 上（`usage_flush::spawn`
+        // 的任务），而 `db` 会被 `flush_once` 的**整个事务**持有（busy 重试最长 5s）——
+        // 同步等它会把 runtime 线程按住，与那个模块"任务本身不做阻塞 IO"的说明矛盾。
+        // "有没有库"是构造时定死的静态事实（见 `has_db`），所以这里根本不需要那把锁。
+        //
+        // `usage` 那把锁只护内存读写、不跨 IO，保留。
+        if !self.has_db {
             return false;
         }
         read_or_recover(&self.usage)
@@ -171,9 +193,14 @@ impl UsageStore {
     /// 返回本轮**已提交**的 key 数（任何一行失败 ⇒ 整批回滚 ⇒ 返回 0）；`force = true` 时
     /// 忽略"是否变化"（用于关闭前落库）。
     pub(crate) fn flush_once(&self, force: bool) -> usize {
+        // 串行化闸门（复扫 C1）：关闭路径的强制 flush 与周期任务可以**并发**（周期任务跑在
+        // `spawn_blocking` 上，而 `run_bounded` 的超时**不取消**它）。闸门必须落在**取快照
+        // 之前**——否则"先取快照、后拿到 `db` 锁"的那次会用旧的绝对累计值覆盖新值，而进程
+        // 随即退出，这段差值永久丢失。谁先开始谁先结束，于是后到的一定看到最新快照。
+        let _serialized = lock_or_recover(&self.flush_gate);
         // 内存模式没有库可写：**先**判断再建批，别把 O(keys) 的快照克隆出来又丢掉（SL-P3-13）。
         // 周期任务现在会被 `has_pending` 挡住，但关闭路径仍会调到这里。
-        if lock_or_recover(&self.db).is_none() {
+        if !self.has_db {
             return 0;
         }
         // 准备阶段只在内存锁内做，不碰 SQLite。
@@ -458,6 +485,43 @@ mod tests {
         );
     }
 
+    /// 规格（2026-09-25 复扫 C2-2）：`has_pending()` **不能**去抢那把同步 `db` 锁。
+    ///
+    /// 它跑在 **async worker** 上（`usage_flush::spawn` 的任务），而 `db` 会被 `flush_once` 的
+    /// **整个事务**持有（busy 重试最长 5s）⇒ 同步等它就是把 runtime 线程按住，与
+    /// `usage_flush` 说的"任务本身不做阻塞 IO"矛盾。
+    ///
+    /// 控制点：测试自己握住 `db` 锁（扮演"一次 flush 正在提交"），再在**另一个线程**上问一次
+    /// `has_pending`。修复后它立刻回答（判据是构造时定死的 `has_db`）；老实现会在那里等锁，
+    /// 于是只能等超时 ⇒ 红。放在另一个线程并带超时，是为了让它**失败**而不是把测试挂死。
+    #[test]
+    fn has_pending_never_waits_for_the_db_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::storage::KeyStore::new(Some(dir.path().join("keys.db")));
+        let key = store.create("c2-2".into()).unwrap();
+        store.accumulate_usage(
+            &key.record.id,
+            "c2-2",
+            &UsageDelta {
+                prompt_tokens: 1,
+                completion_tokens: 0,
+                estimated: false,
+            },
+        );
+
+        let guard = lock_or_recover(&store.inner.db);
+        let probe = store.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(probe.usage_has_pending());
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+            Ok(pending) => assert!(pending, "有库 + 有未落库数据 ⇒ 必须报 pending"),
+            Err(_) => panic!("has_pending 卡在 db 锁上 —— 它会阻塞 async worker（复扫 C2-2）"),
+        }
+        drop(guard);
+    }
+
     /// 对照：**有库时**累加后必须报告待落库 —— 防止上面那条被修成"永远 false"。
     #[test]
     fn a_file_backed_store_still_reports_pending_usage() {
@@ -477,5 +541,64 @@ mod tests {
         assert!(store.usage_has_pending(), "有库时累加后必须报告待落库");
         assert_eq!(store.flush_usage_once(false), 1);
         assert!(!store.usage_has_pending(), "落库后不该再 pending");
+    }
+
+    /// 规格（2026-09-25 复扫 C1）：周期 flush 与关闭 flush 必须**串起来**。
+    ///
+    /// 为什么：两者可以并发（周期任务跑在 `spawn_blocking` 上，而关闭路径 `run_bounded` 的
+    /// 超时**不取消**它），而 `flush_once` 原先在**拿 `db` 锁之前**就取了快照 ⇒ "先取快照、
+    /// 后拿到 `db` 锁"的那次会用**旧值覆盖新值**，紧接着进程退出，这段差值永久丢失——与
+    /// `usage_flush` 承诺的"正常关闭不丢已结算的用量"冲突。
+    ///
+    /// 这条测试用一个**确定的**控制点钉住它：测试自己握住串行化锁来扮演"一次 flush 正在
+    /// 进行"，再从另一个线程发起第二次 flush。修复后第二次会停在**取快照之前**；期间内存
+    /// 继续增长，所以放开锁之后它必须把增量带上。修复前（或把那次加锁删掉时）第二次会立刻
+    /// 取一份旧快照落库，库就落在内存后面 —— 红是确定的，不依赖调度运气。
+    ///
+    /// 注：第一版试图靠"两次 flush 抢 `db` 锁"来复现，结果两次都 park 之后是 FIFO 唤醒、
+    /// 主线程抢锁也被移交给了等待者，**缺陷根本触发不了**。所以这里改成显式控制串行化锁。
+    #[test]
+    fn a_flush_waits_for_the_previous_one_instead_of_snapshotting_early() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keys.db");
+        let store = crate::storage::KeyStore::new(Some(path.clone()));
+        let key = store.create("c1".into()).unwrap();
+        let id = key.record.id.clone();
+
+        let delta = |tokens: u64| UsageDelta {
+            prompt_tokens: tokens,
+            completion_tokens: 0,
+            estimated: false,
+        };
+        store.accumulate_usage(&id, "c1", &delta(1));
+
+        // 扮演"上一次 flush 正在进行"：直接握住串行化锁。
+        let guard = crate::sync::lock_or_recover(&store.inner.usage.flush_gate);
+
+        // 第二次 flush（= 关闭路径）必须**等**这把锁，而不是先取快照、再去等 `db` 锁。
+        let flushing = store.clone();
+        let t = std::thread::spawn(move || flushing.flush_usage_once(true));
+
+        // 排队期间内存继续涨；只有"快照发生在取锁之后"才可能带上它。
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        store.accumulate_usage(&id, "c1", &delta(1000));
+
+        drop(guard);
+        t.join().unwrap();
+
+        let in_memory = store.usage_of(&id).unwrap().prompt_tokens;
+        assert_eq!(in_memory, 1001, "前提：内存账本是 1 + 1000");
+        let conn = Connection::open(&path).unwrap();
+        let db: i64 = conn
+            .query_row(
+                "SELECT prompt_tokens FROM key_usage WHERE key_id = ?1",
+                [&id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            db as u64, in_memory,
+            "第二次 flush 取了旧快照 ⇒ 库里落后于内存（复扫 C1：绝对累计值被旧值覆盖）"
+        );
     }
 }

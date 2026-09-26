@@ -349,11 +349,14 @@
       所以那 5 个骨架动作与 `crates/agent|mock-llm/Cargo.toml` 两次拷贝**都是承重的**
       （原注释只说"覆盖自动发现的 target"，不足以拦住"顺手清理"）。
       **镜像瘦身（2026-09-25）**：部署镜像只 `--bin gateway` + COPY Dashboard，**不含 agent /
-      mock-llm**（agent 按 `DEPLOY.md` §6 用 systemd 部署；要容器化 agent 就用仓库根那份完整
-      `Dockerfile`）。连带改动：compose 的 `build` 指向 `crates/gateway/Dockerfile`（并删掉那段
+      mock-llm**（agent 按 `DEPLOY.md` §6 用 systemd 部署；要容器化 agent 就照
+      `crates/gateway/Dockerfile` 另写一份——本仓库只提供网关镜像）。连带改动：compose 的
+      `build` 指向 `crates/gateway/Dockerfile`（并删掉那段
       "切 entrypoint 跑 agent"的模板——镜像里已经没有 agent 了）、`scripts/check-toolchain.sh`
-      改成**逐份**校验（清单写法，不存在的路径跳过），且有反例自检：把 `ARG RUST_TOOLCHAIN`
-      改错，脚本会指名报错。
+      改成**逐份**校验（枚举仓库里所有 Dockerfile、只挑"真的在构建 Rust"的逐个比对；一份都没
+      发现就报错，免得检查静默落空），且有反例自检：把 `ARG RUST_TOOLCHAIN`
+      改错，脚本会指名报错。（2026-09-25 复扫 H1-4：原先的"清单"是**硬编码**两份路径，第三份
+      不会被校验——已换成自动发现。）
       **收尾（2026-09-25）**：仓库根那份完整 `Dockerfile` 与根 `docker-compose.yml` 已删除，
       现在**只有一对**（`crates/gateway/Dockerfile` + `crates/gateway/docker-compose.yml`）——
       上一轮"两套都留"的重复问题因此消失，"前端钉版一致性 / 两份 compose 等价性"这两个守卫也就
@@ -470,6 +473,18 @@
       7. 测试：proto roundtrip（8 帧/边界）+ 全量 e2e 回归 + bench 对比报告
       8. 分步：schema+prost 接入 → io.rs 切换+单测 → bench 双实现对比（决策门槛）→
          全量回归 → 版本 0.2.0+校验 → 文档（DESIGN §4.2、部署同版本升级说明）
+      9. **迁移时顺手收掉的过渡件（2026-09-26 补记，都是为"协议暂时带不了某个值"而写的）**：
+         ① **`E2` 的过渡提醒**：`agent::config::ASSUMED_GATEWAY_STALE_SECS`、
+            `Options::ASSUMED_AGENT_HEARTBEAT`、以及交叉断言 `the_assumed_defaults_match_the_other_crate`
+            存在的**唯一**理由是协议带不了真值——agent 不知道网关的 `agent_stale_secs`，反之亦然。
+            新 schema 里把 `heartbeat_secs` 放进 `Register`（或把 `agent_stale_secs` 放进注册回应）
+            之后，这三样**应当删掉**，改按协议里的实际数值判断；那时连"只提醒、不拒绝"都可以升级成
+            **拒注册**，因为不再是猜（`E2` 的 (a)/(b) 两个方案就并在这里，见复扫记录）。
+         ② **`E4` 现在不动**：`proto/src/io.rs` 的 `write_frame`（每帧两次分配、两次全长拷贝）正好住在
+            第 3 步要重写的那一层上——postcard 的 `to_allocvec` 会换成 prost 的编码。在**会被替换**的
+            代码上优化等于白花力气，等切换完成后照新编码重新评估（长度前缀那层大概率留着，实现要重写）。
+         ③ **`P3-1`（ALPN 借用了 `h3`）与本次协议变更合并到同一轮**：两者都是"新旧不能混跑"的兼容性
+            变更，一起做只需一次重叠窗口；分开做就要两次（详见下方 P3-1 条的补记）。
 
 ---
 
@@ -639,7 +654,7 @@
       `rustls/src/server/hs.rs` 注释直接引用），任一端配置/提供了 ALPN 而最终没协商出协议 ⇒ 握手
       失败，所以"改名"与"不设 ALPN"都会让新旧网关/agent **不能混跑**。**待定的迁移方案**：三步重叠
       改名（① agent 同时报 `[新值, h3]` ② 网关同时广告两者 ③ 全部升完后网关删 `h3`），跨两次发布；
-      是否值得（收益只有排障清晰度）尚未权衡 → **未决**。**已做**：`proto/src/lib.rs` 的注释与
+      是否值得（收益只有排障清晰度）尚未权衡 → **未决**。**2026-09-26 补记**：协议层正在规划 postcard → protobuf（见上文「P3 — 协议层改造」节），而那次切换**本身就是**一次"新旧不能混跑"的兼容性窗口——若与改名一起做，只需**一次**重叠；若 protobuf 先落地、改名再单独做，就得多来一次。（顺带：那次迁移会把线上编码换掉，所以本条描述里的 `[u32 BE 长度][postcard]` 届时也要跟着改。）**已做**：`proto/src/lib.rs` 的注释与
       `docs/PROJECT_SCAN.md` 的 P3-1 都写清了"有意借用 + 迁移约束"。若最终决定不改，把本条标成
       "有意保留"并关掉即可。
 - [ ] **前端四份独立 `/metrics` 轮询**：`Layout.tsx:24`、`Overview.tsx:9`、`MetricsPage.tsx:10`、
@@ -1175,3 +1190,33 @@
         评估原话：C1 模块化是"**第二步的可选精化**，先有处置接口，再看计数是否需要自己的模块"；
         现在处置接口在、Entry 也不透明了，但**没有第二个消费者、也没有 profiling 说话**，
         所以先不付这份搬迁成本（真有需要再拆，那时 `Entry` 不透明的前提已经满足）。
+
+## 2026-09-25 复扫：回归测试缺口
+
+来源：2026-09-25 的全项目复扫（明细在 gitignored 的 `docs/PROJECT_SCAN_2026-09-25.md`）。
+本节只登记"修复已落地、但约定的测试仍没写成"的那一条；复扫里其余未修项不在这里重复。
+
+- [ ] **`B1`（唯一 agent 忙 ⇒ 429）约定的 e2e 没写成**：修复本身在——`pick()` 改成先判"有没有
+      候选"、再按 `exclude` 过滤，新增 `AcquireError::AllExcluded`，`rejection_response()` 把两种
+      "忙"一起映射成 429 `agent at capacity` + 标签 `all-candidates-at-capacity`，两层都有单测
+      且都做了变异验证。缺的是"单 agent + 忙"的端到端用例。下面记下**正确诊断**与**走过的弯路**，
+      免得下次重踩。
+      - **正确诊断**：`busy` 的判据是 `inflight ≥ min(max_concurrency, ceiling)`
+        （`registry.rs` 的 `open_timeout_is_fatal`），而它要求 `entry.open_stream()`
+        （s2n-quic 的 `open_bidirectional_stream`）**真的阻塞**——那只在**对端**广告的流额度
+        用尽时发生；握手完成后开流是本地行为，额度没满就立刻返回。
+      - **两次失败尝试**：`max_open_tunnel_streams = 2` + 8 并发，以及默认额度 + 150 并发，
+        **全部返回 200**，整条测试只跑了 0.69s / 0.72s。而 `/v1/slow_body` 的正文要停
+        `SLOW_BODY_STALL = 3s`（`crates/mock-llm/src/lib.rs:252`）——总耗时**远小于**它，说明
+        **没有一个请求停过**：探针写的是 `.send().await`，而 reqwest 在**收到响应头**时就返回，
+        它紧接着只取 `.status()` 就把响应丢掉了；隧道流只活几百微秒，流额度从来没被排满，
+        所以 `open_tunnel` 根本没超时，"忙"这条路径压根没进入（与额度设成几无关）。
+      - ⚠️ **订正**：提交 `dd35027` 的正文把 `max_open_tunnel_streams` 说成"限的是**对端**能开
+        多少条流，不是反过来"——**这是错的**。`crates/gateway/src/listen.rs:44` 用的是
+        `with_max_open_local_bidirectional_streams`，s2n-quic 的文档是 "Sets the max **local**
+        limits for bidirectional streams"，即**本地发起**方向，也就是网关自己开出去的隧道流。
+      - **下次照这个走**：让请求真的**握住**隧道流——读完响应体（消费整条 SSE），而不是取到状态码
+        就丢；配 `max_open_tunnel_streams = 2`、agent `max_concurrency = 0`（不限容量，免得准入
+        闸门先把它拦下来）、`tunnel_op_timeout = 1s`、并发 > 2。超出的那批会开流超时，而
+        `inflight(> 2) ≥ min(0 → ceiling = 2)` ⇒ 判"忙"。若这条路仍不通，再上"额度很小的假
+        peer"：只广告很小的 MAX_STREAMS，并且接受流之后**握着不放**。

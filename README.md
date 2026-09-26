@@ -77,7 +77,7 @@ Dashboard 编进镜像（运行镜像里不带 Node），产物在 `/usr/local/s
 
 ### 环境
 
-- Rust stable（建议 1.75+）
+- Rust 1.97+（工具链版本见 `rust-toolchain.toml`，MSRV 见 `Cargo.toml`）
 - `openssl` 命令行（仅证书脚本需要）
 
 ### 1. 生成证书
