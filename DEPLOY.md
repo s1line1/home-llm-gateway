@@ -387,7 +387,9 @@ docker build -f crates/gateway/Dockerfile -t home-llm-gateway .
   （`config.rs` 的 `default_ui_dir()`）——不构建、不挂载、不加配置项，起来就有 Dashboard。
   有配置就用配置（例如你想换成自己挂进去的一套产物，照常写 `ui_dir:` 覆盖）。
 
-  **从老部署升级**：`docker compose build && docker compose up -d`，然后**删掉配置里的
+  **从老部署升级**：`docker compose -f crates/gateway/docker-compose.yml build && docker compose
+  -f crates/gateway/docker-compose.yml up -d`（`-f` 不能省，仓库根已经没有 compose 文件了：裸
+  `docker compose build` 会报 `no configuration file provided`；见 §11.6），然后**删掉配置里的
   `ui_dir` 那一行**（如果它指向宿主上那份 `web/dist` —— 现在镜像自带、且更省事），
   再把宿主上的 `web/` 目录删掉。不删配置也能跑，只是还在用你挂的那份。
 

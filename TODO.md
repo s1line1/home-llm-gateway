@@ -349,11 +349,14 @@
       所以那 5 个骨架动作与 `crates/agent|mock-llm/Cargo.toml` 两次拷贝**都是承重的**
       （原注释只说"覆盖自动发现的 target"，不足以拦住"顺手清理"）。
       **镜像瘦身（2026-09-25）**：部署镜像只 `--bin gateway` + COPY Dashboard，**不含 agent /
-      mock-llm**（agent 按 `DEPLOY.md` §6 用 systemd 部署；要容器化 agent 就用仓库根那份完整
-      `Dockerfile`）。连带改动：compose 的 `build` 指向 `crates/gateway/Dockerfile`（并删掉那段
+      mock-llm**（agent 按 `DEPLOY.md` §6 用 systemd 部署；要容器化 agent 就照
+      `crates/gateway/Dockerfile` 另写一份——本仓库只提供网关镜像）。连带改动：compose 的
+      `build` 指向 `crates/gateway/Dockerfile`（并删掉那段
       "切 entrypoint 跑 agent"的模板——镜像里已经没有 agent 了）、`scripts/check-toolchain.sh`
-      改成**逐份**校验（清单写法，不存在的路径跳过），且有反例自检：把 `ARG RUST_TOOLCHAIN`
-      改错，脚本会指名报错。
+      改成**逐份**校验（枚举仓库里所有 Dockerfile、只挑"真的在构建 Rust"的逐个比对；一份都没
+      发现就报错，免得检查静默落空），且有反例自检：把 `ARG RUST_TOOLCHAIN`
+      改错，脚本会指名报错。（2026-09-25 复扫 H1-4：原先的"清单"是**硬编码**两份路径，第三份
+      不会被校验——已换成自动发现。）
       **收尾（2026-09-25）**：仓库根那份完整 `Dockerfile` 与根 `docker-compose.yml` 已删除，
       现在**只有一对**（`crates/gateway/Dockerfile` + `crates/gateway/docker-compose.yml`）——
       上一轮"两套都留"的重复问题因此消失，"前端钉版一致性 / 两份 compose 等价性"这两个守卫也就

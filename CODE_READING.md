@@ -95,7 +95,7 @@ crates/gateway/tests/e2e/   e2e 场景（common.rs 怎么起全栈；chain.rs �
                             evict_close.rs 摘除宽限）
 crates/proto/benches/       Criterion 微基准（帧编解码；gateway 侧只剩 keystore argon2）
 scripts/bench-k6/           k6 宏观压测模板（SSE 长流 + QPS，含 429 分类断言）
-scripts/check-toolchain.sh  工具链三处一致（rust-toolchain.toml / Dockerfile / MSRV；CI 与 `make check` 跑）
+scripts/check-toolchain.sh  工具链三处一致（rust-toolchain.toml / 所有构建 Rust 的 Dockerfile / MSRV；CI 与 `make check` 跑）
 ```
 
 > 验证：`make check`（fmt + clippy + test + web build）全绿。
@@ -106,7 +106,7 @@ scripts/check-toolchain.sh  工具链三处一致（rust-toolchain.toml / Docker
 Makefile                 dev/stop/check 一键流程 + 证书检查（certs-required）
 DEPLOY.md                生产部署：证书签发、systemd、安全组（UDP 4433 易漏）
 deploy/*.service         关闭流程怎么生效（systemctl stop → SIGTERM → shutdown）
-rust-toolchain.toml      工具链声明（stable 浮动 channel，未钉版本；CI 另行装 stable → 见 TODO）
+rust-toolchain.toml      工具链声明（**唯一来源**：channel 钉到 1.97.1，不再是浮动的 stable）
 ```
 
 ### 第 6 步：前端（可选，30 分钟）

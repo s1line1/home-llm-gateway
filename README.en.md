@@ -37,11 +37,14 @@ crates/
 ├── gateway/    cloud-gateway binary (axum + s2n-quic server)
 ├── agent/      edge-agent binary (s2n-quic client + reqwest)
 └── mock-llm/   fake OpenAI-compatible LLM (to bring up the full chain without a real model)
+web/            React + TS admin Dashboard (served by the gateway itself; see below)
 certs/          dev certificate script
+gateway_config.example.yml  gateway config template (every parameter, YAML)
+agent_config.example.yml    edge-agent config template (every parameter, YAML)
 deploy/         systemd units (gateway.service / agent.service)
 scripts/        multi-platform release packaging script + git pre-commit hook (cargo deny + fmt)
-Dockerfile      multi-stage container build (gateway / agent / mock-llm binaries; see the header comment)
-docker-compose.yml  container deployment example (gateway; agent template at the end of the file)
+crates/gateway/Dockerfile  **gateway deployment image** (gateway + Dashboard only; the build context must be the repository root — see the header comment)
+crates/gateway/docker-compose.yml  container deployment entry point (gateway; builds via the Dockerfile above, see DEPLOY.md §11)
 deny.toml       cargo-deny policy (dependency licenses / advisories; run by CI and the pre-commit hook)
 ```
 
@@ -51,7 +54,7 @@ deny.toml       cargo-deny policy (dependency licenses / advisories; run by CI a
 
 ### Prerequisites
 
-- Rust stable (1.75+ recommended)
+- Rust 1.97+ (toolchain version in `rust-toolchain.toml`, MSRV in `Cargo.toml`)
 - `openssl` CLI (only needed by the certificate script)
 
 ### 1. Generate certificates
