@@ -41,8 +41,15 @@ pub(super) async fn ui_fallback(
         .unwrap_or(false);
     if !wants_html && !has_extension {
         // 统一错误格式：以前这里手搓的是 `type: "not_found"`，与 proxy 的
-        // `not_found_error` 不是同一个语义名（同一个网关两种 404）
-        return crate::openai::error_response(StatusCode::NOT_FOUND, "not found");
+        // `not_found_error` 不是同一个语义名（同一个网关两种 404）。
+        //
+        // `Vary: Accept`（复扫 A5）：**同一个 URI** 带了 `Accept: text/html` 就会拿到 200 的
+        // SPA 页面（下面那个分支），而这个 404 只对非导航请求成立 ⇒ 缓存必须按 Accept 分条，
+        // 否则一份被缓存的 404（或一份被缓存的 HTML）会喂给另一类请求。
+        return super::vary_on_accept(crate::openai::error_response(
+            StatusCode::NOT_FOUND,
+            "not found",
+        ));
     }
     let req = || {
         axum::extract::Request::builder()
@@ -88,7 +95,9 @@ pub(super) async fn ui_fallback(
             // parts 原样保留，故 content-type / content-length / last-modified 等
             // 由 tower-http 决定的头不变。
             let (parts, body) = resp.into_parts();
-            Response::from_parts(parts, axum::body::Body::new(body))
+            // 这是 SPA 页面（只有 `Accept: text/html` 会走到这里）⇒ 必须 `Vary: Accept`（A5）。
+            // 资源分支（带扩展名）不在此列：它与 Accept 无关，同一个 URI 只有一种表示。
+            super::vary_on_accept(Response::from_parts(parts, axum::body::Body::new(body)))
         }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
@@ -148,6 +157,13 @@ mod tests {
     use crate::http::app;
     use crate::http::test_util::{body_str, test_state};
 
+    /// 取响应的 `Vary`（没有就是 None）。
+    fn vary(resp: &Response) -> Option<&str> {
+        resp.headers()
+            .get(axum::http::header::VARY)
+            .and_then(|v| v.to_str().ok())
+    }
+
     /// 构造 ui_fallback 的请求并返回响应。
     async fn call_ui_fallback(state: AppState, path: &str, accept: Option<&str>) -> Response {
         let mut builder = axum::extract::Request::builder().uri(path);
@@ -173,6 +189,11 @@ mod tests {
         // 浏览器导航（Accept: text/html）→ SPA index.html
         let resp = call_ui_fallback(state.clone(), "/keys", Some("text/html")).await;
         assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            vary(&resp),
+            Some("Accept"),
+            "同一个 URI 只对导航请求给 SPA ⇒ 必须声明按 Accept 协商（复扫 A5）"
+        );
         assert!(body_str(resp).await.contains("id=\"root\""));
 
         // 静态资源（带扩展名，Accept: */*）→ 文件
@@ -183,6 +204,11 @@ mod tests {
         // API 类未注册路径（Accept: */*、无扩展名）→ 404，绝不能返回 index.html
         let resp = call_ui_fallback(state.clone(), "/admin/agents", Some("*/*")).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            vary(&resp),
+            Some("Accept"),
+            "同一条路径带 text/html 会拿到 200 的 SPA ⇒ 这个 404 也必须 Vary（复扫 A5）"
+        );
         // 错误体走 openai::error_response：type 是 `not_found_error`
         // （以前这里手搓 `not_found`，与 proxy 的 404 不是同一个语义名）
         let body = body_str(resp).await;

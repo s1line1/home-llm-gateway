@@ -98,7 +98,8 @@ pub(super) async fn metrics_route(State(state): State<AppState>, headers: Header
         // `std::fs::read_to_string`，是在 async 上下文里做阻塞 I/O。
         if let Some(index) = &state.ui_index {
             if let Some(html) = index.load().await {
-                return Html(html.to_string()).into_response();
+                // 同一 URI 也能回 Prometheus 文本 ⇒ 必须声明"按 Accept 协商"（复扫 A5）
+                return super::vary_on_accept(Html(html.to_string()).into_response());
             }
         }
     }
@@ -107,10 +108,19 @@ pub(super) async fn metrics_route(State(state): State<AppState>, headers: Header
     // 注册条目数 与 真正可路由数必须分开暴露：前者含失联但连接未关的 agent，
     // 排查"全部请求 503"时只有后者能说明问题（见 `hlmg_agents_healthy` 的 HELP）。
     let healthy = state.registry.healthy_count(state.agent_stale_after);
-    state
-        .metrics
-        .render(state.registry.len(), healthy, verify_hits, verify_misses)
-        .into_response()
+    // 文本表示：实时数据 ⇒ 明确不许缓存（`Vary` 只解决"张冠李戴"，`no-store` 解决"存了就不用
+    // 再取"——把上一次的指标当成现在的展示，比拿不到更糟）。
+    let mut resp = super::vary_on_accept(
+        state
+            .metrics
+            .render(state.registry.len(), healthy, verify_hits, verify_misses)
+            .into_response(),
+    );
+    resp.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    resp
 }
 
 #[cfg(test)]
@@ -172,6 +182,51 @@ mod tests {
         assert!(
             v["detail"].as_str().is_some_and(|d| d.contains("restart")),
             "degraded 时说清处置方式（重启）：{v}"
+        );
+    }
+
+    /// 规格（复扫 A5）：`/metrics` **按 `Accept` 返回不同表示**，所以两个表示都必须带
+    /// `Vary: Accept`；文本那个还必须 `no-store`（实时数据）。
+    ///
+    /// 少了 `Vary`，缓存只按 URI 作键：浏览器导航一下 `/metrics` 就会把 SPA 页面存进去，
+    /// Dashboard 的 `fetch('/metrics')` 随后可能拿到那份 HTML —— 而前端的解析器会把 HTML
+    /// 解析成"全 0"，与"网关真的空闲"不可区分（G3）。
+    #[tokio::test]
+    async fn metrics_responses_vary_on_accept() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "<div id=\"root\">ui</div>").unwrap();
+        let state = test_state(Some(dir.path().to_path_buf()));
+
+        // ① 浏览器导航（Accept: text/html）→ SPA 页面
+        let resp = metrics_route(State(state.clone()), headers_with_accept("text/html")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(axum::http::header::VARY),
+            Some(&axum::http::HeaderValue::from_static("Accept")),
+            "SPA 表示也必须声明按 Accept 协商"
+        );
+        assert!(
+            body_str(resp).await.contains("id=\"root\""),
+            "Accept: text/html 应当拿到 SPA 页面"
+        );
+
+        // ② Prometheus 抓取 / 前端 fetch（Accept: */*）→ 文本
+        let resp = metrics_route(State(state), headers_with_accept("*/*")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(axum::http::header::VARY),
+            Some(&axum::http::HeaderValue::from_static("Accept")),
+            "文本表示同样必须声明按 Accept 协商"
+        );
+        assert_eq!(
+            resp.headers().get(axum::http::header::CACHE_CONTROL),
+            Some(&axum::http::HeaderValue::from_static("no-store")),
+            "实时指标不许被缓存：把上一次的数值当现在展示，比拿不到更糟"
+        );
+        let body = body_str(resp).await;
+        assert!(
+            body.contains("hlmg_"),
+            "文本表示应当是 Prometheus 文本：{body}"
         );
     }
 
