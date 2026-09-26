@@ -53,7 +53,9 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - "exec /usr/local/bin/gateway --config /etc/home-llm-gateway/gateway-config.yml >> /var/log/home-llm-gateway/gateway.log 2>&1"
-    # 日志文件里不要 ANSI 颜色码（实测：不加时该文件每一行都带 ^[[2m / ^[[32m）
+    # 日志文件里不要 ANSI 颜色码。**现在代码自己保证了**（复扫 A6：`main.rs` 按
+    # "stdout 是不是终端"决定上色，重定向到文件 ⇒ 不上色），这一行只是显式冗余——
+    # 保留是因为它把意图写在部署文件里，删掉也不会有颜色码。
     environment:
       NO_COLOR: "1"
     # 与镜像 WORKDIR 一致；配置里的相对路径（ui_dir 等）以此为基准

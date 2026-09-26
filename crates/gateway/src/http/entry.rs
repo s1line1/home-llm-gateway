@@ -28,9 +28,13 @@ use tokio::{
 };
 use tokio_rustls::TlsAcceptor;
 use tower::Service as TowerService;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
-use crate::{io_stall, metrics::Metrics, state::ShutdownPhase};
+use crate::{
+    io_stall,
+    metrics::Metrics,
+    state::{self, ShutdownPhase},
+};
 
 /// accept 失败后的首次退避。
 const ACCEPT_BACKOFF_MIN: Duration = Duration::from_millis(50);
@@ -200,27 +204,53 @@ async fn serve_entry<S>(
             }
         };
 
+        // 关掉 Nagle（复扫 A7）。公网入口是延迟敏感路径，而它的流量形态正是 Nagle 最不划算的
+        // 那种：SSE 与小型 JSON 响应都是"多次小 write"，Nagle 会把已经写好的那一小块压在缓冲里
+        // 等 ACK，再叠加客户端的 delayed-ACK，每次小写最多白等约 40ms。合并**不靠**它——hyper
+        // 与我们的缓冲已经做了该做的合并。
+        //
+        // 放在 accept 之后、spawn 之前：TLS 握手与 HTTP 服务用的是同一个 socket，这一处就够了。
+        // 失败只告警：设不上（平台不支持 / fd 已被包装过）不该拦下一条本来能用的连接。
+        if let Err(e) = stream.set_nodelay(true) {
+            warn!(entry, %peer, "cannot disable Nagle on an accepted connection: {e}");
+        }
+
         let acceptor = acceptor.clone();
         let app = app.clone();
+        // 每条连接一个接收端（`clone()`，不动 accept 循环自己那个）：网关对象被 drop 时
+        // 硬停这条连接。见 `state::until_gateway_is_gone`——**只认通道关闭**，阶段推进不算。
+        let mut conn_shutdown = shutdown.clone();
         tokio::spawn(async move {
             // 额度随这个任务存活：响应写完 / 停滞超时 / 握手失败才归还。
             let _permit = permit;
-            match acceptor {
-                None => serve_conn(stream, app, peer, client_stall).await,
-                Some(acceptor) => {
-                    // **握手必须有上界**（评估 §5 H8）：客户端连上却不发 ClientHello 时，
-                    // `acceptor.accept` 永不返回——一个 fd + 一个任务被白占，且这类半开连接
-                    // 不经准入闸门（闸门在解析出请求之后才生效），此前只受 NOFILE 约束。
-                    match tokio::time::timeout(client_stall, acceptor.accept(stream)).await {
-                        Ok(Ok(tls_stream)) => serve_conn(tls_stream, app, peer, client_stall).await,
-                        Ok(Err(e)) => warn!("tls handshake from {peer} failed: {e}"),
-                        Err(_) => warn!(
-                            peer = %peer,
-                            stall_ms = client_stall.as_millis(),
-                            "tls handshake stalled; dropping the connection (the client never spoke)"
-                        ),
+            let serve = async move {
+                match acceptor {
+                    None => serve_conn(stream, app, peer, client_stall).await,
+                    Some(acceptor) => {
+                        // **握手必须有上界**（评估 §5 H8）：客户端连上却不发 ClientHello 时，
+                        // `acceptor.accept` 永不返回——一个 fd + 一个任务被白占，且这类半开连接
+                        // 不经准入闸门（闸门在解析出请求之后才生效），此前只受 NOFILE 约束。
+                        match tokio::time::timeout(client_stall, acceptor.accept(stream)).await {
+                            Ok(Ok(tls_stream)) => {
+                                serve_conn(tls_stream, app, peer, client_stall).await
+                            }
+                            Ok(Err(e)) => warn!("tls handshake from {peer} failed: {e}"),
+                            Err(_) => warn!(
+                                peer = %peer,
+                                stall_ms = client_stall.as_millis(),
+                                "tls handshake stalled; dropping the connection (the client never spoke)"
+                            ),
+                        }
                     }
                 }
+            };
+            tokio::select! {
+                // 硬停（复扫 D5）：`drop(Gateway)` 之后这条连接没有继续存在的理由。
+                // 覆盖握手阶段——否则半开连接同样要挂到 `client_stall`（默认 60s）。
+                _ = state::until_gateway_is_gone(&mut conn_shutdown) => {
+                    debug!(%peer, "gateway dropped; closing an accepted connection");
+                }
+                _ = serve => {}
             }
         });
     }
@@ -306,6 +336,98 @@ mod tests {
 
     fn test_app() -> Router {
         Router::new().route("/ping", get(|| async { "pong" }))
+    }
+
+    /// 记录每个被接受连接的源（复扫 A7 的探针）。
+    ///
+    /// 客户端**看不到**对端的 `TCP_NODELAY`——它是本端 socket 选项——所以只能在服务端这一侧
+    /// 观察：`into_std()` + `try_clone()` 拿到指向同一个内核 socket 的第二个句柄，服务端稍后
+    /// 设置选项时，测试手里的克隆也读得到（`nodelay()` 走 getsockopt，与阻塞与否无关）。
+    ///
+    /// 绕这一圈是因为 `tokio::net::TcpStream` **没有** `try_clone`：`into_std()` 换出 std 句柄、
+    /// 克隆、再用 `from_std()` 交还给服务端（`from_std` 要求运行在内核 IO 已启用的 runtime 里，
+    /// 探针正好在）。克隆存的是同一个 fd 的副本，所以读到的就是服务端设置后的值。
+    struct NodelayProbe {
+        inner: tokio::net::TcpListener,
+        seen: Arc<std::sync::Mutex<Vec<std::net::TcpStream>>>,
+    }
+
+    impl NodelayProbe {
+        async fn bind() -> (Self, SocketAddr) {
+            let inner = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = inner.local_addr().unwrap();
+            (
+                Self {
+                    inner,
+                    seen: Arc::new(std::sync::Mutex::new(Vec::new())),
+                },
+                addr,
+            )
+        }
+    }
+
+    impl AcceptSource for NodelayProbe {
+        async fn accept(&self) -> std::io::Result<(TcpStream, SocketAddr)> {
+            let (stream, addr) = self.inner.accept().await?;
+            let std_stream = stream.into_std()?;
+            self.seen.lock().unwrap().push(std_stream.try_clone()?);
+            Ok((TcpStream::from_std(std_stream)?, addr))
+        }
+    }
+
+    /// 规格（复扫 A7）：**公网入口接受的每条连接都要关掉 Nagle**。
+    ///
+    /// 不设的代价是"每次小写最多约 40ms"：SSE 与小型 JSON 响应都是多次小 `write`，Nagle 会压住
+    /// 已写好的那块等 ACK，客户端的 delayed-ACK 也在等。判据必须是**服务端**读到的 socket 选项
+    /// （见 [`NodelayProbe`]），不是"请求成功了"——成功率与 Nagle 无关，那样写这条测试永远绿。
+    #[tokio::test]
+    async fn accepted_connections_disable_nagle() {
+        let metrics = Metrics::default();
+        let (source, addr) = NodelayProbe::bind().await;
+        let seen = source.seen.clone();
+        let (_tx, rx) = watch::channel(ShutdownPhase::Running);
+
+        let entry = tokio::spawn(serve_entry(
+            source,
+            "http",
+            None,
+            test_app(),
+            Duration::from_secs(5),
+            connection_limiter(0),
+            rx,
+            metrics.clone(),
+        ));
+
+        let resp = tokio::time::timeout(
+            Duration::from_secs(5),
+            reqwest::get(format!("http://{addr}/ping")),
+        )
+        .await
+        .expect("入口应当接受连接")
+        .expect("请求应当成功");
+        assert_eq!(resp.status(), 200);
+
+        // 有界轮询：接受与设置发生在服务端任务里，与本次请求完成没有严格先后（实际上设置在前）。
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let (accepted, all_disabled) = {
+                let seen = seen.lock().unwrap();
+                (
+                    !seen.is_empty(),
+                    !seen.is_empty() && seen.iter().all(|s| s.nodelay().unwrap_or(false)),
+                )
+            };
+            if accepted && all_disabled {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "被接受的连接必须设置 TCP_NODELAY（复扫 A7）；accepted={accepted} \
+                 all_disabled={all_disabled}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        entry.abort();
     }
 
     /// 规格：退避必须**单调增并封顶**。

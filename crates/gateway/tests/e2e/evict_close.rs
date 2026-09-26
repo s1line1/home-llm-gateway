@@ -139,8 +139,9 @@ async fn eviction_while_generating(grace: Duration, window: Duration) -> (Durati
 /// 规格：**摘除的宽限期就是那个上界**——到期即强制关闭，正在生成的请求会被打断。
 ///
 /// 这正是 `close_when_drained` 里那条此前零覆盖的截止分支。它也把 H1 的取舍变成可测的事实：
-/// 默认宽限 5s 短于 `head_timeout`(15s)、更远短于 `request_timeout`(120s)，所以"已经在生成"
-/// 的请求在长回答上是保不住的（保多久＝宽限期有多长）。
+/// 默认宽限 **15s 且有意等于** `head_timeout`(15s)（`Options::DEFAULT_EVICT_CLOSE_GRACE`，
+/// 2026-09 由 5s 上调），但远短于 `request_timeout`(120s)——所以"已经在生成"的请求在长回答上
+/// 仍可能保不住（保多久＝宽限期有多长）。复扫 F6：这里原先还写着"默认宽限 5s"，已过时。
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn e2e_eviction_grace_deadline_cuts_an_in_flight_generation() {

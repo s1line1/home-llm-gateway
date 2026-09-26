@@ -224,39 +224,67 @@ async fn e2e_gateway_timeout_cancels_upstream() {
     gw.shutdown().await;
 }
 
+/// 规格：客户端**中途断开**（丢掉响应流）必须让上游也被取消。
+///
+/// 不取消的代价：模型继续生成（白算 token），而 agent 的并发槽要等上游自己跑完才归还。
+///
+/// 复扫 F1：这条用例原先**只断言"网关还能回 200"**——把转发任务里"客户端消失后发 Cancel"
+/// 那一段整段删掉，它照样绿，名字里的承诺一个字都没测（同仓 `lifecycle.rs` 那条才真正钉住了
+/// 取消，但它走的是"客户端停滞"，不是"断开"）。现在判据落在**上游侧**：mock 的
+/// `/stats.cancelled`（`CancelGuard` 唯一会数"上游被取消"的地方）必须在有界时间内 > 0。
+///
+/// 为什么把请求从 `/v1/chat/completions` 换成 `/v1/flood`：chat 的流按字符产出、正文只有几个
+/// 字，读到第一个 chunk 时它常常已经快写完了，"断开"没机会被观察到；而 `/v1/flood` 是**一直
+/// 产出到被取消为止**的端点，也是唯一把取消记进 `/stats` 的那个。断开这个动作本身与端点无关
+/// ——取消逻辑在转发任务里，对所有响应走同一条路。
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn e2e_client_disconnect_cancels_upstream() {
     use futures_util::StreamExt;
 
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
-    let (gw, agent, base, key) = start_stack(4, |_| {}).await;
+    let (gw, agent, base, key, mock_addr) = start_stack_with_mock(4, |_| {}).await;
     let client = test_client();
 
-    // 发起 SSE 流式请求，读到一个 chunk 后直接丢弃响应（模拟客户端断开）
+    // 持续产出、每块之间停 1ms ⇒ 断开会落在流中间，而不是"已经跑完"
     let resp = client
-        .post(format!("{base}/v1/chat/completions"))
+        .post(format!("{base}/v1/flood?chunks=1000000&kb=1&delay_ms=1"))
         .header("Authorization", format!("Bearer {key}"))
-        .json(&serde_json::json!({
-            "model": "mock-llm",
-            "stream": true,
-            "messages": [{"role": "user", "content": "断开测试"}]
-        }))
+        .json(&serde_json::json!({ "model": "mock-llm" }))
         .send()
         .await
         .unwrap();
     let mut stream = resp.bytes_stream();
     let _first = tokio::time::timeout(Duration::from_secs(5), stream.next())
         .await
-        .expect("first SSE chunk within 5s")
+        .expect("first chunk within 5s")
         .unwrap()
         .unwrap();
     drop(stream); // 客户端断开 → 网关通道接收端被丢弃 → 发 Cancel
 
-    // 给网关发 Cancel、agent 取消上游留时间
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    // 上游必须在数秒内看到这次取消：轮询到事实发生，不睡猜窗口
+    let probe = test_client();
+    let stats_url = format!("http://{mock_addr}/stats");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut cancelled = 0;
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(resp) = probe.get(&stats_url).send().await {
+            if let Ok(v) = resp.json::<serde_json::Value>().await {
+                cancelled = v["cancelled"].as_u64().unwrap_or(0);
+                if cancelled > 0 {
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        cancelled > 0,
+        "客户端断开后上游必须看到取消（`/stats.cancelled`）；为 0 说明 Cancel 没发出去，\
+         模型会继续白跑并把并发槽占满（复扫 F1）"
+    );
 
-    // 网关仍可用
+    // 顺带确认网关没被这次断开搞坏（这是原用例唯一做过的事，保留）
     let r = client
         .get(format!("{base}/v1/models"))
         .header("Authorization", format!("Bearer {key}"))

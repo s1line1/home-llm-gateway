@@ -38,8 +38,8 @@ pub(super) struct UsageCollector {
     buf: Vec<u8>,
     /// 已转发字节（估算 completion 用）。
     bytes_forwarded: u64,
-    /// 是否已记录（防止提前返回路径重复记录）。
-    recorded: bool,
+    /// 是否已结算（`finish` 与 `Drop` 都可能是那一次，见 [`Self::settle`]）。
+    settled: bool,
 }
 
 impl UsageCollector {
@@ -59,7 +59,7 @@ impl UsageCollector {
             extracted: None,
             buf: Vec::new(),
             bytes_forwarded: 0,
-            recorded: false,
+            settled: false,
         }
     }
 
@@ -88,10 +88,19 @@ impl UsageCollector {
     /// 这里曾经是"每请求 spawn 一个阻塞任务写一次库"：那条路径让云端 515 个线程里 514 个
     /// 卡在 futex 等同一把 `db` 锁，把 2 vCPU 的吞吐摁在约 190 QPS。
     pub(super) fn finish(mut self) {
-        if self.recorded {
+        self.settle();
+    }
+
+    /// 结算一次（幂等）。
+    ///
+    /// `finish` 与 `Drop` 都可能触发它，所以需要 `settled` 这个标志——**它是活的**（`Drop` 是
+    /// 它的读者）。复扫 B4 曾把同一个字段当死状态删掉，那时确实没有读者；复扫 B3 给 `Drop` 加上
+    /// 职责之后它就成了去重的唯一依据。
+    fn settle(&mut self) {
+        if self.settled {
             return;
         }
-        self.recorded = true;
+        self.settled = true;
         let delta = self.resolve_delta();
         self.key_store
             .accumulate_usage(&self.key_id, &self.key_name, &delta);
@@ -124,6 +133,16 @@ impl UsageCollector {
     }
 }
 
+impl Drop for UsageCollector {
+    /// 结算**兜底**（复扫 B3）：转发任务 panic 时 `usage.finish()` 那几行不会执行，于是整个请求
+    /// 的用量凭空消失——可"上游确实生成过"是事实。panic 展开时唯一还会执行的就是 Drop。
+    ///
+    /// 正常路径早已在 `finish` 里结算过，那次 `settled` 已经是 `true`，这里便是空操作。
+    fn drop(&mut self) {
+        self.settle();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,6 +157,35 @@ mod tests {
             7,
             is_stream,
         )
+    }
+
+    /// 规格（复扫 B3）：**没走 `finish` 的路径也要结算**——panic 展开时唯一会执行的是 Drop。
+    ///
+    /// 不结算的代价：那次请求的用量凭空消失，而"上游确实生成过"是事实。
+    #[test]
+    fn dropping_a_collector_without_finish_still_settles() {
+        let store = KeyStore::new(None);
+        let c = UsageCollector::new(store.clone(), "kid".into(), "kname".into(), 7, false);
+        assert!(
+            store.usage_of("kid").is_none(),
+            "前提：还没结算时账本里什么都没有"
+        );
+        drop(c); // = 转发任务 panic 展开时发生的事
+        let info = store.usage_of("kid").expect("Drop 必须结算这一次用量");
+        assert_eq!(info.requests, 1, "一次请求要记一次");
+    }
+
+    /// 对照：`finish` 之后那次 Drop **不得**重复记账（`settled` 就是为这条存在的）。
+    #[test]
+    fn finish_then_drop_settles_exactly_once() {
+        let store = KeyStore::new(None);
+        let c = UsageCollector::new(store.clone(), "kid".into(), "kname".into(), 7, false);
+        c.finish(); // 按值消费，函数返回时 Drop 会再跑一次
+        assert_eq!(
+            store.usage_of("kid").expect("已结算").requests,
+            1,
+            "记两次会把用量翻倍"
+        );
     }
 
     /// 上界的**期望字面量**：刻意与代码里的常量分开写死。

@@ -56,6 +56,14 @@ export interface AgentInfo {
   inflight: number;
   /** 距上次心跳的秒数（越小越健康）。 */
   last_seen_secs_ago: number;
+  /**
+   * **是否参与路由**——由网关按它自己配的 `agent_stale_secs` 判定（复扫 G1）。
+   *
+   * 为什么不让前端自己比：页面顶部用的是网关算出的 `hlmg_agents_healthy`，而表格原先拿一个
+   * **写死的 15s** 去比 `last_seen_secs_ago` ⇒ `agent_stale_secs` 一旦不是 15，同一页上
+   * "在线总数"与行状态就会自相矛盾。规则只能有一个来源。
+   */
+  healthy: boolean;
 }
 
 /** 从 /metrics 解析出的网关指标快照。 */

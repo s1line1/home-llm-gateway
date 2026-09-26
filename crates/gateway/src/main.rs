@@ -1,3 +1,5 @@
+use std::ffi::OsStr;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -39,8 +41,14 @@ async fn run(args: Args) -> anyhow::Result<()> {
         UtcOffset::from_hms(8, 0, 0).expect("UTC+8 is a valid fixed offset"),
         time::format_description::well_known::Rfc3339,
     );
+    let ansi = ansi_for_logs(
+        std::io::stdout().is_terminal(),
+        std::env::var_os("NO_COLOR").as_deref(),
+    );
     let _ = tracing_subscriber::fmt()
         .with_timer(timer)
+        // 显式给值（复扫 A6）：不写这一行时 tracing-subscriber 只看 `NO_COLOR`，不看 TTY。
+        .with_ansi(ansi)
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .try_init();
 
@@ -55,6 +63,22 @@ async fn run(args: Args) -> anyhow::Result<()> {
     // 先调 flush_usage_on_shutdown —— 现在忘不了。
     gw.shutdown().await;
     Ok(())
+}
+
+/// 是否给日志上色（复扫 A6）。
+///
+/// tracing-subscriber 的默认判据只有两条：编译期 `ansi` feature 与**非空**的 `NO_COLOR`
+/// ——**不看 stdout 是不是终端**（vendored `fmt/fmt_layer.rs`：`cfg!(feature = "ansi") &&
+/// env::var("NO_COLOR").map_or(true, |v| v.is_empty())`）。于是 `StandardOutput=append:` 的
+/// systemd 单元、`> log` 重定向、没设 `NO_COLOR` 的容器，都会把 `ESC[2m`/`ESC[32m` 一路写进
+/// 日志文件——`docker-compose.yml` 那条路径是靠 `NO_COLOR=1` 兜住的，systemd 单元漏了
+/// （照着 compose 补一份环境变量只是补了一个部署；凡是"忘了设环境变量"的落盘路径都会再犯）。
+///
+/// 所以判据改成"**只有交互终端才上色**"，同时保持 `NO_COLOR` 的既有语义不变（设成非空即关闭；
+/// 空串按未设置处理，与 tracing-subscriber 一致）。这样任何非交互落盘自动干净，不需要每一份
+/// 部署配置都记得加一个环境变量。
+fn ansi_for_logs(stdout_is_terminal: bool, no_color: Option<&OsStr>) -> bool {
+    stdout_is_terminal && !no_color.is_some_and(|v| !v.is_empty())
 }
 
 /// 等待 SIGINT / SIGTERM / SIGHUP，收到后干净退出（覆盖 systemd stop / Ctrl+C / job kill /
@@ -127,15 +151,52 @@ mod tests {
         )
     }
 
+    /// 规格（复扫 A6）：**非终端一律不上色**，且 `NO_COLOR` 的语义保持不变。
+    ///
+    /// 这条判据没法在进程内用真日志验证（tracing 的全局订阅者只能装一次，而测试进程的 stdout
+    /// 恰好是 libtest 的管道），所以这里钉纯函数表；"日志真的落盘时干净"由真进程 e2e
+    /// `signals::e2e_logs_written_to_a_file_are_not_colored` 覆盖（它把子进程 stdout 指向文件，
+    /// 并**显式清掉继承来的 `NO_COLOR`**，否则测的就不是 TTY 判据了）。
+    #[test]
+    fn logs_are_only_colored_on_a_terminal() {
+        let empty = OsStr::new("");
+        let set = OsStr::new("1");
+        assert!(ansi_for_logs(true, None), "终端 + 未设 NO_COLOR：上色");
+        assert!(
+            !ansi_for_logs(false, None),
+            "**不是终端就不上色**——复扫 A6 的全部要点（旧行为只认 NO_COLOR，文件里全是 ESC）"
+        );
+        assert!(
+            !ansi_for_logs(true, Some(set)),
+            "NO_COLOR 非空：即使是终端也不上色"
+        );
+        assert!(
+            ansi_for_logs(true, Some(empty)),
+            "NO_COLOR 空串按未设置处理（与 tracing-subscriber 同口径）"
+        );
+        assert!(!ansi_for_logs(false, Some(set)));
+    }
+
+    /// 规格（复扫 F5）：`run` 起来之后**真的在提供服务**，不只是"任务没结束"。
+    ///
+    /// 单看 `!task.is_finished()` 是不够的：把 `run` 里"启动之后"的部分换成 `pending()`，
+    /// 那条断言照样绿——它只证明了这个 future 没有立刻返回。所以这里加第二条判据：
+    /// **公网入口真的在接受 TCP 连接**。
     #[tokio::test]
     async fn run_starts_gateway() {
-        // 写一份完整配置到临时目录，用随机端口启动网关
+        // 端口不能写 0：`listen_addr: 127.0.0.1:0` 让内核挑端口，测试就无从验证"真的在听"。
+        // 先占一个再放掉（取空闲端口的常规办法），把端口号留在手里。
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        // 写一份完整配置到临时目录
         let dir = tempfile::tempdir().unwrap();
         let (ca, cert, key) = gen_cert_files(dir.path());
         let config_path = dir.path().join("config.yml");
         let yaml = format!(
             r#"
-listen_addr: "127.0.0.1:0"
+listen_addr: "127.0.0.1:{port}"
 quic_addr: "127.0.0.1:0"
 cert: {}
 key: {}
@@ -153,6 +214,25 @@ keys_file: {}
         }));
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         assert!(!task.is_finished(), "gateway loop should stay running");
+
+        // 第二判据（复扫 F5）：真的能在那个端口上建立连接。有界轮询——listen 是启动期做的，
+        // 但任务调度可能还没跑到。
+        let mut connected = false;
+        for _ in 0..50 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_ok()
+            {
+                connected = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            connected,
+            "网关必须真的在 127.0.0.1:{port} 上接受连接，而不是挂在一个 pending 上（复扫 F5）"
+        );
+
         task.abort();
     }
 }

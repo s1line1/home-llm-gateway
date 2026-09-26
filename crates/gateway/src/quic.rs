@@ -4,10 +4,12 @@ use std::time::Duration;
 
 use proto::{io::FrameReader, Frame};
 use s2n_quic::Connection;
+use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
 use crate::metrics::Metrics;
 use crate::registry::Registry;
+use crate::state::{self, ShutdownPhase};
 
 /// `stream_ceiling` = 每条连接允许的在途隧道流数（见 `Options::max_open_tunnel_streams`）。
 /// 它只用于**注册时的一致性告警**：agent 声明的 `max_concurrency` 超过这个额度时，网关侧
@@ -33,11 +35,29 @@ pub async fn accept_loop(
     registry: Registry,
     metrics: Metrics,
     stream_ceiling: u32,
+    mut shutdown: watch::Receiver<ShutdownPhase>,
 ) {
     let _accepting = metrics.mark_accepting();
-    while let Some(conn) = server.accept().await {
+    loop {
+        // 网关对象没了（通道关闭）就停止接受，与 HTTP 入口同一个硬停信号（复扫 D5）。
+        // 阶段推进**不**在这里处理：优雅关闭是直接 abort 本任务，已有 agent 连接不受影响
+        // （见 `Gateway::shutdown`）。这里 `return` 而不是 `break`：下面那条 `error!` 说的是
+        // "端点失效"这种真实故障，drop 关停走这里，不该被报成故障。
+        let accepted = tokio::select! {
+            _ = state::until_gateway_is_gone(&mut shutdown) => {
+                debug!("the gateway is gone; the tunnel entry stops accepting new agents");
+                return;
+            }
+            accepted = server.accept() => accepted,
+        };
+        let Some(conn) = accepted else {
+            break;
+        };
         let registry = registry.clone();
         let metrics = metrics.clone();
+        // 每条 agent 连接一个接收端：网关对象被 drop（通道关闭）时放弃这条连接。
+        // 与 HTTP 入口同一个信号，见 `state::until_gateway_is_gone`。
+        let mut conn_shutdown = shutdown.clone();
 
         let remote = match conn.remote_addr() {
             Ok(remote) => remote,
@@ -52,8 +72,18 @@ pub async fn accept_loop(
             // 连接计数的 +1/-1 绑在守卫上（记录 P2-11）：末尾语句在 panic 展开时不会执行，
             // gauge 会永久虚高；注册表条目的摘除同理，见 `registry::Registration`。
             let _connection = metrics.mark_agent_connected();
-            if let Err(e) = handle_conn(conn, registry, stream_ceiling).await {
-                warn!("agent connection error: {e}");
+            let handle = async move {
+                if let Err(e) = handle_conn(conn, registry, stream_ceiling).await {
+                    warn!("agent connection error: {e}");
+                }
+            };
+            tokio::select! {
+                // 硬停（复扫 D5）：`drop(Gateway)` 之后不再服务这条 agent 连接。注册表条目与
+                // `hlmg_agents` 随上面两处守卫在本任务结束时收尾。
+                _ = state::until_gateway_is_gone(&mut conn_shutdown) => {
+                    debug!(%remote, "gateway dropped; closing an agent connection");
+                }
+                _ = handle => {}
             }
         });
     }
@@ -61,7 +91,10 @@ pub async fn accept_loop(
     // `accept()` 返回 None 只有两种可能：UDP I/O 驱动失效，或端点被关闭（quinn 源码
     // endpoint.rs:647-675）。前者是真实故障——入口从此不再接受任何新 agent，而进程照常
     // 运行、HTTP 入口照常服务、systemd 显示健康，网关日志里却什么都没有。所以这里必须
-    // 把后果说清楚。正常关停不会走到这里（Gateway::shutdown 直接 abort 本任务）。
+    // 把后果说清楚。
+    //
+    // 两条正常关停路径都**不会**走到这里：`Gateway::shutdown` 直接 abort 本任务，
+    // `drop(Gateway)` 走上面那条"通道关闭"的 `return`（它连这条 error 都不该打）。
     error!(
         "QUIC 隧道入口已停止接受连接（端点被关闭或 UDP 驱动已失效）：已有 agent 连接不受影响，\
              但新的 edge 节点将无法接入，需要重启网关；hlmg_quic_accepting=0 可用于告警"
@@ -209,11 +242,13 @@ mod tests {
         let metrics = Metrics::default();
         assert_eq!(metrics.quic_accepting(), 0, "未启动时不应是「接受中」");
 
+        let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::Running);
         let task = tokio::spawn(accept_loop(
             test_server(),
             Registry::default(),
             metrics.clone(),
             1024,
+            shutdown_rx,
         ));
 
         // 循环进入等待后应标记为「接受中」
@@ -231,6 +266,39 @@ mod tests {
             0,
             "任务被 abort 后必须回到 0（Drop 守卫的全部意义），否则会一直谎报「接受中」"
         );
+    }
+
+    /// 规格（复扫 D5）：**发送端消失（= `Gateway` 被 drop）时，接受循环自己要退出**，
+    /// 而不是等 abort 落下来。
+    ///
+    /// 判据是"任务在 1s 内结束"与"gauge 回到 0"两件：前者证明循环真的观察到了那个信号
+    /// （`Drop` 只 abort 三个主任务句柄，派生任务全靠它），后者证明退出路径同样走了
+    /// `_accepting` 守卫。
+    #[tokio::test]
+    async fn accept_loop_returns_when_the_gateway_is_gone() {
+        let metrics = Metrics::default();
+        let (shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::Running);
+        let task = tokio::spawn(accept_loop(
+            test_server(),
+            Registry::default(),
+            metrics.clone(),
+            1024,
+            shutdown_rx,
+        ));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while metrics.quic_accepting() == 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(metrics.quic_accepting(), 1, "前提：循环已经跑起来了");
+
+        // `Gateway` 被 drop：唯一发送端消失，接收端看到 `Err`
+        drop(shutdown_tx);
+        let finished = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("通道关闭后接受循环必须自己退出（不能等 abort）");
+        assert!(finished.is_ok(), "任务应当正常结束而不是 panic");
+        assert_eq!(metrics.quic_accepting(), 0, "退出后 gauge 必须回到 0");
     }
 
     // ⚠️ 覆盖退化，需要记号：quinn → s2n-quic 之后，这条测试少了一半。

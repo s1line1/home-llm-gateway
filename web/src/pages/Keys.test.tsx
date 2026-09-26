@@ -76,6 +76,16 @@ describe("Keys 页的吊销失败提示（P3-18②）", () => {
     expect(mocks.deleteKey).toHaveBeenCalledWith("t", "k1");
   });
 
+  it("渲染出来的文本里没有 `//` —— JSX 子节点位置的注释会原样变成文本", async () => {
+    renderPage();
+    expect(await screen.findByText("dsh-client")).toBeDefined();
+
+    // **渲染级**守卫（复扫 G5）：`tsc` / `vite build` 都不会为这种泄漏报错，而产物守卫只认
+    // `P<n>-<n>` 审计标记 ⇒ 不带编号的 `//` 泄漏原先只有 Overview 那一页有断言拦。
+    const text = document.body.textContent ?? "";
+    expect(text).not.toContain("//");
+  });
+
   it("deleteKey 成功时不显示失败提示", async () => {
     mocks.deleteKey.mockResolvedValue(undefined);
     renderPage();

@@ -22,7 +22,7 @@ use crate::body::{read_body_with_stall, BodyRead, MAX_REQUEST_BODY};
 use crate::openai::error_response;
 use crate::usage_meter;
 use crate::{auth::authenticate, state::AppState};
-use forward::forward_body;
+use forward::{forward_body, ForwardGuard};
 
 /// 解析请求体的失败原因：`Invalid` 是客户端的问题（400），`Internal` 是网关自己的（500）。
 #[derive(Debug, PartialEq, Eq)]
@@ -192,6 +192,9 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
         .iter()
         .any(|(k, v)| k.eq_ignore_ascii_case("content-type") && v.contains("text/event-stream"));
     tokio::spawn(async move {
+        // 守卫必须**在 `forward_body` 之前**建好：`tx` 会被移进它，而 panic 展开时我们还得有
+        // 一个发送端把"这份响应不完整"送出去（复扫 B3，见 `ForwardGuard` 的文档）。
+        let mut guard = ForwardGuard::new(tx.clone(), metrics.clone(), request_id);
         let end = forward_body(
             &mut reader,
             &mut send,
@@ -201,8 +204,7 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
             state_client_stall,
             op_timeout,
             slot,
-            // clone：下面还要用同一个 `Metrics` 记退出原因（记录 P2-14）
-            metrics.clone(),
+            metrics,
             key_store,
             key.key_id,
             key.key_name,
@@ -211,10 +213,7 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
             shutdown,
         )
         .await;
-        // 记录 P2-14：这条 `debug!` 是**唯一**消费 ForwardEnd 的地方，于是七条以上的
-        // "状态码已是 200 的失败"在指标上完全不可见；现在每个出口都留一个计数。
-        metrics.record_forward_end(end.label());
-        debug!(request_id, end = ?end, "response forwarding finished");
+        guard.finish(end);
     });
 
     let mut builder = Response::builder().status(status);

@@ -1,3 +1,5 @@
+use std::ffi::OsStr;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use agent::Agent;
@@ -18,6 +20,18 @@ struct Args {
     config: PathBuf,
 }
 
+/// 是否给日志上色（复扫 A6，判据表在 `gateway/src/main.rs` 的同名函数上）。
+///
+/// tracing-subscriber 默认只看 `NO_COLOR` 与编译期 feature，**不看 stdout 是不是终端**，而
+/// `deploy/agent.service` 与 gateway 一样把日志 `append:` 到文件 ⇒ 每行带 ANSI 转义。
+/// 这里与 gateway 侧保持同一判据：**只有交互终端才上色**，`NO_COLOR` 语义不变（非空即关闭）。
+///
+/// 两个二进制各自持有一份 3 行实现（没有共享的 logging crate，而 `proto` 是隧道协议、不适合塞
+/// 日志策略）；改判据时两处都要改，这是刻意的取舍。
+fn ansi_for_logs(stdout_is_terminal: bool, no_color: Option<&OsStr>) -> bool {
+    stdout_is_terminal && !no_color.is_some_and(|v| !v.is_empty())
+}
+
 /// 启动 agent 主循环（独立函数，便于单元测试覆盖启动路径）。
 async fn run(args: Args) -> anyhow::Result<()> {
     // 日志时间戳固定东八区（UTC+8）：China Standard Time，无夏令时。
@@ -27,6 +41,12 @@ async fn run(args: Args) -> anyhow::Result<()> {
     );
     let _ = tracing_subscriber::fmt()
         .with_timer(timer)
+        // 显式给值（复扫 A6）：tracing-subscriber 默认只看 `NO_COLOR`，不看 stdout 是不是终端，
+        // 而 `deploy/agent.service` 把日志 `append:` 到文件（与 gateway 侧同一个缺陷）。
+        .with_ansi(ansi_for_logs(
+            std::io::stdout().is_terminal(),
+            std::env::var_os("NO_COLOR").as_deref(),
+        ))
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .try_init();
 
@@ -129,15 +149,23 @@ mod tests {
         )
     }
 
+    /// 规格（复扫 F5）：`run` 起来之后**真的去连过云端**，不只是"任务没结束"。
+    ///
+    /// 单看 `!task.is_finished()` 是不够的：把 `run` 里"启动之后"的部分换成 `pending()`，
+    /// 那条断言照样绿。所以这里绑一个 UDP socket 当云端地址——s2n-quic 的 Initial 包会打到
+    /// 它上面（不需要有服务端应答），于是"发过包"就是一个不依赖日志、也不依赖服务端的判据。
     #[tokio::test]
     async fn run_starts_agent_loop() {
-        // 写一份完整配置到临时目录；云端地址不可达 → 后台重试，主循环挂起在 pending
+        let cloud = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let cloud_addr = cloud.local_addr().unwrap();
+
+        // 写一份完整配置到临时目录；云端地址指向上面那个 socket（不会有应答）→ 后台重试
         let dir = tempfile::tempdir().unwrap();
         let (ca, cert, key) = gen_cert_files(dir.path());
         let config_path = dir.path().join("config.yml");
         let yaml = format!(
             r#"
-cloud_addr: "127.0.0.1:1"
+cloud_addr: "{cloud_addr}"
 ca: {}
 cert: {}
 key: {}
@@ -151,7 +179,15 @@ heartbeat_secs: 1
         let task = tokio::spawn(run(Args {
             config: config_path,
         }));
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // 第二判据（复扫 F5）：真的发过 QUIC Initial 包（有界等待）
+        let mut buf = [0u8; 1500];
+        let got =
+            tokio::time::timeout(std::time::Duration::from_secs(5), cloud.recv_from(&mut buf))
+                .await;
+        assert!(
+            got.is_ok(),
+            "agent 必须真的向 {cloud_addr} 发过包，而不是挂在一个 pending 上（复扫 F5）"
+        );
         assert!(!task.is_finished(), "agent loop should stay running");
         task.abort();
     }

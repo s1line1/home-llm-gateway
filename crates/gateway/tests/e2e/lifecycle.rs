@@ -93,6 +93,36 @@ async fn e2e_zero_valued_config_fails_fast_before_binding_anything() {
     gw.shutdown().await;
 }
 
+/// 规格（复扫 D4）：**时长的上界也在启动时作为 `Config` 错误失败，而不是 panic**。
+///
+/// 修好前 `validate()` 只查零值：`head_timeout` 取到"接近 u64 上限"的秒数时一路通过，
+/// `Gateway::start` 在 `head_alive_window = head_timeout × 4`（以及随后的 `Instant + grace`）
+/// 处 **panic** ⇒ 进程以 101 退出。配 `Restart=on-failure` 就是崩溃重启循环，而配置文件里
+/// 那个天文数字看起来只是"很大"。所以判据不只是"启动失败"，而是**失败的类型**——
+/// `GatewayError::Config`（一条可以照着改的配置错误），不是 panic。
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn e2e_over_large_timeouts_fail_as_a_config_error_instead_of_panicking() {
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    let certs = TestCerts::generate();
+    // 刻意选一个**能过第一条判据、过不了 × 4 那条**的值：它证明上界判据覆盖了派生式。
+    let opts = Options {
+        head_timeout: Duration::from_secs(u64::MAX / 4 + 1),
+        ..e2e_options(None)
+    };
+    match Gateway::start(gateway_config(&certs, opts)).await {
+        Ok(gw) => {
+            gw.shutdown().await;
+            panic!("head_timeout × 4 溢出必须让启动失败，而不是起来");
+        }
+        Err(GatewayError::Config(msg)) => assert!(
+            msg.contains("head_timeout_secs"),
+            "报错要点名 YAML 键（配置作者写的是这个）：{msg}"
+        ),
+        Err(other) => panic!("必须是 Config（配置错误），不能是 {other:?}"),
+    }
+}
+
 /// 规格：**`Gateway` 被 drop 而未调 `shutdown()` 时，监听口必须释放**。
 ///
 /// 修好前：`tasks` 里的 `JoinHandle` 只是被 drop（tokio 语义是 **detach**，不是 abort），
@@ -123,6 +153,70 @@ async fn e2e_drop_without_shutdown_releases_the_listener() {
             "drop 之后监听口仍在接受连接——入口任务没有被 abort（端口泄漏）"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// 规格（复扫 D5）：**`drop(Gateway)` 也要关掉"已经接受"的连接**，不能只释放监听口。
+///
+/// 修好前 `Drop` 只 abort 了那三个主任务句柄，每连接任务是 detach 的：连接一旦被 accept，
+/// 它就要活到 `client_stall`（这里刻意配 30s，远长于判据窗口）——一条**什么都没在跑**的
+/// keep-alive 连接白占 fd 与任务，而调用方以为"析构即关闭"。
+///
+/// 判据用 **EOF**（`read` 返回 0），与上一条的"连不上"互补：那条只覆盖监听口，这条覆盖
+/// 已建立的连接。步骤刻意先真的服务一个请求（`/healthz` 读完响应），这样"连接任务存在"
+/// 是被证明过的，而不是靠 sleep 猜。
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn e2e_drop_without_shutdown_closes_accepted_connections() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    // 30s：远长于下面 2s 的判据窗口，所以 EOF 只可能来自 drop，不可能来自停滞超时。
+    let TestGateway { gw, .. } =
+        start_gateway(|opts| opts.client_stall = Duration::from_secs(30)).await;
+    let addr = gw.http_addr;
+
+    let mut client = tokio::net::TcpStream::connect(addr).await.expect("先连上");
+    client
+        .write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n")
+        .await
+        .expect("写请求");
+    // 读到响应头 ⇒ 网关确实接受了这条连接并跑起了服务它的任务（不是还躺在 backlog 里）
+    let mut seen = Vec::new();
+    let mut buf = [0u8; 512];
+    loop {
+        let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf))
+            .await
+            .expect("drop 之前应当能读到 /healthz 的响应")
+            .expect("读响应");
+        assert!(n > 0, "drop 之前连接不该被关");
+        seen.extend_from_slice(&buf[..n]);
+        if seen.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+    }
+    assert!(
+        String::from_utf8_lossy(&seen).contains("200"),
+        "前提：这条连接真的被服务过，实际收到：{}",
+        String::from_utf8_lossy(&seen)
+    );
+
+    // 此刻它是一条**空闲 keep-alive** 连接：没有在途请求，只有 hyper 在等下一个请求头。
+    drop(gw);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let verdict = tokio::time::timeout(left, client.read(&mut buf)).await;
+        match verdict {
+            Ok(Ok(0)) => break,    // EOF：drop 关掉了这条连接
+            Ok(Ok(_)) => continue, // 响应体余量，读完再看
+            Ok(Err(e)) => panic!("drop 之后读连接出错（也说明已关闭，但请确认不是 RST）：{e}"),
+            Err(_) => panic!(
+                "drop 之后 2s 内没有 EOF：已接受的连接仍活着（client_stall 是 30s，\
+                 所以这不是停滞超时），说明它没被 drop 关掉"
+            ),
+        }
     }
 }
 

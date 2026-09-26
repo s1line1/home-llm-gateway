@@ -41,6 +41,7 @@ const oneAgent: AgentInfo = {
   max_concurrency: 4,
   inflight: 1,
   last_seen_secs_ago: 2,
+  healthy: true,
 };
 
 describe("Agents 页的明细降级（P3-18①）", () => {
@@ -75,5 +76,38 @@ describe("Agents 页的明细降级（P3-18①）", () => {
     expect(await screen.findByText("agent-1")).toBeDefined();
     expect(screen.getByText("mock-llm")).toBeDefined();
     expect(screen.queryByText(/返回 404/)).toBeNull();
+
+    // **渲染级**守卫（复扫 G5）：`//` 注释写到 JSX 子节点位置时会**原样渲染**成文本，而
+    // `tsc` / `vite build` 都不报错。原先只有 Overview 的测试有这条断言，而产物守卫只认
+    // `P<n>-<n>` 审计标记 ⇒ 不带编号的 `//` 泄漏在别的页面上没人拦。
+    const text = document.body.textContent ?? "";
+    expect(text).not.toContain("//");
+  });
+});
+
+describe("Agents 页的状态判定来自网关（复扫 G1）", () => {
+  beforeEach(() => {
+    localStorage.setItem("hlmg.admin.token", "t");
+    mocks.fetchAgents.mockReset();
+  });
+
+  it("网关说 healthy 就是在线 —— 哪怕 last_seen 看起来很旧", async () => {
+    // 复扫 G1：原先前端拿写死的 15s 去比 `last_seen_secs_ago`，于是把网关按更大的
+    // `agent_stale_secs`（比如 60s）判为健康的 agent 显示成"失联"，与同一页顶部的在线数矛盾。
+    mocks.fetchAgents.mockResolvedValue([{ ...oneAgent, last_seen_secs_ago: 20, healthy: true }]);
+    renderPage();
+
+    expect(await screen.findByText("agent-1")).toBeDefined();
+    expect(screen.getByText("在线")).toBeDefined();
+    expect(screen.queryByText("失联")).toBeNull();
+  });
+
+  it("网关说 not healthy 就是失联 —— 哪怕 last_seen 只有几秒", async () => {
+    mocks.fetchAgents.mockResolvedValue([{ ...oneAgent, last_seen_secs_ago: 2, healthy: false }]);
+    renderPage();
+
+    expect(await screen.findByText("agent-1")).toBeDefined();
+    expect(screen.getByText("失联")).toBeDefined();
+    expect(screen.queryByText("在线")).toBeNull();
   });
 });

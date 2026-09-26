@@ -479,7 +479,7 @@ s2n-quic 的 `initial_max_streams_bidi` 默认只有 **100**（`InitialMaxStream
   **同一次** JSON 解析（`usage_meter::request_facts`），请求帧的 body 用 `Bytes`（零拷贝移动，
   postcard 一次写整块而不是逐字节）。release 实测 16MiB 请求：改动前 ≈27.6ms 的 worker CPU
   （两次解析 + 逐元素序列化 20.0ms），现在 ≈1.6ms，且 ≥256KiB 的解析走阻塞池、不占 worker。
-- **`max_concurrent_requests` 是并发总量闸门，与内存脱钩**。它管的是「所有路径的在途 HTTP 请求总数」（`/metrics` 与 `/healthz` 豁免——探针被 429 会让 LB 摘除实例、把"慢"放大成"全挂"；SSE 长流从开头占到最后一块 body 送完），超限返回 `429 + Retry-After`。缓存关闭时它必须收在 `MemoryMax / 19MiB` 之下，否则那道闸等于没有——**先撞的是 `MemoryMax`（网关被 OOM 杀掉、连接中断），而不是这里优雅地 429**；缓存开启后按业务量给即可：
+- **`max_concurrent_requests` 是并发总量闸门，与内存脱钩**。它管的是「**受限域**的在途 HTTP 请求总数」（`/v1/*`、UI、admin；SSE 长流从开头占到最后一块 body 送完），超限返回 `429 + Retry-After`。两条**无认证**路径各有**独立**的宽松额度、互不相欠（各 64 并发，也不占这里的预算）：探针（`/healthz`）被 429 会让 LB 摘除一个健康实例、把"慢"放大成"全挂"，所以它既不能吃受限预算也不能无界；抓取（`/metrics`）同理——**它另有一条 64 的上限**，且**不计入**请求数/状态码/访问日志（抓取流量不该淹没真实告警，被拒时只在闸门日志里留一条 WARN）。缓存关闭时它必须收在 `MemoryMax / 19MiB` 之下，否则那道闸等于没有——**先撞的是 `MemoryMax`（网关被 OOM 杀掉、连接中断），而不是这里优雅地 429**；缓存开启后按业务量给即可：
 
   ```yaml
   max_concurrent_requests: 32    # 缓存关闭时 ≈ MemoryMax / 20MB；开启后按业务量给
@@ -869,8 +869,10 @@ QPS 压到一两个数量级以下。上面这些数字只在"把模型换快"�
   - `hlmg_agent_rejections_total{reason=...}`：因挑不出可路由 agent 而拒绝的请求数，按原因分：
     `registry-empty`（没人注册）/ `all-candidates-stale`（有人但心跳全过期）/
     `no-agent-serves-model` / `all-candidates-at-capacity`。**503 的成因看这个，不要靠状态码猜**
-  - `hlmg_tunnel_retries_total{outcome=...}`：因隧道建立失败而换 agent 重试的次数——
-    `ok`（重试成功的**自愈**次数）/ `failed`（换了仍失败）/ `no-alternative`（没有别的 agent 可换）
+  - `hlmg_tunnel_retries_total{outcome=...}`：**隧道建立失败后换 agent** 的次数，按结果分——
+    `ok`（重试成功的**自愈**次数）/ `failed`（换了仍失败）/ `no-alternative`（**没有别的 agent
+    可换**，所以它**不是一次重试**）。这一族**求和没有意义**（既不等于重试次数、也不等于失败
+    次数），看单项
   - `hlmg_client_stalls_total{phase="request-body"|"response-body"}`：因客户端**停滞**而主动放弃的
     请求数（读不动请求体 / 不消费响应体）。**它是准入槽位泄漏的直接告警**：修好之前这类停滞
     不留任何痕迹，只表现为 `hlmg_active_requests` 只增不减
@@ -882,10 +884,11 @@ QPS 压到一两个数量级以下。上面这些数字只在"把模型换快"�
     坏连接，摘除）。**`busy` 陡增 = 该扩容或调 agent 的 `max_concurrency`；`dead` 陡增才是隧道/网络故障**
   - `hlmg_forward_ends_total{kind=...}`：**响应转发的退出原因**（`upstream_end` / `upstream_error` /
     `upstream_closed` / `tunnel_error` / `idle_timeout` / `client_gone` / `client_stalled` /
-    `gateway_shutdown` / `protocol_violation`）。**这类失败大多发生在状态码 200 已经发给客户端之后**
-    （响应体半截、上游断流、逐帧空闲超时），访问日志只记状态码 ⇒ 不看这个指标，"客户端拿到半截回答"
-    在生产上完全不可观测。判据：`upstream_end` 之外任何 kind 的**增量**都值得看一眼；
-    `idle_timeout`/`tunnel_error` 陡增 = 隧道或上游出了问题，`client_*` 陡增 = 客户端侧在放弃
+    `gateway_shutdown` / `protocol_violation` / `panicked`）。**这类失败大多发生在状态码 200 已经
+    发给客户端之后**（响应体半截、上游断流、逐帧空闲超时），访问日志只记状态码 ⇒ 不看这个指标，
+    "客户端拿到半截回答"在生产上完全不可观测。判据：`upstream_end` 之外任何 kind 的**增量**都值得
+    看一眼；`idle_timeout`/`tunnel_error` 陡增 = 隧道或上游出了问题，`client_*` 陡增 = 客户端侧在
+    放弃，`panicked` = 转发任务 panic（这一档会把响应**掐断**，客户端不会把半截体当完整结果）
   - `hlmg_key_verify_hits_total` / `hlmg_key_verify_misses_total`：key 校验命中已验证缓存 / **真正跑了 argon2**的次数。misses 的**增量**就是内存与 CPU 的风险信号（一次 miss 峰值 +19MiB，见《并发上限与内存》），稳态下应接近 0；突然上涨说明凭据被吊销/新增，或缓存容量 `verified_cache_max` 不够。⚠️ **`verified_cache_max: 0` 时这两个计数器恒为 0**（走的是不走缓存的旧路径，两个数都不加）——看到 0 要先确认缓存是否被关掉，别当成"没有校验"
 - **结构化日志**：`tracing`，每个请求带 `request_id` / 状态码 / 耗时（`tower-http` TraceLayer）
 - **`/healthz`**：存活探针。**200 ⇔ 隧道入口仍在接受新 agent**（`hlmg_quic_accepting`），否则 `503` + `status: "degraded"` + `detail`（处置方式：重启网关）。body 是 JSON，同时报出诊断信息：
