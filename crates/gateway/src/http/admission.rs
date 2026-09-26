@@ -20,7 +20,31 @@ use axum::{
 };
 use tracing::warn;
 
+use crate::metrics::AdmissionDomain;
 use crate::state::AppState;
+
+/// 探针（`/healthz`）域的独立上限（复扫 A3）。
+///
+/// **为什么不干脆不限**：`/healthz` 是公网**无认证**入口，完全不限等于留一个免费的资源消耗点
+/// （连接、任务、fd 都要花钱）。但它也不能太小——给它任何上限都会在洪水场景下重新引入 R12
+/// 那条失败模式（探针被 429 → LB 摘实例 → 把上游的"慢"放大成整机"全挂"），所以取一个
+/// **显著高于任何正常探针并发**的值：正常 LB 就几条探针，64 足够宽松，同时给洪水封了顶。
+///
+/// 它**不**与 `max_concurrent_requests` 共享计数：那条是受限路径的预算，探针占它就会让
+/// `/v1` 在探针洪水下全线 429（见 [`AdmissionDomain`]）。
+const MAX_CONCURRENT_PROBES: u32 = 64;
+
+/// 路径 → `(准入域, 该域的上限)`。
+///
+/// 抽成纯函数是为了让**接线**本身可测：这条映射写错（例如 `/healthz` 落回受限域），
+/// `Metrics` 那边的域隔离做得再对也没用——探针照样吃 `/v1` 的额度。
+fn admission_domain(path: &str, gated_limit: u32) -> (AdmissionDomain, u32) {
+    if path == "/healthz" {
+        (AdmissionDomain::Probe, MAX_CONCURRENT_PROBES)
+    } else {
+        (AdmissionDomain::Gated, gated_limit)
+    }
+}
 
 pub(super) async fn admission_middleware(
     State(state): State<AppState>,
@@ -48,25 +72,38 @@ pub(super) async fn admission_middleware(
     // 票据的释放完全由 Drop 负责，分两段：① 移交 body 之前（含客户端中断导致 future
     // 被 drop）→ 就地 Drop 归还；② 移交 body 之后 → 随 body 结束/丢弃归还。
     //
-    // /healthz **豁免**（REBUILD §5.3 / R12）：闸门打满时探针若被 429，LB 会摘除实例、
-    // systemd 会重启循环——把上游的"慢"放大成整机"全挂"。用 `0 = 不限` 表达豁免，
-    // 于是 id、访问日志、在途与耗时记账与其它路径完全一致，区别只有"能不能被拒"。
-    let limit = if path == "/healthz" {
-        0
-    } else {
-        state.max_concurrent_requests
-    };
-    let Some(admission) = state.metrics.try_enter(limit) else {
+    // /healthz **豁免受限闸门**（REBUILD §5.3 / R12）：闸门打满时探针若被 429，LB 会摘除实例、
+    // systemd 会重启循环——把上游的"慢"放大成整机"全挂"。
+    //
+    // 但"豁免"必须是**不占受限预算**，不能只是"不能被拒"（复扫 A3）：先前用 `limit = 0` 表达，
+    // 而 `0` 免掉的只是上限判定——领票、计数照旧，加的还是受限路径用来比较的**同一个**计数器
+    // ⇒ 一个无认证的探针洪水就能把 `/v1` 顶到 429，而 LB 看到探针 200、认为实例健康。
+    // 现在它进**探针域**：有自己的在途计数与自己的宽松上限（`MAX_CONCURRENT_PROBES`），与受限域
+    // 互不影响；而 id、访问日志、`hlmg_active_requests` 与耗时记账与其它路径仍然完全一致。
+    let (domain, limit) = admission_domain(&path, state.max_concurrent_requests);
+    let Some(admission) = state.metrics.try_enter(limit, domain) else {
         // 只补"被闸门拒掉也算一次请求"：`try_enter` 失败时没有自增，而状态码由外层统一记。
         state.metrics.record_rejected();
-        warn!(
-            request_id = %request_id,
-            method = %method,
-            path = %path,
-            active = state.metrics.active_count(),
-            limit,
-            "concurrent request limit reached, rejecting 429"
-        );
+        match domain {
+            // 探针被拒说明是**洪水**（正常 LB 那几条碰不到 64），这条日志是它唯一的信号。
+            AdmissionDomain::Probe => warn!(
+                request_id = %request_id,
+                method = %method,
+                path = %path,
+                probes = state.metrics.active_probe_count(),
+                max_probes = MAX_CONCURRENT_PROBES,
+                "probe concurrency limit reached, rejecting 429"
+            ),
+            AdmissionDomain::Gated => warn!(
+                request_id = %request_id,
+                method = %method,
+                path = %path,
+                active = state.metrics.active_count(),
+                gated = state.metrics.active_gated_count(),
+                limit,
+                "concurrent request limit reached, rejecting 429"
+            ),
+        }
         return crate::openai::error_response(
             axum::http::StatusCode::TOO_MANY_REQUESTS,
             "too many concurrent requests, retry later",
@@ -87,8 +124,10 @@ pub(super) async fn admission_middleware(
 
 #[cfg(test)]
 mod tests {
+    use super::{admission_domain, MAX_CONCURRENT_PROBES};
     use crate::http::app;
     use crate::http::test_util::test_state;
+    use crate::metrics::AdmissionDomain;
     use axum::http::StatusCode;
     use tower::ServiceExt; // `Router::oneshot`
 
@@ -105,7 +144,9 @@ mod tests {
         let router = app(state);
 
         // 占住唯一的槽（limit=0 = 不限）
-        let held = metrics.try_enter(0).expect("limit=0 必进");
+        let held = metrics
+            .try_enter(0, AdmissionDomain::Gated)
+            .expect("limit=0 必进");
 
         let uuid = "0197f1c2-9f0b-7c31-8a44-1b2c3d4e5f60";
         let resp = router
@@ -128,5 +169,30 @@ mod tests {
         );
 
         drop(held);
+    }
+
+    /// 规格（复扫 A3）：**`/healthz` 必须落在探针域**，其余路径落在受限域。
+    ///
+    /// 这条测的是接线：`Metrics` 的域隔离再对，映射写错也白搭——探针会重新吃 `/v1` 的额度。
+    #[test]
+    fn healthz_maps_to_the_probe_domain_and_everything_else_to_the_gated_one() {
+        assert_eq!(
+            admission_domain("/healthz", 7),
+            (AdmissionDomain::Probe, MAX_CONCURRENT_PROBES),
+            "探针必须进自己的域，且用探针自己的上限"
+        );
+        for gated in ["/v1/models", "/v1/chat/completions", "/", "/admin/keys"] {
+            assert_eq!(
+                admission_domain(gated, 7),
+                (AdmissionDomain::Gated, 7),
+                "{gated} 必须走受限域、用配置的上限"
+            );
+        }
+        // 只认精确路径：别让 `/healthz/` 或前缀把别的请求也拖进探针域（那等于绕过受限闸门）。
+        assert_eq!(
+            admission_domain("/healthz/", 7),
+            (AdmissionDomain::Gated, 7),
+            "只有精确的 /healthz 才是探针"
+        );
     }
 }

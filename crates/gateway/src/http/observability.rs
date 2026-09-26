@@ -14,9 +14,9 @@
 //!    `client_request_id`。
 //!    （历史缺口：拆分前 `metrics_middleware` 与 `proxy` 各有一个计数器都从 1 起，
 //!    UUID 客户端会让两个数列独立递增、周期性撞号——现已由该模块统一。）
-//! 2. **闸门**：`max_concurrent_requests` 是全局在途上限（`/metrics` 完全不记；`/healthz`
-//!    豁免——探针被 429 会让 LB 摘除实例，把"慢"放大成"全挂"），超限立即 429，
-//!    防多 key 总和压垮单实例。
+//! 2. **闸门**：`max_concurrent_requests` 是**受限域**的在途上限（`/metrics` 完全不记；
+//!    `/healthz` 既不占受限额度、也只受它自己的宽松上限约束，见 `http::admission`），超限立即
+//!    429，防多 key 总和压垮单实例。
 //! 3. **票据移交**：`Admission` 的释放**完全由 Drop 负责**，且分两段——移交 body 之前
 //!    （含客户端中断导致 future 被 drop）就地归还；移交之后随 body 结束/丢弃归还。
 //!    移交用 `map_frame` 把票据绑在 body 上，于是闸门覆盖的是**整个请求**，包括 LLM 的
@@ -168,7 +168,7 @@ pub(super) async fn request_id_middleware(
 mod tests {
     use crate::http::app;
     use crate::http::test_util::test_state;
-    use crate::metrics::Metrics;
+    use crate::metrics::{AdmissionDomain, Metrics};
     use crate::storage::KeyStore;
     use axum::http::StatusCode;
     use std::time::Duration;
@@ -303,7 +303,7 @@ mod tests {
 
         // 占住唯一的并发槽（limit=0 = 不限，必进；票据持有到 drop 为止）
         let held = metrics
-            .try_enter(0)
+            .try_enter(0, AdmissionDomain::Gated)
             .expect("limit=0 admits unconditionally");
         // 记账断言用**增量**：闸门那次 429 应当恰好 +1 请求、+1 状态码、+0 中断
         // （里层补 request_count、外层记状态码，各一半；两边都记就会变成 -1）。
@@ -363,7 +363,7 @@ mod tests {
 
         // 占满唯一的槽位：此刻任何走闸门的请求都 429
         let held = metrics
-            .try_enter(0)
+            .try_enter(0, AdmissionDomain::Gated)
             .expect("limit=0 admits unconditionally");
         let resp = router
             .clone()
@@ -419,15 +419,17 @@ mod tests {
         let mut handles = Vec::new();
         for _ in 0..8 {
             let m = metrics.clone();
-            handles.push(std::thread::spawn(move || m.try_enter(1)));
+            handles.push(std::thread::spawn(move || {
+                m.try_enter(1, AdmissionDomain::Gated)
+            }));
         }
         let admissions: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
         let admitted = admissions.iter().filter(|a| a.is_some()).count();
         assert_eq!(admitted, 1, "exactly one concurrent entry admitted");
         // 占用未释放时后续仍拒；票据 Drop 后恢复
-        assert!(metrics.try_enter(1).is_none());
+        assert!(metrics.try_enter(1, AdmissionDomain::Gated).is_none());
         drop(admissions); // 释放占用的那个
-        assert!(metrics.try_enter(1).is_some());
+        assert!(metrics.try_enter(1, AdmissionDomain::Gated).is_some());
     }
 
     /// 规格：API Key 校验（argon2，单次 10-30ms CPU）**不得阻塞 async worker**。
