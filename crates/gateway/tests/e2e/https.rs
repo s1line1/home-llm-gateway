@@ -242,42 +242,161 @@ async fn e2e_quic_control_stream_edge_frames() {
         "reg-2 should be removed after connection close"
     );
 
-    // 错误 CA 签发的客户端证书 → 握手失败 → "connection attempt failed" 分支
-    let bad_ca_key = KeyPair::generate().unwrap();
-    let mut bad_ca = CertificateParams::default();
-    bad_ca
-        .distinguished_name
-        .push(DnType::CommonName, "other ca");
-    bad_ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    let bad_ca_cert = bad_ca.self_signed(&bad_ca_key).unwrap();
-    let bad_key = KeyPair::generate().unwrap();
-    let mut bad_cli = CertificateParams::default();
-    bad_cli
-        .distinguished_name
-        .push(DnType::CommonName, "bad agent");
-    let bad_cli_cert = bad_cli
-        .signed_by(&bad_key, &bad_ca_cert, &bad_ca_key)
-        .unwrap();
-    let bad_cfg = agent::tls::rustls_client_tls(
-        &[bad_ca_cert.der().clone()],
-        vec![bad_cli_cert.der().clone()],
-        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(bad_key.serialize_der())),
-    )
-    .unwrap();
-    let bad_client = s2n_quic::Client::builder()
-        .with_tls(s2n_quic::provider::tls::rustls::Client::from(Arc::new(
-            bad_cfg,
-        )))
+    // 客户端证书**不由网关信任的 CA 签发** → 网关侧 `WebPkiClientVerifier` 拒绝 → 握手失败 →
+    // "connection attempt failed" 分支。
+    //
+    // roots 用的是**真 CA**（复扫 D1）：原先这里把"坏 CA"当**客户端 root** 传进去，于是失败
+    // 发生在"客户端验服务端"那一步，与网关对客户端证书的校验毫无关系——那样把
+    // `rustls_server_tls` 里的 `with_client_cert_verifier` 换成 `with_no_client_auth()`
+    // 这条也照样绿。这条性质现在由 `e2e_mtls_requires_a_trusted_client_certificate` 单独钉住。
+    let (bad_chain, bad_key) = foreign_client_identity();
+    let bad_cfg = agent::tls::rustls_client_tls(&certs.ca, bad_chain, bad_key).unwrap();
+    assert!(
+        !mtls_registration_succeeds(bad_cfg, &gw, "mtls-foreign").await,
+        "网关必须拒绝由不受信 CA 签发的客户端证书"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(gw.agent_count(), 0, "failed handshake must not register");
+
+    gw.shutdown().await;
+}
+
+/// 用给定 TLS 配置起一个裸客户端并尝试注册；返回"网关注册表里是否真的出现了这个 agent"。
+///
+/// 为什么要走到**注册生效**这一步：握手本身的"成功"信号在客户端这一侧不可靠 ——
+/// `connect()` 返回 `Ok`、`open_bidirectional_stream()` 成功都可能只是本地成立（QUIC 的流
+/// 先本地开、数据后发），而网关对成功的 Register **不回帧**，所以"读到回应"也不是判据
+/// （第一版就先后错在这两处：不带客户端证书也判成了成功、带真证书又判成了失败）。
+/// 唯一可信的判据是注册表里出现了它。
+async fn mtls_registration_succeeds(
+    tls: rustls::ClientConfig,
+    gw: &Gateway,
+    agent_id: &str,
+) -> bool {
+    let client = s2n_quic::Client::builder()
+        .with_tls(s2n_quic::provider::tls::rustls::Client::from(Arc::new(tls)))
         .unwrap()
         .with_io("0.0.0.0:0")
         .unwrap()
         .start()
         .unwrap();
-    let _ = bad_client
+    let Ok(mut conn) = client
         .connect(s2n_quic::client::Connect::new(gw.quic_addr).with_server_name("localhost"))
-        .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(gw.agent_count(), 0, "failed handshake must not register");
+        .await
+    else {
+        return false;
+    };
+    let Ok(stream) = conn.open_bidirectional_stream().await else {
+        return false;
+    };
+    let (_recv, mut send) = stream.split();
+    let register = Frame::Register {
+        agent_id: agent_id.into(),
+        models: vec!["m".into()],
+        max_concurrency: 1,
+        version: "test".into(),
+    };
+    if write_frame(&mut send, &register).await.is_err() || send.finish().is_err() {
+        return false;
+    }
+    // 注册是异步落到注册表的：给它 1 秒（远大于本地环回的耗时，也远小于任何测试超时）。
+    for _ in 0..50 {
+        if gw.agent_count() >= 1 {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    false
+}
+
+/// 生成一份"别家 CA 签发"的客户端身份：(证书链, 私钥)。
+fn foreign_client_identity() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
+    let ca_key = KeyPair::generate().unwrap();
+    let mut ca = CertificateParams::default();
+    ca.distinguished_name.push(DnType::CommonName, "foreign ca");
+    ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca_cert = ca.self_signed(&ca_key).unwrap();
+
+    let cli_key = KeyPair::generate().unwrap();
+    let mut cli = CertificateParams::default();
+    cli.distinguished_name
+        .push(DnType::CommonName, "foreign agent");
+    let cli_cert = cli.signed_by(&cli_key, &ca_cert, &ca_key).unwrap();
+    (
+        vec![cli_cert.der().clone()],
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cli_key.serialize_der())),
+    )
+}
+
+/// 规格（2026-09-25 复扫 D1）：网关侧的 **mTLS 客户端证书校验**必须被真正钉住。
+///
+/// 原先唯一的负例把坏 CA 当**客户端 root** 传入 ⇒ 失败发生在"客户端验服务端"那一步，与
+/// `WebPkiClientVerifier` 毫无关系；而它唯一的断言是 `agent_count() == 0`，那条既可能来自
+/// "握手被拒"，也可能来自"握手成功但没注册" ⇒ 把 `rustls_server_tls` 的
+/// `with_client_cert_verifier` 换成 `with_no_client_auth()` 也不会红。
+///
+/// 这里让**客户端始终信任真 CA**（服务端证书一定验得过），只动客户端证书这一侧，并且断言
+/// **握手本身**的成败：
+///   ① 不带客户端证书 → 必须被拒（直接钉住"必须有受信客户端证书"）
+///   ② 带别家 CA 签的证书 → 必须被拒（钉住信任锚是**哪一把** CA）
+///   ③ 带真客户端证书 → 必须成功（对照：证明上面两条不是"什么都拒"）
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn e2e_mtls_requires_a_trusted_client_certificate() {
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    // rustls 的进程级 provider 由网关的构造函数装；直接手搓 ClientConfig 前先确保它在了。
+    proto::crypto::provider();
+    let TestGateway { gw, certs, .. } = start_gateway(|o| o.keys_file = None).await;
+
+    // roots = **真 CA**：服务端证书验得过，能失败的只剩网关对我们客户端证书的校验。
+    let roots = || {
+        let mut roots = rustls::RootCertStore::empty();
+        for c in &certs.ca {
+            roots.add(c.clone()).unwrap();
+        }
+        roots
+    };
+    let with_alpn = |mut cfg: rustls::ClientConfig| {
+        cfg.alpn_protocols = vec![proto::ALPN.to_vec()];
+        cfg
+    };
+
+    // ① 不带客户端证书
+    let no_cert = with_alpn(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots())
+            .with_no_client_auth(),
+    );
+    assert!(
+        !mtls_registration_succeeds(no_cert, &gw, "mtls-nocert").await,
+        "网关必须拒绝**没有客户端证书**的连接 —— 把 with_client_cert_verifier 换成 \
+         with_no_client_auth() 时这条会红（复扫 D1）"
+    );
+
+    // ② 别家 CA 签的客户端证书
+    let (foreign_chain, foreign_key) = foreign_client_identity();
+    let wrong_ca = with_alpn(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots())
+            .with_client_auth_cert(foreign_chain, foreign_key)
+            .unwrap(),
+    );
+    assert!(
+        !mtls_registration_succeeds(wrong_ca, &gw, "mtls-wrongca").await,
+        "别家 CA 签发的客户端证书必须被拒"
+    );
+
+    // ③ 对照：带真客户端证书必须成功
+    let good = with_alpn(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots())
+            .with_client_auth_cert(certs.client_cert.clone(), certs.client_key.clone_key())
+            .unwrap(),
+    );
+    assert!(
+        mtls_registration_succeeds(good, &gw, "mtls-good").await,
+        "带受信客户端证书必须握手成功 —— 否则上面两条是假绿"
+    );
 
     gw.shutdown().await;
 }
