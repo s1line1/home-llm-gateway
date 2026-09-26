@@ -121,6 +121,11 @@ pub(super) async fn open_and_send(
                 //
                 // 这条判据（忙/死）由注册表给出，本模块只把结果映射成**对外契约**：
                 // 指标标签、状态码、文案、以及要不要换连接重试。
+                //
+                // 注意"忙"这一支在测试里不好到达（踩过一次，缺口与正确做法登记在 `TODO.md`
+                // 的「2026-09-25 复扫：回归测试缺口」）：`entry.open_stream()` 只在**对端**广告的
+                // 流额度用尽时才真的阻塞，而探针若用 `.send().await` 取到状态码就丢掉响应，
+                // 隧道流只活几百微秒、额度永远不会被排满。
                 let disposition = match &failure {
                     OpenFailure::TimedOut => state.registry.report_open_timeout(
                         &entry,

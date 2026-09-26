@@ -1178,3 +1178,33 @@
         评估原话：C1 模块化是"**第二步的可选精化**，先有处置接口，再看计数是否需要自己的模块"；
         现在处置接口在、Entry 也不透明了，但**没有第二个消费者、也没有 profiling 说话**，
         所以先不付这份搬迁成本（真有需要再拆，那时 `Entry` 不透明的前提已经满足）。
+
+## 2026-09-25 复扫：回归测试缺口
+
+来源：2026-09-25 的全项目复扫（明细在 gitignored 的 `docs/PROJECT_SCAN_2026-09-25.md`）。
+本节只登记"修复已落地、但约定的测试仍没写成"的那一条；复扫里其余未修项不在这里重复。
+
+- [ ] **`B1`（唯一 agent 忙 ⇒ 429）约定的 e2e 没写成**：修复本身在——`pick()` 改成先判"有没有
+      候选"、再按 `exclude` 过滤，新增 `AcquireError::AllExcluded`，`rejection_response()` 把两种
+      "忙"一起映射成 429 `agent at capacity` + 标签 `all-candidates-at-capacity`，两层都有单测
+      且都做了变异验证。缺的是"单 agent + 忙"的端到端用例。下面记下**正确诊断**与**走过的弯路**，
+      免得下次重踩。
+      - **正确诊断**：`busy` 的判据是 `inflight ≥ min(max_concurrency, ceiling)`
+        （`registry.rs` 的 `open_timeout_is_fatal`），而它要求 `entry.open_stream()`
+        （s2n-quic 的 `open_bidirectional_stream`）**真的阻塞**——那只在**对端**广告的流额度
+        用尽时发生；握手完成后开流是本地行为，额度没满就立刻返回。
+      - **两次失败尝试**：`max_open_tunnel_streams = 2` + 8 并发，以及默认额度 + 150 并发，
+        **全部返回 200**，整条测试只跑了 0.69s / 0.72s。而 `/v1/slow_body` 的正文要停
+        `SLOW_BODY_STALL = 3s`（`crates/mock-llm/src/lib.rs:252`）——总耗时**远小于**它，说明
+        **没有一个请求停过**：探针写的是 `.send().await`，而 reqwest 在**收到响应头**时就返回，
+        它紧接着只取 `.status()` 就把响应丢掉了；隧道流只活几百微秒，流额度从来没被排满，
+        所以 `open_tunnel` 根本没超时，"忙"这条路径压根没进入（与额度设成几无关）。
+      - ⚠️ **订正**：提交 `dd35027` 的正文把 `max_open_tunnel_streams` 说成"限的是**对端**能开
+        多少条流，不是反过来"——**这是错的**。`crates/gateway/src/listen.rs:44` 用的是
+        `with_max_open_local_bidirectional_streams`，s2n-quic 的文档是 "Sets the max **local**
+        limits for bidirectional streams"，即**本地发起**方向，也就是网关自己开出去的隧道流。
+      - **下次照这个走**：让请求真的**握住**隧道流——读完响应体（消费整条 SSE），而不是取到状态码
+        就丢；配 `max_open_tunnel_streams = 2`、agent `max_concurrency = 0`（不限容量，免得准入
+        闸门先把它拦下来）、`tunnel_op_timeout = 1s`、并发 > 2。超出的那批会开流超时，而
+        `inflight(> 2) ≥ min(0 → ceiling = 2)` ⇒ 判"忙"。若这条路仍不通，再上"额度很小的假
+        peer"：只广告很小的 MAX_STREAMS，并且接受流之后**握着不放**。
