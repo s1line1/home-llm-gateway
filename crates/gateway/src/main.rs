@@ -127,15 +127,26 @@ mod tests {
         )
     }
 
+    /// 规格（复扫 F5）：`run` 起来之后**真的在提供服务**，不只是"任务没结束"。
+    ///
+    /// 单看 `!task.is_finished()` 是不够的：把 `run` 里"启动之后"的部分换成 `pending()`，
+    /// 那条断言照样绿——它只证明了这个 future 没有立刻返回。所以这里加第二条判据：
+    /// **公网入口真的在接受 TCP 连接**。
     #[tokio::test]
     async fn run_starts_gateway() {
-        // 写一份完整配置到临时目录，用随机端口启动网关
+        // 端口不能写 0：`listen_addr: 127.0.0.1:0` 让内核挑端口，测试就无从验证"真的在听"。
+        // 先占一个再放掉（取空闲端口的常规办法），把端口号留在手里。
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        // 写一份完整配置到临时目录
         let dir = tempfile::tempdir().unwrap();
         let (ca, cert, key) = gen_cert_files(dir.path());
         let config_path = dir.path().join("config.yml");
         let yaml = format!(
             r#"
-listen_addr: "127.0.0.1:0"
+listen_addr: "127.0.0.1:{port}"
 quic_addr: "127.0.0.1:0"
 cert: {}
 key: {}
@@ -153,6 +164,25 @@ keys_file: {}
         }));
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         assert!(!task.is_finished(), "gateway loop should stay running");
+
+        // 第二判据（复扫 F5）：真的能在那个端口上建立连接。有界轮询——listen 是启动期做的，
+        // 但任务调度可能还没跑到。
+        let mut connected = false;
+        for _ in 0..50 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_ok()
+            {
+                connected = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            connected,
+            "网关必须真的在 127.0.0.1:{port} 上接受连接，而不是挂在一个 pending 上（复扫 F5）"
+        );
+
         task.abort();
     }
 }

@@ -129,15 +129,23 @@ mod tests {
         )
     }
 
+    /// 规格（复扫 F5）：`run` 起来之后**真的去连过云端**，不只是"任务没结束"。
+    ///
+    /// 单看 `!task.is_finished()` 是不够的：把 `run` 里"启动之后"的部分换成 `pending()`，
+    /// 那条断言照样绿。所以这里绑一个 UDP socket 当云端地址——s2n-quic 的 Initial 包会打到
+    /// 它上面（不需要有服务端应答），于是"发过包"就是一个不依赖日志、也不依赖服务端的判据。
     #[tokio::test]
     async fn run_starts_agent_loop() {
-        // 写一份完整配置到临时目录；云端地址不可达 → 后台重试，主循环挂起在 pending
+        let cloud = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let cloud_addr = cloud.local_addr().unwrap();
+
+        // 写一份完整配置到临时目录；云端地址指向上面那个 socket（不会有应答）→ 后台重试
         let dir = tempfile::tempdir().unwrap();
         let (ca, cert, key) = gen_cert_files(dir.path());
         let config_path = dir.path().join("config.yml");
         let yaml = format!(
             r#"
-cloud_addr: "127.0.0.1:1"
+cloud_addr: "{cloud_addr}"
 ca: {}
 cert: {}
 key: {}
@@ -151,7 +159,15 @@ heartbeat_secs: 1
         let task = tokio::spawn(run(Args {
             config: config_path,
         }));
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // 第二判据（复扫 F5）：真的发过 QUIC Initial 包（有界等待）
+        let mut buf = [0u8; 1500];
+        let got =
+            tokio::time::timeout(std::time::Duration::from_secs(5), cloud.recv_from(&mut buf))
+                .await;
+        assert!(
+            got.is_ok(),
+            "agent 必须真的向 {cloud_addr} 发过包，而不是挂在一个 pending 上（复扫 F5）"
+        );
         assert!(!task.is_finished(), "agent loop should stay running");
         task.abort();
     }
