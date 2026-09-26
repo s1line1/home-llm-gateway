@@ -107,6 +107,73 @@ impl ForwardEnd {
     }
 }
 
+/// 转发任务的收尾守卫（复扫 B3）。
+///
+/// **为什么需要一个 Drop 守卫**：`forward_body` 有九个**返回**出口，而 panic 是第十个——它不走
+/// 任何一条返回路径。`tx` 会随栈展开被 drop，于是 `rx` 干净地结束，客户端拿到一份**看似完整的
+/// 200 截断体**（HTTP 层看不出少了东西），而 `record_forward_end` 只在正常返回后调用 ⇒ 指标里
+/// 连一个样本都没有，排查时完全没有痕迹。
+///
+/// panic 展开时唯一还会执行的是 Drop，所以收尾挂在这里——与 `SlotGuard` / `Admission` /
+/// `AgentConnectionGuard` 同一个理由（那三处的注释写着同一句话："panic 展开时末尾那句不执行"）。
+///
+/// 正常路径调 [`Self::finish`] 记下出口标签并解除守卫，此后 Drop 是空操作。
+pub(super) struct ForwardGuard {
+    tx: mpsc::Sender<Result<Bytes, String>>,
+    metrics: crate::metrics::Metrics,
+    request_id: u64,
+    armed: bool,
+}
+
+impl ForwardGuard {
+    /// 需要在 `forward_body` **之前**建好：守卫必须活到任务结束（含 unwind）。
+    pub(super) fn new(
+        tx: mpsc::Sender<Result<Bytes, String>>,
+        metrics: crate::metrics::Metrics,
+        request_id: u64,
+    ) -> Self {
+        Self {
+            tx,
+            metrics,
+            request_id,
+            armed: true,
+        }
+    }
+
+    /// 正常收尾：记下这次出口并解除守卫。
+    pub(super) fn finish(&mut self, end: ForwardEnd) {
+        // 记录 P2-14：这条 `debug!` 是**唯一**消费 ForwardEnd 的地方，于是七条以上的
+        // "状态码已是 200 的失败"在指标上完全不可见；现在每个出口都留一个计数。
+        self.metrics.record_forward_end(end.label());
+        tracing::debug!(self.request_id, end = ?end, "response forwarding finished");
+        self.armed = false;
+    }
+}
+
+impl Drop for ForwardGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // 走到这里 = 任务在 `finish` 之前就 unwind 了。
+        self.metrics.record_forward_end("panicked");
+        tracing::error!(
+            request_id = self.request_id,
+            "response forwarding task panicked; aborting the client response so a truncated body \
+             is not mistaken for a complete one"
+        );
+        // 推一个**错误项**：`Body::from_stream` 见到错误项会掐断响应（连接中断），而不是正常收尾
+        // ——这正是"截断体不许看起来完整"所需要的信号，与其它九个出口用的是同一个通道。
+        //
+        // 用 `try_send`：Drop 里不能 await。通道满 = 客户端不读，那种情形另有 `client_stalled`
+        // 与 `io_stall` 兜底，这里塞不进去不算丢信号。
+        let _ = self.tx.try_send(Err(
+            "internal error: the gateway's forwarding task panicked; this response is incomplete"
+                .into(),
+        ));
+    }
+}
+
 /// 关闭时写给在途 SSE 的终止事件。
 ///
 /// **必须与正常完成可区分**：`data: [DONE]` 是 OpenAI 的"正常结束"标记，用它收尾等于
@@ -400,6 +467,60 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+
+    /// 规格（复扫 B3）：**转发任务 panic 必须留下痕迹、并且掐断响应**。
+    ///
+    /// 修复前：`tx` 随栈展开 drop ⇒ `rx` 干净结束 ⇒ 客户端拿到"看似完整的 200 截断体"，
+    /// 而指标里连一个样本都没有。现在收尾挂在 `ForwardGuard` 的 Drop 上。
+    #[tokio::test]
+    async fn a_panicking_forward_task_records_it_and_aborts_the_body() {
+        let (tx, mut rx) = mpsc::channel::<Result<Bytes, String>>(4);
+        let metrics = crate::metrics::Metrics::default();
+
+        // 让它在**真的 unwind** 里 drop 守卫（不是正常返回），证明那条路确实会执行。
+        // 顺便静音 panic hook，免得测试输出里混进一段看起来像失败的回溯。
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let joined = tokio::spawn({
+            let metrics = metrics.clone();
+            async move {
+                let _guard = ForwardGuard::new(tx, metrics, 7);
+                panic!("boom");
+            }
+        })
+        .await;
+        std::panic::set_hook(prev);
+
+        assert!(joined.is_err(), "前提：任务确实 panic 了");
+        assert!(
+            rx.recv().await.expect("panic 之后必须还有一项").is_err(),
+            "必须推一个**错误项**：`Body::from_stream` 见到它才会掐断响应，而不是干净收尾"
+        );
+        let text = metrics.render(0, 0, 0, 0);
+        assert!(
+            text.contains("hlmg_forward_ends_total{kind=\"panicked\"} 1"),
+            "panic 必须留一个指标样本：\n{text}"
+        );
+    }
+
+    /// 对照：正常收尾记的是**那个出口的标签**，既不打 `panicked`、也不往流里塞错误项。
+    #[test]
+    fn a_finished_forward_task_records_its_exit_and_leaves_the_body_alone() {
+        let (tx, mut rx) = mpsc::channel::<Result<Bytes, String>>(4);
+        let metrics = crate::metrics::Metrics::default();
+        let mut guard = ForwardGuard::new(tx, metrics.clone(), 7);
+        guard.finish(ForwardEnd::UpstreamEnd);
+        assert!(rx.try_recv().is_err(), "正常收尾不该往流里塞东西");
+        let text = metrics.render(0, 0, 0, 0);
+        assert!(
+            text.contains("hlmg_forward_ends_total{kind=\"upstream_end\"} 1"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("kind=\"panicked\""),
+            "正常收尾不该记 panicked：\n{text}"
+        );
+    }
 
     /// 规格（记录 P2-14）：**每条退出路径都要有自己的指标标签**，且互不相同。
     ///
