@@ -293,9 +293,15 @@ impl Gateway {
         })
         .await
         {
-            Ok(Some(n)) => tracing::info!(keys = n, "usage flushed before shutdown"),
-            Ok(None) => tracing::warn!("usage flush task did not finish before shutdown"),
-            Err(()) => tracing::warn!(
+            Bounded::Done(n) => tracing::info!(keys = n, "usage flushed before shutdown"),
+            // panic 与超时**分开报**（复扫 D3）：前者意味着这次落库**根本没发生**，而旧文案
+            // （"did not finish before shutdown"）把它说成"还没写完"，并把 panic 载荷丢掉。
+            Bounded::Panicked(why) => tracing::error!(
+                panic = %why,
+                "usage flush PANICKED during shutdown: this flush did not happen at all \
+                 (usage settled since the last periodic flush is lost)"
+            ),
+            Bounded::TimedOut => tracing::warn!(
                 timeout_ms = self.shutdown_flush_timeout.as_millis(),
                 "usage flush exceeded shutdown_flush_timeout; aborting tasks anyway \
                  (usage settled since the last periodic flush may be lost)"
@@ -369,20 +375,53 @@ impl Gateway {
 /// 给固定上限是为了不让一个不读的客户端拖住关闭。
 const END_EVENT_WINDOW: Duration = Duration::from_secs(1);
 
+/// [`run_bounded`] 的结果。
+///
+/// 为什么不是 `Result<Option<T>, ()>`（复扫 D3）：那样"阻塞任务 panic"与"正常返回" 挤在同一个
+/// `Ok(None)` 里，而调用方把它渲染成"**没写完**"——一次 panic 于是被说成"还没落完库"，panic
+/// 载荷（真正的原因）也被丢掉。这两件事的处置完全不同：**超时**是"不等了，可能丢一个周期"，
+/// **panic** 是"这次落库根本没发生"。
+#[derive(Debug, PartialEq, Eq)]
+enum Bounded<T> {
+    /// 正常跑完并返回了值。
+    Done(T),
+    /// 阻塞任务 **panic** 了（`spawn_blocking` 只因这个返回 `JoinError`），附可读的载荷。
+    Panicked(String),
+    /// 到点还没回来；任务仍在跑——同步代码取消不了，只是不再等它。
+    TimedOut,
+}
+
 /// 在阻塞池上跑 `f`，最多等 `limit`。
 ///
-/// 返回 `Ok(Some(v))` = 正常完成；`Ok(None)` = 阻塞任务 panic；`Err(())` = 超时。
 /// 超时**不会**取消那个阻塞任务（Rust 取消不了同步代码），只是不再等它——所以调用方
 /// （[`Gateway::shutdown`]）必须接受"落库可能还没写完就继续往下走"。
-async fn run_bounded<F, T>(limit: Duration, f: F) -> Result<Option<T>, ()>
+async fn run_bounded<F, T>(limit: Duration, f: F) -> Bounded<T>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
     match tokio::time::timeout(limit, tokio::task::spawn_blocking(f)).await {
-        Ok(Ok(v)) => Ok(Some(v)),
-        Ok(Err(_join)) => Ok(None),
-        Err(_elapsed) => Err(()),
+        Ok(Ok(v)) => Bounded::Done(v),
+        // `JoinError` 在这里只有 panic 一种来源（挂在本函数里的句柄没人 abort），所以这句话
+        // 必须说"panic 了"——别把它混进超时那一支（复扫 D3）。
+        Ok(Err(join)) => Bounded::Panicked(panic_message(join)),
+        Err(_elapsed) => Bounded::TimedOut,
+    }
+}
+
+/// 从 `JoinError` 里取出能读的 panic 载荷。
+///
+/// `JoinError` 的 `Display` **不含**载荷（只有 "task N panicked"），而"真正的原因"恰恰在载荷里
+/// ——所以这里把它挖出来；载荷不是字符串时退化成一句可辨认的说明，而不是静默丢掉。
+fn panic_message(join: tokio::task::JoinError) -> String {
+    match join.try_into_panic() {
+        Ok(payload) => payload
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<panic payload is not a string>".to_string()),
+        // 不是 panic（理论上只有取消）——照样报出来，别静默。
+        Err(e) => e.to_string(),
     }
 }
 
@@ -403,7 +442,7 @@ impl Drop for Gateway {
 
 #[cfg(test)]
 mod tests {
-    use super::run_bounded;
+    use super::{run_bounded, Bounded};
     use std::time::Duration;
 
     /// 规格：**有界等待**——到点必须放弃，而不是陪着慢任务一起卡住。
@@ -418,7 +457,7 @@ mod tests {
             7usize
         })
         .await;
-        assert_eq!(out, Err(()), "到点必须放弃等待");
+        assert_eq!(out, Bounded::TimedOut, "到点必须放弃等待");
         assert!(
             t0.elapsed() < Duration::from_millis(200),
             "应在超时量级返回，而不是等满阻塞任务，实际 {:?}",
@@ -430,7 +469,33 @@ mod tests {
     async fn run_bounded_returns_the_value_when_it_finishes() {
         assert_eq!(
             run_bounded(Duration::from_secs(5), || 7usize).await,
-            Ok(Some(7))
+            Bounded::Done(7)
         );
+    }
+
+    /// 规格（复扫 D3）：**panic 必须被报成 panic，而不是"没写完"**。
+    ///
+    /// 旧实现把 `JoinError` 映射成 `Ok(None)`，调用方随即打出
+    /// `"usage flush task did not finish before shutdown"` —— 一次 panic 于是被说成"还没落完库"，
+    /// 而真实后果是**这次落库根本没发生**，panic 载荷（真正的原因）也被丢掉。两者处置完全不同。
+    #[tokio::test]
+    async fn run_bounded_reports_a_panic_as_a_panic() {
+        // 这条测试**故意**让阻塞任务 panic：临时把默认 hook 换成空的，免得测试输出里混进
+        // 一段看起来像失败的 panic 回溯（只遮住这条 await，之后立刻还原）。
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let out = run_bounded(Duration::from_secs(5), || {
+            panic!("disk on fire");
+        })
+        .await;
+        std::panic::set_hook(prev);
+
+        match out {
+            Bounded::Panicked(why) => assert!(
+                why.contains("disk on fire"),
+                "必须带上 panic 载荷（真正的原因），实际：{why}"
+            ),
+            other => panic!("panic 必须被单独报出来，而不是混进超时/正常：{other:?}"),
+        }
     }
 }
