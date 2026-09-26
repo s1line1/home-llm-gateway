@@ -76,6 +76,12 @@ describe("Agents 页的明细降级（P3-18①）", () => {
     expect(await screen.findByText("agent-1")).toBeDefined();
     expect(screen.getByText("mock-llm")).toBeDefined();
     expect(screen.queryByText(/返回 404/)).toBeNull();
+
+    // **渲染级**守卫（复扫 G5）：`//` 注释写到 JSX 子节点位置时会**原样渲染**成文本，而
+    // `tsc` / `vite build` 都不报错。原先只有 Overview 的测试有这条断言，而产物守卫只认
+    // `P<n>-<n>` 审计标记 ⇒ 不带编号的 `//` 泄漏在别的页面上没人拦。
+    const text = document.body.textContent ?? "";
+    expect(text).not.toContain("//");
   });
 });
 
