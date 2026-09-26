@@ -25,7 +25,9 @@ function AgentTable({ agents }: { agents: NonNullable<Awaited<ReturnType<typeof 
         </thead>
         <tbody>
           {agents.map((a) => {
-            const stale = a.last_seen_secs_ago > 15;
+            // 复扫 G1：状态一律用网关给的结论，不在前端重算阈值（原先写死 15s，与顶部
+            // 按 `agent_stale_secs` 算出的在线数会在配置不是 15 时互相矛盾）。
+            const stale = !a.healthy;
             const full = a.inflight >= (a.max_concurrency || Number.POSITIVE_INFINITY);
             return (
               <tr key={a.agent_id} className="border-b border-slate-50 last:border-0">

@@ -34,6 +34,13 @@ pub struct AgentInfo {
     pub inflight: u32,
     /// 距上次心跳的秒数。
     pub last_seen_secs_ago: u64,
+    /// **是否参与路由**：与 `try_acquire` 同一个判据（心跳在 `agent_stale_secs` 之内）。
+    ///
+    /// 为什么把它算在网关侧（复扫 G1）：前端原先自己拿一个**写死的 15s** 去比
+    /// `last_seen_secs_ago`，而同一个页面的顶部用的是网关按 `agent_stale_secs` 算出的
+    /// `hlmg_agents_healthy` ⇒ `agent_stale_secs` 一旦不是 15，同一页上"在线总数"与表格行状态
+    /// 就会自相矛盾。规则只能有一个来源，所以由网关给出结论。
+    pub healthy: bool,
 }
 
 /// `agent_id → Entry` 的注册表，外加准入（`try_acquire*`）与隧道失败的判定/记账。
@@ -729,18 +736,24 @@ impl Registry {
     }
 
     /// 返回全部已注册 agent 的明细快照（按 agent_id 排序）。
-    pub fn snapshot(&self) -> Vec<AgentInfo> {
+    ///
+    /// `stale_after` 决定每条的 `healthy`（与选路同一个判据，见 [`AgentInfo::healthy`]）；
+    /// 调用方传 `AppState::agent_stale_after`。
+    pub fn snapshot(&self, stale_after: Duration) -> Vec<AgentInfo> {
         let inner = read_or_recover(&self.inner);
         let now = now_millis();
         let mut out: Vec<AgentInfo> = inner
             .iter()
-            .map(|(id, e)| AgentInfo {
-                agent_id: id.clone(),
-                models: e.models.clone(),
-                max_concurrency: e.max_concurrency,
-                inflight: e.inflight.load(Ordering::Relaxed),
-                last_seen_secs_ago: since_millis(e.last_seen_millis.load(Ordering::Relaxed), now)
-                    / 1000,
+            .map(|(id, e)| {
+                let last_seen = e.last_seen_millis.load(Ordering::Relaxed);
+                AgentInfo {
+                    agent_id: id.clone(),
+                    models: e.models.clone(),
+                    max_concurrency: e.max_concurrency,
+                    inflight: e.inflight.load(Ordering::Relaxed),
+                    last_seen_secs_ago: since_millis(last_seen, now) / 1000,
+                    healthy: is_fresh(last_seen, now, stale_after),
+                }
             })
             .collect();
         out.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
@@ -1467,7 +1480,7 @@ mod tests {
             drop(slots);
         }
         assert_eq!(
-            reg.snapshot()[0].inflight,
+            reg.snapshot(Duration::from_secs(10))[0].inflight,
             0,
             "拿 5 次再全部归还后必须回到 0；只减不加会下溢成 4294967295"
         );
@@ -1483,11 +1496,15 @@ mod tests {
                 "不限并发也必须如实计数：开流判据、摘除判据、负载排序都读这个数"
             );
         }
-        assert_eq!(reg.snapshot()[0].inflight, 5, "运维看到的在途数同样要真实");
+        assert_eq!(
+            reg.snapshot(Duration::from_secs(10))[0].inflight,
+            5,
+            "运维看到的在途数同样要真实"
+        );
 
         drop(slots);
         assert_eq!(
-            reg.snapshot()[0].inflight,
+            reg.snapshot(Duration::from_secs(10))[0].inflight,
             0,
             "最后一次释放后必须回到 0；下溢会变成 4294967295"
         );
@@ -1598,7 +1615,7 @@ mod tests {
             2,
             conn.clone(),
         );
-        let snap = reg.snapshot();
+        let snap = reg.snapshot(Duration::from_secs(10));
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].agent_id, "home-1");
         assert_eq!(
@@ -1608,15 +1625,37 @@ mod tests {
         assert_eq!(snap[0].max_concurrency, 2);
         assert_eq!(snap[0].inflight, 0);
         assert!(snap[0].last_seen_secs_ago < 1, "freshly registered agent");
+        assert!(
+            snap[0].healthy,
+            "刚注册的 agent 必须在路由窗口内（复扫 G1）"
+        );
+
+        // **结论随窗口变**，而不是某个写死的阈值——这正是复扫 G1 的实质：前端原先拿一个
+        // 写死的 15s 去比 `last_seen_secs_ago`，完全无视网关配的 `agent_stale_secs`。
+        //
+        // 为什么不构造"心跳很旧"的条目：`now_millis()` 是**进程相对**时钟（`epoch().elapsed()`），
+        // 测试进程刚起来时它约等于 0，把 `last_seen` 往回拨会被 `saturating_sub` 夹到 0、
+        // 反而变成"最新"（实测踩过）。要造旧条目只能真的 sleep；而"窗口一收就不健康、一放就健康"
+        // 已经把同一条性质钉住了，且不依赖时钟推进。
+        assert!(
+            !reg.snapshot(Duration::ZERO)[0].healthy,
+            "零窗口下没有任何条目算新鲜"
+        );
+        assert!(
+            reg.snapshot(Duration::from_secs(3600))[0].healthy,
+            "同一个条目在足够大的窗口里是健康的 ⇒ 判定跟着窗口走，而不是写死的阈值"
+        );
 
         // 按 agent_id 排序、空注册表为空
         let conn2 = test_connection().await;
         reg.register("agent-a".into(), vec![], 4, conn2.clone());
-        let snap = reg.snapshot();
+        let snap = reg.snapshot(Duration::from_secs(10));
         assert_eq!(snap.len(), 2);
         assert_eq!(snap[0].agent_id, "agent-a");
         assert_eq!(snap[1].agent_id, "home-1");
-        assert!(Registry::default().snapshot().is_empty());
+        assert!(Registry::default()
+            .snapshot(Duration::from_secs(10))
+            .is_empty());
     }
 
     /// 规格：**"开流超时"不等于"连接已死"**。

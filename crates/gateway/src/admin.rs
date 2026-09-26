@@ -205,7 +205,7 @@ pub async fn delete_key(
 
 /// 列出在线 agent 明细（注册表快照，按 agent_id 排序）。
 pub async fn list_agents(State(state): State<AppState>) -> Json<Vec<crate::registry::AgentInfo>> {
-    Json(state.registry.snapshot())
+    Json(state.registry.snapshot(state.agent_stale_after))
 }
 
 #[cfg(test)]
