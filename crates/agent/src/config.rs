@@ -108,10 +108,48 @@ pub fn from_file(cfg: ConfigFile) -> anyhow::Result<AgentConfig> {
         agent_id: cfg.agent_id,
         models: cfg.models,
         max_concurrency: cfg.max_concurrency,
-        upstream_base: cfg.upstream,
+        upstream_base: normalize_upstream(&cfg.upstream)?,
         heartbeat_interval: Duration::from_secs(cfg.heartbeat_secs),
         request_log: cfg.request_log,
     })
+}
+
+/// 校验并规范化 `upstream`（复扫 E3）：必须是**不带路径的 http(s) origin**。
+///
+/// 为什么必须在启动时做：`stream.rs` 用 `format!("{upstream}{path}{query}")` 拼目标 URL，
+/// 所以 `upstream` 的写法直接决定每个请求长什么样。两类写法今天都会让**每一个**请求失败，
+/// 却要等到第一个请求才以 502 暴露：
+///   - 缺 scheme（`127.0.0.1:11434`）——YAML 里看起来毫无异常，reqwest 把解析错误推迟到 send；
+///   - 尾斜杠（`http://host:11434/`）——拼出 `//v1/...`，而项目自己的
+///     `proto::path::safe_upstream_path` 把空段判为不可转发，等于 agent 亲手拼出一个自己会
+///     拒绝的 URL（上游对 `//v1/...` 常 404/301，而 agent 不跟随重定向）。
+///
+/// 尾斜杠是等价的 origin 写法（`http://h:1/` ≡ `http://h:1`），所以**规范化掉**而不是拒掉；
+/// 其余会静默改变语义的一律报错。返回的值可以直接与以 `/` 开头的路径拼接。
+fn normalize_upstream(raw: &str) -> anyhow::Result<String> {
+    let url = reqwest::Url::parse(raw).with_context(|| {
+        format!("config: upstream {raw:?} is not an absolute URL (missing scheme?)")
+    })?;
+    if url.scheme() != "http" && url.scheme() != "https" {
+        anyhow::bail!(
+            "config: upstream {raw:?} must be http or https, but is {:?}",
+            url.scheme()
+        );
+    }
+    if url.host_str().is_none() {
+        anyhow::bail!("config: upstream {raw:?} has no host");
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        anyhow::bail!("config: upstream {raw:?} must not carry a query or a fragment");
+    }
+    // `Url::parse` 会把"没有路径"归一成 `"/"`，所以只认 `/` 为"没有路径"。
+    if url.path() != "/" {
+        anyhow::bail!(
+            "config: upstream {raw:?} must be a bare origin like http://127.0.0.1:11434; \
+             the request path is appended to it, so a path here would be prepended to every request"
+        );
+    }
+    Ok(raw.trim_end_matches('/').to_string())
 }
 
 #[cfg(test)]
@@ -181,6 +219,63 @@ heartbeat_secs: {{}}
             from_file(parse_yaml(&yaml.replace("{}", "5"))).is_ok(),
             "非零心跳必须正常加载"
         );
+    }
+
+    /// 规格（2026-09-25 复扫 E3）：`upstream` 必须在**启动时**校验，而不是等到每个请求 502。
+    ///
+    /// 尾斜杠是这条的起点：`stream.rs` 用 `format!("{upstream}{path}{query}")` 拼 URL，于是
+    /// `http://host:11434/` 与 `/v1/...` 拼成 `//v1/...`——而项目自己的守卫
+    /// （`proto::path::safe_upstream_path`）把空段判为不可转发，等于 **agent 亲手拼出一个自己
+    /// 会拒绝的 URL**；上游对 `//v1/...` 常 404/301，而 agent 明确不跟随重定向（P2-4），
+    /// 所以那台机器每个请求都失败。
+    ///
+    /// 缺 scheme 的写法更隐蔽：YAML 里 `127.0.0.1:11434` 看起来毫无异常，而 reqwest 把 URL 解析
+    /// 错误推迟到 send ⇒ 直到第一个请求才以 502 暴露。
+    #[test]
+    fn upstream_is_validated_at_load_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ca, cert, key) = gen_cert_files(dir.path());
+        let load = |upstream: &str| {
+            let yaml = format!(
+                "cloud_addr: \"127.0.0.1:4433\"\nca: {}\ncert: {}\nkey: {}\nupstream: \"{}\"\n",
+                ca.display(),
+                cert.display(),
+                key.display(),
+                upstream
+            );
+            from_file(parse_yaml(&yaml))
+        };
+
+        // 尾斜杠是**等价的 origin 写法**，规范化掉即可——不能因此把一份合法配置判死。
+        for ok in ["http://127.0.0.1:11434", "http://127.0.0.1:11434/"] {
+            let cfg = load(ok).unwrap_or_else(|e| panic!("{ok} 应当可用：{e}"));
+            assert_eq!(
+                cfg.upstream_base, "http://127.0.0.1:11434",
+                "{ok} 应被规范化"
+            );
+        }
+
+        // 下面每一条都会让**每个请求**失败或静默改变语义 ⇒ 启动时就该报错。
+        for (bad, why) in [
+            ("127.0.0.1:11434", "缺 scheme"),
+            ("localhost:11434", "缺 scheme"),
+            ("ftp://127.0.0.1:11434", "非 http(s)"),
+            (
+                "http://127.0.0.1:11434/api",
+                "带了路径（会被前置到每个请求上）",
+            ),
+            ("http://127.0.0.1:11434?a=b", "带了 query"),
+            ("http://127.0.0.1:11434#frag", "带了 fragment"),
+        ] {
+            let err = match load(bad) {
+                Ok(c) => panic!("{bad}（{why}）必须被拒，却加载成了 {:?}", c.upstream_base),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                err.contains("upstream"),
+                "报错要点名 YAML 键 upstream（{bad}）：{err}"
+            );
+        }
     }
 
     #[test]
