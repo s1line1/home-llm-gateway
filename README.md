@@ -869,8 +869,10 @@ QPS 压到一两个数量级以下。上面这些数字只在"把模型换快"�
   - `hlmg_agent_rejections_total{reason=...}`：因挑不出可路由 agent 而拒绝的请求数，按原因分：
     `registry-empty`（没人注册）/ `all-candidates-stale`（有人但心跳全过期）/
     `no-agent-serves-model` / `all-candidates-at-capacity`。**503 的成因看这个，不要靠状态码猜**
-  - `hlmg_tunnel_retries_total{outcome=...}`：因隧道建立失败而换 agent 重试的次数——
-    `ok`（重试成功的**自愈**次数）/ `failed`（换了仍失败）/ `no-alternative`（没有别的 agent 可换）
+  - `hlmg_tunnel_retries_total{outcome=...}`：**隧道建立失败后换 agent** 的次数，按结果分——
+    `ok`（重试成功的**自愈**次数）/ `failed`（换了仍失败）/ `no-alternative`（**没有别的 agent
+    可换**，所以它**不是一次重试**）。这一族**求和没有意义**（既不等于重试次数、也不等于失败
+    次数），看单项
   - `hlmg_client_stalls_total{phase="request-body"|"response-body"}`：因客户端**停滞**而主动放弃的
     请求数（读不动请求体 / 不消费响应体）。**它是准入槽位泄漏的直接告警**：修好之前这类停滞
     不留任何痕迹，只表现为 `hlmg_active_requests` 只增不减

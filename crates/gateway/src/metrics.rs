@@ -381,7 +381,7 @@ impl Metrics {
         {
             let retries = lock_or_recover(&inner.tunnel_retries);
             if !retries.is_empty() {
-                out.push_str("# HELP hlmg_tunnel_retries_total Requests retried on another agent after a tunnel setup failure, by outcome.\n");
+                out.push_str("# HELP hlmg_tunnel_retries_total Tunnel-setup failures that led to an agent switch, by outcome. ok and failed count retries; no-alternative counts the times there was no other agent to switch to, so it is not a retry and the family sum is neither the retry count nor the failure count.\n");
                 out.push_str("# TYPE hlmg_tunnel_retries_total counter\n");
                 let mut outcomes: Vec<&&str> = retries.keys().collect();
                 outcomes.sort_unstable();
@@ -809,6 +809,39 @@ mod tests {
             ),
             (0, 0, 0),
             "票据 Drop 必须把三个计数都还干净"
+        );
+    }
+
+    /// 规格（复扫 C2-5）：这一族的三种标签是**三件不同的事**，HELP 不能把它们统称"重试"。
+    ///
+    /// 文案是给人看的，但它决定告警怎么写：把 `no-alternative` 当成重试次数，会从"重试很多"
+    /// 得出"上游不稳"的错误结论——而它实际的含义是"**没有别的 agent 可换**"。
+    #[test]
+    fn tunnel_retry_help_does_not_call_every_outcome_a_retry() {
+        let m = Metrics::default();
+        for outcome in ["ok", "failed", "no-alternative"] {
+            m.record_tunnel_retry(outcome);
+        }
+        let text = m.render(0, 0, 0, 0);
+        for outcome in ["ok", "failed", "no-alternative"] {
+            assert!(
+                text.contains(&format!(
+                    "hlmg_tunnel_retries_total{{outcome=\"{outcome}\"}} 1"
+                )),
+                "{outcome} 应当各自成一条样本：\n{text}"
+            );
+        }
+        let help = text
+            .lines()
+            .find(|l| l.starts_with("# HELP hlmg_tunnel_retries_total"))
+            .expect("HELP 必须在");
+        assert!(
+            !help.contains("Requests retried"),
+            "整族不是 'Requests retried'（`no-alternative` 不是重试）：{help}"
+        );
+        assert!(
+            help.contains("no-alternative"),
+            "HELP 要点名那个例外：{help}"
         );
     }
 
