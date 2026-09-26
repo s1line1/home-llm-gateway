@@ -8,7 +8,7 @@ pub use std::{
 };
 
 pub use agent::{Agent, AgentConfig};
-pub use gateway::{Gateway, GatewayConfig, Options, TlsPem, TunnelTls};
+pub use gateway::{error::GatewayError, Gateway, GatewayConfig, Options, TlsPem, TunnelTls};
 pub use proto::{
     io::{write_frame, FrameReader},
     Frame,

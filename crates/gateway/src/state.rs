@@ -123,7 +123,7 @@ impl AppState {
             head_timeout: opts.head_timeout,
             evict_close_grace: opts.evict_close_grace,
             head_silent_grace: opts.head_silent_grace,
-            head_alive_window: opts.head_timeout * 4,
+            head_alive_window: opts.head_alive_window(),
             client_stall: opts.client_stall,
             rate_limiter: RateLimiter::new(opts.rate_limit_per_min),
             max_concurrent_requests: opts.max_concurrent_requests,

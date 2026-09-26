@@ -115,7 +115,7 @@ impl Gateway {
         // 同类自检：「对端还活着」那层静默宽限若**不严格长于窗口**（`4 × head_timeout`），
         // 它永远不可能生效——窗口一过就已经按第一层判死了，延长无从谈起（评估 §5 H2 的修法
         // 就是这么用的）。0 是**有意**关掉这一层，不算配错，所以那种情况不吵。
-        let head_window = opts.head_timeout * 4;
+        let head_window = opts.head_alive_window();
         if !opts.head_silent_grace.is_zero() && opts.head_silent_grace <= head_window {
             tracing::warn!(
                 head_silent_grace_secs = opts.head_silent_grace.as_secs(),

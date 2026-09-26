@@ -210,6 +210,17 @@ impl Options {
         }
     }
 
+    /// 响应头"忙/死"判据窗口：`head_timeout × 4` 的**唯一定义**（[`Options::validate`] 按同一
+    /// 个式子校验上界，`AppState::new` 与 `Gateway::start` 的自检都从这里取值）。
+    ///
+    /// 用 `saturating_mul` 而不是 `*`：`validate()` 已经保证不会饱和（见那里的上界判据），
+    /// 所以正常路径上两者完全一样；区别只在**绕过 `validate()` 直接构造 `Options`** 的调用方
+    /// （库/测试）——`× 4` 溢出是 panic，而 `Instant + Duration` 溢出也是 panic，把"配置太大"
+    /// 从最后一步崩溃改成这里安静地饱和，至少不会在派生量这一步就炸（复扫 D4）。
+    pub fn head_alive_window(&self) -> Duration {
+        self.head_timeout.saturating_mul(4)
+    }
+
     /// 启动前的旋钮校验：**这几个 `0` 不是"关闭"，而是"立刻超时"**，其中两个足以把网关打成
     /// 全量 503/504。返回 `Err` 时 [`crate::Gateway::start`] 会在**碰任何资源之前**失败。
     ///
@@ -224,6 +235,10 @@ impl Options {
     /// `verified_cache_max`（关缓存）、`rate_limit_per_min` / `max_concurrent_requests` /
     /// `max_entry_connections`（不限）、`max_open_tunnel_streams`（用默认值，
     /// 见 [`Options::stream_ceiling`]）、`shutdown_grace` / `shutdown_flush_timeout`（不等待）。
+    ///
+    /// **上界是另一条判据**（复扫 D4，见下面的 `must_fit_the_clock`）：零值被拒是因为它们
+    /// 语义上等于"立刻超时"，而超大值的后果是**算术溢出 panic**——两件事、两套理由，别因为
+    /// 都叫"校验"就合成一条。
     pub fn validate(&self) -> Result<(), String> {
         // (值, YAML 键, 结构体字段, 0 的后果)
         let must_be_non_zero = [
@@ -265,6 +280,84 @@ impl Options {
                     "config: {yaml_key} ({field}) must be at least 1 second, but is 0: {consequence}"
                 ));
             }
+        }
+
+        // 上界（复扫 D4）：这些秒数**没有上限校验**，而"接近 u64 上限"的值能通过上面的零值
+        // 检查、启动到一半才炸。炸法有两条，都要一起看：
+        //   · **今天真的会 panic 的是两处裸 `+`**：`Gateway::drain` 的 `Instant::now() +
+        //     shutdown_grace` 与 `evict_close::defer_close` 的 `Instant::now() +
+        //     evict_close_grace`（`Instant + Duration` 溢出是 `+` 的契约）；
+        //   · 其余时长走 `tokio::time::timeout` / `sleep`，它们在 tokio 里是**截断**而不是
+        //     panic（`checked_add` 失败就退化成 `far_future()`，见 `tokio::time::sleep`）。
+        //     一个"一千年"的超时被悄悄截成 30 年，与 panic 一样不是配置作者的本意，
+        //     而且**将来任何一处改成裸 `+` 就立刻变回 panic**——所以判据对全部时长旋钮统一。
+        // 于是退出码是 101（进程崩了）而不是一条配置错误，配 `Restart=on-failure` 就是崩溃
+        // 重启循环，而现象（"起来了，一会儿就崩"）离配置里那个天文数字很远。
+        //
+        // 判据直接用 `checked_add`，**不自己拍一个"看起来够大"的常量**：单调钟能表示多远
+        // 取决于平台与 Rust 版本——本仓库当前的工具链（1.97.1 / macOS aarch64）上是 i64 秒
+        // （约 9.2e18 秒，本轮实测 `Instant::now() + Duration::from_secs(u64::MAX/4+1)` 不 panic）；
+        // 而单调钟用 **u64 纳秒**的实现只能表示约 584 年——一个 12 位数的秒数误写就能撞上。
+        // 拍出来的常量只会在某个平台上骗人。`std::time::Instant` 与站点使用的
+        // `tokio::time::Instant` 是同一个时钟（后者只是它的包装），所以判据与真实行为一致。
+        let must_fit_the_clock = [
+            (self.request_timeout, "timeout_secs", "request_timeout"),
+            (
+                self.tunnel_op_timeout,
+                "tunnel_op_secs",
+                "tunnel_op_timeout",
+            ),
+            (self.head_timeout, "head_timeout_secs", "head_timeout"),
+            (
+                self.evict_close_grace,
+                "evict_close_grace_secs",
+                "evict_close_grace",
+            ),
+            (
+                self.head_silent_grace,
+                "head_silent_grace_secs",
+                "head_silent_grace",
+            ),
+            (
+                self.agent_stale_after,
+                "agent_stale_secs",
+                "agent_stale_after",
+            ),
+            (self.client_stall, "client_stall_secs", "client_stall"),
+            (
+                self.shutdown_flush_timeout,
+                "shutdown_flush_timeout_secs",
+                "shutdown_flush_timeout",
+            ),
+            (self.shutdown_grace, "shutdown_grace_secs", "shutdown_grace"),
+        ];
+        for (value, yaml_key, field) in must_fit_the_clock {
+            if std::time::Instant::now().checked_add(value).is_none() {
+                return Err(format!(
+                    "config: {yaml_key} ({field}) is too large to be used as a deadline \
+                     ({} seconds): adding it to the monotonic clock overflows, so the derived \
+                     deadlines either panic or are silently clamped to the platform's clock \
+                     horizon; use a value the platform can represent",
+                    value.as_secs()
+                ));
+            }
+        }
+        // `head_alive_window = head_timeout × 4` 是**派生**值，所以"`head_timeout` 本身能上钟"
+        // 不等于它合法：monotonic 时钟的上限是约 9.2e18 秒，`head_timeout = 4.6e18 秒` 能过
+        // 上面那条、`× 4` 就溢出了。派生式只有这一处（[`Options::head_alive_window`]），
+        // 判据也就照着它写。
+        if self
+            .head_timeout
+            .checked_mul(4)
+            .and_then(|window| std::time::Instant::now().checked_add(window))
+            .is_none()
+        {
+            return Err(format!(
+                "config: head_timeout_secs (head_timeout) is too large: head_alive_window is \
+                 derived as 4 x head_timeout ({} seconds) and must also fit the monotonic clock, \
+                 but 4 x that overflows; lower head_timeout_secs",
+                self.head_timeout.as_secs()
+            ));
         }
 
         // `admin_token: ""`（YAML 里写了空串）是**配了却用不了**：`http/mod.rs` 见 `is_some()`
@@ -601,11 +694,73 @@ mod tests {
         Options::default().validate().expect("默认配置必须合法");
     }
 
+    /// 规格（复扫 D4）：**时长的上界也要有判据**，而且判据必须覆盖派生式。
+    ///
+    /// 前提由测试自己证明（`catch_unwind` 看真实运算是否真的 panic），不靠"平台大约是多少年"
+    /// 这种会在别的平台/版本上骗人的断言：这两个值确实会让真实站点炸，所以它们必须被
+    /// `validate()` 拒掉——否则进程以 101 退出、退出的是进程而不是一条配置错误。
+    #[test]
+    fn durations_that_would_overflow_the_deadline_arithmetic_are_rejected() {
+        // ① 大到加不上单调时钟：`deadline = Instant::now() + d` 溢出
+        assert!(
+            std::panic::catch_unwind(|| {
+                let _ = std::time::Instant::now() + Duration::MAX;
+            })
+            .is_err(),
+            "前提：Duration::MAX 加到单调时钟上真的会 panic"
+        );
+        let err = Options {
+            shutdown_grace: Duration::MAX,
+            ..Options::default()
+        }
+        .validate()
+        .expect_err("加不上时钟的时长必须被拒");
+        assert!(
+            err.contains("shutdown_grace") && err.contains("shutdown_grace_secs"),
+            "报错要同时点名 YAML 键与结构体字段：{err}"
+        );
+
+        // ② 本身能上钟、但 **× 4 之后不能**：`head_alive_window` 是派生值，
+        //    所以"head_timeout 合法"不代表配置合法（这正是这条判据不能只查 `head_timeout`
+        //    的原因，也是这条测试与 ① 分开的理由）。
+        let huge = Duration::from_secs(u64::MAX / 4 + 1);
+        assert!(
+            std::time::Instant::now().checked_add(huge).is_some(),
+            "前提①：这个值本身加得上时钟（所以不会被第一条判据拦下）"
+        );
+        assert!(
+            std::panic::catch_unwind(|| {
+                let _ = huge * 4;
+            })
+            .is_err(),
+            "前提②：× 4 真的会 panic"
+        );
+        let err = Options {
+            head_timeout: huge,
+            ..Options::default()
+        }
+        .validate()
+        .expect_err("× 4 之后加不上时钟的 head_timeout 必须被拒");
+        assert!(err.contains("head_timeout_secs"), "{err}");
+
+        // 方向对照：大但**真能**用几十年的值不许被误拒（上界判据不是"大了就拒"）
+        let big_but_usable = Options {
+            head_timeout: Duration::from_secs(365 * 24 * 3600),
+            shutdown_grace: Duration::from_secs(3600),
+            ..Options::default()
+        };
+        assert!(
+            big_but_usable.validate().is_ok(),
+            "一年级的时长是怪异但合法的配置，不该被上界判据误拒：{:?}",
+            big_but_usable.validate()
+        );
+    }
+
     /// 契约：**「对端还活着」的静默宽限必须长于"忙/死"窗口**，否则第二层判据形同虚设
     /// （窗口还没走完就已经按第一层处理了，延长无从谈起）。
     #[test]
     fn default_head_silent_grace_exceeds_the_busy_dead_window() {
-        let window = Options::DEFAULT_HEAD_TIMEOUT * 4; // AppState::head_alive_window 的派生式
+        let window = Options::default().head_alive_window(); // 派生式现在只有这一处定义
         assert!(
             Options::DEFAULT_HEAD_SILENT_GRACE > window,
             "head_silent_grace（{:?}）不长于窗口（{:?}）：第二层判据不会生效",

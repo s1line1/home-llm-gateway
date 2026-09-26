@@ -93,6 +93,36 @@ async fn e2e_zero_valued_config_fails_fast_before_binding_anything() {
     gw.shutdown().await;
 }
 
+/// 规格（复扫 D4）：**时长的上界也在启动时作为 `Config` 错误失败，而不是 panic**。
+///
+/// 修好前 `validate()` 只查零值：`head_timeout` 取到"接近 u64 上限"的秒数时一路通过，
+/// `Gateway::start` 在 `head_alive_window = head_timeout × 4`（以及随后的 `Instant + grace`）
+/// 处 **panic** ⇒ 进程以 101 退出。配 `Restart=on-failure` 就是崩溃重启循环，而配置文件里
+/// 那个天文数字看起来只是"很大"。所以判据不只是"启动失败"，而是**失败的类型**——
+/// `GatewayError::Config`（一条可以照着改的配置错误），不是 panic。
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn e2e_over_large_timeouts_fail_as_a_config_error_instead_of_panicking() {
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    let certs = TestCerts::generate();
+    // 刻意选一个**能过第一条判据、过不了 × 4 那条**的值：它证明上界判据覆盖了派生式。
+    let opts = Options {
+        head_timeout: Duration::from_secs(u64::MAX / 4 + 1),
+        ..e2e_options(None)
+    };
+    match Gateway::start(gateway_config(&certs, opts)).await {
+        Ok(gw) => {
+            gw.shutdown().await;
+            panic!("head_timeout × 4 溢出必须让启动失败，而不是起来");
+        }
+        Err(GatewayError::Config(msg)) => assert!(
+            msg.contains("head_timeout_secs"),
+            "报错要点名 YAML 键（配置作者写的是这个）：{msg}"
+        ),
+        Err(other) => panic!("必须是 Config（配置错误），不能是 {other:?}"),
+    }
+}
+
 /// 规格：**`Gateway` 被 drop 而未调 `shutdown()` 时，监听口必须释放**。
 ///
 /// 修好前：`tasks` 里的 `JoinHandle` 只是被 drop（tokio 语义是 **detach**，不是 abort），
