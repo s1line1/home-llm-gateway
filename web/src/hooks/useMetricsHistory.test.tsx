@@ -1,7 +1,8 @@
 import { act, renderHook } from "@testing-library/react";
+import type { ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { useMetricsHistory } from "./useMetricsHistory";
+import { MetricsHistoryProvider, useMetricsHistory } from "./useMetricsHistory";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -13,12 +14,22 @@ const METRICS_TEXT = ["hlmg_agents 3", "hlmg_agents_healthy 1", "hlmg_active_req
 );
 
 /**
- * 复扫 G2：这个 hook 原先在所有测试里都被 mock 掉，"`/metrics` 挂死"这条失败模式因此零覆盖。
- *
- * 机制：`tick()` 里 `await fetchMetricsText()` 无超时，而下一次采样只在 `finally` 注册 ⇒
- * 请求永不 settle 时循环不再调度、`catch` 也不执行 ⇒ `reachable`/`latest` 冻结在上次成功的
- * 值上，界面继续显示"网关在线 · N agents"（假绿）。超时补在 `client.ts` 那一侧，这里钉住
- * hook 的行为：**一次失败之后轮询必须继续**。
+ * 在 provider 里渲染 hook。轮询归 provider 所有，所以测试也必须**真的**包一层——顺便就钉住了
+ * "没有 provider 会抛错"这条约束（见本文件最后一条）。
+ */
+function renderShared(intervalMs = 1000) {
+  return renderHook(() => useMetricsHistory(), {
+    wrapper: ({ children }: { children: ReactNode }) => (
+      <MetricsHistoryProvider intervalMs={intervalMs}>{children}</MetricsHistoryProvider>
+    ),
+  });
+}
+
+/**
+ * 复扫 G2：`tick()` 里 `await fetchMetricsText()` 原先无超时，而下一次采样只在 `finally`
+ * 注册 ⇒ 请求永不 settle 时循环不再调度、`catch` 也不执行 ⇒ `reachable`/`latest` 冻结在上次
+ * 成功的值上，界面继续显示"网关在线 · N agents"（假绿）。超时补在 `client.ts` 那一侧，这里钉住
+ * **一次失败之后轮询必须继续**。
  */
 describe("useMetricsHistory：一次失败不能停掉轮询（复扫 G2）", () => {
   it("拉取失败后标记不可达，并且继续安排下一次采样", async () => {
@@ -29,7 +40,7 @@ describe("useMetricsHistory：一次失败不能停掉轮询（复扫 G2）", ()
     });
 
     vi.useFakeTimers();
-    const { result } = renderHook(() => useMetricsHistory(1000));
+    const { result } = renderShared();
     await act(async () => {
       await vi.advanceTimersByTimeAsync(0);
     });
@@ -65,7 +76,7 @@ describe("useMetricsHistory：一次失败不能停掉轮询（复扫 G2）", ()
     );
 
     vi.useFakeTimers();
-    const { result } = renderHook(() => useMetricsHistory(1000));
+    const { result } = renderShared();
     await act(async () => {
       await vi.advanceTimersByTimeAsync(0);
     });
@@ -84,7 +95,7 @@ describe("useMetricsHistory：一次失败不能停掉轮询（复扫 G2）", ()
     });
 
     vi.useFakeTimers();
-    const { result } = renderHook(() => useMetricsHistory(1000));
+    const { result } = renderShared();
     await act(async () => {
       await vi.advanceTimersByTimeAsync(0);
     });
@@ -102,5 +113,52 @@ describe("useMetricsHistory：一次失败不能停掉轮询（复扫 G2）", ()
     expect(result.current.latest?.agents_healthy).toBe(1);
     expect(result.current.raw).toBe(METRICS_TEXT);
     expect(result.current.history).toHaveLength(1);
+  });
+});
+
+/**
+ * 复扫 G4：`Layout`（侧边栏）与当前页面**同时**挂着，而它们以前各自实例化这个 hook ⇒ 同一瞬间
+ * 有 2 条独立 `/metrics` 轮询、采样时刻不同步，侧边栏与页面卡片可以显示两个不同的数字。现在
+ * 只有 provider 里的那一条，消费者共享同一次采样。
+ */
+describe("useMetricsHistory：多个消费者共享一条轮询（复扫 G4）", () => {
+  it("两个消费者只产生一次请求，且看到的是同一个快照", async () => {
+    let calls = 0;
+    vi.stubGlobal("fetch", async () => {
+      calls += 1;
+      return new Response(METRICS_TEXT);
+    });
+
+    vi.useFakeTimers();
+    const { result } = renderHook(
+      // 侧边栏与页面：同一个 provider 下的两个消费者
+      () => ({ sidebar: useMetricsHistory(), page: useMetricsHistory() }),
+      {
+        wrapper: ({ children }: { children: ReactNode }) => (
+          <MetricsHistoryProvider intervalMs={1000}>{children}</MetricsHistoryProvider>
+        ),
+      },
+    );
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(calls).toBe(1);
+    expect(result.current.sidebar.latest).not.toBeNull();
+    // 同一个对象：两位消费者读的是**同一次**采样，不是两次各自解析的结果
+    expect(result.current.sidebar.latest).toBe(result.current.page.latest);
+    expect(result.current.sidebar.reachable).toBe(result.current.page.reachable);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    expect(calls).toBe(2);
+    expect(result.current.sidebar.history).toHaveLength(2);
+    expect(result.current.sidebar.history).toBe(result.current.page.history);
+  });
+
+  it("没有 provider 时**抛错**，而不是悄悄退化成一条私有轮询", () => {
+    // 静默退化会把 G4 放回来（"两个数字对不上"又变得不可见），所以这里要吵。
+    expect(() => renderHook(() => useMetricsHistory())).toThrow(/MetricsHistoryProvider/);
   });
 });

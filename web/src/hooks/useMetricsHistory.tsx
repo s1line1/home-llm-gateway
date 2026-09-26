@@ -1,6 +1,14 @@
 // 轮询 /metrics 并保留最近 N 个采样点（用于趋势图表）。
+//
+// **只有一条轮询**（复扫 G4）：它由 [`MetricsHistoryProvider`] 持有，值通过 context 下发。
+// 以前这是"每个调用方各一条轮询"，而 `Layout` 与当前页面是**同时**挂着的（侧边栏要 latest，
+// Overview / MetricsPage 还要 history 与 raw）⇒ 同一瞬间有 2 条独立请求、采样时刻不同步，
+// 侧边栏与页面卡片可以显示两个不同的数字——两个都不算错，但看起来像错的。
+//
+// 为什么是 provider 而不是模块级单例：与 `api/queryClient.ts` 同一口径——可测性靠**注入**
+// （测试自己给 `intervalMs`、自己包 provider），而不是靠"记得在 afterEach 里重置模块状态"。
 
-import { useEffect, useState } from "react";
+import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 
 import { fetchMetricsText } from "../api/client";
 import { parseMetrics } from "../api/metrics";
@@ -21,7 +29,22 @@ export interface MetricsHistory {
   reachable: boolean;
 }
 
-export function useMetricsHistory(intervalMs = POLL_MS): MetricsHistory {
+const MetricsHistoryContext = createContext<MetricsHistory | null>(null);
+
+/**
+ * 唯一的 `/metrics` 轮询。挂在**已登录的壳**上（`main.tsx` 里包住 `Layout`）：登录页不该拉
+ * `/metrics`，而登录之后整棵树共享同一份历史（切页面不会重启采样）。
+ *
+ * `intervalMs` 是 provider 的属性而不是每个消费者的参数：一个循环只有一个节奏，让每个调用方
+ * 各报一个间隔只会重新制造 G4 那个"多个采样时刻"的问题。
+ */
+export function MetricsHistoryProvider({
+  children,
+  intervalMs = POLL_MS,
+}: {
+  children: ReactNode;
+  intervalMs?: number;
+}) {
   const [history, setHistory] = useState<MetricsSnapshot[]>([]);
   const [raw, setRaw] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -64,11 +87,32 @@ export function useMetricsHistory(intervalMs = POLL_MS): MetricsHistory {
     // oxlint-disable-next-line react/exhaustive-effect-dependencies
   }, [intervalMs]);
 
-  return {
-    latest: history.length > 0 ? history[history.length - 1] : null,
-    history,
-    raw,
-    error,
-    reachable,
-  };
+  const value = useMemo<MetricsHistory>(
+    () => ({
+      latest: history.length > 0 ? history[history.length - 1] : null,
+      history,
+      raw,
+      error,
+      reachable,
+    }),
+    [history, raw, error, reachable],
+  );
+
+  return <MetricsHistoryContext.Provider value={value}>{children}</MetricsHistoryContext.Provider>;
+}
+
+/**
+ * 当前共享的 `/metrics` 历史。
+ *
+ * 没有 provider 时**抛错**而不是自己退化成一条私有轮询：那样会在"有人忘了包 provider"时
+ * 悄悄回到 G4 的多份采样，而症状（两个数字对不上）正是这条修复要消灭的东西。
+ */
+export function useMetricsHistory(): MetricsHistory {
+  const value = useContext(MetricsHistoryContext);
+  if (!value) {
+    throw new Error(
+      "useMetricsHistory 需要 <MetricsHistoryProvider>（一个已登录的壳只挂一个，见该组件文档）",
+    );
+  }
+  return value;
 }

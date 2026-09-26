@@ -5,6 +5,7 @@ import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 import { createQueryClient } from "./api/queryClient";
 import Layout from "./components/Layout";
 import RequireAuth from "./components/RequireAuth";
+import { MetricsHistoryProvider } from "./hooks/useMetricsHistory";
 import Agents from "./pages/Agents";
 import Keys from "./pages/Keys";
 import Login from "./pages/Login";
@@ -21,7 +22,18 @@ createRoot(document.getElementById("root")!).render(
       <Routes>
         <Route path="/login" element={<Login />} />
         <Route element={<RequireAuth />}>
-          <Route element={<Layout />}>
+          {/*
+            已登录的壳上挂**唯一**的 `/metrics` 轮询（复扫 G4）：侧边栏（`Layout`）与当前页面
+            （Overview / MetricsPage / Agents）共享同一份历史，不再各自开一条、各采各的
+            （采样时刻不同步时两处数字会对不上）。放在 `RequireAuth` 里面，所以登录页不拉。
+          */}
+          <Route
+            element={
+              <MetricsHistoryProvider>
+                <Layout />
+              </MetricsHistoryProvider>
+            }
+          >
             <Route index element={<Overview />} />
             <Route path="/keys" element={<Keys />} />
             <Route path="/agents" element={<Agents />} />
