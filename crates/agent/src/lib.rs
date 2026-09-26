@@ -396,12 +396,7 @@ async fn connect_once(
     loop {
         tokio::select! {
             r = &mut hb => {
-                match r {
-                    Ok(Ok(())) => warn!("heartbeat loop exited; forcing reconnect"),
-                    Ok(Err(e)) => warn!("heartbeat loop failed: {e}; forcing reconnect"),
-                    Err(e) if e.is_panic() => error!("heartbeat loop panicked: {e}; forcing reconnect"),
-                    Err(e) => warn!("heartbeat task cancelled: {e}; forcing reconnect"),
-                }
+                report_heartbeat_down(r);
                 break;
             }
             accepted = acceptor.accept_bidirectional_stream() => match accepted {
@@ -409,9 +404,12 @@ async fn connect_once(
                     // 先拿许可**再**接手：闸门满了就停在这里不再 accept 下一条流——未接收的流
                     // 留在 QUIC 层，流控自然形成背压，最终由网关自己的 `head_timeout` 收尾
                     // （客户端看到 504）。许可随任务存活，本请求跑完才释放。
-                    let permit = match gate.as_mut() {
-                        Some(g) => Some(g.acquire().await),
-                        None => None,
+                    //
+                    // 取许可走 `acquire_slot`：它把心跳也放进同一个 `select!`，所以**排队期间**
+                    // 心跳结束仍会被观察到（复扫 E1，见该函数的说明）。
+                    let permit = match acquire_slot(&mut gate, &mut hb).await {
+                        SlotOutcome::Permit(p) => p,
+                        SlotOutcome::HeartbeatDown => break,
                     };
                     let http = http.clone();
                     let upstream_base = cfg.upstream_base.clone();
@@ -468,6 +466,54 @@ async fn register(mut conn: s2n_quic::connection::Handle, cfg: &AgentConfig) -> 
         .map_err(|e| anyhow::anyhow!("register read failed: {e}"))?; // io::Error
 
     Ok(())
+}
+
+/// 取闸门许可的结果（复扫 E1）。
+enum SlotOutcome {
+    /// 拿到许可；`None` = 没开闸门（`max_concurrency = 0` = 不限）。
+    Permit(Option<OwnedSemaphorePermit>),
+    /// 等许可期间心跳结束了 —— 必须结束这条连接，交回 `run()` 重连。
+    HeartbeatDown,
+}
+
+/// 取一个闸门许可，但**同时**盯着心跳（复扫 E1）。
+///
+/// 为什么必须放在 `select!` 里：`tokio::select!` 的分支体一旦 await，其它分支就不再被 poll。
+/// 所以"在 accept 分支体里直接 `g.acquire().await`"会让**排队期间**心跳失败/panic 无人观察
+/// ——连接不会被拆，agent 自认连着而网关全程 503（`run_connection` 顶部那段注释描述的静默态）。
+///
+/// 抽成独立函数是为了能直接测这条性质（见本文件测试里的
+/// `waiting_for_a_slot_still_notices_a_dead_heartbeat`）：给一个许可已占满的闸门 + 一个已经
+/// 结束的心跳，它必须**立刻**回 [`SlotOutcome::HeartbeatDown`]，而不是一直排队。
+async fn acquire_slot(
+    gate: &mut Option<ConcurrencyGate>,
+    hb: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
+) -> SlotOutcome {
+    let Some(g) = gate.as_mut() else {
+        return SlotOutcome::Permit(None);
+    };
+    tokio::select! {
+        r = &mut *hb => {
+            report_heartbeat_down(r);
+            SlotOutcome::HeartbeatDown
+        }
+        permit = g.acquire() => SlotOutcome::Permit(Some(permit)),
+    }
+}
+
+/// 心跳任务结束时的统一处置（复扫 E1 把它从 `select!` 分支体里提出来）。
+///
+/// 提取的原因：下面 accept 循环里**有两处**要观察心跳——循环顶部，以及"等闸门许可"的那段。
+/// 两处必须给出同一句日志，否则"哪种死法说什么话"就会随调用点漂移。
+fn report_heartbeat_down(joined: Result<anyhow::Result<()>, tokio::task::JoinError>) {
+    match joined {
+        Ok(Ok(())) => warn!("heartbeat loop exited; forcing reconnect"),
+        Ok(Err(e)) => warn!("heartbeat loop failed: {e}; forcing reconnect"),
+        Err(e) if e.is_panic() => {
+            error!("heartbeat loop panicked: {e}; forcing reconnect")
+        }
+        Err(e) => warn!("heartbeat task cancelled: {e}; forcing reconnect"),
+    }
 }
 
 async fn heartbeat_loop(
@@ -1382,6 +1428,70 @@ mod tests {
         // 连接仍存活（未被心跳逻辑破坏）
         assert!(handle.open_bidirectional_stream().await.is_ok());
         task.abort();
+    }
+
+    /// 规格（2026-09-25 复扫 E1）：**等闸门许可期间心跳仍必须被观察**。
+    ///
+    /// `tokio::select!` 的分支体一旦 await，其它分支就不再被 poll。原先把 `g.acquire().await`
+    /// 直接写在 accept 分支体里，于是"闸门打满（许可被长 SSE 持有）"时心跳失败/panic 无人
+    /// 观察 ⇒ 连接不会被拆 ⇒ agent 自认连着、网关把每个请求判 503，两侧都没日志。
+    ///
+    /// 控制点：许只有一个且已被占住，心跳任务已经结束。`acquire_slot` 必须**立刻**回
+    /// `HeartbeatDown`，而不是一直排队等许可。
+    #[tokio::test]
+    async fn waiting_for_a_slot_still_notices_a_dead_heartbeat() {
+        let mut gate = ConcurrencyGate::new(1);
+        let held = gate
+            .as_mut()
+            .expect("max_concurrency = 1 应当建闸门")
+            .acquire()
+            .await;
+        // 已经结束的心跳任务（真实场景里是心跳失败/panic 之后退出的那个）。
+        let mut hb = tokio::spawn(async { Ok::<(), anyhow::Error>(()) });
+
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(2), acquire_slot(&mut gate, &mut hb))
+                .await
+                .expect("等许可时心跳结束必须立刻返回，而不是一直排队");
+        assert!(
+            matches!(outcome, SlotOutcome::HeartbeatDown),
+            "应当报心跳结束以拆掉这条连接"
+        );
+        drop(held);
+    }
+
+    /// 对照：心跳**还活着**时，许可没空出来就不该返回（别把上面那条修成"总是立刻放弃"）。
+    #[tokio::test]
+    async fn waiting_for_a_slot_does_not_return_early_while_the_heartbeat_is_alive() {
+        let mut gate = ConcurrencyGate::new(1);
+        let held = gate.as_mut().unwrap().acquire().await;
+        let mut hb = tokio::spawn(async { std::future::pending::<anyhow::Result<()>>().await });
+
+        let raced =
+            tokio::time::timeout(Duration::from_millis(200), acquire_slot(&mut gate, &mut hb))
+                .await;
+        assert!(raced.is_err(), "许可没空出来、心跳也没死 ⇒ 不该返回");
+
+        hb.abort();
+        drop(held);
+    }
+
+    /// 对照：有空位就发许可；`max_concurrency = 0`（不限）时没有闸门，返回 `None`。
+    #[tokio::test]
+    async fn a_free_slot_is_granted_and_no_gate_means_no_permit() {
+        let mut gate = ConcurrencyGate::new(2);
+        let mut hb = tokio::spawn(async { std::future::pending::<anyhow::Result<()>>().await });
+        assert!(matches!(
+            acquire_slot(&mut gate, &mut hb).await,
+            SlotOutcome::Permit(Some(_))
+        ));
+
+        let mut no_gate: Option<ConcurrencyGate> = None;
+        assert!(matches!(
+            acquire_slot(&mut no_gate, &mut hb).await,
+            SlotOutcome::Permit(None)
+        ));
+        hb.abort();
     }
 
     #[tokio::test]
