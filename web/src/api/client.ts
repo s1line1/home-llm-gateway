@@ -1,5 +1,6 @@
 // 网关 HTTP 客户端：fetch 封装，Bearer 认证 + 统一错误处理。
 
+import { looksLikePrometheus } from "./metrics";
 import type { AgentInfo, ApiKey, CreatedKey, HealthStatus } from "./types";
 
 export class ApiError extends Error {
@@ -87,7 +88,22 @@ export async function fetchMetricsText(timeoutMs: number = METRICS_TIMEOUT_MS): 
     signal: AbortSignal.timeout(timeoutMs),
   });
   if (!resp.ok) throw new ApiError(resp.status, `metrics: HTTP ${resp.status}`);
-  return resp.text();
+  const text = await resp.text();
+
+  // **200 不等于"这是指标"**（复扫 G3）：网关在**同一个 URL** 上按 `Accept` 也会回 SPA 页面
+  // （A5），中间缓存一旦按 URI 张冠李戴就会把它喂过来；而解析器把"解析不出来"当成"全是 0"，
+  // 界面于是显示 0 agents / 0 请求——与"网关真的空闲"不可区分，比拿不到更糟。
+  // 两道守卫：① 内容类型 —— 拦 A5 那条链；② 正文形状 —— 兜住"类型正常但内容不是指标"。
+  // 宁可判成一次失败：上层（`useMetricsHistory`）会标记不可达并继续轮询。
+  if ((resp.headers.get("content-type") ?? "").toLowerCase().includes("text/html")) {
+    throw new Error(
+      "metrics: 期望 Prometheus 文本，收到的却是 HTML —— 可能是缓存把 /metrics 的 SPA 页面喂了过来",
+    );
+  }
+  if (!looksLikePrometheus(text)) {
+    throw new Error("metrics: 期望 Prometheus 文本，但一行样本都解析不出来");
+  }
+  return text;
 }
 
 export async function listKeys(token: string): Promise<ApiKey[]> {

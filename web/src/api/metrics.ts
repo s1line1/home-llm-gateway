@@ -52,6 +52,20 @@ function first(samples: RawSample[], name: string): number | undefined {
   return undefined;
 }
 
+/**
+ * 这段文本"看起来像" Prometheus 文本吗？
+ *
+ * 复扫 G3：`parseMetrics` 对解析不出来的输入**回退成全 0**，而"全 0"与"网关真的空闲"在界面上
+ * 完全一样。所以调用方需要能先问一句"这到底是不是指标文本"——典型场景是中间缓存把 `/metrics`
+ * 的 SPA 页面（A5）喂了过来，那显然不是。
+ *
+ * 判据刻意宽松（**至少有一行能解析成样本**），而不是"必须含某个具体指标名"：指标集以后会变，
+ * 而"一行样本都解析不出来"才是"这不是指标文本"的确凿信号。
+ */
+export function looksLikePrometheus(text: string): boolean {
+  return parsePrometheus(text).length > 0;
+}
+
 /** 把 /metrics 文本解析为结构化快照（缺字段时回退 0）。 */
 export function parseMetrics(text: string): MetricsSnapshot {
   const samples = parsePrometheus(text);

@@ -50,6 +50,32 @@ describe("useMetricsHistory：一次失败不能停掉轮询（复扫 G2）", ()
     expect(calls).toBe(3);
   });
 
+  it("200 但不是 Prometheus 文本（例如中间缓存塞进来的 HTML）→ 判不可达，而不是展示全 0", async () => {
+    // 复扫 G3：网关对 `Accept: text/html` 会在**同一个 `/metrics` URL** 上回 SPA 页面（A5），
+    // 一旦缓存按 URI 作键张冠李戴，Dashboard 的 fetch 就会拿到 HTML。原先的解析器把"一行都
+    // 解析不出来"当成"所有指标都是 0"，于是界面显示 0 agents / 0 请求——与"网关真的空闲"
+    // 完全不可区分。正确的做法是把它当成一次失败：标记不可达，**不**产出快照。
+    vi.stubGlobal(
+      "fetch",
+      async () =>
+        new Response('<!doctype html><div id="root">ui</div>', {
+          status: 200,
+          headers: { "content-type": "text/html; charset=utf-8" },
+        }),
+    );
+
+    vi.useFakeTimers();
+    const { result } = renderHook(() => useMetricsHistory(1000));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+
+    expect(result.current.reachable).toBe(false);
+    expect(result.current.latest).toBeNull();
+    expect(result.current.history).toHaveLength(0);
+    expect(result.current.error).toBeTruthy();
+  });
+
   it("恢复后 reachable 回到 true，快照与原始文本都重新累积", async () => {
     let failing = true;
     vi.stubGlobal("fetch", async () => {
