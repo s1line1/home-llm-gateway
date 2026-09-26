@@ -67,9 +67,25 @@ export async function fetchHealth(): Promise<HealthStatus> {
   }
 }
 
-/** 网关 /metrics（Prometheus 文本）。 */
-export async function fetchMetricsText(): Promise<string> {
-  const resp = await fetch("/metrics", { cache: "no-store" });
+/** `/metrics` 取数的超时（毫秒）。 */
+export const METRICS_TIMEOUT_MS = 10_000;
+
+/**
+ * 网关 /metrics（Prometheus 文本）。
+ *
+ * 超时是**必须**的（复扫 G2）：网关侧的 `/metrics` 可能长时间不返回（慢查询、连接泄漏、
+ * 后端卡住），而没有 `signal` 的 `fetch` 会一直挂着。调用方 `useMetricsHistory` 只在
+ * `finally` 里安排下一次采样，所以"挂死"会让轮询**永久停止**，且 `reachable`/`latest`
+ * 冻结在上次成功的值上——界面继续显示"网关在线 · N agents"，是**假绿**。有了超时，
+ * 挂死变成一次普通失败：进 `catch`（标记不可达）并重新排期。
+ *
+ * `timeoutMs` 可传：测试用一个小值验证"挂死不返回"这条路径，不必等默认的 10 秒。
+ */
+export async function fetchMetricsText(timeoutMs: number = METRICS_TIMEOUT_MS): Promise<string> {
+  const resp = await fetch("/metrics", {
+    cache: "no-store",
+    signal: AbortSignal.timeout(timeoutMs),
+  });
   if (!resp.ok) throw new ApiError(resp.status, `metrics: HTTP ${resp.status}`);
   return resp.text();
 }
