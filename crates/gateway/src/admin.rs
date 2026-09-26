@@ -535,6 +535,43 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK, "`bearer` 小写应当被接受");
     }
 
+    /// 规格（复扫 D2）：配置里 `admin_token` 带首尾空白时，**`/admin/*` 仍然可用**。
+    ///
+    /// 走完整路由（挂载判据 + 鉴权比较）而不只是 `AppState` 字段：入站凭据到不了带空白的那一步
+    /// （`bearer_token` 与 httparse 各剪一端），所以 `"  admin-token  "` 这种值在修好前是
+    /// "路由挂着、每个请求 401"，而运维看不出哪里配错了。修法是装配时剪掉两端（见 `AppState::new`），
+    /// 这条判据就是"剪掉之后挂载与比较用的是同一个值"。
+    #[tokio::test]
+    async fn a_padded_admin_token_still_authenticates() {
+        use tower::ServiceExt;
+
+        let opts = Options {
+            admin_token: Some("  admin-token  ".into()),
+            ..Options::default()
+        };
+        let state = AppState::new(
+            Registry::default(),
+            KeyStore::new(None),
+            Metrics::default(),
+            &opts,
+        );
+        let resp = crate::http::app(state)
+            .oneshot(
+                axum::extract::Request::builder()
+                    .uri("/admin/keys")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer admin-token")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "带空白的 admin_token 必须被剪成 `admin-token` 而不是每个请求都 401（复扫 D2）"
+        );
+    }
+
     #[tokio::test]
     async fn create_and_list_masks_secret() {
         let state = test_state();

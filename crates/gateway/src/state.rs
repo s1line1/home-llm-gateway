@@ -128,7 +128,22 @@ impl AppState {
         Self {
             registry,
             key_store,
-            admin_token: opts.admin_token.clone(),
+            // `admin_token` 的**首尾空白在这里剪掉**（复扫 D2）。不剪的话它是"配了却用不了"：
+            // `Options::validate` 只拒"全是空白"，而 `admin_token: " x "` 能过校验、`/admin/*`
+            // 也照样挂载（下面的挂载判据与 `admin.rs` 的比较都看这个字段），但每个管理请求都是
+            // 401——因为入站凭据到不了带空白的那一步：`auth::bearer_token` 在 scheme 之后
+            // `trim_start_matches(' ')`，httparse 解析头部时又 **trim trailing whitespace**
+            // （它显式去掉 `' '`、`'\t'`、`'\r'`、`'\n'`，见 `httparse::parse_headers` 里那句
+            // 注释）。这里剪的两端正是这组字符，而不是 `str::trim()` 的 Unicode 空白——后者会把
+            // 一个**本来能用**的（比如尾随 NBSP）token 改成不能用的。
+            //
+            // 修好它而不是拒绝它，与 E3 的 `upstream` 尾斜杠同一口径（等价写法不该把一份合法
+            // 配置判死）；空串 / 全空白仍在 `Options::validate` 里拒绝——那种剪完什么都不剩，
+            // 是另一回事。
+            admin_token: opts
+                .admin_token
+                .as_deref()
+                .map(|token| token.trim_matches([' ', '\t', '\r', '\n']).to_owned()),
             timeout: opts.request_timeout,
             agent_stale_after: opts.agent_stale_after,
             tunnel_op_timeout: opts.tunnel_op_timeout,
@@ -203,6 +218,52 @@ mod tests {
             Metrics::default(),
             &Options::default(),
         )
+    }
+
+    /// 规格（复扫 D2）：**`admin_token` 的首尾空白在装配时剪掉**，否则它是"配了却用不了"。
+    ///
+    /// 这条钉的是装配点：字段是 `pub`，如果有人绕过 `AppState::new` 直接塞一个带空白的值，
+    /// 鉴权仍然会 401——但那不是配置作者的路径，`Options::validate` 也拦不住空白（只拦全空白）。
+    /// 走完整路由的版本在 `admin::tests::a_padded_admin_token_still_authenticates`。
+    #[test]
+    fn a_padded_admin_token_is_trimmed_when_the_state_is_built() {
+        let opts = Options {
+            admin_token: Some("  tok\t".into()),
+            ..Options::default()
+        };
+        let state = AppState::new(
+            Registry::default(),
+            KeyStore::new(None),
+            Metrics::default(),
+            &opts,
+        );
+        assert_eq!(
+            state.admin_token.as_deref(),
+            Some("tok"),
+            "两端空白必须剪掉（入站凭据到不了带空白的那一步，见 `AppState::new` 的说明）"
+        );
+
+        // 内部空白是 token 的一部分，不许动
+        let opts = Options {
+            admin_token: Some("to k".into()),
+            ..Options::default()
+        };
+        let state = AppState::new(
+            Registry::default(),
+            KeyStore::new(None),
+            Metrics::default(),
+            &opts,
+        );
+        assert_eq!(state.admin_token.as_deref(), Some("to k"));
+
+        // `None`（不启用 /admin/*）不受影响
+        let state = AppState::new(
+            Registry::default(),
+            KeyStore::new(None),
+            Metrics::default(),
+            &Options::default(),
+        );
+        assert!(state.admin_token.is_none());
     }
 
     /// 规格（并集评估 §2 S3）：关闭阶段**可查、可订阅**，但推进阶段的能力只属于
