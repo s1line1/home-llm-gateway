@@ -38,8 +38,6 @@ pub(super) struct UsageCollector {
     buf: Vec<u8>,
     /// 已转发字节（估算 completion 用）。
     bytes_forwarded: u64,
-    /// 是否已记录（防止提前返回路径重复记录）。
-    recorded: bool,
 }
 
 impl UsageCollector {
@@ -59,7 +57,6 @@ impl UsageCollector {
             extracted: None,
             buf: Vec::new(),
             bytes_forwarded: 0,
-            recorded: false,
         }
     }
 
@@ -88,10 +85,9 @@ impl UsageCollector {
     /// 这里曾经是"每请求 spawn 一个阻塞任务写一次库"：那条路径让云端 515 个线程里 514 个
     /// 卡在 futex 等同一把 `db` 锁，把 2 vCPU 的吞吐摁在约 190 QPS。
     pub(super) fn finish(mut self) {
-        if self.recorded {
-            return;
-        }
-        self.recorded = true;
+        // 这里**没有**"防重复记录"的守卫：`finish` 按值取 `self`，一个收集器只可能结算一次。
+        // 复扫 B4：原先有个 `recorded` 标志（注释写着"防止提前返回路径重复记录"），但它只在
+        // 本函数内部被置位、**永不读出**——`finish` 一进来它必然是 `false`，那条分支不可达。
         let delta = self.resolve_delta();
         self.key_store
             .accumulate_usage(&self.key_id, &self.key_name, &delta);
