@@ -345,10 +345,17 @@ fn pick<'a>(
 ) -> Result<Vec<&'a Entry>, AcquireError> {
     let mut candidates: Vec<&Entry> = entries
         .filter(|e| is_fresh(e.last_seen_millis.load(Ordering::Relaxed), now, stale_after))
-        .filter(|e| !exclude.contains(&e.stable_id))
         .collect();
     if candidates.is_empty() {
         return Err(AcquireError::NoAgent);
+    }
+    // 排除要**放在"有没有候选"之后**（复扫 B1）：`exclude` 是**调用方自己**传进来的（本轮
+    // 已经试过的连接），把它和"注册表里没人 / 全 stale"混成同一个 `NoAgent`，会让单 agent
+    // 场景下的"忙"最终报成 503 `no edge available` + `all-candidates-stale`——两处都与事实
+    // 相反（注册表里有人、心跳也新鲜，只是它已经顶到承载上限）。
+    candidates.retain(|e| !exclude.contains(&e.stable_id));
+    if candidates.is_empty() {
+        return Err(AcquireError::AllExcluded);
     }
     // 模型过滤：只保留能服务请求模型的 agent（声明含 "*" 或含 model）
     candidates.retain(|e| e.models.iter().any(|m| m == "*" || m == model));
@@ -860,6 +867,12 @@ pub enum AcquireError {
     NoModel,
     /// agent 并发已满。
     AtCapacity,
+    /// 有健康、能服务该模型的候选，但它们**全部**落在调用方给出的 `exclude` 里。
+    ///
+    /// 与 [`Self::NoAgent`] 分开（复扫 B1）：这个错误码的含义是"重试已经把候选试过一遍了"，
+    /// 而不是"没人可用"。调用方据此才能把"忙"如实报成 429 容量不足，而不是
+    /// 503 `no edge available`。
+    AllExcluded,
 }
 
 /// Drop 时自动归还并发槽位。
@@ -1235,9 +1248,17 @@ mod tests {
         let (e, _g) = reg.try_acquire_excluding(stale, "m", &[id2]).unwrap();
         assert_eq!(e.stable_id, id1, "排除 b 后应选中 a");
 
-        // 两条都排除 → 没有候选（这正是"没有别的 agent 可重试"那条分支）
+        // 两条都排除 → 候选**全被本轮排除**，这与"没人可用"是两件事（复扫 B1）：
+        // 混成同一个 `NoAgent`，单 agent 忙时就会对外报 503 `no edge available`。
         assert!(matches!(
             reg.try_acquire_excluding(stale, "m", &[id1, id2]),
+            Err(AcquireError::AllExcluded)
+        ));
+
+        // 对照：注册表里真的没人 → `NoAgent`（别把上面那条修成"什么都报 AllExcluded"）。
+        let empty = Registry::default();
+        assert!(matches!(
+            empty.try_acquire_excluding(stale, "m", &[]),
             Err(AcquireError::NoAgent)
         ));
     }
