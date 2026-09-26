@@ -479,7 +479,7 @@ s2n-quic 的 `initial_max_streams_bidi` 默认只有 **100**（`InitialMaxStream
   **同一次** JSON 解析（`usage_meter::request_facts`），请求帧的 body 用 `Bytes`（零拷贝移动，
   postcard 一次写整块而不是逐字节）。release 实测 16MiB 请求：改动前 ≈27.6ms 的 worker CPU
   （两次解析 + 逐元素序列化 20.0ms），现在 ≈1.6ms，且 ≥256KiB 的解析走阻塞池、不占 worker。
-- **`max_concurrent_requests` 是并发总量闸门，与内存脱钩**。它管的是「所有路径的在途 HTTP 请求总数」（`/metrics` 与 `/healthz` 豁免——探针被 429 会让 LB 摘除实例、把"慢"放大成"全挂"；SSE 长流从开头占到最后一块 body 送完），超限返回 `429 + Retry-After`。缓存关闭时它必须收在 `MemoryMax / 19MiB` 之下，否则那道闸等于没有——**先撞的是 `MemoryMax`（网关被 OOM 杀掉、连接中断），而不是这里优雅地 429**；缓存开启后按业务量给即可：
+- **`max_concurrent_requests` 是并发总量闸门，与内存脱钩**。它管的是「**受限域**的在途 HTTP 请求总数」（`/v1/*`、UI、admin；SSE 长流从开头占到最后一块 body 送完），超限返回 `429 + Retry-After`。两条**无认证**路径各有**独立**的宽松额度、互不相欠（各 64 并发，也不占这里的预算）：探针（`/healthz`）被 429 会让 LB 摘除一个健康实例、把"慢"放大成"全挂"，所以它既不能吃受限预算也不能无界；抓取（`/metrics`）同理——**它另有一条 64 的上限**，且**不计入**请求数/状态码/访问日志（抓取流量不该淹没真实告警，被拒时只在闸门日志里留一条 WARN）。缓存关闭时它必须收在 `MemoryMax / 19MiB` 之下，否则那道闸等于没有——**先撞的是 `MemoryMax`（网关被 OOM 杀掉、连接中断），而不是这里优雅地 429**；缓存开启后按业务量给即可：
 
   ```yaml
   max_concurrent_requests: 32    # 缓存关闭时 ≈ MemoryMax / 20MB；开启后按业务量给

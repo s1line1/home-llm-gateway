@@ -14,8 +14,8 @@
 //!    `client_request_id`。
 //!    （历史缺口：拆分前 `metrics_middleware` 与 `proxy` 各有一个计数器都从 1 起，
 //!    UUID 客户端会让两个数列独立递增、周期性撞号——现已由该模块统一。）
-//! 2. **闸门**：`max_concurrent_requests` 是**受限域**的在途上限（`/metrics` 完全不记；
-//!    `/healthz` 既不占受限额度、也只受它自己的宽松上限约束，见 `http::admission`），超限立即
+//! 2. **闸门**：`max_concurrent_requests` 是**受限域**的在途上限；`/healthz` 与 `/metrics`
+//!    各有一块**独立**的宽松额度（三个域互不相欠，见 `http::admission`），超限立即
 //!    429，防多 key 总和压垮单实例。
 //! 3. **票据移交**：`Admission` 的释放**完全由 Drop 负责**，且分两段——移交 body 之前
 //!    （含客户端中断导致 future 被 drop）就地归还；移交之后随 body 结束/丢弃归还。
@@ -24,7 +24,8 @@
 //!    hyper 没有写超时，客户端不读就永远不 drop body → 票据永不归还（实测 8 个僵尸槽位）。
 //!
 //! 访问日志分级（target `gateway::access`）：<400 debug / 4xx info / 5xx error；
-//! `/metrics` 自身完全不记（抓取流量不该淹没真实告警）。
+//! `/metrics` 自身完全不记（抓取流量不该淹没真实告警——它有自己的额度、被拒时闸门留一条 WARN，
+//! 但**不进** `request_count` / 状态码 / 访问日志）。
 //! 需要临时恢复全量访问日志：`RUST_LOG=info,gateway::access=debug`。
 
 use axum::{

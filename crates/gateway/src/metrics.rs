@@ -28,6 +28,12 @@ pub enum AdmissionDomain {
     /// 探针（`/healthz`）：自己不占受限额度，但有一个**独立的、宽松的**上限，免得这条无认证
     /// 路径被洪水无界消耗（取值与理由见 `http::admission::MAX_CONCURRENT_PROBES`）。
     Probe,
+    /// 指标抓取（`/metrics`）：与探针域同理，但计数**完全独立**（复扫 A8）。
+    ///
+    /// 三个域各自一个计数器，不是"省一个字段"的问题：只要两条路径共用一个域，其中一条的洪水
+    /// 就能把另一条顶成 429——`/healthz` 被 429 会让 LB 摘掉健康实例，`/v1` 被 429 就是全量
+    /// 失败。抓取域的票据还**不算一次请求**（见 [`Metrics::try_enter_uncounted`]）。
+    Scrape,
 }
 
 #[derive(Clone, Default)]
@@ -49,6 +55,11 @@ struct MetricsInner {
     active_gated: AtomicU64,
     /// **探针域**在途数：只有 [`AdmissionDomain::Probe`] 的票据增减它。
     active_probe: AtomicU64,
+    /// **抓取域**在途数：只有 [`AdmissionDomain::Scrape`] 的票据增减它（复扫 A8）。
+    ///
+    /// 与探针域分开的理由同 `active_gated`：`/metrics` 也是**无认证**入口，共用探针域就等于
+    /// "一轮抓取洪水能把 `/healthz` 顶成 429"，而 LB 会因此摘掉一个**健康**实例。
+    active_scrape: AtomicU64,
     /// 转发给客户端的字节数。
     bytes_out: AtomicU64,
     /// 累计请求耗时（毫秒）。
@@ -164,9 +175,26 @@ impl Metrics {
     /// `domain` 决定这笔在途记进哪个域（见 [`AdmissionDomain`]）：受限路径只与受限域的计数比较，
     /// 所以豁免路径在途多少都不会减少别人能用的额度。
     pub fn try_enter(&self, limit: u32, domain: AdmissionDomain) -> Option<Admission> {
+        self.enter(limit, domain, true)
+    }
+
+    /// 同 [`Metrics::try_enter`]，但票据**不算一次请求**：不进 `request_count`、不进
+    /// `active`（`hlmg_active_requests` 与 `drain()`）、也不记耗时（复扫 A8）。
+    ///
+    /// 给 `/metrics` 抓取用。它必须与 `try_enter` 分开，因为"配额"与"记账"是两件事：
+    /// `/metrics` 不走 id / 访问日志 / 状态码那条链（`request_id_middleware` 对它直接放行），
+    /// 而仓库自用的恒等式 `request_count − Σ状态码 − aborted == 0` 依赖"记了状态码才算一次
+    /// 请求"——在这里也 `request_count += 1`，恒等式就会被**每次抓取**各漂移 +1，把真正的槽位
+    /// 泄漏淹没。它占的只有 [`AdmissionDomain::Scrape`] 的在途计数（于是抓取洪水有界）。
+    pub fn try_enter_uncounted(&self, limit: u32, domain: AdmissionDomain) -> Option<Admission> {
+        self.enter(limit, domain, false)
+    }
+
+    fn enter(&self, limit: u32, domain: AdmissionDomain, counted: bool) -> Option<Admission> {
         let domain_counter = match domain {
             AdmissionDomain::Gated => &self.inner.active_gated,
             AdmissionDomain::Probe => &self.inner.active_probe,
+            AdmissionDomain::Scrape => &self.inner.active_scrape,
         };
         if limit > 0 {
             let limit = u64::from(limit);
@@ -190,13 +218,17 @@ impl Metrics {
             domain_counter.fetch_add(1, Ordering::Relaxed);
         }
         // 总数（`hlmg_active_requests` 与 `drain()` 读它）：**只在本域确实占到票之后**才加，
-        // 所以它仍然恒等于已发出的票数、不会留下幽灵占位（R8）。
-        self.inner.active.fetch_add(1, Ordering::Relaxed);
-        self.inner.request_count.fetch_add(1, Ordering::Relaxed);
+        // 所以它仍然恒等于已发出的票数、不会留下幽灵占位（R8）。抓取票（`counted = false`）
+        // 刻意不在这里出现——见 `try_enter_uncounted`。
+        if counted {
+            self.inner.active.fetch_add(1, Ordering::Relaxed);
+            self.inner.request_count.fetch_add(1, Ordering::Relaxed);
+        }
         Some(Admission {
             metrics: self.clone(),
             start: Instant::now(),
             domain,
+            counted,
         })
     }
 
@@ -313,6 +345,11 @@ impl Metrics {
     /// **探针域**在途数（`/healthz`）：拒绝日志与测试读它。
     pub fn active_probe_count(&self) -> u64 {
         self.inner.active_probe.load(Ordering::Relaxed)
+    }
+
+    /// **抓取域**在途数（`/metrics`）：拒绝日志与测试读它（复扫 A8）。
+    pub fn active_scrape_count(&self) -> u64 {
+        self.inner.active_scrape.load(Ordering::Relaxed)
     }
 
     /// agent 连接建立：累计 +1、当前在线 +1。
@@ -564,11 +601,14 @@ impl Metrics {
 /// 因此：票据要么被正常作用域 drop，要么随请求 future 被丢弃而 drop，两条路都归还槽位。
 /// 注意不可 `Clone`/`Copy`（会导致重复释放）。
 ///
-/// 票据记着自己是哪个域的（复扫 A3），否则 Drop 不知道该把票还给受限域还是探针域。
+/// 票据记着自己是哪个域的（复扫 A3），否则 Drop 不知道该把票还给受限域还是探针域；
+/// 还记着它**算不算一次请求**（复扫 A8，见 [`Metrics::try_enter_uncounted`]）。
 pub struct Admission {
     metrics: Metrics,
     start: Instant,
     domain: AdmissionDomain,
+    /// `false` = 只占域额度、不进 `request_count` / `active` / 耗时（`/metrics` 抓取票）。
+    counted: bool,
 }
 
 impl Admission {}
@@ -578,8 +618,12 @@ impl Drop for Admission {
         match self.domain {
             AdmissionDomain::Gated => &self.metrics.inner.active_gated,
             AdmissionDomain::Probe => &self.metrics.inner.active_probe,
+            AdmissionDomain::Scrape => &self.metrics.inner.active_scrape,
         }
         .fetch_sub(1, Ordering::Relaxed);
+        if !self.counted {
+            return;
+        }
         self.metrics.inner.active.fetch_sub(1, Ordering::Relaxed);
         self.metrics
             .inner
@@ -812,8 +856,50 @@ mod tests {
         );
     }
 
-    /// 规格（复扫 C2-5）：这一族的三种标签是**三件不同的事**，HELP 不能把它们统称"重试"。
+    /// 规格（复扫 A8）：**抓取票只占抓取域的额度，完全不算一次请求**。
     ///
+    /// `/metrics` 不走 id / 访问日志 / 状态码那条链（`request_id_middleware` 对它直接放行），而
+    /// 恒等式 `request_count − Σ状态码 − aborted == 0` 依赖"记了状态码才算一次请求"。所以抓取票
+    /// 必须与 `try_enter` 分开：它只加抓取域的计数，`request_count` / `active` / 耗时一个都不动
+    /// ——否则每次抓取都让恒等式 +1，真正的槽位泄漏会被淹没。
+    #[test]
+    fn a_scrape_ticket_bounds_scrapes_without_counting_them_as_requests() {
+        let m = Metrics::default();
+        let before = m.identity_terms();
+
+        let s1 = m
+            .try_enter_uncounted(2, AdmissionDomain::Scrape)
+            .expect("抓取有自己的预算");
+        let s2 = m
+            .try_enter_uncounted(2, AdmissionDomain::Scrape)
+            .expect("抓取有自己的预算");
+        assert_eq!(m.active_scrape_count(), 2);
+        assert!(
+            m.try_enter_uncounted(2, AdmissionDomain::Scrape).is_none(),
+            "抓取预算满了要拒（这条无认证路径此前完全无界）"
+        );
+        assert_eq!(
+            m.identity_terms(),
+            before,
+            "抓取不得动 request_count（否则恒等式每次抓取漂移 +1）"
+        );
+        assert_eq!(
+            m.active_count(),
+            0,
+            "抓取也不该出现在 hlmg_active_requests / drain 的读数里"
+        );
+        assert_eq!(
+            (m.active_gated_count(), m.active_probe_count()),
+            (0, 0),
+            "抓取票不得推动另外两个域的计数"
+        );
+
+        drop((s1, s2));
+        assert_eq!(m.active_scrape_count(), 0, "票据 Drop 要把抓取计数还干净");
+        assert_eq!(m.identity_terms(), before, "归还路径同样不得动请求账本");
+    }
+
+    /// 规格（复扫 C2-5）：这一族的三种标签是**三件不同的事**，HELP 不能把它们统称"重试"。    ///
     /// 文案是给人看的，但它决定告警怎么写：把 `no-alternative` 当成重试次数，会从"重试很多"
     /// 得出"上游不稳"的错误结论——而它实际的含义是"**没有别的 agent 可换**"。
     #[test]
