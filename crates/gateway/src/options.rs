@@ -175,6 +175,17 @@ impl Options {
     pub const DEFAULT_HEAD_SILENT_GRACE: Duration = Self::DEFAULT_REQUEST_TIMEOUT;
     /// agent 失联判定默认值。
     pub const DEFAULT_AGENT_STALE_AFTER: Duration = Duration::from_secs(15);
+
+    /// agent **默认**的心跳间隔，对应 `agent::config::default_heartbeat_secs()`。
+    ///
+    /// 为什么网关里要抄这个数字（复扫 E2）：网关与 agent 是**两个进程、两份配置**——网关只知道
+    /// 自己的 `agent_stale_secs`，而"这个窗口够不够 agent 用"取决于 agent 配了多快的心跳，
+    /// 谁都不知道对方的值。于是这里按对方的**文档默认值**做一条启动期提醒
+    /// （见 [`Options::validate`]），并在日志字段里点出这个假设。
+    ///
+    /// 这对"抄来的默认值"由 `the_assumed_defaults_match_the_other_crate` 交叉钉住。
+    pub const ASSUMED_AGENT_HEARTBEAT: Duration = Duration::from_secs(5);
+
     /// 客户端停滞阈值默认值。
     pub const DEFAULT_CLIENT_STALL: Duration = Duration::from_secs(60);
     /// 公网入口并发连接数默认上限。见 [`Options::max_entry_connections`]。
@@ -275,6 +286,24 @@ impl Options {
             );
         }
 
+        // 失联窗口与 agent 心跳的**交叉校验**（复扫 E2）：两个进程、两份配置，网关不知道 agent
+        // 配了多快的心跳，只知道文档默认是 `ASSUMED_AGENT_HEARTBEAT`。窗口容不下**两次**心跳时，
+        // 任何一次延迟/丢包/调度抖动都够把 agent 判成失联 ⇒ 注册表出现空洞，单 agent 场景直接
+        // 周期性全量 503/404，而两侧进程与注册表看着都正常。
+        //
+        // 只提示不拒绝：把窗口调小是合法的（运维可以把所有 agent 的心跳一起调快），但没有理由
+        // 不吵一声。agent 侧有一条镜像的提醒（`agent::config::slow_heartbeat_warning`）。
+        if self.agent_stale_after < Self::ASSUMED_AGENT_HEARTBEAT.saturating_mul(2) {
+            tracing::warn!(
+                agent_stale_secs = self.agent_stale_after.as_secs(),
+                assumed_agent_heartbeat_secs = Self::ASSUMED_AGENT_HEARTBEAT.as_secs(),
+                "agent_stale_secs is tight: the window holds fewer than two heartbeats at the \
+                 documented agent default, so a single delayed heartbeat marks agents stale -- \
+                 which shows up as periodic 503/404 while both processes look healthy. Use a \
+                 larger agent_stale_secs, or make every agent heartbeat faster"
+            );
+        }
+
         // 上界**只提示不拒绝**：`verified_cache_max` 按每条约 100 字节算（见 `storage::verified`），
         // 10^8 就是 GB 级内存。运维可能是故意配大，但没有理由不吵一声。
         const VERIFIED_CACHE_WARN_ABOVE: usize = 100_000;
@@ -350,6 +379,86 @@ mod tests {
         fn make_writer(&'a self) -> Self::Writer {
             self.clone()
         }
+    }
+
+    /// 在捕获日志的同时跑一次 `validate()`，返回 `(结果, 日志文本)`。
+    ///
+    /// `set_default` 是线程局部的，普通 `#[test]` 正好跑在同一个线程上，所以不需要 tokio。
+    fn validate_capturing(opts: &Options) -> (Result<(), String>, String) {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_env_filter("info")
+            // ANSI 会把**字段名**画成斜体，字节里就没有字面量了（本地设了 NO_COLOR、CI 没设，
+            // 所以别赌运行环境）。断言只用原文案的句子，不受这条影响。
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let verdict = opts.validate();
+        let text = logs.text();
+        drop(guard);
+        (verdict, text)
+    }
+
+    /// 规格（复扫 E2）：**失联窗口偏紧时必须吵一声**（agent 侧那条是同一规格的另一端）。
+    ///
+    /// 网关不知道 agent 配了多快的心跳，只知道文档默认是 `ASSUMED_AGENT_HEARTBEAT`。窗口容不下
+    /// 两次心跳时，一次延迟就够把 agent 判成失联 ⇒ 注册表出现空洞，单 agent 场景直接周期性
+    /// 全量 503/404，而两侧进程与注册表看着都正常。
+    ///
+    /// 只提示不拒绝：把窗口调小是合法的（运维可以把所有 agent 的心跳一起调快），但没有理由
+    /// 不吵一声——而且"只提示"这个折中本身有风险（把 warn 删掉不会让别的测试变红），所以这条
+    /// 把两半都钉住：`Ok` + 日志里确实吵了一声。
+    #[test]
+    fn a_tight_agent_stale_window_is_warned_about() {
+        // 9s < 2 × 5s：容不下两次默认心跳。
+        let (verdict, text) = validate_capturing(&Options {
+            agent_stale_after: Duration::from_secs(9),
+            ..Options::default()
+        });
+        assert!(verdict.is_ok(), "只提示不拒绝：{verdict:?}");
+        assert!(
+            text.contains("agent_stale_secs is tight"),
+            "偏紧的失联窗口必须留下 warn，捕获到的日志：\n{text}"
+        );
+
+        // 边界：恰好 2 × 5s = 10s 就够两次心跳，不该吵。
+        let (verdict, text) = validate_capturing(&Options {
+            agent_stale_after: Duration::from_secs(10),
+            ..Options::default()
+        });
+        assert!(verdict.is_ok());
+        assert!(
+            !text.contains("agent_stale_secs is tight"),
+            "10s 容得下两次默认心跳，不该提醒：\n{text}"
+        );
+
+        // 对照：默认 15s（容得下三次）更不该吵。
+        let (verdict, text) = validate_capturing(&Options::default());
+        assert!(verdict.is_ok());
+        assert!(
+            !text.contains("agent_stale_secs is tight"),
+            "默认窗口不该提醒（吵多了就会被无视）：\n{text}"
+        );
+    }
+
+    /// 复扫 E2 的两侧"抄来的默认值"必须与对方 crate 的真实默认一致。
+    ///
+    /// 两侧的启动期提醒都建立在"对方的默认是多少"上；抄错了，提醒就会在下游静默失效（该吵的
+    /// 时候不吵）。`gateway` 的 dev-dependencies 里有 `agent`，所以这条交叉断言只能写在网关侧
+    /// ——这也正是它存在的理由。
+    #[test]
+    fn the_assumed_defaults_match_the_other_crate() {
+        assert_eq!(
+            Options::DEFAULT_AGENT_STALE_AFTER.as_secs(),
+            agent::config::ASSUMED_GATEWAY_STALE_SECS,
+            "agent 侧假设的\"网关默认失联窗口\"漂了：agent 的启动期提醒会按错的值判断"
+        );
+        assert_eq!(
+            Options::ASSUMED_AGENT_HEARTBEAT.as_secs(),
+            agent::config::ASSUMED_GATEWAY_STALE_SECS / 3,
+            "网关侧假设的\"agent 默认心跳\"漂了：agent 的默认心跳由那个窗口推导，两边必须一致"
+        );
     }
 
     /// 契约（SL-P2-6 ①）：**过大的 `verified_cache_max` 只提示、不拒绝**。

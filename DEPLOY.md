@@ -259,6 +259,7 @@ curl -N -k -H "Authorization: Bearer <你的key>" \
 | agent 日志：连接失败 / 一直重试 | ① 安全组 UDP 4433 是否放行；② edge 侧网络是否封出站 UDP（少见）；③ `nc -u -vz <IP> 4433` 测连通 |
 | agent：TLS 握手失败 | 配置项 `server_name` 与网关 server 证书 SAN 不匹配；确认填的是 SAN 里的域名或公网 IP |
 | 网关日志：agent connected 但很快消失 | agent 心跳被断（网络不稳）；检查 UDP 丢包；`agent_stale_secs`（网关配置）适当调大 |
+| **周期性 503/404，但两侧进程都活着、注册表看着正常** | 心跳与失联窗口**没配成对**：`agent_stale_secs`（网关）必须明显大于 `heartbeat_secs`（agent），窗口里至少容得下**两次**心跳。两侧启动时都会为这种情况打一条 WARN，先去看日志（agent 侧说 `heartbeat_secs is slow…`，网关侧说 `agent_stale_secs is tight…`） |
 | **请求大面积 502/超时，`/admin/agents` 恒显示 1 个 agent，`hlmg_agent_connections_total` 飞涨** | **两台机器 `agent_id` 撞车**（见 §6 警告）：改配置里任一方的 `agent_id` 为唯一值后重启该 agent |
 | curl 返回 401 | API Key 不对或没带 `Authorization: Bearer` |
 | curl 返回 503 | 网关没注册到健康 agent（看网关/agent 日志） |

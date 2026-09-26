@@ -583,9 +583,49 @@ async fn heartbeat_once(
         .map_err(|_| anyhow::anyhow!("heartbeat timed out after {wait:?}"))?
 }
 
+/// 测试用的日志捕获（`#[cfg(test)]`）：断言"某一行日志到底有没有打"。
+///
+/// 为什么要有它：`request_log` 与启动期提醒这类承诺本身就是"打不打那几条日志"，而仓库没有
+/// （也不打算为一条日志引入）tracing 捕获依赖——标准库 + `tracing-subscriber` 的 `MakeWriter`
+/// 就够。提到 crate 级是因为**多个**测试模块要用（`lib::tests` 与 `config::tests`）。
+///
+/// ⚠️ 配合 `flavor = "current_thread"` 用：`set_default` 是**线程局部**的，多线程 runtime 里
+/// 任务可能被调度到别的 worker 上，事件就抓不到了。
+#[cfg(test)]
+pub(crate) mod test_log {
+    use std::sync::Arc;
+
+    #[derive(Clone, Default)]
+    pub(crate) struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        pub(crate) fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogs;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_log::CapturedLogs;
     use proto::ALPN;
 
     /// 规格（记录 P2-1）：**"连上就被踢"不许把退避重置回 500ms**。
@@ -2823,38 +2863,6 @@ mod tests {
         );
 
         handle.abort();
-    }
-
-    /// 把 tracing 输出抓进内存的 `MakeWriter`（只为断言"某一行日志到底有没有打"）。
-    ///
-    /// 为什么要有它：`request_log` 的承诺就是"打不打这几条 INFO"，而仓库没有（也不打算为一条
-    /// 日志引入）tracing 捕获依赖——标准库 + `tracing-subscriber` 的 `MakeWriter` 就够。
-    /// ⚠️ 配合 `flavor = "current_thread"` 用：`set_default` 是**线程局部**的，多线程 runtime 里
-    /// 任务可能被调度到别的 worker 上，事件就抓不到了。
-    #[derive(Clone, Default)]
-    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl CapturedLogs {
-        fn text(&self) -> String {
-            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
-        }
-    }
-
-    impl std::io::Write for CapturedLogs {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
-        type Writer = CapturedLogs;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
     }
 
     /// 跑完一次**成功**的代理请求（假网关 → agent → 假上游），返回时 agent 侧已经写完 done。

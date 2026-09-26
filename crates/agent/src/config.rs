@@ -6,6 +6,17 @@ use crate::AgentConfig;
 use anyhow::Context;
 use serde::Deserialize;
 
+/// 网关**默认**的失联窗口（秒），对应 `gateway::options::Options::DEFAULT_AGENT_STALE_AFTER`。
+///
+/// 为什么 agent 里要抄这个数字（复扫 E2）：agent 与网关是**两个进程、两份配置**——agent 只知道
+/// 自己的 `heartbeat_secs`，而"够不够快"取决于网关的 `agent_stale_secs`，谁都不知道对方的值。
+/// 于是这里按对方的**文档默认值**留一条启动期提醒，并在日志字段里点出这个假设。
+/// 它**只用于提醒**：真值只有网关知道，所以宁可提醒、不可拒绝（见 `slow_heartbeat_warning`）。
+///
+/// 这对"抄来的默认值"由网关侧的 `the_assumed_defaults_match_the_other_crate` 交叉钉住
+/// （`gateway` 的 dev-dependencies 里有 `agent`，所以那条断言只能写在网关侧）。
+pub const ASSUMED_GATEWAY_STALE_SECS: u64 = 15;
+
 /// YAML 配置文件结构。`cloud_addr`/`ca`/`cert`/`key` 必填，其余有默认值。
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -55,7 +66,9 @@ fn default_upstream() -> String {
     "http://127.0.0.1:11434".into()
 }
 fn default_heartbeat_secs() -> u64 {
-    5
+    // **由网关默认窗口推导**，而不是再写一个 5：两者本就有固定关系（窗口里至少要容得下三次
+    // 心跳），写死两处就是下一个漂移点（复扫 E2）。
+    ASSUMED_GATEWAY_STALE_SECS / 3
 }
 fn default_models() -> Vec<String> {
     vec!["*".into()]
@@ -65,6 +78,22 @@ fn default_max_concurrency() -> u32 {
 }
 fn default_request_log() -> bool {
     true
+}
+
+/// 心跳间隔是否偏慢到会被网关判失联：`Some(说明)` = 该提醒。
+///
+/// 判据是"网关**默认**窗口里容不下**两次**心跳"：只容得下一次时，任何一次延迟、丢包或调度
+/// 抖动都会让 `last_seen` 过期，于是该 agent 在每个心跳周期里都有一段不可路由；单 agent 场景
+/// 就是周期性全量 503/404（复扫 E2）。
+///
+/// **只提醒不拒绝**：把 `agent_stale_secs` 调大是合法部署，而 agent 无从知道它。
+fn slow_heartbeat_warning(heartbeat_secs: u64) -> Option<&'static str> {
+    (heartbeat_secs.saturating_mul(2) >= ASSUMED_GATEWAY_STALE_SECS).then_some(
+        "heartbeat_secs is slow for the gateway's default agent_stale_secs: that window holds \
+         fewer than two heartbeats, so a single delayed heartbeat marks this agent stale -- which \
+         shows up as periodic 503/404 while both processes look healthy. Use a faster heartbeat, \
+         or raise the gateway's agent_stale_secs",
+    )
 }
 
 /// 从 YAML 文件加载并映射为 agent 配置。
@@ -91,6 +120,15 @@ pub fn from_file(cfg: ConfigFile) -> anyhow::Result<AgentConfig> {
         anyhow::bail!(
             "config: heartbeat_secs must be at least 1 second, but is 0: a zero heartbeat makes \
              every wait time out immediately, forcing a reconnect on every cycle"
+        );
+    }
+    // 复扫 E2：心跳偏慢不会报错，只会让网关**周期性**把本 agent 判成失联——现象是"周期性
+    // 503/404 而两侧进程与注册表都正常"，排障时没有任何线索指向真因，所以必须在这里吵一声。
+    if let Some(advice) = slow_heartbeat_warning(cfg.heartbeat_secs) {
+        tracing::warn!(
+            heartbeat_secs = cfg.heartbeat_secs,
+            assumed_gateway_stale_secs = ASSUMED_GATEWAY_STALE_SECS,
+            "{advice}"
         );
     }
     Ok(AgentConfig {
@@ -155,6 +193,7 @@ fn normalize_upstream(raw: &str) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_log::CapturedLogs;
     use rcgen::{CertificateParams, DnType, IsCa, KeyPair, SanType};
 
     /// 在临时目录生成 (ca, client.crt, client.key) 并返回路径。
@@ -274,6 +313,80 @@ heartbeat_secs: {{}}
             assert!(
                 err.contains("upstream"),
                 "报错要点名 YAML 键 upstream（{bad}）：{err}"
+            );
+        }
+    }
+
+    /// 规格（复扫 E2）：`heartbeat_secs` 相对网关的失联窗口偏慢时**必须吵一声**。
+    ///
+    /// 为什么会静默：agent 与网关是**两个进程、两份配置**，谁都不知道对方的值。心跳慢于窗口时，
+    /// 每个心跳周期里都有一段该 agent 被判失联 ⇒ 单 agent 场景周期性全量 503/404，而两侧进程、
+    /// 注册表、日志看着全都正常——排障时没有任何线索指向真因。
+    ///
+    /// 判据只能用网关的**文档默认值**（`ASSUMED_GATEWAY_STALE_SECS`），并在文案里点出这个假设，
+    /// 让运维一眼分得清"该调快心跳"与"我的网关用了更大的窗口"。只提醒、不拒绝：把窗口调大是
+    /// 合法部署，而 agent 无从知道它。
+    /// 复扫 E2 的"单一来源"：默认心跳由网关默认窗口**推导**，不是另一处写死的数字。
+    #[test]
+    fn the_default_heartbeat_derives_from_the_assumed_gateway_window() {
+        assert_eq!(
+            default_heartbeat_secs(),
+            ASSUMED_GATEWAY_STALE_SECS / 3,
+            "默认心跳必须由 ASSUMED_GATEWAY_STALE_SECS 推导（窗口里要容得下三次心跳）"
+        );
+    }
+
+    #[test]
+    fn a_slow_heartbeat_is_warned_about() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ca, cert, key) = gen_cert_files(dir.path());
+        let load = |secs: u64| {
+            let yaml = format!(
+                "cloud_addr: \"127.0.0.1:4433\"\nca: {}\ncert: {}\nkey: {}\nheartbeat_secs: {secs}\n",
+                ca.display(),
+                cert.display(),
+                key.display(),
+            );
+            let logs = CapturedLogs::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_env_filter("info")
+                // 与全仓其它日志断言一致：ANSI 会把**字段名**画成斜体，字节里就没有字面量了。
+                .with_ansi(false)
+                .finish();
+            // `set_default` 是线程局部的，普通 `#[test]` 正好跑在同一个线程上。
+            let guard = tracing::subscriber::set_default(subscriber);
+            let verdict = from_file(parse_yaml(&yaml));
+            let text = logs.text();
+            drop(guard);
+            (verdict.is_ok(), text)
+        };
+
+        // 20s：默认窗口 15s 连一次心跳都容不下（每周期有 5s 被判过期）。
+        let (ok, text) = load(20);
+        assert!(
+            ok,
+            "偏慢的心跳只该提醒、不该拒绝：网关完全可能配了更大的 agent_stale_secs"
+        );
+        assert!(
+            text.contains("fewer than two heartbeats"),
+            "偏慢的心跳必须留下 warn 并点名网关那个旋钮，捕获到的日志：\n{text}"
+        );
+
+        // 边界：两倍心跳刚好撑满默认窗口（8 × 2 = 16 ≥ 15）⇒ 一次延迟就够判失联，仍要提醒。
+        let (_, text) = load(8);
+        assert!(
+            text.contains("fewer than two heartbeats"),
+            "8s 在 15s 窗口里容不下两次心跳，仍应提醒：\n{text}"
+        );
+
+        // 对照：默认 5s（窗口里容得下三次）与 7s（容得下两次）都不该吵——吵多了这条 warn
+        // 就会被无视。
+        for quiet in [5, 7] {
+            let (_, text) = load(quiet);
+            assert!(
+                !text.contains("fewer than two heartbeats"),
+                "{quiet}s 在默认窗口里够用，不该提醒：\n{text}"
             );
         }
     }
