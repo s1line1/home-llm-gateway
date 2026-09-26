@@ -1,3 +1,5 @@
+use std::ffi::OsStr;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -39,8 +41,14 @@ async fn run(args: Args) -> anyhow::Result<()> {
         UtcOffset::from_hms(8, 0, 0).expect("UTC+8 is a valid fixed offset"),
         time::format_description::well_known::Rfc3339,
     );
+    let ansi = ansi_for_logs(
+        std::io::stdout().is_terminal(),
+        std::env::var_os("NO_COLOR").as_deref(),
+    );
     let _ = tracing_subscriber::fmt()
         .with_timer(timer)
+        // 显式给值（复扫 A6）：不写这一行时 tracing-subscriber 只看 `NO_COLOR`，不看 TTY。
+        .with_ansi(ansi)
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .try_init();
 
@@ -55,6 +63,22 @@ async fn run(args: Args) -> anyhow::Result<()> {
     // 先调 flush_usage_on_shutdown —— 现在忘不了。
     gw.shutdown().await;
     Ok(())
+}
+
+/// 是否给日志上色（复扫 A6）。
+///
+/// tracing-subscriber 的默认判据只有两条：编译期 `ansi` feature 与**非空**的 `NO_COLOR`
+/// ——**不看 stdout 是不是终端**（vendored `fmt/fmt_layer.rs`：`cfg!(feature = "ansi") &&
+/// env::var("NO_COLOR").map_or(true, |v| v.is_empty())`）。于是 `StandardOutput=append:` 的
+/// systemd 单元、`> log` 重定向、没设 `NO_COLOR` 的容器，都会把 `ESC[2m`/`ESC[32m` 一路写进
+/// 日志文件——`docker-compose.yml` 那条路径是靠 `NO_COLOR=1` 兜住的，systemd 单元漏了
+/// （照着 compose 补一份环境变量只是补了一个部署；凡是"忘了设环境变量"的落盘路径都会再犯）。
+///
+/// 所以判据改成"**只有交互终端才上色**"，同时保持 `NO_COLOR` 的既有语义不变（设成非空即关闭；
+/// 空串按未设置处理，与 tracing-subscriber 一致）。这样任何非交互落盘自动干净，不需要每一份
+/// 部署配置都记得加一个环境变量。
+fn ansi_for_logs(stdout_is_terminal: bool, no_color: Option<&OsStr>) -> bool {
+    stdout_is_terminal && !no_color.is_some_and(|v| !v.is_empty())
 }
 
 /// 等待 SIGINT / SIGTERM / SIGHUP，收到后干净退出（覆盖 systemd stop / Ctrl+C / job kill /
@@ -125,6 +149,32 @@ mod tests {
             write("server.crt", &srv_cert.pem()),
             write("server.key", &srv_key.serialize_pem()),
         )
+    }
+
+    /// 规格（复扫 A6）：**非终端一律不上色**，且 `NO_COLOR` 的语义保持不变。
+    ///
+    /// 这条判据没法在进程内用真日志验证（tracing 的全局订阅者只能装一次，而测试进程的 stdout
+    /// 恰好是 libtest 的管道），所以这里钉纯函数表；"日志真的落盘时干净"由真进程 e2e
+    /// `signals::e2e_logs_written_to_a_file_are_not_colored` 覆盖（它把子进程 stdout 指向文件，
+    /// 并**显式清掉继承来的 `NO_COLOR`**，否则测的就不是 TTY 判据了）。
+    #[test]
+    fn logs_are_only_colored_on_a_terminal() {
+        let empty = OsStr::new("");
+        let set = OsStr::new("1");
+        assert!(ansi_for_logs(true, None), "终端 + 未设 NO_COLOR：上色");
+        assert!(
+            !ansi_for_logs(false, None),
+            "**不是终端就不上色**——复扫 A6 的全部要点（旧行为只认 NO_COLOR，文件里全是 ESC）"
+        );
+        assert!(
+            !ansi_for_logs(true, Some(set)),
+            "NO_COLOR 非空：即使是终端也不上色"
+        );
+        assert!(
+            ansi_for_logs(true, Some(empty)),
+            "NO_COLOR 空串按未设置处理（与 tracing-subscriber 同口径）"
+        );
+        assert!(!ansi_for_logs(false, Some(set)));
     }
 
     /// 规格（复扫 F5）：`run` 起来之后**真的在提供服务**，不只是"任务没结束"。

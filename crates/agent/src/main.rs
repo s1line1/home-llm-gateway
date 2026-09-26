@@ -1,3 +1,5 @@
+use std::ffi::OsStr;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use agent::Agent;
@@ -18,6 +20,18 @@ struct Args {
     config: PathBuf,
 }
 
+/// 是否给日志上色（复扫 A6，判据表在 `gateway/src/main.rs` 的同名函数上）。
+///
+/// tracing-subscriber 默认只看 `NO_COLOR` 与编译期 feature，**不看 stdout 是不是终端**，而
+/// `deploy/agent.service` 与 gateway 一样把日志 `append:` 到文件 ⇒ 每行带 ANSI 转义。
+/// 这里与 gateway 侧保持同一判据：**只有交互终端才上色**，`NO_COLOR` 语义不变（非空即关闭）。
+///
+/// 两个二进制各自持有一份 3 行实现（没有共享的 logging crate，而 `proto` 是隧道协议、不适合塞
+/// 日志策略）；改判据时两处都要改，这是刻意的取舍。
+fn ansi_for_logs(stdout_is_terminal: bool, no_color: Option<&OsStr>) -> bool {
+    stdout_is_terminal && !no_color.is_some_and(|v| !v.is_empty())
+}
+
 /// 启动 agent 主循环（独立函数，便于单元测试覆盖启动路径）。
 async fn run(args: Args) -> anyhow::Result<()> {
     // 日志时间戳固定东八区（UTC+8）：China Standard Time，无夏令时。
@@ -27,6 +41,12 @@ async fn run(args: Args) -> anyhow::Result<()> {
     );
     let _ = tracing_subscriber::fmt()
         .with_timer(timer)
+        // 显式给值（复扫 A6）：tracing-subscriber 默认只看 `NO_COLOR`，不看 stdout 是不是终端，
+        // 而 `deploy/agent.service` 把日志 `append:` 到文件（与 gateway 侧同一个缺陷）。
+        .with_ansi(ansi_for_logs(
+            std::io::stdout().is_terminal(),
+            std::env::var_os("NO_COLOR").as_deref(),
+        ))
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .try_init();
 
