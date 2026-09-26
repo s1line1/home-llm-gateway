@@ -156,11 +156,15 @@ impl Gateway {
                  empty key store (every request would 401 while the gateway looks healthy)"
             )));
         }
-        let app_state =
+        let mut app_state =
             state::AppState::new(registry.clone(), key_store.clone(), metrics.clone(), &opts);
         // 关闭阶段的发送端留在 `Gateway`；接收端给 accept 循环，在途响应各自 `subscribe()`。
-        // 发送端只有这里拿得到（`shutdown_sender` 是 pub(crate)）：推进关闭阶段的能力
-        // 属于进程生命周期，不随 `AppState` 外流（评估 §2 S3）。
+        // **取走（而不是克隆）是复扫 D5 的要害**：发送端全仓只有一份，"通道关闭"才真正等于
+        // "`Gateway` 没了"——每连接任务据此硬停，在途转发任务据此收尾（见 `Drop` 的文档）。
+        // 必须在 `http::app` 之前取：那个 Router 会被每条连接克隆，而克隆会把 `AppState`
+        // 里剩下的东西一起带走（取走之后它手上只有接收端）。
+        // `shutdown_sender` 是 pub(crate) 的：推进关闭阶段的能力属于进程生命周期，
+        // 不随 `AppState` 外流（评估 §2 S3）。
         let shutdown = app_state.shutdown_sender();
         let app = http::app(app_state);
 
@@ -182,6 +186,7 @@ impl Gateway {
                 registry.clone(),
                 metrics.clone(),
                 opts.stream_ceiling(),
+                shutdown.subscribe(),
             )),
         ];
 
@@ -426,17 +431,35 @@ fn panic_message(join: tokio::task::JoinError) -> String {
 }
 
 impl Drop for Gateway {
-    /// drop 而**没有**调 [`Gateway::shutdown`] 时的兜底：abort 所有任务，别把监听口与后台
-    /// flusher 留给进程——tokio 里 drop `JoinHandle` 只是 **detach**，任务会继续跑（并集
-    /// 报告 §5-H2 实测：drop 之后端口仍可 connect）。
+    /// drop 而**没有**调 [`Gateway::shutdown`] 时的兜底：abort 那三个主任务，并让**所有**
+    /// 订阅者看到关闭通道消失。tokio 里 drop `JoinHandle` 只是 **detach**，任务会继续跑
+    /// （并集报告 §5-H2 实测：drop 之后端口仍可 connect），所以两件事都要做。
+    ///
+    /// **通道消失是各派生任务共同的那个硬停信号**（复扫 D5）。发送端只有本结构持有
+    /// （`Gateway::start` 从 `AppState` 把它 `take()` 走了，见 `AppState::shutdown_sender`），
+    /// 所以本结构被 drop ⇒ 每个接收端的 `changed()` 得到 `Err`：
+    /// - **在途转发任务**（`proxy/forward.rs`）把 `has_changed().is_err()` 当 `Terminating`，
+    ///   于是给客户端写一个明确的"不完整"事件再收尾，而不是被硬切；
+    /// - **每条 HTTP 连接任务**（`http/entry.rs`）在 `select!` 里等它，醒来即丢连接——
+    ///   **含**那条连上来却一个请求都没发的连接，否则它要挂到 `client_stall`（默认 60s）；
+    /// - **每条 agent 连接任务**（`quic.rs`）同样在 `select!` 里等它，醒来即放弃连接
+    ///   （注册表条目与 `hlmg_agents` 随守卫一起收尾）。
+    ///
+    /// 没被覆盖的两处**是取舍**，不是遗漏：`evict_close::defer_close` 的任务不登记
+    /// （理由见该模块文档，上限只有一个宽限期），阻塞池上那次 `flush_usage_blocking` 不做
+    /// （见下）。
     ///
     /// **刻意不做用量落库**：`flush_usage_blocking` 是阻塞式 SQLite 写，在析构里做会在
     /// 不可预期的上下文（runtime worker、unwind）里阻塞；丢的只是最后一个 flush 周期
     /// （≤1s），与崩溃同级。要"已结算用量不丢"就调 `shutdown()`（`main` 就是这么做的）。
     fn drop(&mut self) {
+        // 三个主任务先 abort：accept 循环停了才不会再有新连接进来。
         for t in &self.tasks {
             t.abort();
         }
+        // 字段 `shutdown`（唯一的发送端）随后按声明顺序 drop ⇒ 上面那条硬停信号。这里不显式
+        // `self.shutdown = ...`（类型上没有"清空"这一步，`watch::Sender` 也不能置空）：
+        // 只有本结构持有它，drop 就是关闭，任何"顺手再发一个 Terminating"都是多余的。
     }
 }
 

@@ -28,9 +28,13 @@ use tokio::{
 };
 use tokio_rustls::TlsAcceptor;
 use tower::Service as TowerService;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
-use crate::{io_stall, metrics::Metrics, state::ShutdownPhase};
+use crate::{
+    io_stall,
+    metrics::Metrics,
+    state::{self, ShutdownPhase},
+};
 
 /// accept 失败后的首次退避。
 const ACCEPT_BACKOFF_MIN: Duration = Duration::from_millis(50);
@@ -202,25 +206,40 @@ async fn serve_entry<S>(
 
         let acceptor = acceptor.clone();
         let app = app.clone();
+        // 每条连接一个接收端（`clone()`，不动 accept 循环自己那个）：网关对象被 drop 时
+        // 硬停这条连接。见 `state::until_gateway_is_gone`——**只认通道关闭**，阶段推进不算。
+        let mut conn_shutdown = shutdown.clone();
         tokio::spawn(async move {
             // 额度随这个任务存活：响应写完 / 停滞超时 / 握手失败才归还。
             let _permit = permit;
-            match acceptor {
-                None => serve_conn(stream, app, peer, client_stall).await,
-                Some(acceptor) => {
-                    // **握手必须有上界**（评估 §5 H8）：客户端连上却不发 ClientHello 时，
-                    // `acceptor.accept` 永不返回——一个 fd + 一个任务被白占，且这类半开连接
-                    // 不经准入闸门（闸门在解析出请求之后才生效），此前只受 NOFILE 约束。
-                    match tokio::time::timeout(client_stall, acceptor.accept(stream)).await {
-                        Ok(Ok(tls_stream)) => serve_conn(tls_stream, app, peer, client_stall).await,
-                        Ok(Err(e)) => warn!("tls handshake from {peer} failed: {e}"),
-                        Err(_) => warn!(
-                            peer = %peer,
-                            stall_ms = client_stall.as_millis(),
-                            "tls handshake stalled; dropping the connection (the client never spoke)"
-                        ),
+            let serve = async move {
+                match acceptor {
+                    None => serve_conn(stream, app, peer, client_stall).await,
+                    Some(acceptor) => {
+                        // **握手必须有上界**（评估 §5 H8）：客户端连上却不发 ClientHello 时，
+                        // `acceptor.accept` 永不返回——一个 fd + 一个任务被白占，且这类半开连接
+                        // 不经准入闸门（闸门在解析出请求之后才生效），此前只受 NOFILE 约束。
+                        match tokio::time::timeout(client_stall, acceptor.accept(stream)).await {
+                            Ok(Ok(tls_stream)) => {
+                                serve_conn(tls_stream, app, peer, client_stall).await
+                            }
+                            Ok(Err(e)) => warn!("tls handshake from {peer} failed: {e}"),
+                            Err(_) => warn!(
+                                peer = %peer,
+                                stall_ms = client_stall.as_millis(),
+                                "tls handshake stalled; dropping the connection (the client never spoke)"
+                            ),
+                        }
                     }
                 }
+            };
+            tokio::select! {
+                // 硬停（复扫 D5）：`drop(Gateway)` 之后这条连接没有继续存在的理由。
+                // 覆盖握手阶段——否则半开连接同样要挂到 `client_stall`（默认 60s）。
+                _ = state::until_gateway_is_gone(&mut conn_shutdown) => {
+                    debug!(%peer, "gateway dropped; closing an accepted connection");
+                }
+                _ = serve => {}
             }
         });
     }

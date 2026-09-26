@@ -27,11 +27,13 @@ use crate::ui::{resolve_ui, IndexHtml};
 
 /// 关闭阶段。`Running` → `Draining` → `Terminating`，只向一个方向走。
 ///
-/// `Gateway::shutdown` 通过 `AppState` 里那个私有的 `watch` 通道广播它（推进能力不外流，
-/// 见 [`AppState::subscribe_shutdown`]），两类消费者：
+/// `Gateway::shutdown` 推进它（发送端由 `Gateway` **独占**，见 `AppState::shutdown_sender`），
+/// 三类消费者：
 /// - **accept 循环**（`http/entry.rs`）：`Draining` 起停止接受新连接，但在途请求继续跑；
 /// - **每条在途响应**（`proxy/forward.rs`）：`Terminating` 起带一个明确的"不完整"事件收尾，
-///   而不是被硬切。
+///   而不是被硬切；
+/// - **每连接任务**：只关心**发送端消失**（= `Gateway` 被 drop），见
+///   `state::until_gateway_is_gone`——那条路径等于"硬停"，与阶段推进不是一回事。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ShutdownPhase {
     Running,
@@ -89,14 +91,23 @@ pub struct AppState {
     /// `ui_dir` 不可用的具体原因（None = 没配 ui_dir，或配了且可用）。
     /// 由启动时 [`resolve_ui`] 判定后写入，占位页会把它显示出来——否则用户只看到白屏/通用文案。
     pub ui_problem: Option<String>,
-    /// 关闭阶段的广播端。见 [`ShutdownPhase`]：`Gateway::shutdown` 发，accept 循环与
-    /// 在途响应任务收。
+    /// 关闭阶段的广播端。见 [`ShutdownPhase`]：`Gateway` 发，accept 循环与在途响应任务收。
+    ///
+    /// **`Option`，而且是 `AppState` 里唯一的一份**（复扫 D5）：`Gateway::start` 通过
+    /// [`AppState::shutdown_sender`] 把它**取走**（`take()`），此后 `AppState`——以及它被克隆
+    /// 进每条连接任务的那份——只剩接收端。这条不变量很要紧：`watch` 通道在**最后一个发送端
+    /// 被 drop** 时才让接收端看到 `Err`，而如果 `AppState` 也留着一个发送端，那么它会被
+    /// "每条连接任务手里的 Router"钉活 ⇒ `drop(Gateway)` 之后谁都不会看到通道关闭，
+    /// 在途转发任务不会收尾、已接受的连接要挂到 `client_stall`（默认 60s）。
     ///
     /// **刻意私有**（评估 §2 S3）：推进阶段是**进程生命周期**的能力，只有 `Gateway` 该有。
     /// 外部拿到一个 `AppState` 只能 [`AppState::shutdown_phase`] 查询、
     /// [`AppState::subscribe_shutdown`] 订阅——`pub` 的 `watch::Sender` 等于把"停服"
-    /// 交给每一个持有者。发送端克隆走 `pub(crate) fn shutdown_sender`。
-    shutdown: watch::Sender<ShutdownPhase>,
+    /// 交给每一个持有者。发送端只经 `pub(crate) fn shutdown_sender` **取走一次**。
+    shutdown_tx: Option<watch::Sender<ShutdownPhase>>,
+    /// 同一个通道的接收端：查询与订阅都从这里出发，所以发送端被取走之后
+    /// [`AppState::shutdown_phase`] / [`AppState::subscribe_shutdown`] 照旧可用。
+    shutdown_rx: watch::Receiver<ShutdownPhase>,
 }
 
 impl AppState {
@@ -113,6 +124,7 @@ impl AppState {
         let ui_index = ui
             .as_ref()
             .map(|dir| IndexHtml::new(dir.join("index.html")));
+        let (shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::Running);
         Self {
             registry,
             key_store,
@@ -132,32 +144,52 @@ impl AppState {
             ui,
             ui_index,
             ui_problem,
-            // 关闭通道由 `AppState` 自己建：接收端各自 `subscribe()`，所以起始的接收端丢弃即可。
-            shutdown: {
-                let (tx, _rx) = watch::channel(ShutdownPhase::Running);
-                tx
-            },
+            // 关闭通道由 `AppState` 建、**发送端交给调用方**（`Gateway`）取走：接收端各自
+            // `subscribe()`，所以起始的接收端留着做查询即可（见字段文档里那条不变量）。
+            shutdown_tx: Some(shutdown_tx),
+            shutdown_rx,
         }
     }
 
     /// 当前关闭阶段（只读）。给"探针要不要报不健康"这类判断用。
     pub fn shutdown_phase(&self) -> ShutdownPhase {
-        *self.shutdown.borrow()
+        *self.shutdown_rx.borrow()
     }
 
     /// 订阅关闭阶段的变化：每个在途响应各持一个接收端（`Gateway` 用 `Draining` 停 accept、
     /// 用 `Terminating` 给在途 SSE 一个明确的收尾事件）。
     pub fn subscribe_shutdown(&self) -> watch::Receiver<ShutdownPhase> {
-        self.shutdown.subscribe()
+        self.shutdown_rx.clone()
     }
 
-    /// 关闭通道的发送端克隆：**只给进程生命周期（`Gateway`）**。
+    /// 把关闭通道的发送端**取走**：只给进程生命周期（`Gateway`）。
     ///
     /// `pub(crate)` 而不是 `pub`：拿不到发送端就推不动阶段，这正是收窄后的契约
-    /// （见字段文档与评估 §2 S3）。
-    pub(crate) fn shutdown_sender(&self) -> watch::Sender<ShutdownPhase> {
-        self.shutdown.clone()
+    /// （见字段文档与评估 §2 S3）。`&mut self` + `take()` 而不是克隆，是复扫 D5 的要害：
+    /// **发送端全仓只有一份**，"所有接收端看到 `Err`" 才真正等于"`Gateway` 没了"。
+    ///
+    /// 取第二次是代码错误（一个进程只有一个 `Gateway` 推进关闭阶段），所以 `.expect` 而不是
+    /// 静默返回一个新的：静默克隆会把刚刚建立的不变量又破掉。
+    pub(crate) fn shutdown_sender(&mut self) -> watch::Sender<ShutdownPhase> {
+        self.shutdown_tx
+            .take()
+            .expect("shutdown_sender 只能取一次（只有 Gateway::start 该取）")
     }
+}
+
+/// 等到关闭通道**关闭**：也就是持有唯一发送端的 `Gateway` 被 drop。
+///
+/// 与 [`ShutdownPhase`] 的推进**不是一回事**，两个方向都不能混：
+/// - `Draining` 只停 accept，已建立的连接要继续服务在途请求；
+/// - `Terminating` 之后还有 `END_EVENT_WINDOW` 让在途响应把"不完整"事件真的写出去。
+///
+/// 只有"发送端没了"才意味着网关对象已经不在了、连接没有继续存在的理由（复扫 D5：
+/// `Drop for Gateway` 承诺 abort 所有任务，而它只能 abort 那三个主任务句柄）。
+/// `watch::Receiver::changed()` 在阶段变化时返回 `Ok`、在**所有发送端消失**后返回 `Err`，
+/// 所以这个循环只在后者退出。返回后接收端仍可 `borrow()` 到最后一个阶段值，只是没有
+/// 任何东西会再改它。
+pub(crate) async fn until_gateway_is_gone(rx: &mut watch::Receiver<ShutdownPhase>) {
+    while rx.changed().await.is_ok() {}
 }
 
 #[cfg(test)]
@@ -174,14 +206,14 @@ mod tests {
     }
 
     /// 规格（并集评估 §2 S3）：关闭阶段**可查、可订阅**，但推进阶段的能力只属于
-    /// 进程生命周期——`shutdown` 字段私有、发送端克隆是 `pub(crate)`。
+    /// 进程生命周期——`shutdown_tx` 私有且**只有一份**，发送端只经 `pub(crate)` 取走。
     ///
     /// 这条测试钉的是"新接口的行为"：查询反映当前阶段，订阅端能收到后续变化。
-    /// "外部拿不到发送端"由编译器保证（把 `shutdown` 改回 `pub` 或把
+    /// "外部拿不到发送端"由编译器保证（把 `shutdown_tx` 改回 `pub` 或把
     /// `shutdown_sender` 提成 `pub` 不在任何测试里会被拦住，所以字段文档里写了理由）。
     #[test]
     fn shutdown_phase_is_queryable_and_subscribable() {
-        let state = state();
+        let mut state = state();
         assert_eq!(state.shutdown_phase(), ShutdownPhase::Running);
 
         let mut rx = state.subscribe_shutdown();
@@ -196,5 +228,39 @@ mod tests {
         let _ = tx.send(ShutdownPhase::Terminating);
         assert_eq!(*rx.borrow_and_update(), ShutdownPhase::Terminating);
         assert_eq!(*rx2.borrow_and_update(), ShutdownPhase::Terminating);
+    }
+
+    /// 规格（复扫 D5）：**`AppState` 及其克隆不得把关闭通道钉活**。
+    ///
+    /// 通道在最后一个发送端消失时才算"关闭"，而在途转发任务与每连接任务靠这个信号判断
+    /// "网关对象没了"。如果 `AppState` 自己也留着一个发送端（修好前它确实留着一个，
+    /// 且 `shutdown_sender` 给的是克隆），那么每条连接任务手里的 Router 都会把它钉活
+    /// ⇒ `drop(Gateway)` 之后谁都看不到关闭：在途响应不会收尾、已接受的空闲连接要挂到
+    /// `client_stall`（默认 60s）。
+    ///
+    /// 判据写成 `changed()` 返回 `Err`：它只可能在**所有发送端消失**时发生。
+    #[tokio::test]
+    async fn app_state_does_not_pin_the_shutdown_sender() {
+        let mut state = state();
+        let mut rx = state.subscribe_shutdown();
+
+        // `Gateway` 的角色：取走唯一发送端，随后被 drop
+        let tx = state.shutdown_sender();
+        drop(tx);
+
+        // "每条连接任务手里那份 Router"里的 AppState 克隆
+        let per_connection = state.clone();
+        // 带超时：判据本身就是"通道关了"，而这个缺陷的形态是"永远关不了"——不设超时的话
+        // 这条测试会挂到被外部打断，而不是给出一个干净的红（`Err(Elapsed)` 直接说明原因）。
+        let verdict = tokio::time::timeout(Duration::from_secs(1), rx.changed()).await;
+        assert!(
+            matches!(verdict, Ok(Err(_))),
+            "AppState 或其克隆仍持有发送端 ⇒ 通道不会关闭，drop 网关后没人会醒来：{verdict:?}"
+        );
+        assert_eq!(
+            per_connection.shutdown_phase(),
+            ShutdownPhase::Running,
+            "通道关闭只是不再变化，阶段值仍可查（连接任务据此打的日志才不会撒谎）"
+        );
     }
 }

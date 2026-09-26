@@ -156,6 +156,70 @@ async fn e2e_drop_without_shutdown_releases_the_listener() {
     }
 }
 
+/// 规格（复扫 D5）：**`drop(Gateway)` 也要关掉"已经接受"的连接**，不能只释放监听口。
+///
+/// 修好前 `Drop` 只 abort 了那三个主任务句柄，每连接任务是 detach 的：连接一旦被 accept，
+/// 它就要活到 `client_stall`（这里刻意配 30s，远长于判据窗口）——一条**什么都没在跑**的
+/// keep-alive 连接白占 fd 与任务，而调用方以为"析构即关闭"。
+///
+/// 判据用 **EOF**（`read` 返回 0），与上一条的"连不上"互补：那条只覆盖监听口，这条覆盖
+/// 已建立的连接。步骤刻意先真的服务一个请求（`/healthz` 读完响应），这样"连接任务存在"
+/// 是被证明过的，而不是靠 sleep 猜。
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn e2e_drop_without_shutdown_closes_accepted_connections() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    // 30s：远长于下面 2s 的判据窗口，所以 EOF 只可能来自 drop，不可能来自停滞超时。
+    let TestGateway { gw, .. } =
+        start_gateway(|opts| opts.client_stall = Duration::from_secs(30)).await;
+    let addr = gw.http_addr;
+
+    let mut client = tokio::net::TcpStream::connect(addr).await.expect("先连上");
+    client
+        .write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n")
+        .await
+        .expect("写请求");
+    // 读到响应头 ⇒ 网关确实接受了这条连接并跑起了服务它的任务（不是还躺在 backlog 里）
+    let mut seen = Vec::new();
+    let mut buf = [0u8; 512];
+    loop {
+        let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf))
+            .await
+            .expect("drop 之前应当能读到 /healthz 的响应")
+            .expect("读响应");
+        assert!(n > 0, "drop 之前连接不该被关");
+        seen.extend_from_slice(&buf[..n]);
+        if seen.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+    }
+    assert!(
+        String::from_utf8_lossy(&seen).contains("200"),
+        "前提：这条连接真的被服务过，实际收到：{}",
+        String::from_utf8_lossy(&seen)
+    );
+
+    // 此刻它是一条**空闲 keep-alive** 连接：没有在途请求，只有 hyper 在等下一个请求头。
+    drop(gw);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let verdict = tokio::time::timeout(left, client.read(&mut buf)).await;
+        match verdict {
+            Ok(Ok(0)) => break,    // EOF：drop 关掉了这条连接
+            Ok(Ok(_)) => continue, // 响应体余量，读完再看
+            Ok(Err(e)) => panic!("drop 之后读连接出错（也说明已关闭，但请确认不是 RST）：{e}"),
+            Err(_) => panic!(
+                "drop 之后 2s 内没有 EOF：已接受的连接仍活着（client_stall 是 30s，\
+                 所以这不是停滞超时），说明它没被 drop 关掉"
+            ),
+        }
+    }
+}
+
 /// 规格：**`healthy_agent_count()` 与 `agent_count()` 必须分得开**。
 ///
 /// `agent_count()` 是注册表条目数（含心跳已过期、连接还没关的）；`healthy_agent_count()`
