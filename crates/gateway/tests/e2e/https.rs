@@ -202,12 +202,15 @@ async fn e2e_quic_control_stream_edge_frames() {
     let (_recv4, mut send4) = stream.split();
     send4.write_all(&u32::MAX.to_be_bytes()).await.unwrap();
     send4.finish().unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(
-        gw.agent_count(),
+    // 复扫 F3：摘除是异步的（断连要经 QUIC 传播到网关的 accept 循环），所以这里**有界轮询到
+    // 事实发生**，而不是 `sleep(300ms)` 睡猜窗口——快机器白等、慢机器假失败。
+    wait_for_agent_count(
+        &gw,
         0,
-        "reg-1 should be removed after control-loop error"
-    );
+        "reg-1 should be removed after a malformed frame kills the control loop",
+        Duration::from_secs(5),
+    )
+    .await;
 
     // 第二个裸客户端：注册后直接关闭连接 → accept_bi 出错 → 正常摘除
     let mut conn2 = client
@@ -235,12 +238,13 @@ async fn e2e_quic_control_stream_edge_frames() {
     .await;
     assert_eq!(gw.agent_count(), 1);
     conn2.close(0u32.into());
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(
-        gw.agent_count(),
+    wait_for_agent_count(
+        &gw,
         0,
-        "reg-2 should be removed after connection close"
-    );
+        "reg-2 should be removed after the connection closes",
+        Duration::from_secs(5),
+    )
+    .await;
 
     // 客户端证书**不由网关信任的 CA 签发** → 网关侧 `WebPkiClientVerifier` 拒绝 → 握手失败 →
     // "connection attempt failed" 分支。

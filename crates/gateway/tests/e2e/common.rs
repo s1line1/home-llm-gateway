@@ -179,6 +179,28 @@ pub async fn wait_for_agents(gw: &Gateway, count: usize, timeout: Duration) {
     panic!("expected {count} agents, got {}", gw.agent_count());
 }
 
+/// 等注册表里**恰好剩下** `want` 个 agent；超时 panic，`what` 写进文案说明在等什么。
+///
+/// 为什么不复用 [`wait_for_agents`]：那条判据是"**至少** N 个"（启动期等待），所以
+/// `wait_for_agents(gw, 0, ..)` 会**立刻**返回——等不了"降到 0"。
+///
+/// 为什么需要它（复扫 F3）：摘除是**异步**的——连接断开要经 QUIC 传播到网关的 accept 循环，
+/// 再摘掉条目，中间没有同步点。固定的 `sleep(300ms)` 是在睡猜这个窗口：机器快时白等，机器慢
+/// 或 CI 负载高时就是假失败。这里改成"有界轮询到事实发生"，超时才报错并把实际值带出来。
+pub async fn wait_for_agent_count(gw: &Gateway, want: usize, what: &str, timeout: Duration) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while tokio::time::Instant::now() < deadline {
+        if gw.agent_count() == want {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!(
+        "{what}: expected exactly {want} agent(s) within {timeout:?}, still {}",
+        gw.agent_count()
+    );
+}
+
 /// 建一个临时 SQLite 库并种入一个测试 key，返回 (库路径, key)。
 /// 临时目录被 forget 保活，避免网关持有连接时库文件被清理。
 pub fn seed_keys_db() -> (PathBuf, String) {
