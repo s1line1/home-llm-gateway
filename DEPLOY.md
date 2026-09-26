@@ -358,7 +358,9 @@ docker build -f crates/gateway/Dockerfile -t home-llm-gateway .
    多一个 `--bin agent` 与一次 COPY）——本仓库不再提供 agent 镜像。
 3. **`keys.db` 是 SQLite WAL 模式**：会额外生成 `keys.db-wal` / `keys.db-shm`，所以必须挂
    **目录**（不能只挂那个文件），而且**目录**要可写；SELinux 主机上可能还要加 `:z` / `:Z`。
-   三个文件的权限由网关启动时收紧为 `0600`（`-wal`/`-shm` 跟随主库）。
+   三个文件的权限由网关启动时收紧为 `0600`：主库与**已经存在**的 `-wal`/`-shm` 都会被显式
+   `chmod`（侧车平时是 0600 只是继承主库的 mode，所以拷贝/迁移来的旧库要专门收一遍；本次
+   复扫 C2-1 正是漏在这里）。
 
 ### 11.4 端口与安全组
 

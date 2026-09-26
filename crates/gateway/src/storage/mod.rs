@@ -45,21 +45,39 @@ pub use usage::{KeyUsageInfo, UsageDelta};
 use crate::storage::hash::{generate_id_key, hash_argon2, lookup_of, now_secs, verify_argon2};
 use crate::sync::{lock_or_recover, read_or_recover, write_or_recover};
 
-/// 把库文件权限收紧到 `0600`（评估 §7 步骤 6 / P3-7）。
+/// 把库文件**及其 WAL 侧车**权限收紧到 `0600`（评估 §7 步骤 6 / P3-7；复扫 C2-1）。
 ///
 /// 库文件是按调用方 umask 创建的（常见 0644），而它通常放在 `/etc/home-llm-gateway/`
 /// 下（`DEPLOY.md` 的目录清单）。库里只有 argon2 哈希与 sha256 lookup，属纵深防御；
 /// 但升级/拷贝过来的旧库往往仍是宽权限，所以**每次打开都收紧一次**。
 ///
+/// **为什么连 `-wal`/`-shm` 一起收**：`-wal` 里是还没 checkpoint 回主库的页，与主库同级
+/// 敏感；而侧车平时是 0600 **只是因为** SQLite 建它时继承了主库刚设好的 mode——它们自己
+/// 从来没被 `chmod` 过。于是"从别处拷贝/迁移过来的旧库"会带着 0644 的侧车进来，而 SQLite
+/// 打开时会**复用**一份还含有效帧的 WAL（不是删掉重建），宽权限就留了下来。所以三个路径都
+/// 显式收一遍：已存在的当场收口，之后 SQLite 新建的侧车继续继承已经收好的主库 mode。
+///
 /// 失败只告警：只读挂载或某些文件系统不支持 `chmod` 不该让网关起不来。
 #[cfg(unix)]
 fn tighten_db_to_owner(path: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;
-    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
-        tracing::warn!(
-            path = %path.display(),
-            "sqlite: cannot tighten keys.db to 0600 (non-fatal): {e}"
-        );
+    // 主库 + 两个 SQLite 侧车：`-wal`（预写日志）、`-shm`（共享内存索引）。
+    let mut targets = vec![path.to_path_buf()];
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        targets.push(PathBuf::from(sidecar));
+    }
+    for target in targets {
+        match std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)) {
+            Ok(()) => {}
+            // 侧车不一定存在（WAL 尚未启用，或已 checkpoint 清理过）——这不是错误。
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(
+                path = %target.display(),
+                "sqlite: cannot tighten to 0600 (non-fatal): {e}"
+            ),
+        }
     }
 }
 
@@ -206,8 +224,8 @@ impl KeyStore {
         let db = match &file {
             Some(path) => match Connection::open(path) {
                 Ok(mut conn) => {
-                    // ① 权限先收紧：库文件刚被创建（或已存在）就以 0600 收口，
-                    //    不靠运维记得 `chmod`（见 `tighten_db_to_owner`）。
+                    // ① 权限先收紧：主库（刚被创建，或已存在）与**遗留的** `-wal`/`-shm`
+                    //    都以 0600 收口，不靠运维记得 `chmod`（见 `tighten_db_to_owner`）。
                     tighten_db_to_owner(path);
                     // ② 顺带做的持久化设置：WAL + synchronous=NORMAL。
                     // 落库已经改成"按周期批量"，提交次数从每请求一次降到每周期一次；
@@ -1238,6 +1256,58 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         let _store = KeyStore::new(Some(path.clone()));
         assert_eq!(mode_of(&path), 0o600, "打开已存在的库也要收紧到 0600");
+    }
+
+    /// 规格（2026-09-25 复扫 C2-1）：`-wal`/`-shm` 必须被**显式**收紧，而不是"靠继承"。
+    ///
+    /// 上面那条测试覆盖的是"主库收紧后由 SQLite 现建侧车"——那种场景下侧车继承主库刚设好的
+    /// 0600，所以**即使代码只 chmod 主库也会通过**。真正会漏的是迁移/拷贝过来的旧库：侧车早就
+    /// 躺在磁盘上、权限是旧的 0644，而 `tighten_db_to_owner` 只收主库 ⇒ 打开后侧车仍是 0644
+    /// （WAL 里是还没 checkpoint 回主库的页，与主库同级敏感）。
+    ///
+    /// 怎么复刻：空侧车没用——SQLite 分辨得出那是"没有内容的 WAL"，会把它删掉重建，重建时
+    /// 主库已经被收紧了，于是"继承"又把它救回来（这正是这条缺陷长期没被发现的原因）。所以
+    /// 这里让第一个 store **保持打开**，使 `-wal` 里留着真实帧；再把它摆成 0644，然后用第二个
+    /// store 打开同一个库——SQLite 会**复用**这份 WAL 而不是重建，宽权限因此留了下来。
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn preexisting_wal_sidecars_are_tightened_too() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode_of =
+            |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keys.db");
+
+        // 第一个 store 故意不 drop：连接活着，WAL 里才有未 checkpoint 的帧。
+        let live = KeyStore::new(Some(path.clone()));
+        live.create("perm".into()).unwrap();
+
+        let wal = dir.path().join("keys.db-wal");
+        let shm = dir.path().join("keys.db-shm");
+        assert!(wal.exists(), "前置条件：WAL 模式下 -wal 应该存在");
+        assert!(shm.exists(), "前置条件：WAL 模式下 -shm 应该存在");
+
+        // 复刻"从别处拷贝 / 迁移过来的旧库"：三个文件都是宽的 0644。
+        for f in [&path, &wal, &shm] {
+            std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert_eq!(mode_of(f), 0o644, "前置条件：先摆成宽权限");
+        }
+
+        // 第二个 store 打开同一个库：SQLite 复用现存的 WAL，三个文件都要被显式收紧。
+        let _second = KeyStore::new(Some(path.clone()));
+        assert_eq!(mode_of(&path), 0o600, "主库");
+        assert_eq!(
+            mode_of(&wal),
+            0o600,
+            "遗留的 -wal 必须显式收紧（不能只靠继承）"
+        );
+        assert_eq!(
+            mode_of(&shm),
+            0o600,
+            "遗留的 -shm 必须显式收紧（不能只靠继承）"
+        );
     }
 }
 
