@@ -165,8 +165,10 @@
       修法：用 `socket2` 建 socket → `listen(4096)` → `TcpListener::from_std`。
       属**次要因素**（accept 被上面那条 EMFILE 卡住时才会放大），故排在 fd 之后。
 - [ ] **网关日志无轮转、体量失控**（**2026-09-22 补充现状**：`deploy/logrotate.example` 与
-      `crates/gateway/docker-compose.yml` 的注释都已给出规则；缺的是"部署步骤里真的装上"——`DEPLOY.md` 只提了一句，
-      没有安装命令/检查项）：`StandardOutput=append:/var/log/home-llm-gateway/gateway.log`，
+      `crates/gateway/docker-compose.yml` 的注释都已给出规则；缺的是"部署步骤里真的装上"。
+      **2026-09-26 订正**：原文说"`DEPLOY.md` 只提了一句"**已不成立**——今天 `grep -n 'logrotate\|轮转' DEPLOY.md README.md`
+      为空，两条路径里只有 **compose** 那份给了安装命令（`docker-compose.yml:76-84` 的 cp/chown/chmod/`logrotate -d`），
+      **`deploy/gateway.service`（systemd）那条路径与 `DEPLOY.md` 一句都没有**）：`StandardOutput=append:/var/log/home-llm-gateway/gateway.log`，
       每请求至少一行 INFO，实测单日 **652MB**（`tail -c 6000000` 只覆盖约 20 秒，
       排查时按时间 grep 会误以为"日志里什么都没有"）。修法：`logrotate` + 降级为
       `RUST_LOG=info,gateway::access=debug` 之类的分级，或按请求采样。
@@ -657,15 +659,27 @@
       是否值得（收益只有排障清晰度）尚未权衡 → **未决**。**2026-09-26 补记**：协议层正在规划 postcard → protobuf（见上文「P3 — 协议层改造」节），而那次切换**本身就是**一次"新旧不能混跑"的兼容性窗口——若与改名一起做，只需**一次**重叠；若 protobuf 先落地、改名再单独做，就得多来一次。（顺带：那次迁移会把线上编码换掉，所以本条描述里的 `[u32 BE 长度][postcard]` 届时也要跟着改。）**已做**：`proto/src/lib.rs` 的注释与
       `docs/PROJECT_SCAN.md` 的 P3-1 都写清了"有意借用 + 迁移约束"。若最终决定不改，把本条标成
       "有意保留"并关掉即可。
-- [ ] **前端四份独立 `/metrics` 轮询**：`Layout.tsx:24`、`Overview.tsx:9`、`MetricsPage.tsx:10`、
-      `Agents.tsx:61` 各实例化一个 `useMetricsHistory()`（各自 5s 轮询、各自一份历史）。抽 context 共享。
+- [x] **前端四份独立 `/metrics` 轮询（2026-09-26 已修，复扫 `G4`）**：原先 `Layout.tsx:24`、`Overview.tsx:9`、
+      `MetricsPage.tsx:10`、`Agents.tsx:61` 各实例化一个 `useMetricsHistory()`（各自 5s 轮询、各自一份历史），
+      而侧边栏与当前页面**同时**挂着 ⇒ 2 条独立请求、采样时刻不同步（两处数字可能对不上）。
+      **已做**：抽成 `MetricsHistoryProvider`（`web/src/hooks/useMetricsHistory.tsx`）持有唯一那条轮询、值经
+      context 下发；provider 挂在 `main.tsx` 的 `RequireAuth` 之内、包住 `Layout`（登录页不拉，登出随卸载停表）；
+      `useMetricsHistory()` 不再收 interval（一个循环只有一个节奏），没有 provider 时**抛错**而不退化成一条
+      私有轮询（静默退化会把这条缺陷放回来）。四个调用点一行未改。判据：两个消费者只产生一次请求、且拿到
+      **同一个快照对象**（`toBe`）+ 无 provider 抛错。commit `24fcbcc`。
 - [ ] **小体积/常量类**：~~`Agents.tsx:72` 用 `error.message.includes("404")` 嗅探状态码~~
       （**2026-09-23 已修**，见 P3-18：404 被 `fetchAgents` 折成 `null`，嗅探那段永远为假，
-      改成按 `data === null` 判）；`Agents.tsx:28` 硬编码 `agent_stale_secs` 的默认值 `15`；
-      `registry.rs:124,151,158` 三处裸比较 `"*"`；`extract_model -> Result<String, ()>` 丢掉失败原因；
-      `HeadOutcome::Error(u16, String)` 用裸状态码。
-- [ ] **死代码 / 死常量**：`KeyStore::authorize_id`（`storage/mod.rs:210`）、`Metrics::request_count`
-      （`metrics.rs:98`）、`HISTORY_LEN` 被导出但 `useMetricsHistory.ts:41` 硬编码 `60`。
+      改成按 `data === null` 判）；~~`Agents.tsx:28` 硬编码 `agent_stale_secs` 的默认值 `15`~~
+      （**2026-09-26 已修**，见复扫 `G1`：状态一律用网关给的 `healthy` 结论、不在前端重算阈值，
+      该行注释就写着"原先写死 15s"，commit `ae477b7`）；**剩下三项仍然有效**：
+      `registry.rs:368,771` 两处裸比较 `"*"`（**行号已随重构移动**，原记录写的是 `:124,151,158`）；
+      `extract_model -> Result<String, ()>` 丢掉失败原因（与上面"`extract_model` 卡住非 chat 路径"
+      那条同源，一起改更省）；`HeadOutcome::Error(u16, String)` 用裸状态码。
+- [x] **死代码 / 死常量（2026-09-26 复核：已在更早的改动里清掉，本次只是对账）**：
+      `KeyStore::authorize_id`（原 `storage/mod.rs:210`）与 `Metrics::request_count`（原 `metrics.rs:98`）
+      现在**全树无匹配**（`grep -rn 'authorize_id' crates/`、`grep -rn 'fn request_count' crates/` 都为空；
+      `request_count` 作为**字段**仍在用，见其 23 处引用与 `identity_terms`）；`HISTORY_LEN` 现在由
+      `web/src/hooks/useMetricsHistory.tsx` 正常导入使用，硬编码 `60` 只剩 `api/types.ts` 里那一处**定义**。
 - [x] **`Atomic::fetch_update` 已弃用 → 改 `try_update`**：`registry.rs:406`（`try_acquire`
       抢并发槽位那处）。nightly 1.100.0 的措辞是 `deprecated: renamed to try_update for
       consistency`——**纯改名**，签名与返回值语义完全一致（本地实测对照：成功路径两边都
@@ -684,15 +698,16 @@
       它是启发式的（只抓这种标记），但把"这一类"变成了**构建即失败**；放进 `build` 脚本而不是
       Makefile，是因为 CI 跑的是 `pnpm build`（`.github/workflows/ci.yml:90`），这样三处都覆盖。
 
-### 前端工程化：待决（P3-21 的剩余部分，需要**新增依赖**，按顶部范围约定先不动）
+### 前端工程化（P3-21：三条工具已落地，下述条目为历史登记）
 
-- [ ] **前端无 lint / formatter / 测试**：`web/` 目前只有 `tsc` + `vite build` 两道，
-      没有 eslint/prettier，也没有任何测试框架（`vitest` 之类）。**这三样都要新增 devDependencies**
-      —— 属于本阶段冻结的"新依赖"，所以先登记、不实施。真要上的话建议一次只加一件：
-      ① `prettier`（纯格式化，风险最低）；② `eslint` + `typescript-eslint`（会立刻产生一批
-      历史债务告警，需要先定规则集/是否 `--max-warnings 0`）；③ `vitest` + `@testing-library/react`
-      （给 `parseMetrics`、`handle/expectArray`、`RequireAuth` 这类纯逻辑/小组件写测试）。
-      注意 CI 的 node 是 22（`.github/workflows/ci.yml:82`），加依赖时别引入要求更高 node 的工具。
+- [x] **前端 lint / formatter / 测试（2026-09-26 复核：三样都已落地，本次只是对账）**：
+      `web/` 现在有 **prettier**（`pnpm format:check`）、**oxlint**（`pnpm lint`，`--max-warnings 0`）、
+      **vitest + @testing-library/react**（`pnpm test`，当前 35 条），CI 四步全覆盖
+      （`.github/workflows/ci.yml:89-99` 跑 format:check / lint / test / build）。与当初预案的差别：
+      lint 用的是 **oxlint** 而不是 `eslint` + `typescript-eslint`——零配置、更快，也省掉了"先定规则集"
+      那一步。**原始登记（供对照）**：当时 `web/` 只有 `tsc` + `vite build` 两道，三样都要新增
+      devDependencies、属本阶段冻结的"新依赖"，故先登记不实施；当时建议一次只加一件，并提醒 CI 的 node 是 22
+      （`ci.yml:82`）。
 - [x] **`@types/node` 与 CI 的 node 版本不一致**（**2026-09-23 已修**）：原为 `^26.4.0`（CI 跑 node 22），
       已对齐到 `^22.20.4` 并 `pnpm install` 更新锁文件。
 - [x] **`typecheck` 脚本无人引用**（**2026-09-23 已修**）：`pnpm build` 本身就是 `tsc -b && vite build`，
