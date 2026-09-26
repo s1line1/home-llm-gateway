@@ -62,6 +62,20 @@ impl Buckets {
 }
 
 impl RateLimiter {
+    /// 桶**取不到令牌**时该等多久（秒，向上取整、至少 1）——429 的 `Retry-After` 用它（复扫 A4）。
+    ///
+    /// 为什么不能写死：真实回填时间由 `per_minute` 决定。`per_minute = 1` 时一个令牌确实要 60s
+    /// （旧行为恰好对），但 `per_minute = 600` 时只要 0.1s —— 按 60s 退避的 SDK 被多罚六百倍。
+    /// 这个头是**承诺**，给大了就是让客户端白等。
+    pub fn retry_after_secs(&self) -> u64 {
+        if self.refill_per_sec <= 0.0 {
+            // 构造器保证 `per_minute >= 1` ⇒ `refill_per_sec > 0`；真到了这里也不该发出 0
+            // （`Retry-After: 0` 等于"立刻重试"，会把限流变成忙等）。
+            return 1;
+        }
+        ((1.0 / self.refill_per_sec).ceil() as u64).max(1)
+    }
+
     /// `per_minute == 0` 表示不限流，返回 None。
     pub fn new(per_minute: u32) -> Option<Self> {
         if per_minute == 0 {
@@ -145,6 +159,25 @@ impl RateLimiter {
 mod tests {
     use super::RateLimiter;
     use std::time::Duration;
+
+    /// 规格（复扫 A4）：`Retry-After` 必须由**回填速度**算出，而不是写死 60s。
+    ///
+    /// 边界：`per_minute = 1` 时一个令牌确实要 60s（旧行为恰好对，e2e 里那条断言就是它）；
+    /// `per_minute = 600` 时只要 0.1s ⇒ 向上取整成 1s（旧行为多罚六百倍）。
+    #[test]
+    fn retry_after_follows_the_refill_rate() {
+        for (per_minute, expected) in [(1u32, 60u64), (2, 30), (30, 2), (60, 1), (600, 1)] {
+            let rl = RateLimiter::new(per_minute).expect("非 0 应当建出限流器");
+            assert_eq!(
+                rl.retry_after_secs(),
+                expected,
+                "per_minute={per_minute} 时一个令牌需要 {expected}s"
+            );
+        }
+        // 永远不该给 0：`Retry-After: 0` 等于"立刻重试"，会把限流变成忙等。
+        let rl = RateLimiter::new(100_000).unwrap();
+        assert_eq!(rl.retry_after_secs(), 1, "下限是 1s");
+    }
 
     /// 规格（并集评估 §7 步骤 2 / `sync.rs:15`）：**桶锁中毒后仍要能限流**。
     ///

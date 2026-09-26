@@ -326,8 +326,9 @@ mod tests {
         );
         assert_eq!(
             resp.headers().get(axum::http::header::RETRY_AFTER),
-            Some(&axum::http::HeaderValue::from_static("60")),
-            "429 carries Retry-After"
+            // 复扫 A4：闸门的 429 给的是 1s（槽位通常亚秒级释放），不再是写死的 60s。
+            Some(&axum::http::HeaderValue::from_static("1")),
+            "429 carries the truthful Retry-After"
         );
         let after = metrics.identity_terms();
         assert_eq!(

@@ -104,10 +104,9 @@ pub(super) async fn admission_middleware(
                 "concurrent request limit reached, rejecting 429"
             ),
         }
-        return crate::openai::error_response(
-            axum::http::StatusCode::TOO_MANY_REQUESTS,
-            "too many concurrent requests, retry later",
-        );
+        // 429 的 `Retry-After` 给 1s（复扫 A4）：准入槽位在**任何**在途请求结束时释放，通常是
+        // 亚秒级；原先那个写死的 60s 是凭空的，按它退避的客户端白等一分钟。
+        return crate::openai::rate_limited("too many concurrent requests, retry later", 1);
     };
 
     // 把准入票据**移交**给 response body：槽位与耗时记账持有到 body 流结束、或中途

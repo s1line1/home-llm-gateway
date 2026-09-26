@@ -13,7 +13,7 @@ use axum::{
     response::Response,
 };
 
-use crate::openai::error_response;
+use crate::openai::{error_response, rate_limited};
 use crate::state::AppState;
 use tracing::warn;
 
@@ -38,8 +38,9 @@ pub struct AuthenticatedKey {
 pub enum AuthRejection {
     /// 缺少 / 无效的 Bearer key → 401。
     InvalidKey,
-    /// 超过该 key 的每分钟配额 → 429（带 `Retry-After`）。
-    RateLimited,
+    /// 超过该 key 的每分钟配额 → 429，带**按回填速度算出的** `Retry-After`（复扫 A4：
+    /// 不再是写死的 60s，见 [`crate::ratelimit::RateLimiter::retry_after_secs`]）。
+    RateLimited { retry_after_secs: u64 },
 }
 
 impl AuthRejection {
@@ -49,8 +50,8 @@ impl AuthRejection {
             AuthRejection::InvalidKey => {
                 error_response(StatusCode::UNAUTHORIZED, "invalid or missing API key")
             }
-            AuthRejection::RateLimited => {
-                error_response(StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded")
+            AuthRejection::RateLimited { retry_after_secs } => {
+                rate_limited("rate limit exceeded", retry_after_secs)
             }
         }
     }
@@ -72,7 +73,9 @@ pub async fn authenticate(
         // 常驻进程内存（`/proc/<pid>/mem`、core dump 都带着它）。同一条身份对同一个桶
         // 的映射不受影响——id 与 token 一一对应。
         if !rl.try_acquire(&key.key_id) {
-            return Err(AuthRejection::RateLimited);
+            return Err(AuthRejection::RateLimited {
+                retry_after_secs: rl.retry_after_secs(),
+            });
         }
     }
     Ok(key)
@@ -186,7 +189,9 @@ mod tests {
                 Some("Bearer"),
             ),
             (
-                AuthRejection::RateLimited,
+                AuthRejection::RateLimited {
+                    retry_after_secs: 7,
+                },
                 StatusCode::TOO_MANY_REQUESTS,
                 "rate_limit_error",
                 None,
@@ -198,6 +203,14 @@ mod tests {
                 resp.headers().contains_key(axum::http::header::RETRY_AFTER),
                 status == StatusCode::TOO_MANY_REQUESTS,
                 "只有 429 带 Retry-After"
+            );
+            // 而且必须是**调用方给出的那个值**（复扫 A4：不再编造 60s）
+            assert_eq!(
+                resp.headers()
+                    .get(axum::http::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok()),
+                (status == StatusCode::TOO_MANY_REQUESTS).then_some("7"),
+                "429 的 Retry-After 必须原样带上调用方算出的值"
             );
             assert_eq!(
                 resp.headers()
