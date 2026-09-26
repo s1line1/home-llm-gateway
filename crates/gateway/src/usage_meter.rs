@@ -24,8 +24,15 @@ fn usage_from_json(value: &serde_json::Value) -> Option<ExtractedUsage> {
         .get("completion_tokens")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
-    // 两者都缺（或都为 0 且无 total）→ 视为没有可用 usage，交给估算
-    if u.get("prompt_tokens").is_none() && u.get("completion_tokens").is_none() {
+    // 两者都缺（或都为 0 且无 total）→ 视为没有可用 usage，交给估算。
+    //
+    // 复扫 C2-4：注释一直是这么承诺的，代码却只判了 `is_none()`。真跑过模型的响应不会给出
+    // 0/0，而把 `{"prompt_tokens":0,"completion_tokens":0}`（**没有** `total_tokens`）当成
+    // "精确 0 token"，会让 `estimated_requests` 少计、账面上凭空出现一批"零消耗请求"。
+    // 显式带了 `total_tokens` 的 0/0 仍是明确报告，照收。
+    let both_missing = u.get("prompt_tokens").is_none() && u.get("completion_tokens").is_none();
+    let placeholder_zero = prompt == 0 && completion == 0 && u.get("total_tokens").is_none();
+    if both_missing || placeholder_zero {
         return None;
     }
     Some(ExtractedUsage {
@@ -162,6 +169,29 @@ mod tests {
         // 普通非流式 JSON 但无 usage
         let no_usage = br#"{"id":"x","choices":[]}"#;
         assert!(extract_usage(no_usage).is_none());
+    }
+
+    /// 规格（复扫 C2-4）：**"占位式 usage"按"没有 usage"处理**——注释一直这么承诺，
+    /// 代码此前只判 `is_none()`。
+    ///
+    /// 真跑过模型的响应不会给出 0/0；而把 `{"prompt_tokens":0,"completion_tokens":0}`
+    /// （**没有** `total_tokens`）当成"精确 0 token"，会让 `estimated_requests` 少计、
+    /// 账面上凭空出现一批"零消耗请求"。带了 `total_tokens` 的 0/0 是**明确**报告，照收。
+    #[test]
+    fn placeholder_zero_usage_falls_back_to_estimation() {
+        assert!(
+            extract_usage(br#"{"usage":{"prompt_tokens":0,"completion_tokens":0}}"#).is_none(),
+            "无 total 的 0/0 是占位形状 ⇒ 交给估算"
+        );
+        let explicit = extract_usage(
+            br#"{"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}"#,
+        )
+        .expect("显式给了 total 的 0/0 应当照收");
+        assert_eq!((explicit.prompt_tokens, explicit.completion_tokens), (0, 0));
+        assert!(
+            extract_usage(br#"{"usage":{"prompt_tokens":1,"completion_tokens":0}}"#).is_some(),
+            "非零照收"
+        );
     }
 
     #[test]
