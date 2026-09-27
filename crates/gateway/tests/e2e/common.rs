@@ -152,6 +152,8 @@ pub fn test_client() -> reqwest::Client {
 
 /// 同 [`test_client`]，窗口可指定（哨兵测试要毫秒级窗口）。
 pub fn test_client_within(limit: Duration) -> reqwest::Client {
+    // 同上：reqwest 的 no-provider 变体要求进程默认 provider 已在，否则构建即 panic。
+    proto::crypto::provider();
     reqwest::Client::builder()
         .timeout(limit)
         .build()
@@ -566,6 +568,8 @@ mod step_guard_tests {
             std::future::pending::<()>().await;
         });
 
+        // reqwest 的 no-provider 变体要求进程默认 provider 已在（见 proto::crypto 的说明）。
+        proto::crypto::provider();
         let client = reqwest::Client::builder()
             .danger_accept_invalid_certs(true)
             .build()
@@ -594,6 +598,11 @@ mod step_guard_tests {
             std::future::pending::<()>().await;
         });
         let url = format!("http://{addr}/healthz");
+
+        // 这条测试**不启网关**（只有黑洞监听器），没有别的东西替它装 rustls provider ⇒
+        // 自己装，否则下面那个裸 `Client::new()` 直接 panic "No provider set"（见 proto::crypto）。
+        // 启了网关的测试不用管：建 rustls 配置时 rustls 会自动装上那个唯一 provider。
+        proto::crypto::provider();
 
         // ① 裸 client：500ms 的外层窗口内不会返回（这就是缺陷）
         // e2e-bare-client: 哨兵本身要证明"裸 client 对黑洞连接不会自己放弃"，必须不加超时

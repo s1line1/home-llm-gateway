@@ -18,6 +18,7 @@ async fn e2e_https_public_entry() {
     let agent = certs.agent(&gw, "test-agent", &["mock-llm"], mock_addr, 4, true);
     wait_for_agents(&gw, 1, Duration::from_secs(10)).await;
 
+    proto::crypto::provider();
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .build()
@@ -348,8 +349,6 @@ fn foreign_client_identity() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'st
 #[serial]
 async fn e2e_mtls_requires_a_trusted_client_certificate() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
-    // rustls 的进程级 provider 由网关的构造函数装；直接手搓 ClientConfig 前先确保它在了。
-    proto::crypto::provider();
     let TestGateway { gw, certs, .. } = start_gateway(|o| o.keys_file = None).await;
 
     // roots = **真 CA**：服务端证书验得过，能失败的只剩网关对我们客户端证书的校验。

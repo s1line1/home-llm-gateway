@@ -918,9 +918,6 @@ mod tests {
     /// （s2n-quic-transport/src/connection/connection_container.rs:319-321），
     /// 所以连接死掉之后读 id 依然有效——注册表测试不依赖连接可用性。
     async fn test_connection() -> s2n_quic::connection::Handle {
-        // 本测试直接构建 rustls 配置（绕过 tls 构造函数）→ 自己确保 provider 已装。
-        proto::crypto::provider();
-
         // 服务端：自签证书；ALPN 两端必须一致，否则握手协商不上
         let key = KeyPair::generate().unwrap();
         let cert = CertificateParams::new(vec!["localhost".to_string()])
