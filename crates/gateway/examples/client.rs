@@ -13,9 +13,6 @@ async fn main() -> anyhow::Result<()> {
     let path = PathBuf::from("agent-config.yml");
     let cfg = config::from_path(&path)?;
 
-    // 示例直接构建 rustls 配置 → 自己确保 provider 已装。
-    proto::crypto::provider();
-
     let tls = rustls_client_config(&cfg.ca_cert, cfg.client_cert, cfg.client_key)?; // 上面那份，含 mTLS
     let client = s2n_quic::Client::builder()
         .with_tls(Client::from(Arc::new(tls)))?
@@ -57,8 +54,6 @@ fn rustls_client_config(
     cert: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
 ) -> Result<rustls::ClientConfig, AgentError> {
-    // 示例直接构建 rustls 配置 → 自己确保 provider 已装。
-    proto::crypto::provider();
     let mut roots = RootCertStore::empty();
     for c in ca {
         roots.add(c.clone())?

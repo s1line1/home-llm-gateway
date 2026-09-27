@@ -1,20 +1,25 @@
-//! rustls 进程级 CryptoProvider 的**唯一**安装点。
+//! rustls 进程级 CryptoProvider 的**唯一**安装点（provider 是 **aws-lc-rs**）。
 //!
-//! **为什么必须显式安装**：本 workspace 同时链接了两个 rustls provider——ring（rustls /
-//! tokio-rustls / hyper-rustls）与 aws-lc-rs（`s2n-quic-rustls` 的 Cargo.toml 硬开，
-//! 我们这边关不掉）。rustls 0.23 在"两个 provider 同时可用"时无法自动选择，任何
-//! `ServerConfig::builder()` / `ClientConfig::builder()` 都会 panic：
-//! "Could not automatically determine the process-level CryptoProvider from Rustls crate features"。
+//! **为什么还要显式安装**（2026-09-27 起：workspace 里 ring 已彻底移除，`cargo tree -i ring`
+//! 为空，provider 只剩 aws-lc-rs 一个）：
 //!
-//! 以前这个安装散在 12 个调用点（两个二进制的启动路径、两个 tls 构造函数、测试 helper、
-//! examples），每一处都写着"你必须先装"。而 `gateway/src/tls.rs` 里那条注释正好记录了
-//! 这种冗余的代价：`cargo test` 下同进程总有别的测试先装（所以一直没暴露），
-//! nextest 每条测试一个进程就崩。现在只有这一个入口，且幂等。
+//! 1. **reqwest 要求它**。`reqwest` 用的是 `rustls-tls-webpki-roots-no-provider`（它自己的
+//!    `rustls-tls` 会拉 `__rustls-ring`，即把 ring 重新拉回树里，所以刻意不用）；这个变体在
+//!    构建客户端时是 `rustls::crypto::CryptoProvider::get_default()` **否则 panic
+//!    "No provider set"**（vendored `reqwest-0.12.28/src/async_impl/client.rs:763-770`：有 ring
+//!    feature 时它会退回 `ring::default_provider()`，没有就直接 panic）。**它不会**走 rustls
+//!    的"按 crate feature 自动选择"那条路。
+//! 2. **不该依赖调用顺序**。库代码构造 rustls 配置时，若默认 provider 由"上一位调用者"安装，
+//!    行为就取决于谁先跑（`cargo test` 同进程下一直没暴露，nextest 每条测试一个进程就崩）。
 //!
-//! 用法：**任何会构建 rustls 配置的代码路径**都调用 [`provider`]。本仓库的
-//! `gateway::tls` / `agent::tls` 构造函数已经自己调用它，所以正常路径不需要显式调用；
-//! 只有绕过这些构造函数、直接 `rustls::…Config::builder()` 的地方（测试 helper、examples）
-//! 需要自己调一次。
+//! 用法（2026-09-27 收窄）：**只有"即将构建 `reqwest` 客户端"的代码路径**需要调用 [`provider`]。
+//! 构建 rustls 配置（`ServerConfig` / `ClientConfig` / `RootCertStore`）**不需要**调用——rustls
+//! 在只有一个 provider feature 时会自己安装并选中（vendored `rustls-0.23.45/src/crypto/mod.rs:243`
+//! 的 `get_default_or_install_from_crate_features`，由 `Config::builder()` 调用）。
+//!
+//! 当前需要它的地方只有：agent 的上游客户端（`agent::upstream_client`）、e2e 的 `test_client*`
+//! 与那个自建 TLS 客户端、以及 `http/entry.rs` 里用 `reqwest::get` 的两个单测。原先那 12 个
+//! "构造 rustls 配置前先装"的调用点已随 ring 的移除一并删除。
 
 use std::sync::OnceLock;
 
@@ -28,8 +33,8 @@ pub struct Installed(Origin);
 /// 拿到凭证时实际发生了什么（只为日志与测试）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {
-    /// 本次调用装上了 ring。
-    InstalledRing,
+    /// 本次调用装上了 aws-lc-rs。
+    InstalledAwsLcRs,
     /// 已经有人装过了（别的调用点、同一个测试进程里的别的测试）。
     AlreadyInstalled,
 }
@@ -52,8 +57,8 @@ pub fn provider() -> &'static Installed {
     static INSTALLED: OnceLock<Installed> = OnceLock::new();
     INSTALLED.get_or_init(|| {
         Installed(
-            match rustls::crypto::ring::default_provider().install_default() {
-                Ok(()) => Origin::InstalledRing,
+            match rustls::crypto::aws_lc_rs::default_provider().install_default() {
+                Ok(()) => Origin::InstalledAwsLcRs,
                 // 每进程最多成功一次；失败说明别人已经装好了，这正是我们想要的状态。
                 Err(_existing) => Origin::AlreadyInstalled,
             },
@@ -74,10 +79,26 @@ mod tests {
         assert_eq!(first.origin(), second.origin());
         assert_eq!(
             first.origin(),
-            Origin::InstalledRing,
+            Origin::InstalledAwsLcRs,
             "本测试进程里应是首次安装"
         );
-        // 装完之后 rustls 侧必须能取到默认 provider，否则 builder 仍会 panic。
-        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+        // 装完之后 rustls 侧必须能取到默认 provider，否则 `Config::builder()` 仍会 panic。
+        let installed = rustls::crypto::CryptoProvider::get_default().expect("已装上默认 provider");
+
+        // 而且装上的必须是 **aws-lc-rs** 那一个（不是"随便谁装的"）：ring 已从依赖树移除，
+        // 但哪天有人把它加回来、或改成先装 ring，这条会立刻红——不必等到某个 tls 测试
+        // 在某个进程里偶然 panic。判据用密钥交换组的名字集合（同 crate 内构造，不受版本漂移影响）。
+        let expected = rustls::crypto::aws_lc_rs::default_provider();
+        let names = |p: &rustls::crypto::CryptoProvider| {
+            p.kx_groups
+                .iter()
+                .map(|g| format!("{:?}", g.name()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(installed),
+            names(&expected),
+            "进程默认 provider 必须是 aws-lc-rs 的（ring 已移除；见本模块说明）"
+        );
     }
 }

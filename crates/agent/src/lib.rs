@@ -251,6 +251,9 @@ const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// - **连接有超时**：上游不监听时不要无限等。响应阶段的兜底在网关侧（`head_timeout` 与
 ///   逐帧空闲超时 → 发 `Cancel`），所以这里只限"连上"这一跳，不设总超时。
 fn upstream_client() -> anyhow::Result<reqwest::Client> {
+    // 上游客户端走 reqwest 的 rustls no-provider 变体：**构建前**必须有进程默认 provider，
+    // 否则 panic "No provider set"（见 `proto::crypto` 的模块说明）。
+    proto::crypto::provider();
     Ok(reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
@@ -926,9 +929,6 @@ mod tests {
     /// 建立一个本地的 s2n-quic 连接对（无 mTLS），返回客户端 [`Handle`]。
     /// 服务端只保活连接、不读流。
     async fn test_connection() -> Handle {
-        // 本测试直接构建 rustls 配置（绕过 tls 构造函数）→ 自己确保 provider 已装。
-        proto::crypto::provider();
-
         // 服务端：自签证书 + 无客户端认证
         let key = KeyPair::generate().unwrap();
         let cert = CertificateParams::new(vec!["localhost".to_string()])
@@ -993,9 +993,6 @@ mod tests {
         cert: CertificateDer<'static>,
         key: PrivateKeyDer<'static>,
     ) -> (SocketAddr, tokio::sync::mpsc::Receiver<Handle>) {
-        // 本测试直接构建 rustls 配置（绕过 tls 构造函数）→ 自己确保 provider 已装。
-        proto::crypto::provider();
-
         let mut roots = rustls::RootCertStore::empty();
         roots.add(ca.clone()).unwrap();
         let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
@@ -1039,9 +1036,6 @@ mod tests {
         cert: CertificateDer<'static>,
         key: PrivateKeyDer<'static>,
     ) -> (SocketAddr, tokio::sync::mpsc::Receiver<()>) {
-        // 本测试直接构建 rustls 配置（绕过 tls 构造函数）→ 自己确保 provider 已装。
-        proto::crypto::provider();
-
         let mut roots = rustls::RootCertStore::empty();
         roots.add(ca.clone()).unwrap();
         let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
@@ -1097,9 +1091,6 @@ mod tests {
         cert: CertificateDer<'static>,
         key: PrivateKeyDer<'static>,
     ) -> (SocketAddr, tokio::sync::mpsc::Receiver<Handle>) {
-        // 本测试直接构建 rustls 配置（绕过 tls 构造函数）→ 自己确保 provider 已装。
-        proto::crypto::provider();
-
         let mut roots = rustls::RootCertStore::empty();
         roots.add(ca.clone()).unwrap();
         let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
@@ -1156,9 +1147,6 @@ mod tests {
         key: PrivateKeyDer<'static>,
         first_reply_delay: Duration,
     ) -> SocketAddr {
-        // 本测试直接构建 rustls 配置（绕过 tls 构造函数）→ 自己确保 provider 已装。
-        proto::crypto::provider();
-
         let mut roots = rustls::RootCertStore::empty();
         roots.add(ca.clone()).unwrap();
         let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
@@ -1852,8 +1840,6 @@ mod tests {
         cert: CertificateDer<'static>,
         key: PrivateKeyDer<'static>,
     ) -> (SocketAddr, tokio::sync::mpsc::Receiver<Handle>) {
-        proto::crypto::provider();
-
         let mut roots = rustls::RootCertStore::empty();
         roots.add(ca.clone()).unwrap();
         let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))

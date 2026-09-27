@@ -152,6 +152,8 @@ pub fn test_client() -> reqwest::Client {
 
 /// 同 [`test_client`]，窗口可指定（哨兵测试要毫秒级窗口）。
 pub fn test_client_within(limit: Duration) -> reqwest::Client {
+    // 同上：reqwest 的 no-provider 变体要求进程默认 provider 已在，否则构建即 panic。
+    proto::crypto::provider();
     reqwest::Client::builder()
         .timeout(limit)
         .build()
@@ -566,6 +568,8 @@ mod step_guard_tests {
             std::future::pending::<()>().await;
         });
 
+        // reqwest 的 no-provider 变体要求进程默认 provider 已在（见 proto::crypto 的说明）。
+        proto::crypto::provider();
         let client = reqwest::Client::builder()
             .danger_accept_invalid_certs(true)
             .build()

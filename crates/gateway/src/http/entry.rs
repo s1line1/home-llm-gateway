@@ -398,6 +398,8 @@ mod tests {
             metrics.clone(),
         ));
 
+        // reqwest 的 rustls no-provider 变体要求进程里已有默认 provider（见 proto::crypto）。
+        proto::crypto::provider();
         let resp = tokio::time::timeout(
             Duration::from_secs(5),
             reqwest::get(format!("http://{addr}/ping")),
@@ -476,6 +478,8 @@ mod tests {
         ));
 
         let started = Instant::now();
+        // reqwest 的 rustls no-provider 变体要求进程里已有默认 provider（见 proto::crypto）。
+        proto::crypto::provider();
         let resp = tokio::time::timeout(
             Duration::from_secs(5),
             reqwest::get(format!("http://{addr}/ping")),
