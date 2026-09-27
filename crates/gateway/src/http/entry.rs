@@ -272,7 +272,8 @@ where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let io = TokioIo::new(io_stall::WriteStall::new(io, client_stall));
-    // 桥接 hyper(0.4 Service) 与 axum(tower 0.5 Service)
+    // 桥接 hyper 1.x 的连接服务与 axum 的 `Router`（后者是 tower 0.5 的 `Service`）：
+    // `service_fn` 把"请求 → future"的闭包适配成 hyper 要的形态，闭包里调 `Router::call`。
     let service = service_fn(move |req: hyper::Request<Incoming>| {
         let mut app = app.clone();
         async move { app.call(req).await }
