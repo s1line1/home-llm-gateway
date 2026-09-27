@@ -92,15 +92,61 @@ cd home-llm-gateway
 cargo build --release            # 产出 target/release/{gateway,agent,mock-llm}
 ```
 
-### 方案 B：本机交叉编译后上传
+### 方案 B：发布流水线 / 本机打包
+
+打 tag 即产出正式交付物（`.github/workflows/release.yml`）：三个平台在**各自的 native runner** 上
+构建（ubuntu-24.04 → x86_64 Linux、ubuntu-24.04-arm → aarch64 Linux、macos-14 → arm64 macOS），
+先过 `fmt + clippy + nextest` 门槛，产物再验一遍静态性，最后附到 GitHub Release。
 
 ```bash
-./scripts/build-release.sh       # 已安装的 target 会构建；未安装的按提示 rustup target add
-# 某个目标构建/打包失败**不会**中断后面的目标（跨平台常常只装得上其中几个）：
-# 脚本逐个跑完再汇总，有失败时列出失败的 target 并以非 0 退出
-# macOS → Linux 需要交叉链接器，见脚本头部注释；推荐 musl 目标出静态二进制
-# 产物：dist/home-llm-gateway-<版本>-<平台>.tar.gz
+git tag v0.1.3 && git push origin v0.1.3   # tag 版本必须与 Cargo.toml 一致，否则流水线直接失败
 ```
+
+本机只出某个平台：
+
+```bash
+rustup target add aarch64-apple-darwin
+./scripts/build-release.sh --target aarch64-apple-darwin
+
+# Linux **静态**产物：光 rustup target add 不够，还要目标 C 工具链（aws-lc-sys 与
+# bundled SQLite 都是 C 代码），脚本会把安装方式打印出来：
+#   Linux : sudo apt-get install -y musl-tools cmake nasm perl   # musl-gcc
+#   macOS : MUSL_CROSS_DIR=~/toolchains/x86_64-linux-musl-cross \
+#             ./scripts/build-release.sh --strict --target x86_64-unknown-linux-musl
+#           （工具链来自 https://musl.cc/x86_64-linux-musl-cross.tgz）
+./scripts/build-release.sh --strict --target x86_64-unknown-linux-musl
+```
+
+产物：`dist/home-llm-gateway-<版本>-<平台>.tar.gz` + `dist/SHA256SUMS`。包内结构：
+
+```
+home-llm-gateway-<版本>-<平台>/
+  bin/{gateway,agent,mock-llm}
+  deploy/{gateway.service,agent.service,logrotate.example}
+  gateway_config.example.yml  agent_config.example.yml
+  SHA256SUMS            # 对 bin/ 下三个二进制的校验和
+```
+
+几个刻意的口径，别被文件名骗了：
+
+- **Linux 只出 musl 静态产物**（不再出 `*-unknown-linux-gnu`）。静态 ELF 不绑定 glibc 版本，
+  一份产物落在任意发行版上都能跑——这正是 `crates/gateway/Dockerfile` 里那条血泪注释
+  （构建基底与运行阶段 glibc 不一致 ⇒ 镜像构建成功、启动即 `GLIBC_2.38 not found`）要根除的
+  那类问题。**macOS 产物仍是动态 Mach-O**（链接 libSystem，macOS 上无法静态化），"静态二进制"
+  这句话只指 Linux 产物。
+- **静态性是脚本自己断言的**：`file` 必须写 `statically linked` 或 `static-pie linked`
+  （x86_64-musl 上 Rust 默认 PIE，出的是后者；两者都不需要动态加载器），且 ELF 里不许出现
+  `PT_INTERP` / `NEEDED`；不满足就是**构建失败**（不是提示）。自己复核：
+  ```bash
+  file bin/gateway                        # 期望 "statically linked" 或 "static-pie linked"
+  readelf -l bin/gateway | grep INTERP    # 期望无输出（没有动态加载器）
+  sha256sum -c SHA256SUMS
+  ```
+  （**别用 `ldd` 自查**：它是 shell 包装，对 `static-pie` 形态可能真的去执行目标程序。）
+  CI 里还会对**已打包解包后的**产物再验一遍，并用 `bin/gateway --version` 实跑一次。
+- **未安装的 target / 缺交叉工具链的目标默认跳过**（跨平台开发机常常只装得上其中几个），脚本
+  逐个跑完再汇总；构建失败与打包失败一律算失败。`--strict` 下"缺失"也算失败——CI 一个 job 一个
+  target 用的就是它：装了却编不出来必须让流水线红。
 
 ## 4. 目录规划（中转服务器）
 

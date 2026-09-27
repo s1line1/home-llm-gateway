@@ -1,0 +1,243 @@
+name: Release
+
+# 交付流水线：打 tag（`v*`）时在**原生 runner** 上构建并发布多平台产物；
+# workflow_dispatch 用来演练（只产出 run artifacts，不建 Release）。
+#
+# 为什么用原生 runner 而不是交叉工具链：
+#   · x86_64-unknown-linux-musl  → ubuntu-24.04（x86_64）装 musl-tools 就是本机编译
+#   · aarch64-unknown-linux-musl → ubuntu-24.04-arm（公共仓库免费的 arm64 runner）
+#   · aarch64-apple-darwin       → macos-14
+#   这样每个产物的 C 依赖（aws-lc-sys、bundled SQLite）都由**目标架构自己的** C 工具链
+#   编译，不需要维护交叉工具链；而且 Linux 两个产物都能在同一个 runner 上**直接执行**，
+#   于是"静态二进制"这句话可以在打包之后再验一遍（见 verify 步骤）。
+#   若哪天 arm64 runner 不可用：在 x86_64 runner 上下载 musl.cc 的
+#   aarch64-linux-musl-cross 工具链并用 MUSL_CROSS_DIR 指过去即可（本机开发就是这么做的，
+#   见 scripts/build-release.sh 头部注释）。
+#
+# 静态性断言有两道：构建脚本里（`file` + `readelf`，见 scripts/build-release.sh）和
+# 下面 verify 步骤里（**对解包后的产物** `file` + `readelf`）。第二道针对的是"真正被发布的
+# 那个文件"，而不是构建目录里的中间产物。
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write # tag 推送时创建 GitHub Release
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  meta:
+    name: Read version & toolchain
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      channel: ${{ steps.meta.outputs.channel }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version and pinned toolchain
+        id: meta
+        run: |
+          set -euo pipefail
+          channel="$(sed -n 's/^channel *= *"\([^"]*\)"/\1/p' rust-toolchain.toml)"
+          if [ -z "$channel" ]; then
+            echo "rust-toolchain.toml does not pin a channel"; exit 1
+          fi
+          manifest="$(sed -n 's/^version *= *"\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+            # 产物名/二进制自报版本都取自 Cargo.toml，tag 与它不一致就会发出一个
+            # "文件名说 0.1.3、二进制说 0.1.2" 的交付物，所以这里硬性对齐。
+            if [ "$version" != "$manifest" ]; then
+              echo "tag v$version 与 Cargo.toml 的 $manifest 不一致"; exit 1
+            fi
+          else
+            version="$manifest"
+          fi
+          case "$version" in
+            "" | *[!0-9.]*)
+              echo "版本号不合法：$version"; exit 1 ;;
+          esac
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+          echo "channel=$channel" >>"$GITHUB_OUTPUT"
+
+  gate:
+    name: Gate (fmt + clippy + test)
+    needs: meta
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ needs.meta.outputs.channel }}
+          components: rustfmt, clippy
+
+      - name: Toolchain pins agree
+        run: ./scripts/check-toolchain.sh
+
+      - uses: Swatinem/rust-cache@v2
+
+      # tag 推送不会触发 ci.yml（它只监听 feature_* 分支与指向 main 的 PR），
+      # 所以发布前的基本门槛在这里补上：不通过就不产出任何交付物。
+      - name: Format check
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Test
+        run: cargo nextest run --workspace
+
+  build:
+    name: ${{ matrix.target }}
+    needs: [meta, gate]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            apt: musl-tools cmake nasm perl binutils # nasm：aws-lc-sys 的 x86_64 汇编
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            apt: musl-tools cmake perl binutils
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            apt: ""
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ needs.meta.outputs.channel }}
+          targets: ${{ matrix.target }}
+
+      - name: Install build deps (Linux)
+        if: startsWith(matrix.runner, 'ubuntu')
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ${{ matrix.apt }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build release tarball (static asserted)
+        run: |
+          bash scripts/build-release.sh "${{ needs.meta.outputs.version }}" \
+            --strict --target "${{ matrix.target }}"
+          ls -l dist/
+
+      - name: Verify the packaged artifact
+        run: |
+          set -euo pipefail
+          version="${{ needs.meta.outputs.version }}"
+          target="${{ matrix.target }}"
+          tarball="dist/home-llm-gateway-${version}-${target}.tar.gz"
+          test -f "$tarball"
+          rm -rf verify && mkdir verify
+          tar -C verify -xzf "$tarball"
+          root="verify/home-llm-gateway-${version}-${target}"
+          # 1) 产物真的能跑：Linux 静态 ELF 在同架构 glibc runner 上直接执行，
+          #    这同时说明"不依赖 glibc 版本"不是纸面结论。
+          "$root/bin/gateway" --version
+          "$root/bin/agent" --version
+          # 2) 从**已打包的文件**上再验一次静态性。
+          case "$target" in
+            *-linux-musl)
+              for bin in gateway agent mock-llm; do
+                # `file` 对 aarch64-musl 写 "statically linked"，对 x86_64-musl 写
+                # "static-pie linked"（Rust 默认 PIE）——两种都是"不需要动态加载器"，
+                # 只认前者会把合格产物判失败。
+                desc="$(file -b "$root/bin/$bin")"
+                echo "$bin: $desc"
+                case "$desc" in
+                  *"statically linked"* | *"static-pie linked"*) ;;
+                  *)
+                    echo "不是静态链接：$desc"
+                    exit 1
+                    ;;
+                esac
+                # 真正的判据是 readelf（binutils），**故意不用 ldd**：ldd 是个 shell
+                # 包装，对 static-pie（x86_64-musl 就是这个形态）可能走到"把目标当加载器
+                # 执行"那条路——既不可靠，又会误跑二进制。readelf 只看程序头/动态段。
+                if readelf -l "$root/bin/$bin" | grep -q 'INTERP'; then
+                  echo "$bin 有 PT_INTERP：不是静态产物"
+                  exit 1
+                fi
+                if readelf -d "$root/bin/$bin" | grep -q 'NEEDED'; then
+                  echo "$bin 有 NEEDED 动态依赖："
+                  readelf -d "$root/bin/$bin" | grep 'NEEDED'
+                  exit 1
+                fi
+              done
+              ;;
+            *)
+              file "$root/bin/gateway"
+              ;;
+          esac
+          # macOS runner 上没有 sha256sum（只有 shasum -a 256）。
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd "$root" && sha256sum -c SHA256SUMS)
+          else
+            (cd "$root" && shasum -a 256 -c SHA256SUMS)
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    if: github.ref_type == 'tag'
+    needs: [meta, build]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Aggregate checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          # 三个平台缺一不可：矩阵里任何一个 job 失败都会让 build 失败，这里再挡一次
+          # "产物被静默少传/改名"的情况（Release 一旦发出就很难收回）。
+          # 用 glob 数组而不是 `ls | wc -l`：文件名由矩阵决定，但 `ls` 解析在
+          # 非字母数字文件名上不可靠（shellcheck SC2012，actionlint 会红）。
+          shopt -s nullglob
+          tarballs=(home-llm-gateway-*.tar.gz)
+          if [ "${#tarballs[@]}" -ne 3 ]; then
+            echo "期望 3 个平台产物，实际 ${#tarballs[@]} 个"
+            printf '%s\n' "${tarballs[@]-}"
+            exit 1
+          fi
+          sha256sum "${tarballs[@]}" >SHA256SUMS
+          cat SHA256SUMS
+          # 每个包内部还有一份对二进制的 SHA256SUMS，解包校验一遍再发布。
+          for tarball in "${tarballs[@]}"; do
+            mkdir -p "check-${tarball%.tar.gz}"
+            tar -C "check-${tarball%.tar.gz}" -xzf "$tarball"
+            (cd "check-${tarball%.tar.gz}"/* && sha256sum -c SHA256SUMS)
+          done
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          generate_release_notes: true

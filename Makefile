@@ -20,7 +20,7 @@ MODEL ?= qwen2.5
 LIMIT ?= 20
 
 .PHONY: help setup certs certs-required web-install web-build web-dev build build-debug fmt clippy check test bench bench-k6 \
-        bench-admission bench-admission-local release check-records \
+        bench-admission bench-admission-local release release-strict check-records \
         run-gateway run-agent run-mock dev dev-ui logs stop clean
 
 help: ## 显示所有命令
@@ -139,8 +139,11 @@ bench-admission-local: ## 本地自建栈验证闸门：make bench-admission-loc
 	## 输出 hlmg_active_requests 峰值，应精确等于 LIMIT。
 	bash scripts/bench-admission-local.sh $(LIMIT) $(VUS)
 
-release: ## 多平台打包到 dist/（见 scripts/build-release.sh）
+release: ## 多平台打包到 dist/（Linux 出 musl **静态**产物；见 scripts/build-release.sh）
 	bash scripts/build-release.sh
+
+release-strict: ## 同上，但"目标未安装 / 缺交叉工具链"也算失败（CI 一个平台一个 job 用的模式）
+	bash scripts/build-release.sh --strict
 
 ## ---------- 运行 ----------
 

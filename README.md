@@ -906,12 +906,24 @@ QPS 压到一两个数量级以下。上面这些数字只在"把模型换快"�
 ### 多平台打包与开机自启
 
 ```bash
-scripts/build-release.sh          # 构建已安装 target 的 release 二进制并打包到 dist/
-rustup target add aarch64-unknown-linux-gnu   # 需要交叉目标时先安装
+scripts/build-release.sh          # 构建已安装 target 的 release 产物并打包到 dist/
+make release-strict               # 同上，但"目标未安装 / 缺交叉工具链"也算失败（CI 用的模式）
 ```
 
-产物：`dist/home-llm-gateway-<版本>-<平台>.tar.gz`（gateway / agent / mock-llm 三个二进制）。
-macOS 交叉编译到 Linux 的说明见脚本头部注释；推荐 musl 目标得到静态二进制。
+默认目标：当前主机、`x86_64-unknown-linux-musl`、`aarch64-unknown-linux-musl`、`aarch64-apple-darwin`。
+**Linux 只出 musl 静态产物**：静态 ELF 不绑定 glibc 版本，一份产物落在任意发行版上都能跑
+（`crates/gateway/Dockerfile` 里那条 "构建基底必须与运行阶段对齐" 的约束因此不复存在）。
+静态性是**脚本自己断言的**——`file` 必须写 `statically linked` 或 `static-pie linked`
+（x86_64-musl 上 Rust 默认 PIE，出的是后者），ELF 里不许有 `PT_INTERP` / `NEEDED`，
+不满足就是构建失败；缺目标 C 工具链时脚本会打印安装方式（`musl-tools` / musl.cc 工具链）。
+
+打包产物：`dist/home-llm-gateway-<版本>-<平台>.tar.gz` + `dist/SHA256SUMS`，包内是
+`bin/{gateway,agent,mock-llm}` + `deploy/` 单元 + 示例配置 + 包内校验和。
+
+打 tag（`v*`）由 `.github/workflows/release.yml` 在**各自的 native runner** 上构建三个平台
+（ubuntu-24.04 / ubuntu-24.04-arm / macos-14），先过 `fmt + clippy + nextest` 门槛，再对**解包后的
+产物**复验静态性（`file` + `readelf`）、实跑 `--version`、校验包内 SHA256，最后附到 GitHub Release。
+本机交叉（如 macOS → `x86_64-unknown-linux-musl`）仍可用 `MUSL_CROSS_DIR` 指工具链，见 `DEPLOY.md` §3。
 
 systemd 单元：`deploy/gateway.service`（云服务器）、`deploy/agent.service`（LLM 机器），改好参数后 `systemctl enable --now` 即可开机自启。
 
