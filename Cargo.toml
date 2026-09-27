@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/proto", "crates/gateway", "crates/agent", "crates/mock-llm"]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "MIT"
 # 最低支持的编译器（MSRV）。**刻意声明我们真正验证过的版本**（见 `rust-toolchain.toml`
