@@ -27,14 +27,37 @@
       （认证 → 模型路由 → 隧道 → 上游 → SSE 回传 [DONE]），确认工具可直接连。
       后续可选补：`/v1/models` 与工具端 `--model` 的对应关系文档化、实机断开触发 Cancel 复核
       （后两者 e2e 已覆盖，属锦上添花）
-- [ ] **`/v1/responses`（OpenAI Responses API，Codex 新版）**：
+- [ ] **客户端面 API 方言：支持清单（2026-09-26 定）**：入站**只认两家方言**——**OpenAI 兼容**（主，
+      `/v1/*`）与 **Anthropic Messages**（次，`/v1/messages`）；Gemini 不进（`generateContent` 不在 `/v1/`
+      下、形态也不同）。分层（**P0 的缺口是"验证 + 文档"，在阶段范围内；P1/P2 属新能力，按阶段范围只登记**）：
+      - **P0 必须有**：`POST /v1/chat/completions`（已有）、`GET /v1/models`（已有，网关聚合）、
+        `POST /v1/embeddings`（与 chat 同形状，缺的只是验证与文档）。
+      - **P1**：`POST /v1/completions`；`POST /v1/responses`（Codex 新版，见下一条）。
+      - **P2 按需**：`POST /v1/audio/speech`、`/v1/images/generations`、`/v1/moderations`；
+        `POST /v1/audio/transcriptions` 是 **multipart**，要先定"无 model 怎么选路"（见 `extract_model` 那条）。
+      - **明确不做**：`/v1/files`、`/v1/batches`、`/v1/vector_stores`、`/v1/fine_tuning/*`（OpenAI 平台侧
+        状态化 API，Ollama / vLLM / llama.cpp 都没有）；所有不在 `/v1/` 下的路径（Ollama `/api/*`、
+        vLLM `/tokenize`、上游 `/health`）；WebSocket 类（`/v1/realtime`）。
+      - **Anthropic 的两个前置缺口**（路径不是障碍：`/v1/messages` 是"JSON + `model`"，形状上已能透传）：
+        ① **入站鉴权**只认 `Authorization: Bearer`（`auth.rs::bearer_token`），而 Claude 客户端发
+        `x-api-key` + `anthropic-version` ⇒ 今天直接 401；且 `x-api-key` 目前**既不识别也不剥离**
+        （会漏给 edge/上游，与 `CLIENT_CREDENTIAL_HEADERS` 只列 `authorization`/`cookie` 的意图不符）；
+        ② **`/v1/models` 撞路径**：两家都占它而响应形状不同 ⇒ 只能按认证头 / `anthropic-version` 分派方言。
+      - **要不要翻译**：上游原生支持 Anthropic 方言（vLLM 有实验性入口）则透传即用；Ollama / llama.cpp
+        没有 ⇒ 要么做 `/v1/messages` → `chat/completions` 翻译（含 SSE 事件转换），要么文档化前置 router。
+        **未决**，与下一条 `/v1/messages` 合并推进。
+      - **与白名单的关系**：支持面落成"路径 × 方法 × 状态（已验证 / 可透传未验证 / 不支持）"之后，
+        "必须带 `model`"只约束确实需要选路的端点，其余回"明确不支持 + 按原因区分的状态码与文案"
+        ——即 `extract_model` 那条的修法 (c)。
+- [ ] **`/v1/responses`（OpenAI Responses API，Codex 新版；见上一条支持清单的 P1）**：
       方案 A：网关内把 Responses 请求翻译为上游 chat/completions（含流式事件格式转换）；
       方案 B：确认上游（vLLM 等）原生支持后仅文档化。当前为纯透传，上游不支持即 404
-- [ ] **`/v1/messages`（Anthropic Messages API，Claude Code）**：
+- [ ] **`/v1/messages`（Anthropic Messages API，Claude Code；见上一条支持清单的"两个前置缺口"）**：
       方案 A：网关内 OpenAI↔Anthropic 双向格式翻译（含 SSE 事件转换，中等工作量）；
       方案 B：文档化前置 claude-code-router / LiteLLM 翻译层的部署方式
 - [ ] **接入文档**：README/DEPLOY 增加 DSH（`DEEPSEEK_BASE_URL`）、Codex（`OPENAI_BASE_URL`）、
-      Claude Code（`ANTHROPIC_BASE_URL` 或 router）的配置示例与模型名约定
+      Claude Code（`ANTHROPIC_BASE_URL` 或 router）的配置示例与模型名约定；**并按上一条支持清单写清"当前支持面"
+      （哪些端点已验证、哪些可透传未验证、哪些明确不支持）**
 - [x] **OpenAI 兼容错误语义标准化（2026-09 实施）**：对照 OpenAI 协议修补三处，
       SDK/工具按 error.type 与 Retry-After 决定重试行为：
       1. **error.type 按状态码映射**（`openai::error_response`，唯一构造器）：400→
@@ -1235,3 +1258,126 @@
         闸门先把它拦下来）、`tunnel_op_timeout = 1s`、并发 > 2。超出的那批会开流超时，而
         `inflight(> 2) ≥ min(0 → ceiling = 2)` ⇒ 判"忙"。若这条路仍不通，再上"额度很小的假
         peer"：只广告很小的 MAX_STREAMS，并且接受流之后**握着不放**。
+
+## 2026-09-26 全项目复扫（第二轮，六切片）
+
+来源：2026-09-26 用六个并行**只读**子代理按切片普查（HTTP/入口/安全、proxy+registry、agent、
+proto+mock-llm、storage+用量、web+部署+文档），随后**由我逐条复核代码**。`S2-1..S2-16` 我都自己
+读过代码（个别还实跑了命令，注在各条里）；`S2-17..S2-21` 只是子代理读码报告、我**未**逐行确认，
+标 `待核`。已登记或已修的旧问题不在这里重复（`S2-4`/`S2-5`/`S2-21` 曾只出现在
+`docs/refactor-assessment.md`，本轮复核后正式登记）。
+
+### 中危
+
+- [ ] **`S2-1` `ProxyResponseEnd.ok` 写了但没人读（上游中途断流被当成正常结束）**：
+      `proto/src/frame.rs:67` 定义了 `ok`，agent 在上游响应体 `next()` 出错时置 `false` 并照发
+      （`crates/agent/src/stream.rs:313,336`），而网关**两处**消费点都用 `{ .. }` 忽略它
+      （`crates/gateway/src/proxy/forward.rs:406`、`head.rs:69`）⇒ 客户端拿到**语法完整**的 200 +
+      半截 JSON / 没有 `[DONE]` 的 SSE，指标还记成 `upstream_end`（与真正常结束同标签）、用量按
+      "已结束"结算。修法：`ok == false` 时走 `Frame::Error` 那条路（推错误项掐断响应体）。
+      **复核**：我自己读了代码（全仓无 `ok` 读者）。
+- [ ] **`S2-2` 关停时非 SSE 的在途响应没有任何"不完整"信号**：
+      `forward.rs:284-318` 里只有 `is_stream` 分支写 `event: error`；非 SSE 直接
+      `tunnel_cancel + send.finish()` ⇒ 同样给客户端一个"完整"的截断体（`content-length` 是逐跳头、
+      早就被剥掉，hyper 会补上 chunked 终止块）。`TODO` 的 R12 条把"非 SSE 只能**诚实截断**"
+      记为已完成，但代码没有任何客户端可见的截断信号，e2e 也只钉了 SSE
+      （`tests/e2e/lifecycle.rs` 的 `e2e_shutdown_announces_incomplete_sse_instead_of_cutting`）。
+      **复核**：我自己读了代码。
+- [ ] **`S2-3` "唯一能服务该模型的 agent 正忙"被报成 404（应 429）**：
+      忙（`Disposition::Transient`）刻意不写 `last_failure`（`routing.rs:188-194`），但重试时
+      `pick()` 是"**先按 exclude 过滤、再按 model 过滤**"（`registry.rs:360-371`）⇒ 唯一服务该模型
+      的候选被 exclude 后，模型过滤滤空 → `AcquireError::NoModel` → **404 `model not found on any
+      agent`** + 标签 `no-agent-serves-model`，把"该扩容"说成"没人声明这个模型"（SDK 也不会按 429
+      退避重试）。`B1` 的修复只覆盖了"候选全被 exclude"那一格（`AllExcluded` → 429）。
+      触发：异构 edge（A 只声明 qwen、B 只声明 llama）+ A 到达流额度。**复核**：我自己读了代码。
+- [ ] **`S2-4` key id 只有 32 位，且 `create` 用 `INSERT OR REPLACE`：撞 id 时静默删掉另一把 key 的库行**：
+      `storage/hash.rs:119-127` 把 4 个随机字节格式化成 8 位十六进制；这条 id 同时是主键、吊销的键
+      与用量归因的键（`storage/mod.rs:388` 的 `INSERT OR REPLACE`，无碰撞检查/重试）。生日碰撞：
+      1 万把 key ≈1.2%、6.5 万把 ≈39%。后果：旧 key 的库行被销毁（内存里两把都还在、继续放行，
+      重启后旧 key 静默 401）、`delete(id)` 会一次吊销两把、两把用量并进同一行。**修法要单独定**
+      （扩 id 位数是库/接口层面的变化）。**复核**：我自己读了代码；子代理另用 `sqlite3 :memory:`
+      跑了同形语句复现"旧行被删"。
+- [ ] **`S2-5` `key_usage` 载入失败降级成空账本 + flush 写绝对值 ⇒ 覆盖库里已累计的用量**：
+      `storage/usage.rs:106-122` 载入失败只 `warn!` + 空 `HashMap`（凭据侧同位置是记 failure 并让
+      启动 fail-fast），而 upsert 写的是 `excluded.prompt_tokens`（`:238`）⇒ 之后第一次 flush 就把
+      库里原有的大数值覆盖成重启后的小数值，**抹掉历史**（不是"少记一段"）。触发：任何让这条
+      SELECT 失败但写仍可用的状态（某行列被写成 TEXT、页损坏等）；`for row in rows { row? }` 还会
+      因一行坏而丢弃整次载入。`TODO` 曾把"告警 + 空账本继续"定性为刻意不改，但**没有覆盖这个
+      覆盖后果**，需重新确认。**复核**：我自己读了代码；子代理跑了同形 UPSERT 复现覆盖。
+- [ ] **`S2-6` 指标页把 `hlmg_agents`（含心跳过期）当"在线 Agents"，与同屏侧边栏矛盾**：
+      `web/src/pages/MetricsPage.tsx:82`（卡片标题"在线 Agent 数"、副标题"已注册 agent 数"）
+      用的是 `latest.agents`，而 `Layout.tsx:78` 用 `agents_healthy`。G1/P3-19 修了
+      Layout/Overview/Agents 三处，**漏了 MetricsPage**（`git log -S agents_healthy --
+      web/src/pages/MetricsPage.tsx` 为空）。**复核**：我自己读了代码。
+- [ ] **`S2-7` agent 的 `server_name` 不做校验：非法值在 s2n-quic 端点任务里 panic，进程再也注册不上**：
+      `agent/src/config.rs:139` 原样传递（只有 serde 默认值，`from_file` 不校验），非法值（空串、
+      带尾点 FQDN、IDN/Unicode、超 253 字节）会在 `s2n-quic-rustls-0.88.0/src/client.rs:89` 命中
+      `.expect("invalid server name")`——那是在**端点事件循环任务**里，于是 `connect()` 永远失败、
+      每次重连的新端点再 panic 一次，进程看着在跑却永远注册不上。修法：`from_file` 里做一次
+      `ServerName::try_from` 校验（与 E3 的 `upstream` 同口径）。**复核**：我自己读了代码 +
+      确认了 vendored `.expect`。
+
+### 低危
+
+- [ ] **`S2-8` SPA fallback 重造内部请求时丢掉方法与全部头**：`http/ui.rs:54-59` 只设了 URI
+      （`Request::builder().uri(..)`），于是静态路径上的 `POST` 会拿到 200 + 文件内容（tower-http
+      对非 GET/HEAD 本应回 405），带 `If-Modified-Since` 的 GET 也永远拿不到 304（协商头被丢弃）。
+      **复核**：我复核了调用侧（确实只传 URI）。
+- [ ] **`S2-9` `hlmg_agent_rejections_total` 的 HELP/README 把"容量打满(429)"也算成"无可路由 agent(503)"**：
+      `metrics.rs:436` 的 HELP（与 `README.md` 对应段落）称整族是"因挑不出可路由 agent 而拒绝"，
+      但标签 `all-candidates-at-capacity` 来自 `routing.rs:270-281`，客户端拿到的是 **429
+      `agent at capacity`**。同类问题在 `hlmg_tunnel_retries_total` 上已按 C2-5 修过，这一族漏了。
+      **复核**：我自己读了 HELP 与映射两侧。
+- [ ] **`S2-10` `Connection` 头点名的字段不会被剥离**：`proto/src/headers.rs:38-40` 的谓词只收
+      **头名**，全仓没有任何调用点读 `Connection` 的取值（RFC 9110 §7.6.1 要求连它点名的字段一起
+      删）⇒ 客户端/前置反代用 `Connection: X-Client-Cert` 标成单跳的头会一路进隧道、可能进上游的
+      鉴权分支或日志。**复核**：我自己 grep 了全仓（无读者）。
+- [ ] **`S2-11` `build-release.sh` 四个目标全被跳过时仍报成功**：`scripts/build-release.sh:49-54`
+      只在 `failed` 非空时退出 1；全 `continue` 时 `built` 为空也会打印"完成（0 个目标），产物在
+      dist/"并 exit 0（rustup 不在 PATH 时必然如此），dist/ 是空的。H1-6 只修了"第一个失败吞掉
+      后面的目标"。**复核**：我自己读了脚本末尾分支。
+- [ ] **`S2-12` `check-bundle.mjs` 用 `URL.pathname` 取 dist 目录**：`web/scripts/check-bundle.mjs:12`
+      拿到的是**百分号编码**路径（Windows 还带前导 `/C:`）⇒ 检出目录含空格/非 ASCII 时
+      `pnpm build` 在最后一步 ENOENT 失败（CI 路径没空格，所以从不暴露）。改成
+      `fileURLToPath(new URL("../dist/", import.meta.url))`。**复核**：我自己读了代码。
+- [ ] **`S2-13` agent 首帧错误把整帧 Debug 进日志（单行最大 64 MiB）**：
+      `agent/src/stream.rs:125` 的 `bail!("first frame is not a ProxyRequest: {first:?}")`，
+      而 `Frame::ProxyRequest.body` 是 `Bytes`（Debug 逐字节输出全部内容）。同类问题 P3-27 已在
+      gateway 侧改用 `Frame::kind()`，这是唯一漏点（全仓 `grep '{first:?}'` 只此一处）。
+      **复核**：我自己 grep 了。
+- [ ] **`S2-14` mock-llm 的 usage 恒 `1/1/2`，让"prompt/completion 记反"恒绿**：
+      `crates/mock-llm/src/lib.rs:215` 是字面量，而 `e2e_usage_metering` 断言 `2/2`（两值相等 ⇒
+      判据退化）。把替身改成两个不同的数（如 prompt>completion）即可让这类归属错误可观测。
+      **复核**：我自己读了替身与断言两侧。
+- [ ] **`S2-15`（本轮 A3/A8 的漏改）配置侧文档仍写"只有 `/metrics` 豁免"**：
+      `crates/gateway/src/config.rs:87` 与 `gateway_config.example.yml:129` 都没跟上 A3（`/healthz`
+      进探针域）与 A8（`/metrics` 进抓取域）——真实语义是"两条无认证路径**各有独立额度**、都不吃
+      受限预算"。`README.md:482` 已是对的。**复核**：我自己读了这三处。
+- [ ] **`S2-16`（本轮 G6 的漏）`clearAdminToken` 丢弃 `removeItem` 失败并把内存态置 `null`**：
+      `web/src/hooks/useAdminToken.ts:43-47`。localStorage 处于"读可用、写/删抛错"的半坏形态时，
+      旧 token 仍在存储里、`readToken` 又回落读到它 ⇒ `/admin/*` 401 之后**用户不会被登出**，
+      继续"已登录但每页加载失败"（正是 P3-18 要消灭的状态）。G6 的测试只覆盖了"完全不可用"。
+      修法：`writeStored("")` 返回 false 时把 `memoryToken` 置 `""`（而不是 `null`）。
+      **复核**：我自己读了代码。
+
+### 待核（子代理读码报告，我未逐行确认）
+
+- [ ] **`S2-17` `待核` admin 的 `Json` 提取器绕过统一错误形状**：`admin.rs:115` 用
+      `Json<serde_json::Value>`，axum 的拒绝是 `(StatusCode, &str)` 纯文本 ⇒ 415（Content-Type
+      不对）/400（JSON 语法错）/413（超 `DefaultBodyLimit`）都没有 `{"error":{"type":…}}`，
+      与 `openai.rs:22-24` 承诺的"网关自己产生的错误全局一致"不符。
+- [ ] **`S2-18` `待核` `open_timeout_is_fatal` 传的是**本地**流上限而非 `min(本地, 对端)`**：
+      `routing.rs:130-134` 传 `state.max_open_tunnel_streams`（默认 1024），而 agent 只广告 1000
+      （`agent/src/lib.rs:342`）⇒ `max_concurrency: 0`（文档语义"不限"）的 agent 在 inflight
+      落在 [1000, 1024) 时会被判**死**（`inflight < effective` 为假以外的分支）而不是"忙"，
+      连续 3 次即摘除 → 全量 503。
+- [ ] **`S2-19` `待核` `run_loop_handles_clean_disconnect` 的夹具到不了它声称的 Ok 分支**：
+      用的是把 acceptor 丢掉的 `test_server`（`agent/src/lib.rs:1022-1028`），register 永远等不到
+      半关 ⇒ 走的是 Err 分支；断言只有"900ms 后任务还活着"，把 Ok 分支删掉也不会红。
+- [ ] **`S2-20` `待核` `TODO` 的 R2 描述与实现不符**：R2 说读帧"按声明长度直接分配 64 MiB"，
+      但那条 `read_frame` 已在 R3 删除，唯一路径 `FrameReader` 只把声明值记进 `want`、缓冲区随
+      **真实到达**字节增长，且 `len > MAX_FRAME` 在载荷到达前就拒绝（`proto/src/io.rs:93,105-111`）。
+- [ ] **`S2-21` `待核` `DESIGN` 的 `cred_generation` 缓存失效只存在于文档**：DESIGN 写"命中条件是
+      `cred_version == 当前代次`、变更即 bump 失效"，而代码里 `cred_generation` **只写不读**
+      （`storage/mod.rs:324-329,452`），库里 `cred_version` 恒为列默认值（`create` 不写该列）；
+      真正让吊销生效的只有"记录被删除"。
