@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agent"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "bytes",
@@ -749,7 +749,7 @@ dependencies = [
 
 [[package]]
 name = "gateway"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "agent",
  "anyhow",
@@ -1309,7 +1309,7 @@ dependencies = [
 
 [[package]]
 name = "mock-llm"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1523,7 +1523,7 @@ dependencies = [
 
 [[package]]
 name = "proto"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "bytes",
