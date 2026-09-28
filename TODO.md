@@ -1332,10 +1332,13 @@ proto+mock-llm、storage+用量、web+部署+文档），随后**由我逐条复
       **头名**，全仓没有任何调用点读 `Connection` 的取值（RFC 9110 §7.6.1 要求连它点名的字段一起
       删）⇒ 客户端/前置反代用 `Connection: X-Client-Cert` 标成单跳的头会一路进隧道、可能进上游的
       鉴权分支或日志。**复核**：我自己 grep 了全仓（无读者）。
-- [ ] **`S2-11` `build-release.sh` 四个目标全被跳过时仍报成功**：`scripts/build-release.sh:49-54`
+- [x] **`S2-11` `build-release.sh` 四个目标全被跳过时仍报成功**：`scripts/build-release.sh:49-54`
       只在 `failed` 非空时退出 1；全 `continue` 时 `built` 为空也会打印"完成（0 个目标），产物在
       dist/"并 exit 0（rustup 不在 PATH 时必然如此），dist/ 是空的。H1-6 只修了"第一个失败吞掉
       后面的目标"。**复核**：我自己读了脚本末尾分支。
+      **已修（2026-09-28，随 release 交付改造）**：末尾新增"`built` 为空 ⇒ 打印空产物的原因
+      （列出被跳过的目标）并 exit 1"。**验证**：`env PATH=/usr/bin:/bin:$HOME/.cargo/bin`（无 rustup
+      目标可编）跑 `--strict` 得到 exit 1 与"没有任何目标构建成功"；正常三目标全量跑仍是 exit 0。
 - [ ] **`S2-12` `check-bundle.mjs` 用 `URL.pathname` 取 dist 目录**：`web/scripts/check-bundle.mjs:12`
       拿到的是**百分号编码**路径（Windows 还带前导 `/C:`）⇒ 检出目录含空格/非 ASCII 时
       `pnpm build` 在最后一步 ENOENT 失败（CI 路径没空格，所以从不暴露）。改成
@@ -1381,3 +1384,48 @@ proto+mock-llm、storage+用量、web+部署+文档），随后**由我逐条复
       `cred_version == 当前代次`、变更即 bump 失效"，而代码里 `cred_generation` **只写不读**
       （`storage/mod.rs:324-329,452`），库里 `cred_version` 恒为列默认值（`create` 不写该列）；
       真正让吊销生效的只有"记录被删除"。
+
+## 2026-09-28 交付工程化：多平台 release（Linux 静态 musl）
+
+背景：交付口径里的"静态二进制 + 多平台交叉编译"此前**只有一份目标清单**——`build-release.sh`
+列出四个 target、装了哪个编哪个，本机唯一能真跑的是 `aarch64-apple-darwin`，而 Docker 运行镜像
+是动态 glibc；也就是说这句话当时**站不住**。本节把它做成可复验的事实（判据是 `file`/`readelf`/
+`readelf`，不是文件名里有没有 `musl`）。
+
+- [x] **`scripts/build-release.sh` 重写**：默认目标 = host / `x86_64-unknown-linux-musl` /
+      `aarch64-unknown-linux-musl` / `aarch64-apple-darwin`（去重：Apple Silicon 上 host 与最后
+      一个重复；不去重会把同一个包打两次、`dist/SHA256SUMS` 出现重复行——实测踩到）。Linux 侧
+      **只出 musl 静态产物**，不再出 `*-unknown-linux-gnu`——静态 ELF 不绑定 glibc 版本，
+      `crates/gateway/Dockerfile` 里"构建基底必须与运行阶段对齐"那条隐性契约随之消失。按 target
+      探测 `${arch}-linux-musl-gcc` / `${target}-gcc` / `musl-gcc`（裸 `musl-gcc` 只在本机架构匹配
+      时认，否则得到的是链接期的诡异错误而不是清晰提示），注入 `CC_<target>` 与
+      `CARGO_TARGET_<TARGET>_LINKER`；**不写进 `.cargo/config.toml`**（Linux 叫 `musl-gcc`、
+      musl.cc 工具链叫 `x86_64-linux-musl-gcc`，钉死一个必然在另一环境断）。`--strict` 把
+      "未安装 target / 缺交叉 C 工具链"也算失败，未安装默认跳过；构建 / 静态断言 / 打包失败一律算失败。
+- [x] **静态性断言进脚本（硬失败）**：`file` 写 `statically linked` 或 `static-pie linked`，且
+      `readelf` 里没有 `PT_INTERP` / `NEEDED`。踩坑：第一版只认 `statically linked`，把
+      x86_64-musl 的**合格**产物（Rust 默认 PIE ⇒ `static-pie linked`）判成动态失败——两者都不需要
+      动态加载器，真正的判据是那两条 readelf。
+- [x] **包结构**：`bin/{gateway,agent,mock-llm}` + `deploy/`（两份 unit + logrotate）+
+      两个示例配置 + 包内 `SHA256SUMS`，顶层一层目录（原来三个二进制平铺在包根，解包会散在宿主机
+      当前目录）；另出汇总 `dist/SHA256SUMS`。
+- [x] **本机实测证据（2026-09-28，macOS arm64 + messense/macos-cross-toolchains v15.2.0，GCC 15.2.0）**：
+      · `aarch64-unknown-linux-musl` → `file` = `ELF 64-bit LSB executable, ARM aarch64, statically linked`；
+        `readelf -l` INTERP=0、`readelf -d` NEEDED=0（三个二进制都是）
+      · `x86_64-unknown-linux-musl` → `file` = `ELF 64-bit LSB pie executable, x86-64, static-pie linked`；
+        INTERP=0、NEEDED=0（本机**没有 nasm** 也编得过：aws-lc-sys 走了预生成汇编那条路）
+      · 产物：`dist/home-llm-gateway-0.1.2-{x86_64-unknown-linux-musl,aarch64-unknown-linux-musl,
+        aarch64-apple-darwin}.tar.gz` + `dist/SHA256SUMS`
+- [x] **新增 `.github/workflows/release.yml`**：`v*` tag 或手动触发。meta（tag 必须与
+      `Cargo.toml` 版本一致，否则产物名与二进制自报版本会打架）→ gate（fmt + clippy + nextest；
+      **tag 推送不触发 `ci.yml`**，它只监听 `feature_*` 与指向 main 的 PR，门槛必须在这里补）
+      → 三个 native runner 矩阵（ubuntu-24.04 出 x86_64-musl、ubuntu-24.04-arm 出 aarch64-musl、
+      macos-14 出 apple-darwin；Linux 装 `musl-tools`/`cmake`，x86_64 另加 `nasm`/`perl`）→ 对
+      **解包后的产物**再验静态性（`file` 两种措辞 + `readelf` 无 `PT_INTERP`/`NEEDED`）+ 实跑
+      `gateway/agent --version` + 校验包内 SHA256 → 汇总校验和（包数必须 = 3）后发布 Release。
+- [ ] **流水线尚未在 GitHub 上实跑**（需要 push tag；按约定等提交指令）。脚本路径已在本机
+      `--strict` 全量跑通（3 个目标），CI 侧差异只有 runner 与包管理器。
+- 口径边界（别写宽）："静态二进制"只指 **Linux musl** 产物；macOS 产物是动态 Mach-O（链接
+      libSystem，无法静态化）。"跨平台"当前的形态是**每个平台在自己的原生 runner 上构建**，
+      本机交叉（macOS → `*-linux-musl`）走 `MUSL_CROSS_DIR` 是可选路径，不是交付前提。
+

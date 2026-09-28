@@ -73,11 +73,24 @@ pub struct AppState {
     pub rate_limiter: Option<RateLimiter>,
     /// HTTP 全局在途请求上限（0 = 不限；per-key 限流之外的总闸门）。
     pub max_concurrent_requests: u32,
-    /// 每条 agent 连接允许的同时在途隧道流数（QUIC 双向流额度）。
+    /// 每条 agent 连接允许的同时在途隧道流数（QUIC 双向流额度），**网关这一侧**的上限。
     ///
-    /// 两个用途：① 建 QUIC 端点时作为双向流额度（见 `Gateway::start`）；
-    /// ② 开流超时时用来区分"忙"（额度排满，排队超时）与"死"（见
-    /// `registry::Entry::open_timeout_is_fatal`）。
+    /// **唯一用途**：开流超时时区分"忙"（额度排满、只是排队）与"死"——`proxy/routing.rs` 把它
+    /// 交给 `registry::Entry::report_open_timeout`，后者在 agent 声明 `max_concurrency == 0`
+    /// （不限）时拿它当有效上限（见 `registry.rs` 的 `open_timeout_is_fatal`）。
+    ///
+    /// **它不参与绑 QUIC 端点**（原先的文档在这里写错了）：端点额度用的是
+    /// [`crate::Options::stream_ceiling`]——`listen.rs` 的
+    /// `with_max_open_local_bidirectional_streams`，accept 循环那处也直接用 `opts.stream_ceiling()`，
+    /// 两条路径都不经过 `AppState`。之所以这个值还要进 `AppState`，只是因为"忙/死"判定发生在
+    /// **请求路径**上，而请求路径上只有 `AppState`（`Options` 在 `Gateway::start` 里已被拆开、
+    /// 不进 Router）。
+    ///
+    /// **语义边界（复扫 `S2-18`，待核）**：这是**本地**上限，**不是**本条连接的有效额度——有效额度
+    /// 是 `min(本地, 对端广告)`（agent 侧广告 1000）。两者不等时（例如网关默认 1024），
+    /// `max_concurrency == 0` 的 agent 在途落在 `[1000, 1024)` 会被判成"死"而不是"忙"，
+    /// 连续 3 次即摘除连接。修那条时要先决定：把对端额度也带进来，还是把这里的语义写成
+    /// "本地上限"并据此调整判据。
     pub max_open_tunnel_streams: u32,
     pub metrics: Metrics,
     /// React UI 静态目录（None = `/` 显示构建提示页）。

@@ -221,12 +221,27 @@ max_concurrency: 4
 ### Multi-platform packaging & auto-start
 
 ```bash
-scripts/build-release.sh          # build release binaries for every installed target into dist/
-rustup target add aarch64-unknown-linux-gnu   # install cross targets when needed
+scripts/build-release.sh          # build every installed target and pack it into dist/
+make release-strict               # same, but a missing target / missing cross toolchain is a failure
 ```
 
-Artifacts: `dist/home-llm-gateway-<version>-<platform>.tar.gz` (gateway / agent / mock-llm binaries).
-Cross-compilation notes (macOS → Linux) are in the script header; musl targets are recommended for static binaries.
+Default targets: the host, `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`,
+`aarch64-apple-darwin`. **Linux artifacts are static musl builds**: a static ELF is not tied to a glibc
+version, so one artifact runs on any distribution — this removes the "build base must match the runtime
+stage" constraint documented in `crates/gateway/Dockerfile`. Staticness is **asserted by the script
+itself**: `file` must report `statically linked` or `static-pie linked` (x86_64-musl defaults to PIE),
+and `readelf` must find no `PT_INTERP` / `NEEDED`; otherwise the build fails. A missing cross C toolchain
+is reported with install instructions (`musl-tools` / musl.cc toolchain).
+
+Artifacts: `dist/home-llm-gateway-<version>-<platform>.tar.gz` + `dist/SHA256SUMS`, containing
+`bin/{gateway,agent,mock-llm}`, the `deploy/` units, example configs and an in-package checksum file.
+If **no** target can be built, the script fails instead of reporting an empty success.
+
+Tagging (`v*`) runs `.github/workflows/release.yml`: all three platforms are built on their **native
+runners** (ubuntu-24.04 / ubuntu-24.04-arm / macos-14), gated on `fmt + clippy + nextest`, and the
+**unpacked artifacts** are re-verified (`file` + `readelf`), executed (`--version`), checksum-checked and
+attached to the GitHub Release. Local cross builds (macOS → `x86_64-unknown-linux-musl`) remain possible
+via `MUSL_CROSS_DIR`, see `DEPLOY.md` §3.
 
 systemd units: `deploy/gateway.service` (cloud server) and `deploy/agent.service` (LLM machine). Adjust the parameters, then `systemctl enable --now` for auto-start on boot.
 
