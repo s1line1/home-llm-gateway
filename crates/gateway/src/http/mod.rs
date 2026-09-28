@@ -1,6 +1,12 @@
 //! 公网 HTTP 入口：认证 → 路由 → 编码为隧道帧转发。
 
-use axum::{extract::DefaultBodyLimit, middleware, response::Response, routing::get, Router};
+use axum::{
+    extract::DefaultBodyLimit,
+    middleware,
+    response::Response,
+    routing::{delete, get},
+    Router,
+};
 use tracing::info;
 
 use crate::state::AppState;
@@ -68,10 +74,7 @@ pub fn app(state: AppState) -> Router {
                 "/keys",
                 get(crate::admin::list_keys).post(crate::admin::create_key),
             )
-            .route(
-                "/keys/{id}",
-                axum::routing::delete(crate::admin::delete_key),
-            )
+            .route("/keys/{id}", delete(crate::admin::delete_key))
             .route("/agents", get(crate::admin::list_agents))
             .route("/usage", get(crate::admin::usage_route))
             .route_layer(middleware::from_fn_with_state(
