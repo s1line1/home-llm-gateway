@@ -24,3 +24,4 @@ keys.db-shm
 .DS_Store
 
 /docs/*
+/diagrams/*
