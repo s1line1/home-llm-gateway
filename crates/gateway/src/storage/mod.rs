@@ -86,11 +86,11 @@ fn tighten_db_to_owner(path: &std::path::Path) {
 fn tighten_db_to_owner(_path: &std::path::Path) {}
 
 #[derive(Clone)]
-pub struct KeyStore {
-    inner: Arc<KeyStoreInner>,
+pub struct Storage {
+    inner: Arc<StoreInner>,
 }
 
-struct KeyStoreInner {
+struct StoreInner {
     /// 动态 key，key = lookup（sha256(token) 十六进制），value = 记录。
     runtime: RwLock<HashMap<String, KeyRecord>>,
     /// SQLite 持久化连接（None = 仅内存，如 db 打开失败时降级）。
@@ -109,7 +109,7 @@ struct KeyStoreInner {
     /// `Some(Ok(()))` = 库已就绪；`Some(Err(why))` = 已降级成内存模式，`why` 是原因。
     ///
     /// 库/测试语义：失败仍降级（构造器刻意保持不可失败）。**生产启动路径据此 fail-fast**
-    /// ——见 [`KeyStore::persistence_state`] 与 `Gateway::start`：一个载不出任何 key 的网关
+    /// ——见 [`Storage::persistence_state`] 与 `Gateway::start`：一个载不出任何 key 的网关
     /// 就是个空壳（每个请求 401），却会一直报健康。
     persistence: Option<Result<(), String>>,
 }
@@ -154,7 +154,7 @@ impl KeyRecord {
     }
 
     /// 是否启用。注意**吊销**不是靠它：吊销会把记录从 `runtime` 表里删掉（见
-    /// [`KeyStore::delete`]），所以"查得到 + enabled"才代表可用。
+    /// [`Storage::delete`]），所以"查得到 + enabled"才代表可用。
     pub fn enabled(&self) -> bool {
         self.enabled
     }
@@ -192,7 +192,7 @@ const USAGE_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS key_usage (
     last_used_at INTEGER NOT NULL DEFAULT 0
 )";
 
-impl KeyStore {
+impl Storage {
     /// 默认：1650 条缓存、30 分钟有效期（够覆盖"同一批客户端持续打"的场景；
     /// 吊销仍然是即时的——版本校验在缓存之前，不依赖 TTL）。
     /// 启动期持久化自检的结果：`None` = 没配 `keys_file`；`Some(Ok(()))` = 就绪；
@@ -308,7 +308,7 @@ impl KeyStore {
         let db = Arc::new(Mutex::new(db));
         let usage = usage::UsageStore::new(db.clone());
         Self {
-            inner: Arc::new(KeyStoreInner {
+            inner: Arc::new(StoreInner {
                 runtime: RwLock::new(runtime),
                 db,
                 usage,
@@ -630,7 +630,7 @@ mod tests {
     fn persist_roundtrip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("keys.db");
-        let store = KeyStore::new(Some(path.clone()));
+        let store = Storage::new(Some(path.clone()));
         let created = store.create("dsh".into()).unwrap();
         assert!(
             store.authorize(&created.plaintext),
@@ -639,7 +639,7 @@ mod tests {
         assert!(!store.authorize("nope"));
         drop(store);
 
-        let reloaded = KeyStore::new(Some(path.clone()));
+        let reloaded = Storage::new(Some(path.clone()));
         assert!(
             reloaded.authorize(&created.plaintext),
             "persisted key should survive reload"
@@ -650,7 +650,7 @@ mod tests {
     fn plaintext_never_persisted() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("keys.db");
-        let store = KeyStore::new(Some(path.clone()));
+        let store = Storage::new(Some(path.clone()));
         let created = store.create("sec".into()).unwrap();
         drop(store); // 确保落盘
 
@@ -665,7 +665,7 @@ mod tests {
             "argon2 hash should be persisted"
         );
         // 明文不落盘后，重启依然能通过哈希校验授权
-        let reloaded = KeyStore::new(Some(path.clone()));
+        let reloaded = Storage::new(Some(path.clone()));
         assert!(reloaded.authorize(&created.plaintext));
         assert!(!reloaded.authorize("wrong"));
     }
@@ -674,7 +674,7 @@ mod tests {
     fn delete_revokes_and_persists() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("keys.db");
-        let store = KeyStore::new(Some(path.clone()));
+        let store = Storage::new(Some(path.clone()));
         let created = store.create("x".into()).unwrap();
         assert!(store.authorize(&created.plaintext));
         assert!(store.delete(&created.record.id).unwrap());
@@ -688,7 +688,7 @@ mod tests {
         );
 
         // 吊销同样持久化：重载后 key 依然失效
-        let reloaded = KeyStore::new(Some(path.clone()));
+        let reloaded = Storage::new(Some(path.clone()));
         assert!(
             !reloaded.authorize(&created.plaintext),
             "revocation should survive reload"
@@ -701,7 +701,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("keys.db");
         std::fs::write(&path, "{ not a sqlite database !!!").unwrap();
-        let store = KeyStore::new(Some(path.clone()));
+        let store = Storage::new(Some(path.clone()));
         assert!(!store.authorize("anything"));
     }
 
@@ -711,7 +711,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("keys.db");
         std::fs::create_dir(&path).unwrap();
-        let store = KeyStore::new(Some(path.clone()));
+        let store = Storage::new(Some(path.clone()));
         assert!(!store.authorize("anything"));
         // 降级为仅内存后，动态 key 仍可用
         let created = store.create("mem".into()).unwrap();
@@ -722,7 +722,7 @@ mod tests {
     fn usage_accumulates_and_persists() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("keys.db");
-        let store = KeyStore::new(Some(path.clone()));
+        let store = Storage::new(Some(path.clone()));
         let created = store.create("usage-test".into()).unwrap();
         let id = created.record.id.clone();
 
@@ -765,7 +765,7 @@ mod tests {
 
         // 持久化：重载后用量仍在（吊销 key 也不丢记录，可审计）
         drop(store);
-        let reloaded = KeyStore::new(Some(path.clone()));
+        let reloaded = Storage::new(Some(path.clone()));
         let again = reloaded.usage_of(&id).unwrap();
         assert_eq!(again.prompt_tokens, 115);
         assert_eq!(again.completion_tokens, 75);
@@ -773,10 +773,10 @@ mod tests {
         assert_eq!(again.estimated_requests, 1);
 
         // 吊销 key 后 usage 记录仍保留（key 删了，用量表独立）
-        let store2 = KeyStore::new(Some(path.clone()));
+        let store2 = Storage::new(Some(path.clone()));
         store2.delete(&id).unwrap();
         drop(store2);
-        let store3 = KeyStore::new(Some(path));
+        let store3 = Storage::new(Some(path));
         let kept = store3.usage_of(&id).unwrap();
         assert_eq!(kept.requests, 3, "usage survives key revocation");
     }
@@ -785,7 +785,7 @@ mod tests {
     fn usage_accumulates_in_memory_and_flushes_in_one_batch() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("keys.db");
-        let store = KeyStore::new(Some(path.clone()));
+        let store = Storage::new(Some(path.clone()));
         let a = store.create("batch-a".into()).unwrap();
         let b = store.create("batch-b".into()).unwrap();
         let delta = UsageDelta {
@@ -805,7 +805,7 @@ mod tests {
         assert_eq!(store.usage_of(&a.record.id).unwrap().requests, 100);
         assert_eq!(store.usage_of(&b.record.id).unwrap().requests, 50);
         assert!(store.usage_has_pending(), "累加后应报告有待落库数据");
-        let fresh = KeyStore::new(Some(path.clone()));
+        let fresh = Storage::new(Some(path.clone()));
         assert!(
             fresh.usage_of(&a.record.id).is_none(),
             "未 flush 前不应有库记录"
@@ -824,7 +824,7 @@ mod tests {
         );
 
         // ④ 重启（新建 store 读同一个库）后用量仍在，且不重复累加
-        let reloaded = KeyStore::new(Some(path.clone()));
+        let reloaded = Storage::new(Some(path.clone()));
         let info = reloaded.usage_of(&a.record.id).unwrap();
         assert_eq!(info.requests, 100);
         assert_eq!(info.prompt_tokens, 1000);
@@ -836,7 +836,7 @@ mod tests {
     fn shutdown_flush_writes_without_waiting_for_the_period() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("keys.db");
-        let store = KeyStore::new(Some(path.clone()));
+        let store = Storage::new(Some(path.clone()));
         let created = store.create("shutdown".into()).unwrap();
         store.accumulate_usage(
             &created.record.id,
@@ -852,7 +852,7 @@ mod tests {
         let store2 = store.clone();
         assert_eq!(store2.flush_usage_blocking(), 1);
 
-        let fresh = KeyStore::new(Some(path));
+        let fresh = Storage::new(Some(path));
         let info = fresh.usage_of(&created.record.id).unwrap();
         assert_eq!(info.requests, 1);
         assert_eq!(info.total_tokens, 15);
@@ -860,7 +860,7 @@ mod tests {
 
     #[test]
     fn usage_in_memory_only_store() {
-        let store = KeyStore::new(None);
+        let store = Storage::new(None);
         store.record_usage(
             "mem-key",
             "m",
@@ -880,7 +880,7 @@ mod tests {
     fn creates_sqlite_db_and_schema() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("keys.db");
-        let store = KeyStore::new(Some(path.clone()));
+        let store = Storage::new(Some(path.clone()));
         let created = store.create("y".into()).unwrap();
         assert!(store.authorize(&created.plaintext));
         assert_eq!(store.list().len(), 1);
@@ -898,7 +898,7 @@ mod tests {
     #[test]
     fn authorize_rejects_unknown_lookup_without_argon2() {
         // lookup 不在表中直接拒绝，不做无意义的 argon2 计算
-        let store = KeyStore::new(None);
+        let store = Storage::new(None);
         assert!(!store.authorize("sk-not-a-real-key"));
     }
 
@@ -953,7 +953,7 @@ mod tests {
         drop(hash);
 
         // 用新代码打开旧库 → 应自动补列，且旧 key 依旧可用
-        let store = KeyStore::new(Some(path.clone()));
+        let store = Storage::new(Some(path.clone()));
         assert!(
             store.authorize("sk-upgrade-secret"),
             "升级后旧 key 必须仍然有效"
@@ -1006,7 +1006,7 @@ mod tests {
             .unwrap();
         }
 
-        let store = KeyStore::new(Some(path.clone()));
+        let store = Storage::new(Some(path.clone()));
         assert!(
             store.authorize("sk-legacy-secret"),
             "migrated plaintext key should still authorize"
@@ -1025,7 +1025,7 @@ mod tests {
         }
 
         // 重载后依然有效，且不再重复迁移
-        let reloaded = KeyStore::new(Some(path.clone()));
+        let reloaded = Storage::new(Some(path.clone()));
         assert!(reloaded.authorize("sk-legacy-secret"));
         let list = reloaded.list();
         assert_eq!(list.len(), 1);
@@ -1050,12 +1050,12 @@ mod tests {
             )
             .unwrap();
         }
-        let store = KeyStore::new(Some(path.clone()));
+        let store = Storage::new(Some(path.clone()));
         assert_eq!(store.list().len(), 0);
         // 结构已修复：新 key 可正常创建并持久化
         let created = store.create("new".into()).unwrap();
         drop(store);
-        let reloaded = KeyStore::new(Some(path.clone()));
+        let reloaded = Storage::new(Some(path.clone()));
         assert!(reloaded.authorize(&created.plaintext));
     }
 
@@ -1068,7 +1068,7 @@ mod tests {
     fn persistence_state_distinguishes_unconfigured_ready_and_degraded() {
         // ① 没配 keys_file：内存模式，不是故障
         assert!(
-            KeyStore::new(None).persistence_state().is_none(),
+            Storage::new(None).persistence_state().is_none(),
             "没配 keys_file 不该有'持久化状态'"
         );
 
@@ -1076,7 +1076,7 @@ mod tests {
         // ② 可用（会被自动创建）的库：就绪
         let path = dir.path().join("keys.db");
         assert_eq!(
-            KeyStore::new(Some(path.clone())).persistence_state(),
+            Storage::new(Some(path.clone())).persistence_state(),
             Some(Ok(())),
             "正常库应当是就绪"
         );
@@ -1084,7 +1084,7 @@ mod tests {
         // ③ 不是 SQLite 库的文件：降级，且原因里带路径
         let bogus = dir.path().join("bogus.db");
         std::fs::write(&bogus, b"this is definitely not a sqlite database").unwrap();
-        let store = KeyStore::new(Some(bogus.clone()));
+        let store = Storage::new(Some(bogus.clone()));
         let why = store
             .persistence_state()
             .expect("配了 keys_file 就该有状态")
@@ -1102,7 +1102,7 @@ mod tests {
     fn create_that_fails_to_persist_leaves_no_key() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("keys.db");
-        let store = KeyStore::new(Some(path.clone()));
+        let store = Storage::new(Some(path.clone()));
         {
             let conn = Connection::open(&path).unwrap();
             conn.execute_batch(
@@ -1136,7 +1136,7 @@ mod tests {
     fn delete_that_fails_to_persist_keeps_the_key_usable() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("keys.db");
-        let store = KeyStore::new(Some(path.clone()));
+        let store = Storage::new(Some(path.clone()));
         let created = store.create("cannot-delete".into()).unwrap();
         assert!(store.authorize(&created.plaintext), "前提：这把 key 可用");
         {
@@ -1171,7 +1171,7 @@ mod tests {
     #[test]
     #[serial]
     fn a_poisoned_runtime_lock_does_not_take_the_gateway_down() {
-        let store = KeyStore::new(None);
+        let store = Storage::new(None);
         let key = store.create("poison-runtime".into()).unwrap();
         assert!(store.authorize(&key.plaintext), "前提：这把 key 可用");
 
@@ -1198,7 +1198,7 @@ mod tests {
     #[serial]
     fn a_poisoned_db_lock_still_lets_credential_writes_through() {
         let dir = tempfile::tempdir().unwrap();
-        let store = KeyStore::new(Some(dir.path().join("keys.db")));
+        let store = Storage::new(Some(dir.path().join("keys.db")));
 
         let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = store.inner.db.lock().unwrap();
@@ -1235,7 +1235,7 @@ mod tests {
             |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("keys.db");
-        let store = KeyStore::new(Some(path.clone()));
+        let store = Storage::new(Some(path.clone()));
         store.create("perm".into()).unwrap(); // 让 WAL/SHM 也建起来
 
         assert_eq!(mode_of(&path), 0o600, "新建的 keys.db 必须是 0600");
@@ -1254,7 +1254,7 @@ mod tests {
         // 已经存在的宽权限库：打开时也要收紧（升级/拷贝场景）
         drop(store);
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let _store = KeyStore::new(Some(path.clone()));
+        let _store = Storage::new(Some(path.clone()));
         assert_eq!(mode_of(&path), 0o600, "打开已存在的库也要收紧到 0600");
     }
 
@@ -1281,7 +1281,7 @@ mod tests {
         let path = dir.path().join("keys.db");
 
         // 第一个 store 故意不 drop：连接活着，WAL 里才有未 checkpoint 的帧。
-        let live = KeyStore::new(Some(path.clone()));
+        let live = Storage::new(Some(path.clone()));
         live.create("perm".into()).unwrap();
 
         let wal = dir.path().join("keys.db-wal");
@@ -1296,7 +1296,7 @@ mod tests {
         }
 
         // 第二个 store 打开同一个库：SQLite 复用现存的 WAL，三个文件都要被显式收紧。
-        let _second = KeyStore::new(Some(path.clone()));
+        let _second = Storage::new(Some(path.clone()));
         assert_eq!(mode_of(&path), 0o600, "主库");
         assert_eq!(
             mode_of(&wal),
@@ -1318,18 +1318,18 @@ mod verified_tests {
     use std::sync::{Arc, Barrier};
 
     // 这一组**不需要** `#[serial]`（记录 P3-22 的复核）：
-    //   · 每条测试自己 `KeyStore::new(..)`，而"跑了几次 argon2"的计数器是**每个 store 一个**
-    //     （`KeyStore::argon2_runs` / `verified_counters`），不是进程级 ⇒ 没有跨测试污染；
+    //   · 每条测试自己 `Storage::new(..)`，而"跑了几次 argon2"的计数器是**每个 store 一个**
+    //     （`Storage::argon2_runs` / `verified_counters`），不是进程级 ⇒ 没有跨测试污染；
     //   · `CheapArgon2` 是**线程局部**的，只影响本线程新算的哈希；
     //   · 校验的成本参数取自 **PHC 串**（argon2 crate 文档原话："hash params from `parsed_hash`
     //     are used instead of what is configured in the `Argon2` instance"）⇒ 用便宜参数写进去的
     //     记录，在**任何**线程上校验都是便宜的。
-    // 早年的注释写的是"这些测试都要读进程级的 argon2 调用计数器"——那是计数器搬进 `KeyStore`
+    // 早年的注释写的是"这些测试都要读进程级的 argon2 调用计数器"——那是计数器搬进 `Storage`
     // **之前**的事实（迁移记录见 `hash.rs` 里 `verify_argon2` 的文档），注释没跟着改。
 
     /// 并发压同一个 token；返回 (argon2 调用次数增量, 全部请求的结果)。
     /// `cache_max = 0` 时代表"关闭缓存"（旧行为）。
-    fn hammer(store: &KeyStore, token: &str, threads: usize) -> (usize, Vec<bool>) {
+    fn hammer(store: &Storage, token: &str, threads: usize) -> (usize, Vec<bool>) {
         let before = store.argon2_runs();
         let barrier = Arc::new(Barrier::new(threads));
         let results = Arc::new(Mutex::new(Vec::new()));
@@ -1357,7 +1357,7 @@ mod verified_tests {
     fn concurrent_same_token_hashes_once() {
         let _cheap = CheapArgon2::install();
         // 这是把内存峰值从 `并发数 × 19MiB` 压到 `1 × 19MiB` 的核心契约
-        let store = KeyStore::new(None);
+        let store = Storage::new(None);
         let key = store.create("one".into()).unwrap();
         let (calls, results) = hammer(&store, &key.plaintext, 8);
         assert_eq!(calls, 1, "同一个 token 的 8 个并发请求只应跑 1 次 argon2");
@@ -1367,7 +1367,7 @@ mod verified_tests {
     #[test]
     fn warm_token_never_hashes_again() {
         let _cheap = CheapArgon2::install();
-        let store = KeyStore::new(None);
+        let store = Storage::new(None);
         let key = store.create("warm".into()).unwrap();
         assert!(store.authorize(&key.plaintext)); // 首次：算一次（create 那次不算）
         let before = store.argon2_runs();
@@ -1383,7 +1383,7 @@ mod verified_tests {
     fn disabled_cache_keeps_old_behaviour() {
         let _cheap = CheapArgon2::install();
         // cache_max = 0 → 每个请求都完整校验（与改造前语义一致）
-        let key = KeyStore::with_verified(None, 0, DEFAULT_VERIFIED_TTL);
+        let key = Storage::with_verified(None, 0, DEFAULT_VERIFIED_TTL);
         let token = key.create("nocache".into()).unwrap().plaintext;
         let before = key.argon2_runs();
         for _ in 0..3 {
@@ -1392,7 +1392,7 @@ mod verified_tests {
         let off = key.argon2_runs() - before;
 
         // 对照：开启缓存时，首个请求填缓存（1 次 argon2），之后不再跑
-        let warm = KeyStore::new(None);
+        let warm = Storage::new(None);
         let token2 = warm.create("cached".into()).unwrap().plaintext;
         assert!(warm.authorize(&token2)); // 预热：这一次是缓存未命中
         let before2 = warm.argon2_runs();
@@ -1418,7 +1418,7 @@ mod verified_tests {
     #[test]
     fn counter_counts_argon2_runs_when_the_cache_is_disabled() {
         let _cheap = CheapArgon2::install();
-        let store = KeyStore::with_verified(None, 0, DEFAULT_VERIFIED_TTL);
+        let store = Storage::with_verified(None, 0, DEFAULT_VERIFIED_TTL);
         let token = store.create("nocache-metric".into()).unwrap().plaintext;
         for _ in 0..3 {
             assert!(store.authorize(&token));
@@ -1435,7 +1435,7 @@ mod verified_tests {
     fn revoke_takes_effect_immediately() {
         let _cheap = CheapArgon2::install();
         // 缓存**不得**延长吊销窗口：delete 后必须立刻 401
-        let store = KeyStore::new(None);
+        let store = Storage::new(None);
         let key = store.create("revoke".into()).unwrap();
         assert!(store.authorize(&key.plaintext));
         assert!(store.authorize(&key.plaintext)); // 已进缓存
@@ -1450,7 +1450,7 @@ mod verified_tests {
     fn credential_version_bump_invalidates_cache() {
         let _cheap = CheapArgon2::install();
         // 模拟"改 key 但不 bump 版本"以外的正确路径：bump 之后旧缓存条目必须失效
-        let store = KeyStore::new(None);
+        let store = Storage::new(None);
         let key = store.create("bump".into()).unwrap();
         assert!(store.authorize(&key.plaintext));
         let before = store.argon2_runs();
@@ -1479,7 +1479,7 @@ mod verified_tests {
     fn expired_entry_is_revalidated() {
         let _cheap = CheapArgon2::install();
         // TTL 到期后重算（不改变"吊销即时"这条，只影响多久重付一次 argon2 的钱）
-        let store = KeyStore::with_verified(None, DEFAULT_VERIFIED_MAX, Duration::from_millis(50));
+        let store = Storage::with_verified(None, DEFAULT_VERIFIED_MAX, Duration::from_millis(50));
         let key = store.create("ttl".into()).unwrap();
         assert!(store.authorize(&key.plaintext));
         std::thread::sleep(Duration::from_millis(80));
@@ -1491,7 +1491,7 @@ mod verified_tests {
     #[test]
     fn cache_is_bounded_and_never_stores_plaintext() {
         let _cheap = CheapArgon2::install();
-        let store = KeyStore::with_verified(None, 2, DEFAULT_VERIFIED_TTL);
+        let store = Storage::with_verified(None, 2, DEFAULT_VERIFIED_TTL);
         let mut tokens = Vec::new();
         for i in 0..5 {
             let k = store.create(format!("k{i}")).unwrap();
@@ -1523,7 +1523,7 @@ mod verified_tests {
     fn wrong_token_still_rejected_with_cache() {
         let _cheap = CheapArgon2::install();
         // 命中路径不得绕过校验：拿别人的 token 永远进不去
-        let store = KeyStore::new(None);
+        let store = Storage::new(None);
         let good = store.create("good".into()).unwrap();
         assert!(store.authorize(&good.plaintext));
         assert!(!store.authorize("sk-deadbeef"));

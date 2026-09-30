@@ -553,7 +553,7 @@ gateway**，不是给出"网关能跑多少"——那个数字看下面 200-口�
 - **这次不是别人拖后腿**（并发采三侧）：agent **1.05 核**、上游 mock 0.31 核（都可忽略）；链路 0.3MB/s 且 **UDP 丢包增量为 0**。
 - **改造前的实测上限 ≈190 QPS**（k6 口径、失败率列在上表；批量落库后为 ≈460–500 QPS，见下方云端复测）。
 
-**为什么停在这里（已剖析）**：不是算力用尽，而是**每请求一次同步落库把网关串行化了**。本地全栈用 `sample` 剖析网关，热点不在 HTTP/QUIC，而在阻塞线程池里的 `KeyStore::persist_usage`——**13 951 / 13 965 个采样停在 `Mutex::lock()`**（真正执行 SQL 的只有 14 个），调用栈上全是 `sqlite3VdbeExec` / `syncJournal` / `unixSync` / `fsync`。在云机上取线程等待点更直接：
+**为什么停在这里（已剖析）**：不是算力用尽，而是**每请求一次同步落库把网关串行化了**。本地全栈用 `sample` 剖析网关，热点不在 HTTP/QUIC，而在阻塞线程池里的 `Storage::persist_usage`——**13 951 / 13 965 个采样停在 `Mutex::lock()`**（真正执行 SQL 的只有 14 个），调用栈上全是 `sqlite3VdbeExec` / `syncJournal` / `unixSync` / `fsync`。在云机上取线程等待点更直接：
 
 ```
 线程数 515；卡在 futex(等同一把 db 锁) 的线程 = 514 / 511 / 511 / 514 / 514 / 514
@@ -809,8 +809,8 @@ EIP 带宽抬上去）。
 
 用量（token / 请求数）落库在改造前是**每请求一次** `INSERT ... ON CONFLICT`，也就是上面那条把吞吐摁住的路径。现在改成：
 
-- **热路径只做内存累加**（`UsageCollector::finish` → `KeyStore::accumulate_usage`），纳秒级、无 IO；
-- **后台任务按周期（1s）批量落库**（`usage_flush::spawn` → `KeyStore::flush_usage_once`），一个事务里把有变化的 key 各写一行；
+- **热路径只做内存累加**（`UsageCollector::finish` → `Storage::accumulate_usage`），纳秒级、无 IO；
+- **后台任务按周期（1s）批量落库**（`usage_flush::spawn` → `Storage::flush_usage_once`），一个事务里把有变化的 key 各写一行；
 - **写的是绝对累计值而不是增量**：库里始终收敛到内存的真相，天然幂等、重启不会重复累加，也不存在"增量被取走但落库失败 ⇒ 永久少一段"的窗口；
 - **关闭前强制落库**：`main` 收到 SIGTERM/SIGINT 后调用 `Gateway::shutdown()`——它先停 accept 并把在途请求排空（`shutdown_grace_secs`，默认 15s），**最后**把用量强制落库一次（有界阻塞写）再 abort 所有任务；日志会打 `usage flushed before shutdown keys=N`；
 - 顺带开启 `journal_mode=WAL` + `synchronous=NORMAL`。

@@ -5,7 +5,7 @@ use std::{net::SocketAddr, path::PathBuf, time::Duration};
 use anyhow::Context;
 use serde::Deserialize;
 
-use crate::{storage::KeyStore, GatewayConfig, Options, TlsPem, TunnelTls};
+use crate::{storage::Storage, GatewayConfig, Options, TlsPem, TunnelTls};
 
 /// YAML 配置文件结构。所有字段均有默认值；`cert`/`key`/`ca` 必须显式提供。
 #[derive(Debug, Deserialize)]
@@ -181,7 +181,7 @@ fn default_agent_stale_secs() -> u64 {
     Options::DEFAULT_AGENT_STALE_AFTER.as_secs()
 }
 fn default_verified_cache_max() -> usize {
-    KeyStore::default_verified_max()
+    Storage::default_verified_max()
 }
 /// 隧道控制操作超时默认值（秒）。
 ///

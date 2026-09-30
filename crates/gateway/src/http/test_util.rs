@@ -13,7 +13,7 @@ use axum::{
 
 use crate::options::Options;
 use crate::state::AppState;
-use crate::{metrics::Metrics, registry::Registry, storage::KeyStore};
+use crate::{metrics::Metrics, registry::Registry, storage::Storage};
 
 pub(super) fn test_state(ui: Option<PathBuf>) -> AppState {
     // 测试档位：只改这个文件真正关心的旋钮，其余取库默认（`Options::default()`）。
@@ -24,7 +24,7 @@ pub(super) fn test_state(ui: Option<PathBuf>) -> AppState {
     };
     let state = AppState::new(
         Registry::default(),
-        KeyStore::new(None),
+        Storage::new(None),
         Metrics::default(),
         &opts,
     );

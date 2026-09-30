@@ -388,8 +388,8 @@ async fn e2e_upstream_never_receives_client_credentials() {
 
 /// 已验证身份缓存**端到端**生效：同一 key 连续请求只跑一次 argon2。
 ///
-/// 为什么值得一条 e2e：单元测试证明的是 `KeyStore` 的契约，而这里走的是
-/// **HTTP → api_key() → spawn_blocking → KeyStore** 整条真实路径；同时它把
+/// 为什么值得一条 e2e：单元测试证明的是 `Storage` 的契约，而这里走的是
+/// **HTTP → api_key() → spawn_blocking → Storage** 整条真实路径；同时它把
 /// "每请求一次 argon2（19MiB）" 换成 "每凭据版本一次" 的收益钉在可观测指标上
 /// （`hlmg_key_verify_misses_total` 只涨 1）。
 #[tokio::test(flavor = "multi_thread")]
@@ -446,7 +446,7 @@ async fn e2e_verified_cache_reuses_argon2_across_requests() {
 
 /// e2e 层的**并发单飞**：8 个请求同时首用同一个 key，也只应跑 1 次 argon2。
 ///
-/// 为什么必须单独测：单元测试（`concurrent_same_token_hashes_once`）证明的是 KeyStore 的
+/// 为什么必须单独测：单元测试（`concurrent_same_token_hashes_once`）证明的是 Storage 的
 /// 契约；这里走的是真实 HTTP + 真实并发（8 个连接同时打进来），也就是现网那个
 /// "32 并发 → 654MB" 的形态。misses 计数是确定性的证据（内存数字太脆）。
 #[tokio::test(flavor = "multi_thread")]

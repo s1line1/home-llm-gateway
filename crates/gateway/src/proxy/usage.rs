@@ -7,7 +7,7 @@
 //! 在这里，纯函数在 `usage_meter`，落库在 `storage`。
 //!
 //! 与 `storage` 的边界是硬性的：这里**只做内存累加**
-//! （[`crate::storage::KeyStore::accumulate_usage`]），落库交给周期任务
+//! （[`crate::storage::Storage::accumulate_usage`]），落库交给周期任务
 //! （`usage_flush::spawn`）——SQLite 写可能因锁重试阻塞数秒，而 `finish` 在响应流关闭
 //! **之前**执行，等它就会变成客户端的尾延迟。
 
@@ -25,7 +25,7 @@ const MAX_NON_STREAM_BUFFER: usize = 32 * 1024 * 1024;
 /// 请求级 usage 收集：SSE 流式逐块预过滤提取；非流式缓冲到 End 后整包解析；
 /// 均拿不到 usage（上游未提供 / 取消 / 断流）→ 估算并标记。
 pub(super) struct UsageCollector {
-    key_store: crate::storage::KeyStore,
+    key_store: crate::storage::Storage,
     key_id: String,
     key_name: String,
     /// 请求 body 的 prompt 估算（无 usage 时的 prompt 降级）。
@@ -44,7 +44,7 @@ pub(super) struct UsageCollector {
 
 impl UsageCollector {
     pub(super) fn new(
-        key_store: crate::storage::KeyStore,
+        key_store: crate::storage::Storage,
         key_id: String,
         key_name: String,
         prompt_est: u64,
@@ -83,7 +83,7 @@ impl UsageCollector {
     /// 而本函数在响应流关闭**之前**执行——等它就会变成客户端的尾延迟（实测：DB 被独占锁
     /// 卡住 3s，客户端就要多等 3s 才拿到 body 结束）。所以这里**只做内存累加**
     /// （`/admin/usage` 读的正是这份内存计数，读一致性不受影响），落库交给后台周期任务
-    /// （`usage_flush::spawn` → `KeyStore::flush_usage_once`），并由关闭前的强制 flush 兜底。
+    /// （`usage_flush::spawn` → `Storage::flush_usage_once`），并由关闭前的强制 flush 兜底。
     ///
     /// 这里曾经是"每请求 spawn 一个阻塞任务写一次库"：那条路径让云端 515 个线程里 514 个
     /// 卡在 futex 等同一把 `db` 锁，把 2 vCPU 的吞吐摁在约 190 QPS。
@@ -146,12 +146,12 @@ impl Drop for UsageCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::KeyStore;
+    use crate::storage::Storage;
     use proto::frame::MAX_RESPONSE_CHUNK;
 
     fn collector(is_stream: bool) -> UsageCollector {
         UsageCollector::new(
-            KeyStore::new(None),
+            Storage::new(None),
             "kid".into(),
             "kname".into(),
             7,
@@ -164,7 +164,7 @@ mod tests {
     /// 不结算的代价：那次请求的用量凭空消失，而"上游确实生成过"是事实。
     #[test]
     fn dropping_a_collector_without_finish_still_settles() {
-        let store = KeyStore::new(None);
+        let store = Storage::new(None);
         let c = UsageCollector::new(store.clone(), "kid".into(), "kname".into(), 7, false);
         assert!(
             store.usage_of("kid").is_none(),
@@ -178,7 +178,7 @@ mod tests {
     /// 对照：`finish` 之后那次 Drop **不得**重复记账（`settled` 就是为这条存在的）。
     #[test]
     fn finish_then_drop_settles_exactly_once() {
-        let store = KeyStore::new(None);
+        let store = Storage::new(None);
         let c = UsageCollector::new(store.clone(), "kid".into(), "kname".into(), 7, false);
         c.finish(); // 按值消费，函数返回时 Drop 会再跑一次
         assert_eq!(

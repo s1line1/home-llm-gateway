@@ -105,7 +105,7 @@ pub(crate) fn bearer_token(headers: &HeaderMap) -> Option<&str> {
 
 async fn verify_api_key(state: &AppState, headers: &HeaderMap) -> Option<AuthenticatedKey> {
     let token = bearer_token(headers)?.to_string();
-    let store = state.key_store.clone();
+    let store = state.store.clone();
     // 明文 token 移动进校验任务（不 clone）：它是这段代码里唯一持有明文的地方，
     // 任务结束即释放。
     let record = match tokio::task::spawn_blocking(move || store.authorize_record(&token)).await {
@@ -125,7 +125,7 @@ async fn verify_api_key(state: &AppState, headers: &HeaderMap) -> Option<Authent
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{metrics::Metrics, options::Options, registry::Registry, storage::KeyStore};
+    use crate::{metrics::Metrics, options::Options, registry::Registry, storage::Storage};
 
     /// 规格（评估记录 P2-19）：限流桶必须按 **[`KeyRecord::id`]** 作键，**不能**按明文 token。
     ///
@@ -141,7 +141,7 @@ mod tests {
             rate_limit_per_min: 60,
             ..Options::default()
         };
-        let store = KeyStore::new(None);
+        let store = Storage::new(None);
         let created = store.create("p2-19".into()).expect("建 key 应当成功");
         let state = AppState::new(Registry::default(), store, Metrics::default(), &opts);
 
@@ -232,7 +232,7 @@ mod tests {
     /// 而 OpenAI 官方接口接受小写 scheme——"兼容"就该有这一条。
     #[tokio::test]
     async fn the_bearer_scheme_is_case_insensitive_and_spacing_tolerant() {
-        let store = KeyStore::new(None);
+        let store = Storage::new(None);
         let created = store.create("p3-17".into()).expect("建 key 应当成功");
         let state = AppState::new(
             Registry::default(),
@@ -268,7 +268,7 @@ mod tests {
     /// / `Basic` 更不是 Bearer；空凭据 / 缺凭据也不该走到 keystore 比较。
     #[tokio::test]
     async fn a_non_bearer_scheme_is_still_rejected() {
-        let store = KeyStore::new(None);
+        let store = Storage::new(None);
         let created = store.create("p3-17-neg".into()).expect("建 key 应当成功");
         let state = AppState::new(
             Registry::default(),

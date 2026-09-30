@@ -17,7 +17,7 @@
 
 use std::time::Duration;
 
-use crate::storage::KeyStore;
+use crate::storage::Storage;
 
 /// flush 周期。取 1s 是权衡：崩溃时最多丢 1s 的用量，而写库频率已经比"每请求一次"
 /// 低三个数量级（190 QPS 时是 190 次/秒 → 1 次/秒）。
@@ -26,7 +26,7 @@ const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 /// 启动后台 flush 任务。它只在有变化时才真正碰 SQLite（`usage_has_pending`）。
 ///
 /// 任务本身不做阻塞 IO：真正的写库丢到阻塞线程池上跑，避免占住 async worker。
-pub fn spawn(store: KeyStore) -> tokio::task::JoinHandle<()> {
+pub fn spawn(store: Storage) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(FLUSH_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);

@@ -28,8 +28,8 @@
 //! - 校验通过的判据 = 缓存版本 == 当前记录版本 且 `enabled`；删除 key 会让记录从
 //!   `runtime` 表消失 → 直接 miss → 401，与版本号无关。
 //! - 唯一的语义变化：**同一凭据在被缓存的这段时间内不再重算 argon2**。若将来新增
-//!   "改 key 但不 bump 版本"的写路径，缓存会静默失效——所以 `KeyStore` 里每次
-//!   凭据变更都必须走 [`crate::storage::KeyStore`] 的版本自增（见
+//!   "改 key 但不 bump 版本"的写路径，缓存会静默失效——所以 `Storage` 里每次
+//!   凭据变更都必须走 [`crate::storage::Storage`] 的版本自增（见
 //!   `bump_cred_generation`）。测试 `credential_version_bump_invalidates_cache`
 //!   （`storage::verified_tests`）守住这条。
 //!
@@ -65,7 +65,7 @@ type FlightSlot = Arc<Mutex<()>>;
 /// 见 `TODO.md` 的《argon2 使用方式重构》。
 ///
 /// **协议住在这里**（评估 §7 步骤 4 / C2）：快路径 → 单飞 → 双检 → 校验 → 写缓存
-/// 的五步次序只在 [`Self::verify_or_cached`] 里写了一遍；调用方（`KeyStore`）只提供
+/// 的五步次序只在 [`Self::verify_or_cached`] 里写了一遍；调用方（`Storage`）只提供
 /// "按 lookup 取记录"与"真跑一次 argon2"两个动作。容量与有效期也是本模块的状态，
 /// 不再由调用点每次传进来。
 pub(crate) struct VerifiedCache {
@@ -113,7 +113,7 @@ impl VerifiedCache {
     /// 建一个缓存：`max_entries = 0` 表示**关闭缓存**（每次请求都完整校验）。
     ///
     /// 容量与有效期由缓存自己持有（而不是每个调用点各传一次）：它们是这个模块的
-    /// **策略**，把 `usize` + `Duration` 一路传到 `get`/`put` 只是把 `KeyStore` 的字段
+    /// **策略**，把 `usize` + `Duration` 一路传到 `get`/`put` 只是把 `Storage` 的字段
     /// 借过来用，还给了"传错顺序"的机会。
     pub(crate) fn new(max_entries: usize, ttl: Duration) -> Self {
         Self {
@@ -128,7 +128,7 @@ impl VerifiedCache {
 
     /// 认证的**三段协议**（快路径 → 单飞 → 双检 → 校验 → 写缓存），全仓库只此一处。
     ///
-    /// - `load`：按 lookup 取**当前记录**（`KeyStore` 从 `runtime` 读）；`None` = 这个
+    /// - `load`：按 lookup 取**当前记录**（`Storage` 从 `runtime` 读）；`None` = 这个
     ///   lookup 根本不存在（未知 token / 已吊销）→ 直接拒绝。
     /// - `probe`：真跑一次 argon2，回答"这个 token 与这条记录的哈希匹配吗"。
     ///
