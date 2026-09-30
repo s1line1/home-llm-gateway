@@ -170,7 +170,7 @@ mod tests {
     use crate::http::app;
     use crate::http::test_util::test_state;
     use crate::metrics::{AdmissionDomain, Metrics};
-    use crate::storage::KeyStore;
+    use crate::storage::Storage;
     use axum::http::StatusCode;
     use std::time::Duration;
     use tower::ServiceExt;
@@ -445,11 +445,11 @@ mod tests {
             Arc,
         };
 
-        // 真实 KeyStore（argon2 校验真的会跑）；key 在计时任务起跑前先建好
-        let store = KeyStore::new(None);
+        // 真实 Storage（argon2 校验真的会跑）；key 在计时任务起跑前先建好
+        let store = Storage::new(None);
         let created = store.create("blocking-test".into()).unwrap();
         let mut state = test_state(None);
-        state.key_store = store;
+        state.store = store;
         let router = app(state);
 
         // 1ms 周期的计时任务：只有 runtime 让出线程时才会推进

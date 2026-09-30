@@ -699,7 +699,7 @@
       `extract_model -> Result<String, ()>` 丢掉失败原因（与上面"`extract_model` 卡住非 chat 路径"
       那条同源，一起改更省）；`HeadOutcome::Error(u16, String)` 用裸状态码。
 - [x] **死代码 / 死常量（2026-09-26 复核：已在更早的改动里清掉，本次只是对账）**：
-      `KeyStore::authorize_id`（原 `storage/mod.rs:210`）与 `Metrics::request_count`（原 `metrics.rs:98`）
+      `Storage::authorize_id`（原 `storage/mod.rs:210`）与 `Metrics::request_count`（原 `metrics.rs:98`）
       现在**全树无匹配**（`grep -rn 'authorize_id' crates/`、`grep -rn 'fn request_count' crates/` 都为空；
       `request_count` 作为**字段**仍在用，见其 23 处引用与 `identity_terms`）；`HISTORY_LEN` 现在由
       `web/src/hooks/useMetricsHistory.tsx` 正常导入使用，硬编码 `60` 只剩 `api/types.ts` 里那一处**定义**。
@@ -1197,7 +1197,7 @@
     （下一轮重试），所以调用方不会打出"已落库"的假日志。
   - **复核查出的新缺口（本次修掉）**：**启动期**失败仍是静默降级——库打不开 / 建不出表 / 迁移
     或载入失败时只 `warn!` 然后切内存模式 ⇒ "库里明明有 key，网关一个都认不出来"，每个请求 401，
-    而进程、systemd、`/healthz` 全都正常。现在 `KeyStore::persistence_state()` 给出三态
+    而进程、systemd、`/healthz` 全都正常。现在 `Storage::persistence_state()` 给出三态
     （`None` = 没配 keys_file，内存模式是合法配置；`Some(Ok)` = 就绪；`Some(Err(why))` = 降级 +
     原因），`Gateway::start` 对"配了却用不了"直接 `GatewayError::Config` fail-fast
     （在绑端口之后、起任务之前；Err 时已绑 socket 随局部变量 drop）。

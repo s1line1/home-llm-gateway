@@ -10,7 +10,7 @@ use tokio::sync::watch;
 
 use crate::{
     error::GatewayError, http, listen, metrics::Metrics, nofile, quic, registry::Registry, state,
-    storage::KeyStore, tls::TlsPem, usage_flush,
+    storage::Storage, tls::TlsPem, usage_flush,
 };
 
 /// 启动旋钮住在 [`crate::options`]；这里再导出，保住 `gateway::Options` 这个既有公开路径
@@ -51,7 +51,7 @@ pub struct Gateway {
     metrics: Metrics,
     registry: Registry,
     /// 用量落库需要在关闭前强制 flush 一次（见 [`Gateway::shutdown`]）。
-    key_store: KeyStore,
+    key_store: Storage,
     tasks: Vec<tokio::task::JoinHandle<()>>,
     /// 「启动时抬过 NOFILE 额度」的凭证，见 [`nofile::Raised`] 与 [`nofile::install`]。
     ///
@@ -139,13 +139,13 @@ impl Gateway {
         // ④ 进程内状态
         let registry = Registry::default();
         let metrics = Metrics::default();
-        let key_store = KeyStore::with_verified(
+        let key_store = Storage::with_verified(
             opts.keys_file.clone(),
             opts.verified_cache_max,
-            KeyStore::default_verified_ttl(),
+            Storage::default_verified_ttl(),
         );
         // ④.1 持久化自检（fail-fast）：配了 `keys_file` 却打不开/建不出表/迁移或载入失败时，
-        //     `KeyStore` 会降级成**内存模式**——库里明明有 key，网关却一个都认不出来，于是每个
+        //     `Storage` 会降级成**内存模式**——库里明明有 key，网关却一个都认不出来，于是每个
         //     请求 401，而进程、systemd、`/healthz` 全都正常。这与本文件开头的原则同源
         //     （"不留一个看起来启动了的空壳进程"）。位置在**绑端口之后、起任何任务之前**：
         //     返回 Err 时④之前绑好的 socket 随局部变量一起 drop（这正是"全有或全无"）。

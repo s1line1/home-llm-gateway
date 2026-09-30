@@ -252,7 +252,7 @@ pub(super) async fn forward_body<R>(
     op_timeout: Duration,
     _slot: crate::registry::SlotGuard,
     metrics: crate::metrics::Metrics,
-    key_store: crate::storage::KeyStore,
+    key_store: crate::storage::Storage,
     key_id: String,
     key_name: String,
     prompt_est: u64,

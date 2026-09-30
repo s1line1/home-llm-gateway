@@ -1,4 +1,4 @@
-//! 每 key 用量：**内存记账 + 批量落库**。与凭据存储（[`super::KeyStore`]）分开。
+//! 每 key 用量：**内存记账 + 批量落库**。与凭据存储（[`super::Storage`]）分开。
 //!
 //! ## 为什么它与凭据分开
 //!
@@ -401,7 +401,7 @@ mod tests {
     fn flush_reports_nothing_when_the_transaction_rolls_back() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("keys.db");
-        let store = crate::storage::KeyStore::new(Some(path.clone()));
+        let store = crate::storage::Storage::new(Some(path.clone()));
         let delta = UsageDelta {
             prompt_tokens: 1,
             completion_tokens: 2,
@@ -457,7 +457,7 @@ mod tests {
     /// `spawn_blocking` 往返，并把每个 key 的用量快照克隆进 batch（`O(keys)` 分配）之后原样丢掉。
     #[test]
     fn a_memory_only_store_never_reports_pending_usage() {
-        let store = crate::storage::KeyStore::new(None);
+        let store = crate::storage::Storage::new(None);
         let key = store.create("p3-13".into()).unwrap();
         store.accumulate_usage(
             &key.record.id,
@@ -497,7 +497,7 @@ mod tests {
     #[test]
     fn has_pending_never_waits_for_the_db_lock() {
         let dir = tempfile::tempdir().unwrap();
-        let store = crate::storage::KeyStore::new(Some(dir.path().join("keys.db")));
+        let store = crate::storage::Storage::new(Some(dir.path().join("keys.db")));
         let key = store.create("c2-2".into()).unwrap();
         store.accumulate_usage(
             &key.record.id,
@@ -526,7 +526,7 @@ mod tests {
     #[test]
     fn a_file_backed_store_still_reports_pending_usage() {
         let dir = tempfile::tempdir().unwrap();
-        let store = crate::storage::KeyStore::new(Some(dir.path().join("keys.db")));
+        let store = crate::storage::Storage::new(Some(dir.path().join("keys.db")));
         let key = store.create("p3-13-control".into()).unwrap();
         store.accumulate_usage(
             &key.record.id,
@@ -561,7 +561,7 @@ mod tests {
     fn a_flush_waits_for_the_previous_one_instead_of_snapshotting_early() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("keys.db");
-        let store = crate::storage::KeyStore::new(Some(path.clone()));
+        let store = crate::storage::Storage::new(Some(path.clone()));
         let key = store.create("c1".into()).unwrap();
         let id = key.record.id.clone();
 

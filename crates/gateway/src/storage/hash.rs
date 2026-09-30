@@ -1,5 +1,5 @@
 //! 密钥哈希原语：argon2 哈希/校验、sha256 lookup 索引、key 生成、常量时间比较。
-//! 与存储（KeyStore）分离，便于独立测试与复用。
+//! 与存储（Storage）分离，便于独立测试与复用。
 
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
@@ -83,7 +83,7 @@ pub fn hash_argon2(token: &str) -> String {
 /// 历史：这里曾有一个 `Argon2InFlight` 空标记，声称"标出并发校验的边界"，但它不计数、也没有
 /// 任何行为（2026-09-22 删除）。**调用次数不要再放回全局计数**：那会被同一测试进程里其他测试
 /// 的 argon2 调用污染（实测并行跑全量 lib 时，一个只应 1 次的断言被顶到 2 次）；次数由
-/// `KeyStore` 各实例自己统计（`KeyStore::argon2_runs`）。
+/// `Storage` 各实例自己统计（`Storage::argon2_runs`）。
 pub fn verify_argon2(token: &str, encoded: &str) -> bool {
     let parsed = match PasswordHash::new(encoded) {
         Ok(p) => p,

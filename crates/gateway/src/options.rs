@@ -10,7 +10,7 @@
 
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
-use crate::{storage::KeyStore, tls::TlsPem};
+use crate::{storage::Storage, tls::TlsPem};
 
 /// 启动的全部可选项，**一次 [`Default`] 收口所有旋钮**。
 ///
@@ -42,7 +42,7 @@ pub struct Options {
     ///
     /// 配了它却**用不了**（打不开 / 建不出表 / 迁移或载入失败）时 `Gateway::start` **直接失败**：
     /// 那种情况下网关会认不出任何 key（每个请求 401），却照样报健康——与其起一个空壳，不如
-    /// 启动就报错（见 `KeyStore::persistence_state`）。
+    /// 启动就报错（见 `Storage::persistence_state`）。
     pub keys_file: Option<PathBuf>,
     /// React UI 静态目录（含 index.html；None = `/` 显示构建提示页）。
     pub ui_dir: Option<PathBuf>,
@@ -366,7 +366,7 @@ impl Options {
         // 按"配了却用不了 ⇒ 启动失败"的既有口径拒掉它，并点名字段。
         //
         // **`None`（不写这一项）必须继续放行**：那表示不挂载 `/admin/*`，是合法配置（内存模式
-        // 同样的口径，见 `storage::KeyStore::persistence_state`）。
+        // 同样的口径，见 `storage::Storage::persistence_state`）。
         if self
             .admin_token
             .as_deref()
@@ -421,7 +421,7 @@ impl Default for Options {
             admin_token: None,
             keys_file: None,
             ui_dir: None,
-            verified_cache_max: KeyStore::default_verified_max(),
+            verified_cache_max: Storage::default_verified_max(),
             request_timeout: Self::DEFAULT_REQUEST_TIMEOUT,
             tunnel_op_timeout: Self::DEFAULT_TUNNEL_OP_TIMEOUT,
             head_timeout: Self::DEFAULT_HEAD_TIMEOUT,

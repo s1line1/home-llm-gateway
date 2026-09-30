@@ -5,10 +5,10 @@
 use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, Criterion};
-use gateway::storage::KeyStore;
+use gateway::storage::Storage;
 
 fn bench_keystore(c: &mut Criterion) {
-    let store = KeyStore::new(None);
+    let store = Storage::new(None);
     let created = store.create("bench".into()).unwrap();
     let plaintext = created.plaintext.clone();
     let _id = created.record.id();
@@ -16,7 +16,7 @@ fn bench_keystore(c: &mut Criterion) {
     // 创建 key（哈希 + 落内存索引）：每次新建 store 保持独立测量
     c.bench_function("keystore/create-key", |b| {
         b.iter_batched(
-            || KeyStore::new(None),
+            || Storage::new(None),
             |s| black_box(s.create("bench".into()).unwrap()),
             criterion::BatchSize::SmallInput,
         )

@@ -14,7 +14,7 @@ use axum::{
 };
 use serde_json::json;
 
-use crate::state::AppState;
+use crate::{auth, state::AppState};
 
 /// 存活探针：状态码回答**唯一一个"探针还答得上、但实例已经没用"**的问题——
 /// 隧道入口是否还在接受新 agent（`hlmg_quic_accepting`）。
@@ -65,7 +65,7 @@ pub(super) async fn healthz(State(state): State<AppState>) -> Response {
 /// （`["*"]` 全匹配的 agent 不贡献条目——它接受任意请求，但具体能跑什么
 /// 只有上游知道，列出会误导客户端）。与代理入口同级的认证 + 限流。
 pub(super) async fn models_route(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Err(rejection) = crate::auth::authenticate(&state, &headers).await {
+    if let Err(rejection) = auth::authenticate(&state, &headers).await {
         return rejection.into_response();
     }
     let data: Vec<_> = state
@@ -104,7 +104,7 @@ pub(super) async fn metrics_route(State(state): State<AppState>, headers: Header
         }
     }
     // 已验证身份缓存的命中/未命中：命中多说明 argon2 复用良好（内存/CPU 都省）
-    let (verify_hits, verify_misses) = state.key_store.verified_counters();
+    let (verify_hits, verify_misses) = state.store.verified_counters();
     // 注册条目数 与 真正可路由数必须分开暴露：前者含失联但连接未关的 agent，
     // 排查"全部请求 503"时只有后者能说明问题（见 `hlmg_agents_healthy` 的 HELP）。
     let healthy = state.registry.healthy_count(state.agent_stale_after);

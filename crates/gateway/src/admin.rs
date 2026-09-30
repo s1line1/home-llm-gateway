@@ -54,11 +54,11 @@ pub async fn admin_auth(
 /// 每项附带该 key 的用量汇总（无记录时为 0）。
 pub async fn list_keys(State(state): State<AppState>) -> Json<serde_json::Value> {
     let out: Vec<serde_json::Value> = state
-        .key_store
+        .store
         .list()
         .into_iter()
         .map(|r| {
-            let usage = state.key_store.usage_of(r.id());
+            let usage = state.store.usage_of(r.id());
             json!({
                 "id": r.id(),
                 "name": r.name(),
@@ -89,7 +89,7 @@ pub async fn list_keys(State(state): State<AppState>) -> Json<serde_json::Value>
 /// 全部 key 的用量汇总（含已吊销 key 的历史记录，可审计）。
 pub async fn usage_route(State(state): State<AppState>) -> Json<serde_json::Value> {
     let out: Vec<serde_json::Value> = state
-        .key_store
+        .store
         .usage_snapshot()
         .into_iter()
         .map(|u| {
@@ -123,7 +123,7 @@ pub async fn create_key(
         return crate::openai::error_response(StatusCode::BAD_REQUEST, "name too long");
     }
     // argon2 哈希 + SQLite 写穿较重，移到阻塞线程池，避免卡 async worker
-    let store = state.key_store.clone();
+    let store = state.store.clone();
     let created = match tokio::task::spawn_blocking(move || store.create(name)).await {
         Ok(Ok(c)) => c,
         // 落库失败：**什么都没创建**（key 也没发出去），必须让运维看到失败而不是 201。
@@ -173,7 +173,7 @@ pub async fn delete_key(
     // 桶键就是 key id（`ratelimit.rs`）：吊销成功后要把桶一并丢掉，否则一个再也不会被
     // 取用的桶要留到空闲清扫为止（P2-19）。
     let bucket_key = id.clone();
-    let store = state.key_store.clone();
+    let store = state.store.clone();
     let removed = match tokio::task::spawn_blocking(move || store.delete(&id)).await {
         Ok(Ok(r)) => r,
         // 落库失败：**吊销没有生效**，那把 key 仍然可用——文案要说清这一点，
@@ -215,7 +215,7 @@ mod tests {
     use std::time::Duration;
 
     use crate::{
-        metrics::Metrics, options::Options, registry::Registry, state::AppState, storage::KeyStore,
+        metrics::Metrics, options::Options, registry::Registry, state::AppState, storage::Storage,
     };
 
     fn test_state() -> AppState {
@@ -226,7 +226,7 @@ mod tests {
         };
         AppState::new(
             Registry::default(),
-            KeyStore::new(None),
+            Storage::new(None),
             Metrics::default(),
             &opts,
         )
@@ -243,7 +243,7 @@ mod tests {
         };
         let state = AppState::new(
             Registry::default(),
-            KeyStore::new(Some(path.clone())),
+            Storage::new(Some(path.clone())),
             Metrics::default(),
             &opts,
         );
@@ -355,7 +355,7 @@ mod tests {
         let _guard = tracing::subscriber::set_default(subscriber);
 
         let (state, _dir, path) = file_backed_state();
-        let created = state.key_store.create("p3-20".into()).unwrap();
+        let created = state.store.create("p3-20".into()).unwrap();
         let id = created.record.id().to_string();
         install_trigger(
             &path,
@@ -412,14 +412,11 @@ mod tests {
         };
         let state = AppState::new(
             Registry::default(),
-            KeyStore::new(None),
+            Storage::new(None),
             Metrics::default(),
             &opts,
         );
-        let created = state
-            .key_store
-            .create("p2-19".into())
-            .expect("建 key 应当成功");
+        let created = state.store.create("p2-19".into()).expect("建 key 应当成功");
         let id = created.record.id().to_string();
         // 克隆一份句柄：桶表在 `Arc` 里，`delete_key` 会把 `state` 整个吃掉。
         let rl = state
@@ -551,7 +548,7 @@ mod tests {
         };
         let state = AppState::new(
             Registry::default(),
-            KeyStore::new(None),
+            Storage::new(None),
             Metrics::default(),
             &opts,
         );

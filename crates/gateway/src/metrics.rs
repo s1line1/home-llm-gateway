@@ -380,7 +380,7 @@ impl Metrics {
     /// - `agent_count`：注册表条目数（含失联但连接未关的）
     /// - `agents_healthy`：其中**心跳未过期、真正可路由**的数量
     /// - `verify_hits` / `verify_misses`：已验证身份缓存的命中数与**真跑 argon2 的次数**
-    ///   （来自 `KeyStore`；`verified_cache_max: 0` 时前者恒为 0、后者等于校验次数）
+    ///   （来自 `Storage`；`verified_cache_max: 0` 时前者恒为 0、后者等于校验次数）
     pub fn render(
         &self,
         agent_count: usize,

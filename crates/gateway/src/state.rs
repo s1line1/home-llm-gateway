@@ -22,7 +22,7 @@ use crate::metrics::Metrics;
 use crate::options::Options;
 use crate::ratelimit::RateLimiter;
 use crate::registry::Registry;
-use crate::storage::KeyStore;
+use crate::storage::Storage;
 use crate::ui::{resolve_ui, IndexHtml};
 
 /// 关闭阶段。`Running` → `Draining` → `Terminating`，只向一个方向走。
@@ -44,7 +44,7 @@ pub enum ShutdownPhase {
 #[derive(Clone)]
 pub struct AppState {
     pub registry: Registry,
-    pub key_store: KeyStore,
+    pub store: Storage,
     /// Admin token（None 表示不启用 /admin/*）。
     pub admin_token: Option<String>,
     pub timeout: Duration,
@@ -132,7 +132,7 @@ impl AppState {
     ///
     /// `ui_dir` 的可用性判定（[`resolve_ui`]）也在这里：它是**非致命**的启动自检，
     /// 不通过就降级成占位页，并把原因交给页面自己显示。
-    pub fn new(registry: Registry, key_store: KeyStore, metrics: Metrics, opts: &Options) -> Self {
+    pub fn new(registry: Registry, store: Storage, metrics: Metrics, opts: &Options) -> Self {
         let (ui, ui_problem) = resolve_ui(opts.ui_dir.as_deref());
         let ui_index = ui
             .as_ref()
@@ -140,7 +140,7 @@ impl AppState {
         let (shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::Running);
         Self {
             registry,
-            key_store,
+            store,
             // `admin_token` 的**首尾空白在这里剪掉**（复扫 D2）。不剪的话它是"配了却用不了"：
             // `Options::validate` 只拒"全是空白"，而 `admin_token: " x "` 能过校验、`/admin/*`
             // 也照样挂载（下面的挂载判据与 `admin.rs` 的比较都看这个字段），但每个管理请求都是
@@ -227,7 +227,7 @@ mod tests {
     fn state() -> AppState {
         AppState::new(
             Registry::default(),
-            KeyStore::new(None),
+            Storage::new(None),
             Metrics::default(),
             &Options::default(),
         )
@@ -246,7 +246,7 @@ mod tests {
         };
         let state = AppState::new(
             Registry::default(),
-            KeyStore::new(None),
+            Storage::new(None),
             Metrics::default(),
             &opts,
         );
@@ -263,7 +263,7 @@ mod tests {
         };
         let state = AppState::new(
             Registry::default(),
-            KeyStore::new(None),
+            Storage::new(None),
             Metrics::default(),
             &opts,
         );
@@ -272,7 +272,7 @@ mod tests {
         // `None`（不启用 /admin/*）不受影响
         let state = AppState::new(
             Registry::default(),
-            KeyStore::new(None),
+            Storage::new(None),
             Metrics::default(),
             &Options::default(),
         );
