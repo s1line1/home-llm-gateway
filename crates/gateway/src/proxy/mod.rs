@@ -16,7 +16,7 @@ use proto::{io::FrameReader, Frame};
 
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crate::body::{read_body_with_stall, BodyRead, MAX_REQUEST_BODY};
 use crate::openai::error_response;
@@ -50,7 +50,7 @@ async fn request_facts_for(
     match tokio::task::spawn_blocking(move || usage_meter::request_facts(&owned)).await {
         Ok(facts) => facts.map_err(|_| FactsError::Invalid),
         Err(e) => {
-            tracing::error!("request body parsing task failed: {e}");
+            error!("request body parsing task failed: {e}");
             Err(FactsError::Internal)
         }
     }
