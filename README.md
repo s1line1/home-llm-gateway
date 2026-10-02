@@ -20,7 +20,7 @@ edge-agent（模型所在机器）    主动拨号 + 心跳 + 断线重连 → �
 本地 LLM（Ollama / vLLM / llama.cpp）
 ```
 
-**零外部依赖组件**：不依赖 frp / ngrok / nginx / caddy。隧道、认证、流式转发、TLS 全在这三个
+**不依赖外部隧道/代理服务**：无需 frp / ngrok / nginx / caddy。隧道、认证、流式转发、TLS 全在这三个
 Rust crate 里。
 
 ---
@@ -53,7 +53,7 @@ flowchart TB
 ### Gateway → Agent
 
 隧道用 **QUIC** 而不是 TCP+TLS，有三个实际理由：QUIC 的流是**独立**的（一个慢流不阻塞同连接上的其他流，
-TCP 上会队头阻塞）；**连接迁移**让客户端换网（Wi-Fi ↔ 蜂窝）不断连；建连只需 1-RTT。
+TCP 上会队头阻塞）；**连接迁移**让 edge agent 在网络地址变化时有机会免于重连（这是 QUIC 传输层的能力，本项目未单独验证）；建连只需 1-RTT。
 
 **由 agent 主动向外拨号**是这套设计的关键——本地机器不需要任何入站端口、不需要公网 IP、不需要 DDNS，
 NAT 和动态 IP 因此都不成问题。**mTLS 双向认证**：agent 持云端 CA 签发的客户端证书，未注册的连接
@@ -109,7 +109,7 @@ agent 只做一件事：把隧道里收到的请求帧，变成一次对本地 L
 **Reliability**
 - 建立阶段失败（开流 / 写请求帧）**换一个 agent 重试**：那时请求帧必然未送达，重放无副作用
 - 响应头超时（504）**刻意不重试**：请求可能已在模型侧执行，重放会重复计费/重复生成
-- 「忙」与「死」分开处置：局部过载不会被误判成连接故障而摘除（见 Design Highlights）
+- 「忙」与「死」分开处置：局部过载不会被误判成连接故障而摘除（见 Core Design）
 - 入口侧五处客户端等待全部有上限，停滞的客户端不会永久占住准入槽位
 
 **Observability**
@@ -305,7 +305,7 @@ fmt · clippy -D warnings · cargo deny · nextest · web-format · web-lint · 
 web-build · toolchain-check · check-records
 ```
 
-> **当前规模（`cargo nextest run --workspace` 实测）**：**368 tests，0 skipped**，其中
+> **当前规模（`cargo nextest run --workspace` 实测）**：**368 个被执行且通过的测试（0 skipped）**，其中
 > **69 条 e2e**（每个 e2e 在独立进程里起完整 QUIC + mTLS 栈）。这个数字随提交变化，以实跑输出为准。
 >
 > 两点与 `cargo test` 不同的行为要知道：**nextest 每条测试一个进程**，所以 `serial_test` 的
@@ -347,7 +347,7 @@ make dev && make bench-k6 KEY=<sk-...> VUS=20 DUR=30s
 要点：
 
 1. **网关放公网服务器**：安全组放行 **UDP 4433**（QUIC 隧道）与 **TCP 8443**（HTTPS API）。
-   UDP 容易漏——QUIC 走 UDP；若它被封，可降级成 TCP+TLS（帧协议不变，见 [`DESIGN.md`](DESIGN.md) §10）。
+   UDP 容易漏——QUIC 走 UDP；**当前版本只有 UDP 传输、未实现 TCP 降级**。若 UDP 被封，目前需要放行 UDP 4433；TCP+TLS 降级只是备选设计，见 [`DESIGN.md`](DESIGN.md) §10。
 2. **agent 放模型所在机器**：`cloud_addr` 填 `<公网IP>:4433`，`server_name` 填证书 SAN 中的域名。
 3. **mTLS 是关键安全线**：CA 私钥自己保管，**每个 agent 单独签发**客户端证书。
 4. 部署形态：单静态二进制（Linux musl / macOS）+ systemd 单元，或 Docker Compose

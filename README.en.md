@@ -21,7 +21,7 @@ edge-agent (model host)         dials out + heartbeat + auto-reconnect → proxi
 Local LLM (Ollama / vLLM / llama.cpp)
 ```
 
-**Zero external proxy components** — no frp, ngrok, nginx or caddy. The tunnel, authentication,
+**No external tunnel or proxy service required** — no frp, ngrok, nginx or caddy. The tunnel, authentication,
 streaming relay and TLS all live in these three Rust crates.
 
 > **Note on documentation**: this README is bilingual, but the deep-dive documents
@@ -61,7 +61,7 @@ handle it anyway).
 
 The tunnel uses **QUIC** rather than TCP+TLS for three practical reasons: QUIC streams are
 **independent** (one slow stream does not block others on the same connection, which TCP would);
-**connection migration** survives a client changing networks (Wi-Fi ↔ cellular); and the handshake is
+**connection migration** lets the edge agent potentially survive a network address change without reconnecting (a QUIC transport property, not separately validated by this project); and the handshake is
 1-RTT.
 
 **The agent dials out** — that is the key to the whole design. The local machine needs no inbound port,
@@ -127,7 +127,7 @@ the local LLM, and stream the response back. Point `upstream` at your local serv
 - Response-head timeout (504) is **deliberately not retried**: the request may already be executing on
   the model, and a replay would double-bill and double-generate
 - "Busy" and "dead" are handled separately, so a local overload is never mistaken for a broken
-  connection and evicted (see Design Highlights)
+  connection and evicted (see Core Design)
 - All five client-side waits on the entry path are bounded, so a stalled client cannot pin an admission
   slot forever
 
@@ -346,7 +346,7 @@ fmt · clippy -D warnings · cargo deny · nextest · web-format · web-lint · 
 web-build · toolchain-check · check-records
 ```
 
-> **Current scale (`cargo nextest run --workspace`, measured)**: **368 tests, 0 skipped**, of which
+> **Current scale (`cargo nextest run --workspace`, measured)**: **368 tests executed and passed (0 skipped)**, of which
 > **69 are e2e** (each spinning up a complete QUIC + mTLS stack in its own process). The number changes
 > per commit; trust the actual run output.
 >
@@ -392,8 +392,9 @@ Production deployment (certificate issuance, security groups, systemd / Docker, 
 troubleshooting) is in **[`DEPLOY.md`](DEPLOY.md)**. The essentials:
 
 1. **Gateway on a public server**: allow **UDP 4433** (QUIC tunnel) and **TCP 8443** (HTTPS API) in your
-   security group. UDP is easy to forget — QUIC runs over UDP. If it is blocked, you can fall back to
-   TCP+TLS (the frame protocol is unchanged, see [`DESIGN.md`](DESIGN.md) §10).
+   security group. UDP is easy to forget — QUIC runs over UDP. **The current version is UDP-only and
+   does not implement a TCP fallback**; if UDP is blocked, allow UDP 4433 for now. A TCP+TLS downgrade
+   is a contingency design only — see [`DESIGN.md`](DESIGN.md) §10.
 2. **Agent on the model host**: set `cloud_addr` to `<public-ip>:4433` and `server_name` to a name in the
    certificate's SAN.
 3. **mTLS is the critical security line**: keep the CA private key to yourself and issue a **separate
