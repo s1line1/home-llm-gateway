@@ -94,7 +94,7 @@ the local LLM, and stream the response back. Point `upstream` at your local serv
 
 ---
 
-## Key Features
+## Core Features
 
 **API**
 - OpenAI-compatible: `/v1/*` forwarded verbatim; `/v1/models` aggregated by the gateway across healthy edges
@@ -216,7 +216,7 @@ curl           http://127.0.0.1:8080/admin/usage     -H "Authorization: Bearer <
 
 ---
 
-## Design Highlights
+## Core Design
 
 The README states **conclusions only**; the rationale, measurements and trade-offs are in the documents
 named in each section.
@@ -230,20 +230,25 @@ The price is a custom binary protocol with 8 frame types (`Register` / `Heartbea
 `ProxyResponseHead` / `ProxyResponseBody` / `ProxyResponseEnd` / `Cancel` / `Error`).
 → `DESIGN.md` §3–§4
 
-### 2. "Busy" and "dead" must be distinguished — a judgment paid for by a real incident
+### 2. SSE streaming & cancellation propagation
 
-A timeout does not mean the connection is dead. An open-stream timeout may simply mean **in-flight
-requests have hit the capacity ceiling and are queueing for QUIC stream credit** (normal backpressure);
-a response-head timeout may simply mean **the upstream is slow to first byte** (the model is thinking).
+Responses are **forwarded chunk by chunk; the gateway never buffers the whole body**. Each upstream SSE
+chunk becomes one `ProxyResponseBody` frame and is written to the client immediately, so a long answer
+is a typewriter, not a buffer-and-flush.
 
-Treating either as "dead" **amplifies a local overload into a full outage**: evict → connection closed →
-agent reconnects (backoff up to 30s) → no routable agent in the meantime → everything 503. Measured once
-in the cloud: during a 30-second load test, `registry-empty` +6835 and 503 +6057. The current criteria
-are "**has in-flight reached the capacity ceiling**" (open stream) and "**was there a successful response
-head within the window / is the peer still talking**" (response head), with `busy`/`dead` and
-`slow`/`silent` exposed as separate classes — so "scale up" and "check the network" are distinguishable
-at a glance.
-→ `DESIGN.md` §5
+**Cancellation travels only as a `Cancel` frame**: when the client disconnects or stalls, the gateway sends
+`Cancel` explicitly, and the agent uses it to abort the in-flight upstream request — an abandoned request
+does not keep burning GPU/tokens. The response phase has three distinct timeouts (per-frame idle / client
+stall / cancel-frame write), and all three are load-bearing.
+
+**Every relay ending carries an explicit "this is incomplete" signal**: once the response body starts
+streaming, the HTTP status has already gone out (200), and everything that fails afterwards (upstream
+disconnect, idle timeout, client stall, a panicking forwarding task) is invisible in the access log. So
+every ending funnels into an explicit outcome enum (9 normal exits plus `panicked`), counted per class;
+the panic class also **aborts the response body**, so a client cannot mistake a truncated answer for a
+complete one. On shutdown, the terminating event for in-flight SSE is `event: error`, and **never
+`data: [DONE]`** — the latter is OpenAI's "finished normally" marker.
+→ `DESIGN.md` §4.3, §12
 
 ### 3. Retry only when the frame never arrived
 
@@ -259,7 +264,38 @@ dedup table on the agent) — the full design is in [`EXACTLY_ONCE.md`](EXACTLY_
 **currently a proposal, not implemented**.
 → `DESIGN.md` §5, `EXACTLY_ONCE.md`
 
-### 4. Three separate gates: rate, per-agent concurrency, global in-flight
+### 4. "Busy" and "dead" must be distinguished — a judgment paid for by a real incident
+
+A timeout does not mean the connection is dead. An open-stream timeout may simply mean **in-flight
+requests have hit the capacity ceiling and are queueing for QUIC stream credit** (normal backpressure);
+a response-head timeout may simply mean **the upstream is slow to first byte** (the model is thinking).
+
+Treating either as "dead" **amplifies a local overload into a full outage**: evict → connection closed →
+agent reconnects (backoff up to 30s) → no routable agent in the meantime → everything 503. Measured once
+in the cloud: during a 30-second load test, `registry-empty` +6835 and 503 +6057. The current criteria
+are "**has in-flight reached the capacity ceiling**" (open stream) and "**was there a successful response
+head within the window / is the peer still talking**" (response head), with `busy`/`dead` and
+`slow`/`silent` exposed as separate classes — so "scale up" and "check the network" are distinguishable
+at a glance.
+→ `DESIGN.md` §5
+
+### 5. Model-aware routing: candidate selection & load balancing
+
+The client sends a `model`; the gateway decides which edge it goes to. Four steps, each with a distinct
+failure meaning:
+
+| Step | Rule | On failure |
+|---|---|---|
+| Health | keep only edges with a fresh heartbeat | none fresh / none at all → 503 |
+| Model | keep only edges declaring this `model` (or `*`) | nobody serves it → 404 |
+| Order | an **exact declaration wins** over a `*` wildcard; least-in-flight within the group | — |
+| Admission | an atomic slot acquisition is required; full → try the next | all full → 429 |
+
+`*` is a **fallback, not a competitor** — which is why `/v1/models` does not list `*` edges (listing them
+would mislead the client: they accept any request, but only the upstream knows what they can actually run).
+→ `MODEL_ROUTING.md`, `DESIGN.md` §5
+
+### 6. Three separate gates: rate, per-agent concurrency, global in-flight
 
 They do different jobs and cannot substitute for one another; conflating them yields wrong capacity
 conclusions:
@@ -276,7 +312,7 @@ gated one — otherwise a 429 on the probe would make a load balancer evict a **
 turning "slow" into "all down".
 → `REBUILD.md` §4.1, `DESIGN.md` §5
 
-### 5. argon2 is memory-hard, so it cannot run once per request
+### 7. argon2 is memory-hard, so it cannot run once per request
 
 Each `argon2id` verification holds **19 MiB** of working memory (`m=19456 KiB`), and that adds up
 linearly with concurrency — "verify once per request" means gateway memory equals
@@ -288,26 +324,6 @@ in O(1), and a hit skips argon2 entirely (just two comparisons, `enabled` and `c
 cold starts for the same token are serialized so argon2 runs once. **Revocation is still immediate** —
 it relies on the credential version, not a TTL.
 → `DESIGN.md` §5 ("verified-identity cache"), `OPTIMIZATION.md` §8
-
-### 6. Every ending of a streaming relay needs an explicit "this is incomplete" signal
-
-Once the response body starts streaming, **the HTTP status has already gone out (200)**. Everything that
-fails after that (upstream disconnect, per-frame idle timeout, client stall, a panicking forwarding task)
-is invisible in the access log. So every relay ending funnels into an explicit outcome enum (9 normal
-exits plus `panicked`), counted per class; the panic class also **aborts the response body**, so a client
-cannot mistake a truncated answer for a complete one.
-
-When the gateway shuts down, the terminating event sent to in-flight SSE clients is `event: error`, and
-**never `data: [DONE]`** — the latter is OpenAI's "finished normally" marker, and using it would be lying
-about the model having finished.
-→ `DESIGN.md` §12
-
-### 7. Documentation organized by information hierarchy, not dumped into the README
-
-The Markdown in this repo has a clear division of labour: the README answers "what is this / how do I run
-it", and the other documents go deep. If you want the evidence behind a number while reading the README,
-it is most likely in `OPTIMIZATION.md`; if you want protocol detail, it is in `DESIGN.md`. **The README
-deliberately does not duplicate them.**
 
 ---
 
@@ -330,7 +346,10 @@ fmt · clippy -D warnings · cargo deny · nextest · web-format · web-lint · 
 web-build · toolchain-check · check-records
 ```
 
-> **The test count is not hard-coded** — it changes per commit; trust the actual run output.
+> **Current scale (`cargo nextest run --workspace`, measured)**: **368 tests, 0 skipped**, of which
+> **69 are e2e** (each spinning up a complete QUIC + mTLS stack in its own process). The number changes
+> per commit; trust the actual run output.
+>
 > Two behaviours differ from `cargo test` and are worth knowing: **nextest runs one process per test**,
 > so `serial_test`'s `#[serial]` (an in-process lock) stops working under it — e2e serialization is
 > instead guaranteed by a `test-group` in `.config/nextest.toml`; and **nextest does not run doctests**.
@@ -398,8 +417,8 @@ troubleshooting) is in **[`DEPLOY.md`](DEPLOY.md)**. The essentials:
 crates/
 ├── proto/      tunnel frame protocol + shared primitives (frame codec, mTLS material loading,
 │               hop-by-hop / credential header filtering, path guard)
-├── gateway/    cloud-gateway binary (axum + s2n-quic server + SQLite keystore)
-├── agent/      edge-agent binary (s2n-quic client + reqwest)
+├── gateway/    cloud-gateway binary (Axum + Tokio + s2n-quic server + SQLite keystore)
+├── agent/      edge-agent binary (Tokio + s2n-quic client + reqwest)
 └── mock-llm/   fake OpenAI-compatible LLM (to bring up the chain without a real model)
 web/            React + TS admin dashboard (Vite + React 19 + Tailwind; served by the gateway)
 certs/          dev certificate generation script

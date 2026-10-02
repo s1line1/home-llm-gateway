@@ -133,6 +133,18 @@
    **建立阶段失败会换 agent 重试**（`MAX_TUNNEL_ATTEMPTS = 2`）：只有"开流失败 / 写请求帧失败"
    才重试——那时请求帧必然未完整送达（`write_frame` 是一整块 `write_all`，超时即帧不完整；
    agent 侧 `FrameReader` 先读满整帧再动上游），重放不会产生重复副作用。
+
+   这两条"必然未送达"的判据各自有实测支撑，不是推断：
+
+   - `write_frame` 是**一次 `write_all`**，只有**全部字节被接受**才返回；超时 ⇒ 帧不完整 ⇒ agent
+     读不到完整帧（`FrameReader` 先读满长度前缀+载荷）⇒ 它不会调用上游。2026-09-22 用
+     "读到一半就停"的 peer 实测确认（`tests/e2e/write_backpressure.rs`）：对端只拿到真帧的
+     **严格前缀**，随后收到网关 `SendStream` Drop 时的 `finish()`（= FIN）⇒ `FrameReader` 报
+     `early eof`，那条流上的请求**永远不会被执行**，也不会挂在连接上。
+   - 另一半同样成立：`tokio::time::timeout` **先轮询内层 future**，所以"整帧已送达但超时先到"
+     这种情况根本不会被判成失败（`tokio::time::timeout` 的 `Timeout::poll` 第一句就是
+     `me.value.poll(cx)`）——超时分支只在"内层先返回 Pending"之后才可能触发。
+
    **响应头超时（504）刻意不重试**：请求可能已在模型侧执行，重试会重复计费/重复生成；
    要安全地扩展到那一步需要协议级去重，见 [`EXACTLY_ONCE.md`](EXACTLY_ONCE.md)。
    重试排除刚失败的连接（`try_acquire_excluding`），无候选时返回真正的隧道错误而不是 503。
