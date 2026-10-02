@@ -107,7 +107,7 @@
   （网关 `max_open_tunnel_streams`，默认 1024；agent 侧 `with_max_open_remote_bidirectional_streams(1000)`），
   且 `流额度 ≥ agent 声明的并发上限`。否则第 `额度+1` 条请求就在排队，上游一慢便排过
   `tunnel_op_secs`，被误判成"隧道已死"→ 摘除健康 agent → 重连期间注册表为空 → 全量 503
-  （实测一次 30s 压测 `registry-empty` +6835；见 README《失败处理：重试、摘除与延迟关闭》）。
+  （实测一次 30s 压测 `registry-empty` +6835；见本文档 §5）。
 - 同一原因还决定了**摘除判据**：开流超时只有在"在途未达承载上限"时才说明连接坏了；
   已达上限时的排队超时是背压，绝不能摘除（`registry::Entry::open_timeout_is_fatal`）。
 
@@ -140,7 +140,47 @@
    **客户端侧同样要有上限**（`client_stall_secs`，默认 60s）：准入票据的释放依赖相关任务能
    结束，而读请求体、写响应体通道、hyper 往 socket 写这三处以前都没有超时——任一停滞的客户端
    都能让在途请求**永久**占住槽位（实测沉淀 8 个，只能重启）。判定用"停滞"（该方向有字节就
-   续期）而不是"总时长"，避免误杀慢客户端。详见 README《失败处理》里那张三行表。
+   续期）而不是"总时长"，避免误杀慢客户端。
+
+   **入口侧有五处客户端等待，每一处都必须有上限**（任一处都能让连接/任务永久占住资源）：
+
+| 位置 | 谁能触发 | 修法 |
+|---|---|---|
+| 读请求体（曾是 `Bytes` 提取器） | 只发 headers、声明大 `Content-Length` 却不发 body 的客户端 | 改为逐块读 + **停滞**超时（有字节就续期）→ `408` |
+| 写响应体通道（`tx.send().await`） | 读完响应头就不再读 socket 的客户端 | 通道满且 `stall` 内无人取 → 记指标 + 取消上游（`Cancel`，别白烧 token）+ 结束响应体 |
+| hyper 往 socket 写响应 | 同上（这一半**应用层修不到**：数据已在 hyper/socket 缓冲里） | IO 层包 `io_stall::WriteStall`：连续 `stall` 写不进一个字节 → 断开连接，body 随连接任务 drop，票据归还 |
+| TLS 握手（`acceptor.accept`） | 连上却**一个字节都不发**的客户端（半开连接） | `tokio::time::timeout(client_stall, ..)` → 记 WARN 并断开 |
+| 读请求头（hyper） | 发了**半个请求头**就不再发的客户端 | `http1::Builder::header_read_timeout(client_stall)` **+ `.timer(TokioTimer::new())`**：不 set timer 时 hyper 只是"记下配置"，超时值不生效——它默认的 30s 就是这样一直没生效的 |
+
+后两处（2026-09-21 补，评估 H8 / `PROJECT_SCAN` P1-1）与前三处有一个关键区别：前三处是
+**准入之后**占住槽位，这两处**连闸门都没进**（闸门在"解析出请求"之后才生效），所以它们吃的是
+**fd 与连接任务**，此前只受 NOFILE 约束。与之配套的是并发连接数上限
+`max_entry_connections`（默认 1024，0 = 不限）：满额时**暂停 accept**，新连接留在内核 backlog
+里排队——不是拒绝，所以突发流量只会变慢、不会变成 5xx，fd 也不会被吃光。
+
+实测（2026-09-18 云端）：这类泄漏沉淀过 **8 个永不复位的槽位**——`hlmg_active_requests` 恒定 8，
+而 `hlmg_request_count − Σ状态码 = 8` 精确对上（= "被准入但永不结束"）。它只增不减：
+当前 `max_concurrent_requests: 5000` 时无害，但按本文件的内存口径生产该是 ~32 量级，
+8 个就是 25%，且**只能重启恢复**。
+
+> ⚠️ 判据要**减掉中断**：`僵尸槽位 = hlmg_request_count − Σ状态码 − hlmg_requests_aborted_total`。
+> 客户端中途断开时 hyper 会 drop 掉 handler 的 future——准入数已经 +1 而状态码永远写不出来，
+> 不减这一项的话每中断一次差值就漂移 +1，真泄漏会被淹没（2026-09-22 修：中断单独计数，
+> 由 `metrics_middleware` 的 RAII 守卫补记）。上面那次历史事故里没有中断参与，所以当时直接对得上。
+
+判定的是**停滞**而不是**总时长**：该方向只要还有字节在动就持续续期，所以慢而持续的大 body
+上传、弱网下逐块到达的 SSE 都不会被误杀。五个方向共用同一个 `client_stall_secs`。
+
+   **每连接流额度必须显式设置**（`max_open_tunnel_streams`，默认 1024）——
+s2n-quic 的 `initial_max_streams_bidi` 默认只有 **100**（`InitialMaxStreamsBidi::RECOMMENDED`），
+实际可用额度取 `min(本地额度, 对端额度)`。agent 侧已经给了 1000（`agent::connect_once`），
+**但网关自己的本地额度以前从没设过 = 100**：一条 agent 连接最多只能有 100 条在途请求，
+第 101 条起就在排队等额度回收，上游一慢（首字节超过 `tunnel_op_secs`）就排队超时。
+取值必须 **≥ 每个 agent 声明的 `max_concurrency`**，声明超过本值时网关注册时会打 WARN
+（这类配置不一致表现为"隧道随机超时"，比容量不足难查得多）。
+回归测试：`e2e_more_concurrent_tunnels_than_the_default_quic_stream_ceiling`
+（120 条并发慢流；把额度改回 100 时正好 20/120 失败，且失败的是 503——正是上面那条放大链）。
+
 
    **摘除连接时延迟关闭**：达到"连续 3 次隧道操作超时"后先移出路由，再决定何时关连接——
    若还有别的在途请求（它们已送达 agent、模型正在生成，不属于可重试范围），
@@ -174,6 +214,24 @@
 
    代价：缓存存活期内不再重新校验哈希——安全性由 `cred_version` 核对兜底，而不是靠定期重算。生产实测（单 key、21 516 个 200）命中 22 426 / miss 3，内存峰值 7.5MB；`hlmg_key_verify_hits_total` / `_misses_total` 暴露这两个计数（miss 增量即风险信号）。
 7. **可观测性**：`tracing` 结构化日志 + `metrics`（请求数、延迟、token 量、在线 agent 数）。
+
+**启动期持久化自检（`keys_file`）—— 配了却用不了就拒绝启动，不是降级**：打不开 / 建不出表 /
+迁移或载入失败时 `KeyStore` 会退化成**内存模式**，于是库里明明有 key、网关却一个都认不出来：
+每个请求 401，而进程、systemd、`/healthz` 全都正常。这与本文件开头"不留一个看起来启动了的空壳进程"
+同源，所以宁可在**绑端口之后、起任何任务之前**返回 `Config` 错误。`keys_file: None`（开发/测试）
+不受影响；持久化文件权限由网关打开时收紧为 `0600`。
+
+**隧道坏掉时的典型症状**（2026-10 从 README 迁出，都是踩过的）：
+
+`/healthz` 正常但**所有 API 请求挂住不返回**、日志停在最后一行的 `agent registered`、内存只涨不落
+—— 因为请求卡在"等响应头"上，占着连接、并发槽位与缓冲区，客户端早已断开也发现不了。监控可关注：
+
+- 日志出现 `upstream head timeout; evicting agent` / `tunnel write timed out; evicting agent`；
+- 日志出现 `tunnel open timed out while agent is at capacity; not evicting` = 容量不足（该扩容或调 `max_concurrency`），不是故障；
+- `hlmg_agents` 掉到 0，但 agent 侧日志显示"已连接"（说明两侧对连接死活的判断不一致）。
+
+排查顺序：① 看 agent 侧日志（有没有 `agent error` / 重连退避）；② 看网关 `edge connected` /
+`agent removed` 时间点；③ 连接数对不上时按本节上面的超时表把超时调小以更快失败，而不是靠重启网关。
 
 ## 6. 边缘端（edge-agent）设计
 
@@ -306,6 +364,143 @@
 - ✅ Cancel/超时传播语义
 - ✅ agent 侧转发逻辑——瓶颈在网关状态管理，不在 agent
 - ⚠️ 大规模下瓶颈会转移到**上游 LLM 集群**（每实例并发有限）→ 届时需要模型池、排队调度、容量管理，而非网关自身
+
+---
+
+## 12. 可观测性规格（指标参考）
+
+> 2026-10 从 README 迁出。这是**运维判读手册**：每个指标回答什么问题、什么方向才是信号。
+> 判读顺序与常见误读都在这里，改动指标时同步改本节。
+
+- **`GET /metrics`**：Prometheus 文本格式指标（按状态码计数、在途请求、在线 agent 数、转发字节、累计耗时），可直接被 Prometheus/Grafana 抓取
+  - 浏览器直接访问（`Accept: text/html`）时返回 Dashboard 页面而非文本，便于点进指标页；Prometheus 抓取（`Accept: */*`）不受影响
+  - `hlmg_quic_accepting`：隧道入口是否仍在接受新 agent（1/0）。UDP 驱动失效时入口会停止接受新连接，而进程与 HTTP 入口照常运行——**建议对该指标为 0 告警**（这是唯一能发现该故障的信号）
+  - `hlmg_http_accept_errors_total`：公网入口 `accept()` 失败的累计次数（`EMFILE`/`ECONNABORTED` 一类**暂时性**错误）。入口现在**退避重试、不会退出**（退避 50ms 起翻倍、封顶 1s），所以这个数**持续增长**才是信号：说明 fd 长期不够用（先看下面《文件描述符上限》一节），而不是"入口挂了"。⚠️ 修复之前，**一次**这样的错误就会让入口永久停摆（进程、systemd、`/healthz` 全都正常，端口却不再接受连接）
+  - **`hlmg_agents` 与 `hlmg_agents_healthy`**：前者是**注册条目数**（含心跳已过期、连接还没关的），
+    后者是**心跳未过期、真正可路由**的数量。排查"所有请求 503"时只有后者能说明问题——
+    `hlmg_agents=2` 而 `hlmg_agents_healthy=0` 意味着"有人注册，但全部不健康"，与"没人注册"完全不同
+  - `hlmg_agent_rejections_total{reason=...}`：因挑不出可路由 agent 而拒绝的请求数，按原因分：
+    `registry-empty`（没人注册）/ `all-candidates-stale`（有人但心跳全过期）/
+    `no-agent-serves-model` / `all-candidates-at-capacity`。**503 的成因看这个，不要靠状态码猜**
+  - `hlmg_tunnel_retries_total{outcome=...}`：**隧道建立失败后换 agent** 的次数，按结果分——
+    `ok`（重试成功的**自愈**次数）/ `failed`（换了仍失败）/ `no-alternative`（**没有别的 agent
+    可换**，所以它**不是一次重试**）。这一族**求和没有意义**（既不等于重试次数、也不等于失败
+    次数），看单项
+  - `hlmg_client_stalls_total{phase="request-body"|"response-body"}`：因客户端**停滞**而主动放弃的
+    请求数（读不动请求体 / 不消费响应体）。**它是准入槽位泄漏的直接告警**：修好之前这类停滞
+    不留任何痕迹，只表现为 `hlmg_active_requests` 只增不减
+  - `hlmg_upstream_head_timeouts_total{class="slow"|"silent"}`：响应头超过 `head_timeout_secs` 的次数，
+    `slow` = 窗口内有过成功响应头（被堵住的慢，**回 504 但不摘除**）、`silent` = 窗口内一次都没回来
+    （计入连续超时，够 3 次就摘除）。**它回答的是"该扩容还是该查网络"**：`slow` 陡增通常是链路/上游慢
+  - `hlmg_tunnel_open_timeouts_total{class=...}`：开流超过 `tunnel_op_secs` 的次数，按判定分——
+    `busy`（在途已顶到承载上限，**背压**，不摘除，改换 agent 或 429）/ `dead`（没到上限却开不出流，
+    坏连接，摘除）。**`busy` 陡增 = 该扩容或调 agent 的 `max_concurrency`；`dead` 陡增才是隧道/网络故障**
+  - `hlmg_forward_ends_total{kind=...}`：**响应转发的退出原因**（`upstream_end` / `upstream_error` /
+    `upstream_closed` / `tunnel_error` / `idle_timeout` / `client_gone` / `client_stalled` /
+    `gateway_shutdown` / `protocol_violation` / `panicked`）。**这类失败大多发生在状态码 200 已经
+    发给客户端之后**（响应体半截、上游断流、逐帧空闲超时），访问日志只记状态码 ⇒ 不看这个指标，
+    "客户端拿到半截回答"在生产上完全不可观测。判据：`upstream_end` 之外任何 kind 的**增量**都值得
+    看一眼；`idle_timeout`/`tunnel_error` 陡增 = 隧道或上游出了问题，`client_*` 陡增 = 客户端侧在
+    放弃，`panicked` = 转发任务 panic（这一档会把响应**掐断**，客户端不会把半截体当完整结果）
+  - `hlmg_key_verify_hits_total` / `hlmg_key_verify_misses_total`：key 校验命中已验证缓存 / **真正跑了 argon2**的次数。misses 的**增量**就是内存与 CPU 的风险信号（一次 miss 峰值 +19MiB，见《并发上限与内存》），稳态下应接近 0；突然上涨说明凭据被吊销/新增，或缓存容量 `verified_cache_max` 不够。⚠️ **`verified_cache_max: 0` 时这两个计数器恒为 0**（走的是不走缓存的旧路径，两个数都不加）——看到 0 要先确认缓存是否被关掉，别当成"没有校验"
+- **结构化日志**：`tracing`，每个请求带 `request_id` / 状态码 / 耗时（`tower-http` TraceLayer）
+- **`/healthz`**：存活探针。**200 ⇔ 隧道入口仍在接受新 agent**（`hlmg_quic_accepting`），否则 `503` + `status: "degraded"` + `detail`（处置方式：重启网关）。body 是 JSON，同时报出诊断信息：
+  ```json
+  {"status":"ok","tunnel_entry":"accepting",
+   "agents":{"registered":2,"healthy":2,"oldest_last_seen_secs_ago":3}}
+  ```
+  - **为什么只有"隧道入口"进状态码**：它是唯一一个「探针还答得上、但实例已经没用」的故障——QUIC 端点停摆后进程、systemd、HTTP 入口、`/metrics` 全都正常，而此后每个 `/v1` 都会 503（没有 agent 能接入）。HTTP 入口自己不查：它一停，探针本身就不可达，探针失败即是信号。
+  - **agent 数只在 body 里**（`registered` = 注册条目数、`healthy` = 心跳未过期即可路由数、`oldest_last_seen_secs_ago` = 最久没心跳的条目，`null` = 注册表为空）：没有 agent ≠ 进程不健康。把 `healthy == 0` 变成 503 会让"刚启动、agent 还没注册"触发 LB 摘除 / 容器重启循环，而重启并不能让 agent 出现；要按 readiness 摘流的部署请自己读 body。
+  - **落库可写性不在探针里**：唯一可靠的判据是"真写一次"，而 SQLite 目前没有 `busy_timeout`（`TODO.md` P2-7），探针写入可能撞 `SQLITE_BUSY` 把健康实例判死。
+  - 探针**豁免并发闸门**（闸门打满时也是 200/503 而不是 429，否则 LB 摘除会把"慢"放大成"全挂"，见 `REBUILD.md` §5.3）。⚠️ body 在 2026-09-22 从纯文本 `ok` 改成 JSON：只按状态码判的脚本、`curl -sf`、Docker `HEALTHCHECK` 都不受影响。
+
+> 注意：`/metrics` 未加认证，公网部署建议在安全组中仅对监控网段放行。
+
+## 13. 用量落库（每请求写库 → 按周期批量写）
+
+> 2026-10 从 README 迁出。
+
+用量（token / 请求数）落库在改造前是**每请求一次** `INSERT ... ON CONFLICT`，也就是上面那条把吞吐摁住的路径。现在改成：
+
+- **热路径只做内存累加**（`UsageCollector::finish` → `Storage::accumulate_usage`），纳秒级、无 IO；
+- **后台任务按周期（1s）批量落库**（`usage_flush::spawn` → `Storage::flush_usage_once`），一个事务里把有变化的 key 各写一行；
+- **写的是绝对累计值而不是增量**：库里始终收敛到内存的真相，天然幂等、重启不会重复累加，也不存在"增量被取走但落库失败 ⇒ 永久少一段"的窗口；
+- **关闭前强制落库**：`main` 收到 SIGTERM/SIGINT 后调用 `Gateway::shutdown()`——它先停 accept 并把在途请求排空（`shutdown_grace_secs`，默认 15s），**最后**把用量强制落库一次（有界阻塞写）再 abort 所有任务；日志会打 `usage flushed before shutdown keys=N`；
+- 顺带开启 `journal_mode=WAL` + `synchronous=NORMAL`。
+
+**触发条件是"时间"，不是"攒够多少条"**（`usage_flush.rs`）：
+
+```rust
+const FLUSH_INTERVAL: Duration = Duration::from_secs(1);   // 每 1 秒 tick 一次
+if !store.usage_has_pending() { continue; }                // 无变化 → 整轮跳过，连库锁都不拿
+// 只写有变化的 key：
+.filter(|(_, r)| force || !r.ever_flushed || r.current != r.flushed)
+```
+
+所以**不存在"流量太小、一直攒着不写"的状态**——阈值只决定"一轮写几个 key"，不决定"多久开始写"。三种边界：
+
+| 情形 | 行为 |
+|---|---|
+| 零星流量 | 最迟 1 秒内落库 |
+| 完全无流量 | `usage_has_pending()` 为 false，整轮跳过，**静默期零 IO** |
+| 落库失败（磁盘满 / 锁冲突） | 事务未提交 ⇒ **不更新 `flushed` 标记** ⇒ 下一轮自动重试，不会丢 |
+
+**内存语义**（两点要分清）：
+
+- **不会积压增量**：内存里存的是"绝对累计值 + 已落库镜像"，不是待写队列。flush 之后 `current` 仍在（`/admin/usage` 直接读它，响应返回即一致），但库里已经是同一个值。
+- **map 只增不减**：每个**用过的 key** 一个条目（约 150 字节），不做淘汰。线上 17 个 key ≈ 3KB，可忽略；但若频繁轮换 key（例如每请求一把新 key），它会随**累计用过的 key 数**线性增长（1 万 key ≈ 2MB）。这是有界但单调的增长，尚未做淘汰。
+
+**崩溃窗口**（代价说清楚）：
+
+| 事件 | 会丢多少用量 |
+|---|---|
+| 正常关闭（SIGTERM/SIGINT、systemd stop、Ctrl+C） | **已结算的用量 0 丢失**：先停 accept 并把在途排空（默认 15s 宽限），**最后**才强制 flush 再 abort；仍可能丢的只有"强制 flush 之后、进程退出之前"那一瞬 |
+| `kill -9`（SIGKILL） | 最多 **1 秒** |
+| 断电 / 宿主机崩溃 | 最多 1 秒，**且**可能丢最后一次提交（`synchronous=NORMAL` 抗进程崩溃、不抗断电） |
+
+要"断电也不丢"就得改回 `synchronous=FULL`（每次提交 fsync 主库，云端实测 ≈3.5ms/次）。批量之后提交只有约 1 次/秒，这个代价不大——**需要更硬的持久性就把它调回去**。
+
+`/admin/usage` 读的仍是内存计数，响应返回时立即一致，不受 flush 周期影响。
+
+## 14. 文件描述符上限（为什么网关自己抬 NOFILE）
+
+> 2026-10 从 README 迁出。设计决策（抬到 16384 而非 hard）+ 与 `deploy/*.service` 的分工。
+
+**现象**：并发一高，客户端开始零星 `connection reset by peer`，而网关 `/healthz` 正常、
+CPU/内存都不高；网关日志里是 `accept error: Too many open files (os error 24)`。
+实测（2026-09-17，云端 2 vCPU）日志里这种错误有 296 次，全部落在压测窗口内。
+
+> 注：那 296 次错误发生在**明文入口还在用 `axum::serve`** 的时期——它记一行日志后继续接受连接，
+> 所以网关没有真的停摆。2026-09-18 `55c56f1`（为写超时把明文入口也换成自研循环）之后那点容错丢了，
+> HTTPS 入口则从最初就是 `listener.accept().await?`：**一次** `EMFILE` 就会结束整个 accept 循环
+> （进程活着、systemd active、日志一行 warn，端口再不通）。现在两条入口合并成同一个循环并带退避重试，
+> 见 `hlmg_http_accept_errors_total` 与 `crates/gateway/src/http/entry.rs`。
+
+**成因**：进程的 `RLIMIT_NOFILE` 有 soft（运行时实际强制执行，用满即 `EMFILE`）与 hard
+（soft 允许抬到的天花板）两个值。`gateway.service` 没设 `LimitNOFILE`，于是吃 systemd 的
+全局默认 —— `/proc/<pid>/limits` 显示 `Max open files 1024 524288`。1024 不是内核限制
+（`fs.nr_open` 是 1048576，同机 `cron` 也是 1024，`sshd` 则自己抬到了 1048576），
+而实测 768 个并发客户端连接时网关 fd 峰值就有 **785**，默认值在生产水位上是贴脸的。
+
+**处理**：网关启动时（绑任何 socket 之前）自己把 soft 抬到 `min(hard, 16384)`
+（`gateway/src/nofile.rs`）。任何进程都能在 hard 以内抬自己的 soft，不需要特权；
+失败只记 WARN 不阻止启动。另有一道**业务级**的水位：公网入口的并发连接数上限
+`max_entry_connections`（默认 1024，0 = 不限）——它把"半开连接能吃多少 fd"从一个进程级天花板
+收成一个明确的数字，满额时暂停 accept、新连接在内核 backlog 排队（见《客户端停滞》）。
+启动日志会留一行，便于事后核对：
+
+```
+INFO gateway::nofile: raised NOFILE soft limit from=1024 to=16384 hard=524288 target=16384 limited_by_hard=false
+```
+
+**为什么不抬到 hard（云端是 524288）**：上限给到几十万，等于把"fd 泄漏"的引爆点从**本进程的
+`EMFILE`**（止损范围一个进程、日志直接可见）推到**整机的 `fs.file-max`/内存**（拖垮同机其他
+服务、现场更难还原）。16384 已是实测水位的约 20 倍，够用且代价不外溢。
+
+**unit 里还要不要写 `LimitNOFILE`**：可选。两者分工是"unit 定 hard（真正天花板），代码抬 soft"。
+如果想让天花板更高（例如要跑 2000+ 并发连接），在 unit 里加 `LimitNOFILE=65536` 即可——
+**不写也不会再撞那个 1024**。反过来若 unit 把 hard 压到 1024 以下，代码也只能抬到 hard，
+日志里 `limited_by_hard=true` 就是在提示这件事。
 
 ---
 

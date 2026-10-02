@@ -2,284 +2,448 @@
 
 # home-llm-gateway
 
-**Edge LLM gateway: run local LLMs at home / branch / edge nodes, use a cloud server as the public relay, and access your edge model services from anywhere via an OpenAI-compatible API, routed by model.** (Home deployment is the first instance.)
+**An edge LLM gateway in Rust: it exposes local models running behind NAT on your home or office network as an OpenAI-compatible API on the public Internet.**
 
-Implemented in Rust with zero external proxy components (no frp / ngrok / nginx). Tunnel protocol: **QUIC** with **mutual TLS**. SSE streaming passthrough, model-aware multi-edge routing with load balancing.
+It solves one specific networking problem: the model runs on a machine behind NAT (dynamic IP, no inbound
+port), and you want to call it from anywhere with a standard OpenAI SDK — **without ever exposing the
+local inference endpoint to the public Internet.**
 
 ```
 Client (anywhere)
-   │  HTTPS + OpenAI-compatible API (incl. SSE streaming)
+   │  HTTPS · OpenAI-compatible API (incl. SSE streaming)
    ▼
-cloud-gateway (public)     axum entry: API-key auth → rate limit → routing → tunnel frames
-   │  QUIC (UDP, mTLS, multiplexed single connection, no head-of-line blocking)
+cloud-gateway (public server)   API-key auth → rate limit → admission → route by model → tunnel frames
+   │  QUIC (UDP, mutual TLS, one connection multiplexed, no head-of-line blocking)
    ▼
-edge-agent (LLM host)      dials out + heartbeat + auto-reconnect, proxies to local LLM
+edge-agent (model host)         dials out + heartbeat + auto-reconnect → proxies to the local LLM
    │  HTTP
    ▼
-Local LLM (Ollama / vLLM / llama.cpp / mock-llm)
+Local LLM (Ollama / vLLM / llama.cpp)
 ```
 
-## Features
+**Zero external proxy components** — no frp, ngrok, nginx or caddy. The tunnel, authentication,
+streaming relay and TLS all live in these three Rust crates.
 
-- **QUIC tunnel + mTLS**: the agent dials an outbound long-lived connection, naturally punching through NAT / dynamic IPs; two-way certificate authentication keeps unregistered agents out
-- **Streaming-first**: SSE chunks are forwarded as they arrive (typewriter effect); client disconnect / timeout sends `Cancel` upstream so you never pay for abandoned tokens; per-frame idle timeout never kills long streams
-- **Native public HTTPS**: rustls listens on the HTTPS port itself (the example config uses **8443**; the QUIC tunnel takes UDP **4433**) — no nginx/caddy needed
-- **Security & governance**: API-key auth (`sha256(token)` index lookup + argon2 verify, plaintext never stored), per-key token-bucket rate limiting, per-agent concurrency admission control (429 when full)
-- **Model-aware multi-edge routing**: routes each request by its `model` to an edge that can serve it (exact match first, `*` wildcard as fallback), least-loaded within the same model group; stale agents stop being routing candidates; `/v1/models` is aggregated by the gateway
-- **Observability**: `/metrics` in Prometheus text format, structured request logs (`request_id` / status / latency), `/healthz` probe
-- **Multi-platform deployment**: single static binary (Linux / macOS), cross-compile script + systemd units
+> **Note on documentation**: this README is bilingual, but the deep-dive documents
+> (`DESIGN.md`, `OPTIMIZATION.md`, `DEPLOY.md`, …) are written in Chinese. This file covers the same
+> ground as the [Chinese README](README.md) and points at the same documents.
 
-## Layout
+---
 
-```
-crates/
-├── proto/      tunnel frame protocol (Register/Heartbeat/ProxyRequest/Response*/Cancel/Error)
-├── gateway/    cloud-gateway binary (axum + s2n-quic server)
-├── agent/      edge-agent binary (s2n-quic client + reqwest)
-└── mock-llm/   fake OpenAI-compatible LLM (to bring up the full chain without a real model)
-web/            React + TS admin Dashboard (served by the gateway itself; see below)
-certs/          dev certificate script
-gateway_config.example.yml  gateway config template (every parameter, YAML)
-agent_config.example.yml    edge-agent config template (every parameter, YAML)
-deploy/         systemd units (gateway.service / agent.service)
-scripts/        multi-platform release packaging script + git pre-commit hook (cargo deny + fmt)
-crates/gateway/Dockerfile  **gateway deployment image** (gateway + Dashboard only; the build context must be the repository root — see the header comment)
-crates/gateway/docker-compose.yml  container deployment entry point (gateway; builds via the Dockerfile above, see DEPLOY.md §11)
-deny.toml       cargo-deny policy (dependency licenses / advisories; run by CI and the pre-commit hook)
+## Architecture
+
+```mermaid
+flowchart TB
+    C["LLM client<br/>OpenAI SDK / curl"]
+    G["<b>cloud-gateway</b> (public)<br/>auth · rate limit · admission<br/>model-aware routing · SSE relay"]
+    A1["<b>edge-agent</b> #1<br/>home GPU"]
+    A2["<b>edge-agent</b> #2<br/>cloud GPU"]
+    L1["Local LLM<br/>Ollama / vLLM / llama.cpp"]
+    L2["Local LLM"]
+
+    C -->|"HTTPS · OpenAI-compatible API (incl. SSE)"| G
+    G <-->|"QUIC + mTLS · one long-lived multiplexed connection"| A1
+    G <-->|"QUIC + mTLS"| A2
+    A1 -->|HTTP| L1
+    A2 -->|HTTP| L2
 ```
 
-## Quick Start (fully local, no real LLM required)
+### Client → Gateway
 
-> `cargo run` below is only for local development convenience (debug builds). **For production, run the compiled release binaries directly** — no Rust toolchain needed on the server, see [`DEPLOY.md`](DEPLOY.md).
+The single public entry point is `cloud-gateway`. It exposes **OpenAI-compatible** `/v1/*` paths
+(`/v1/chat/completions`, `/v1/embeddings`, … are forwarded verbatim to an edge; `/v1/models` is answered
+by the gateway itself, aggregated across edges), supports **SSE streaming**, and performs API-key
+authentication and rate limiting before forwarding. HTTPS is served directly with `rustls` —
+**no reverse proxy required** (the tunnel speaks a private frame protocol, so a reverse proxy could not
+handle it anyway).
 
-### Prerequisites
+### Gateway → Agent
 
-- Rust 1.97+ (toolchain version in `rust-toolchain.toml`, MSRV in `Cargo.toml`)
-- `openssl` CLI (only needed by the certificate script)
+The tunnel uses **QUIC** rather than TCP+TLS for three practical reasons: QUIC streams are
+**independent** (one slow stream does not block others on the same connection, which TCP would);
+**connection migration** survives a client changing networks (Wi-Fi ↔ cellular); and the handshake is
+1-RTT.
 
-### 1. Generate certificates
+**The agent dials out** — that is the key to the whole design. The local machine needs no inbound port,
+no public IP and no DDNS, so NAT and dynamic IPs stop being a problem. **mTLS** authenticates both
+directions: the agent presents a client certificate signed by your own CA, and unregistered peers are
+rejected during the handshake.
+
+### Agent → LLM
+
+The agent does exactly one thing: turn a request frame arriving on the tunnel into an HTTP request to
+the local LLM, and stream the response back. Point `upstream` at your local service
+(Ollama on `:11434`, vLLM / llama.cpp on `:8000`) — nothing on the upstream side needs changing.
+
+> Protocol details (frame format, state machine, cancellation semantics) are in [`DESIGN.md`](DESIGN.md).
+
+---
+
+## Why
+
+- **A local inference endpoint should not be exposed to the public Internet.** All three local servers
+  (Ollama / vLLM / llama.cpp) are **unauthenticated** by default. Publish the port and you hand over the
+  GPU and the prompts together.
+- **Home and office networks have no stable inbound entry.** Dynamic IPs, CGNAT, ISPs blocking inbound
+  ports — port forwarding simply is not available in most home-broadband setups. An outbound reverse
+  connection sidesteps that entire class of problems.
+- **Clients want the OpenAI API, not a bespoke protocol.** Standard SDKs, standard paths, standard SSE:
+  integration cost is "change one `base_url`".
+- **One machine is not enough, and the models differ.** One box at home serves `qwen2.5`, one cloud GPU
+  serves `llama3`; the client sends a `model` and the gateway decides where it goes.
+
+---
+
+## Key Features
+
+**API**
+- OpenAI-compatible: `/v1/*` forwarded verbatim; `/v1/models` aggregated by the gateway across healthy edges
+- SSE streamed chunk by chunk (typewriter effect); the whole response is never buffered in the gateway
+- Client disconnect / stall → `Cancel` is sent upstream so the edge stops burning tokens
+- 16 MiB request-body limit; request-path guard (rejects dot segments and `%2e`·`%2f`-style encoded separators)
+
+**Edge Connectivity**
+- QUIC tunnel + mTLS, agent dials out, NAT traversal for free
+- Heartbeat with staleness detection; exponential backoff reconnect (jittered)
+- Configurable per-connection stream ceiling, so "queueing" is not misread as "broken tunnel"
+
+**Routing**
+- Candidates filtered by the request's `model`: an exact declaration wins over a `models: ["*"]` wildcard
+- Least-in-flight within the group; agents with stale heartbeats stop being candidates
+- No agent available → 503; nobody serves that model → 404; capacity full → 429 (the three causes are
+  counted separately in metrics)
+
+**Security**
+- API keys: `sha256(token)` fast index lookup + **argon2id** verification, **plaintext never stored**
+- Verified-identity cache (single-flight + credential-version check) turns argon2 from "once per request"
+  into "once per credential version" — and **revocation is still immediate**, not TTL-based
+- Caller credentials (`Authorization` / `Cookie`) stay on the *client ↔ gateway* hop and are **not**
+  forwarded to the edge (if your upstream needs auth, configure it on the agent)
+- `admin_token` is independent from API keys; `/admin/*` responses carry `Cache-Control: no-store`
+
+**Reliability**
+- Establishment-phase failures (open stream / write request frame) are **retried on another agent**:
+  the request frame provably never arrived, so replay has no side effects
+- Response-head timeout (504) is **deliberately not retried**: the request may already be executing on
+  the model, and a replay would double-bill and double-generate
+- "Busy" and "dead" are handled separately, so a local overload is never mistaken for a broken
+  connection and evicted (see Design Highlights)
+- All five client-side waits on the entry path are bounded, so a stalled client cannot pin an admission
+  slot forever
+
+**Observability**
+- `/metrics` in Prometheus text format; `/healthz` liveness probe (JSON body with agent diagnostics)
+- Structured request logs carrying `request_id`, status and latency
+- Built-in React admin dashboard: overview / API keys / agents / metrics
+
+---
+
+## Quick Start
+
+Everything runs locally, **no real model required** (`mock-llm` stands in for the upstream).
+
+**Prerequisites**: Rust 1.97+ (toolchain version in `rust-toolchain.toml`), the `openssl` CLI, and
+`pnpm` (only for the dashboard).
 
 ```bash
-certs/gen-dev.sh        # outputs to certs/out/ (CA + server + client)
+git clone <repo> && cd home-llm-gateway
+
+make setup     # generate dev certificates (certs/out/) + install frontend deps
+make dev       # build debug binaries, then bring up mock-llm + gateway + agent
+               # if any process fails to start it exits with an error and prints that process's log tail
 ```
 
-### 2. Start the mock LLM (pretend it is your edge model service)
+Once `make dev` is up (logs in `.tmp/logs/`):
 
 ```bash
-cargo run -p mock-llm -- --addr 127.0.0.1:11435
-```
-
-### 3. Start edge-agent (on the machine next to your LLM)
-
-The agent also uses a YAML config file (`agent --config agent-config.yml`, see `agent_config.example.yml`):
-
-```bash
-cat > agent-config.yml <<'EOF'
-cloud_addr: "127.0.0.1:4433"
-ca: certs/out/ca.crt
-cert: certs/out/client.crt
-key: certs/out/client.key
-agent_id: edge-1
-upstream: "http://127.0.0.1:11435"
-EOF
-cargo run -p agent -- --config agent-config.yml
-```
-
-### 4. Start cloud-gateway (on the cloud server)
-
-All gateway settings live in a **YAML config file** (`gateway --config gateway-config.yml`, see `gateway_config.example.yml`). A minimal dev config:
-
-```bash
-cat > gateway-config.yml <<'EOF'
-listen_addr: "0.0.0.0:8080"
-quic_addr: "0.0.0.0:4433"
-cert: certs/out/server.crt
-key: certs/out/server.key
-ca: certs/out/ca.crt
-admin_token: dev-admin   # admin password, used to create the first API key
-EOF
-cargo run -p gateway -- --config gateway-config.yml
-```
-
-The gateway has **no static keys** — every API key is created at runtime through the Admin API and stored in SQLite. Create the first key after startup:
-
-```bash
-curl -X POST http://127.0.0.1:8080/admin/keys \
+# 1) Create your first API key — the gateway has no static keys, everything is issued at runtime
+KEY=$(curl -s -X POST http://127.0.0.1:8080/admin/keys \
   -H "Authorization: Bearer dev-admin" -H "Content-Type: application/json" \
-  -d '{"name":"dev"}'
-# → {"id":"...","key":"sk-...","name":"dev",...}  the returned sk-... is "dev-key" below
-```
+  -d '{"name":"dev"}' | python3 -c "import sys,json;print(json.load(sys.stdin)['key'])")
 
-### 5. Access from "anywhere"
-
-> `dev-key` below refers to the plaintext key returned by the Admin API in step 4.
-
-```bash
-curl -H "Authorization: Bearer dev-key" http://127.0.0.1:8080/v1/models
-curl -H "Authorization: Bearer dev-key" \
+# 2) Send a request — exercises HTTP → auth → QUIC tunnel → agent → upstream
+curl -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
   http://127.0.0.1:8080/v1/chat/completions \
   -d '{"model":"mock-llm","messages":[{"role":"user","content":"hello"}]}'
-```
 
-Seeing the mock echo means the full chain (HTTP → auth → QUIC tunnel → agent → upstream) is up.
-
-**SSE streaming** (a typewriter effect once you connect a real model):
-
-```bash
-curl -N -H "Authorization: Bearer dev-key" \
+# 3) Streaming
+curl -N -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
   http://127.0.0.1:8080/v1/chat/completions \
   -d '{"model":"mock-llm","stream":true,"messages":[{"role":"user","content":"hello"}]}'
 ```
 
-### 6. Tests
+An echo from the mock means the whole chain works. `make stop` shuts everything down; `make help` lists
+all targets.
 
-```bash
-cargo test    # proto roundtrip + end-to-end integration tests (in-memory certs, no external services)
-```
+**Connecting a real model**: point `upstream` in `agent-config.yml` at your local service.
 
-## Connecting a Real LLM
-
-Point the agent config's `upstream` at your real service — nothing else changes:
-
-| Service | `upstream` value |
+| Local service | `upstream` |
 |---|---|
 | Ollama | `http://127.0.0.1:11434` |
 | vLLM | `http://127.0.0.1:8000` |
 | llama.cpp server | `http://127.0.0.1:8000` |
 
-## Production Deployment (Alibaba Cloud / public Internet)
+---
 
-> Full step-by-step deployment guide (certificates, security groups, systemd, verification, troubleshooting): [`DEPLOY.md`](DEPLOY.md). Key points below.
-
-1. **Gateway on a public server**: open **UDP 4433** (QUIC tunnel) and **TCP 8443** (HTTPS API) in the security group / firewall. The gateway speaks HTTPS natively — no reverse proxy required (a reverse proxy couldn't handle the QUIC tunnel anyway, since it is a private frame protocol). If you later want a domain + automatic certificate renewal, add caddy (nginx needs `proxy_buffering off` or SSE streaming breaks).
-2. **Agent next to the LLM**: in the agent config set `cloud_addr` to `<PUBLIC_IP>:4433` and `server_name` to a domain present in the certificate SAN (a domain + DNS SAN certificate is recommended so an IP change never breaks the connection).
-3. **mTLS is the key security line**: keep the CA private key yourself; issue a separate client certificate for every agent.
-4. **UDP caveat**: QUIC runs over UDP — make sure it is not blocked; as a last resort you can downgrade the transport to TCP+TLS (the frame protocol stays the same, see `DESIGN.md` §10).
-
-### Enabling HTTPS + rate limiting
-
-Enable TLS and rate limiting in `gateway-config.yml`:
-
-```yaml
-listen_addr: "0.0.0.0:8443"
-quic_addr: "0.0.0.0:4433"
-cert: certs/out/server.crt
-key: certs/out/server.key
-ca: certs/out/ca.crt
-admin_token: dev-admin
-tls_cert: certs/out/server.crt   # enables HTTPS on the public entry
-tls_key: certs/out/server.key
-rate_limit_per_min: 60            # per API key per minute (0 = unlimited)
-```
+## API Example
 
 ```bash
-cargo run -p gateway -- --config gateway-config.yml
+curl https://<your-gateway>:8443/v1/chat/completions \
+  -H "Authorization: Bearer sk-..." \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen2.5","stream":true,
+       "messages":[{"role":"user","content":"Explain QUIC in one sentence"}]}'
 ```
 
-Clients now use `https://`; for self-signed certificates either install `ca.crt` into the system trust store (or temporarily use `curl -k`).
+Any OpenAI-compatible client works the same way — change `base_url` and `api_key`:
 
-### Agent concurrency cap (admission control)
-
-Set `max_concurrency: 2` in the agent config (advertise at most 2 concurrent requests).
-
-The gateway reserves concurrency slots according to the advertised cap and returns 429 when full, so the edge GPU is never overwhelmed.
-
-### Multiple agents (multiple LLM machines)
-
-Point several agents at the same gateway; it routes by **least load** (fewest in-flight requests). Each machine keeps its own agent config:
-
-```yaml
-# edge node 1 agent-config.yml
-cloud_addr: "<gateway>:4433"
-ca/cert/key: /etc/home-llm-gateway/*.crt
-agent_id: edge-1
-upstream: "http://127.0.0.1:11434"
-max_concurrency: 2
-
-# machine 2 (another box / cloud) agent-config.yml
-cloud_addr: "<gateway>:4433"
-ca/cert/key: /etc/home-llm-gateway/*.crt
-agent_id: edge-2
-upstream: "http://127.0.0.1:8000"
-max_concurrency: 4
+```python
+from openai import OpenAI
+client = OpenAI(base_url="https://<your-gateway>:8443/v1", api_key="sk-...")
+client.chat.completions.create(model="qwen2.5", messages=[{"role": "user", "content": "hello"}])
 ```
 
-- Issue a separate client certificate per agent; `agent_id` distinguishes them
-- ⚠️ **`agent_id` must be unique per machine**: a duplicate id makes the gateway close the older connection (intended for reconnect takeover), and two machines evicting each other makes **every request that outlives the eviction period fail** (the only visible signals are `/admin/agents` forever showing 1 online agent and `hlmg_agent_connections_total` climbing) — see `TODO.md` P1
-- Agents that miss heartbeats for `agent_stale_secs` (gateway config, default 15s) **stop being routing candidates** (503/404). The registry entry is only removed once the connection actually closes, so `/metrics hlmg_agents` and `/admin/agents` still count a stale agent as online meanwhile
-- When every agent is at capacity, the gateway returns 429
-
-### Observability
-
-- **`GET /metrics`**: Prometheus text format (per-status counters, in-flight requests, online agents, bytes forwarded, cumulative latency) — scrapable by Prometheus/Grafana
-  - Opened directly in a browser (`Accept: text/html`) it serves the dashboard page instead of text; scrapers (`Accept: */*`) are unaffected
-- **Structured logs**: `tracing` with `request_id` / status / latency per request (`tower-http` TraceLayer)
-- **`/healthz`**: liveness probe (still a constant `ok`, no deep checks; but it is **exempt from the concurrency gate** — a probe must not 429 under saturation, or the LB would turn "slow" into "down". See `REBUILD.md` §5.3)
-
-> Note: `/metrics` has no auth; on a public deployment, restrict it to your monitoring network via the security group.
-
-### Multi-platform packaging & auto-start
+**Admin API** (enabled by `admin_token`; there is also a web UI at `/`):
 
 ```bash
-scripts/build-release.sh          # build every installed target and pack it into dist/
-make release-strict               # same, but a missing target / missing cross toolchain is a failure
+curl -X POST   http://127.0.0.1:8080/admin/keys      -H "Authorization: Bearer <admin-token>" \
+  -H "Content-Type: application/json" -d '{"name":"dsh-client"}'   # returns the plaintext key, once
+curl           http://127.0.0.1:8080/admin/keys      -H "Authorization: Bearer <admin-token>"   # list (masked)
+curl -X DELETE http://127.0.0.1:8080/admin/keys/<id> -H "Authorization: Bearer <admin-token>"   # revoke (immediate)
+curl           http://127.0.0.1:8080/admin/agents    -H "Authorization: Bearer <admin-token>"
+curl           http://127.0.0.1:8080/admin/usage     -H "Authorization: Bearer <admin-token>"
 ```
 
-Default targets: the host, `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`,
-`aarch64-apple-darwin`. **Linux artifacts are static musl builds**: a static ELF is not tied to a glibc
-version, so one artifact runs on any distribution — this removes the "build base must match the runtime
-stage" constraint documented in `crates/gateway/Dockerfile`. Staticness is **asserted by the script
-itself**: `file` must report `statically linked` or `static-pie linked` (x86_64-musl defaults to PIE),
-and `readelf` must find no `PT_INTERP` / `NEEDED`; otherwise the build fails. A missing cross C toolchain
-is reported with install instructions (`musl-tools` / musl.cc toolchain).
+---
 
-Artifacts: `dist/home-llm-gateway-<version>-<platform>.tar.gz` + `dist/SHA256SUMS`, containing
-`bin/{gateway,agent,mock-llm}`, the `deploy/` units, example configs and an in-package checksum file.
-If **no** target can be built, the script fails instead of reporting an empty success.
+## Design Highlights
 
-Tagging (`v*`) runs `.github/workflows/release.yml`: all three platforms are built on their **native
-runners** (ubuntu-24.04 / ubuntu-24.04-arm / macos-14), gated on `fmt + clippy + nextest`, and the
-**unpacked artifacts** are re-verified (`file` + `readelf`), executed (`--version`), checksum-checked and
-attached to the GitHub Release. Local cross builds (macOS → `x86_64-unknown-linux-musl`) remain possible
-via `MUSL_CROSS_DIR`, see `DEPLOY.md` §3.
+The README states **conclusions only**; the rationale, measurements and trade-offs are in the documents
+named in each section.
 
-systemd units: `deploy/gateway.service` (cloud server) and `deploy/agent.service` (LLM machine). Adjust the parameters, then `systemctl enable --now` for auto-start on boot.
+### 1. Outbound dialing + a QUIC tunnel, instead of port forwarding
 
-## API Key Management (Admin API)
+The agent opens **one long-lived connection** to the cloud, and requests are multiplexed over it as
+**one QUIC bidirectional stream per request**. You get: zero inbound ports locally, NAT traversal for
+free, and dozens of in-flight requests on one machine that do not block each other (they would on TCP).
+The price is a custom binary protocol with 8 frame types (`Register` / `Heartbeat` / `ProxyRequest` /
+`ProxyResponseHead` / `ProxyResponseBody` / `ProxyResponseEnd` / `Cancel` / `Error`).
+→ `DESIGN.md` §3–§4
 
-The gateway ships a lightweight admin interface to **issue / revoke keys at runtime — no restart needed**:
+### 2. "Busy" and "dead" must be distinguished — a judgment paid for by a real incident
 
-- **Web admin page**: open `http://<gateway-addr>/` in a browser — enter the admin token and **create / revoke / list keys** right from the page
-- Config `admin_token` (`gateway-config.yml`): admin password (independent of API keys); enables `/admin/*` and the page's management features when provided
-- Config `keys_file`: SQLite database file for dynamic keys (default `keys.db`); keys survive restarts
-- The gateway has no static keys — all keys are created through the Admin API (persisted in SQLite) and are used uniformly on `/v1/*`
+A timeout does not mean the connection is dead. An open-stream timeout may simply mean **in-flight
+requests have hit the capacity ceiling and are queueing for QUIC stream credit** (normal backpressure);
+a response-head timeout may simply mean **the upstream is slow to first byte** (the model is thinking).
+
+Treating either as "dead" **amplifies a local overload into a full outage**: evict → connection closed →
+agent reconnects (backoff up to 30s) → no routable agent in the meantime → everything 503. Measured once
+in the cloud: during a 30-second load test, `registry-empty` +6835 and 503 +6057. The current criteria
+are "**has in-flight reached the capacity ceiling**" (open stream) and "**was there a successful response
+head within the window / is the peer still talking**" (response head), with `busy`/`dead` and
+`slow`/`silent` exposed as separate classes — so "scale up" and "check the network" are distinguishable
+at a glance.
+→ `DESIGN.md` §5
+
+### 3. Retry only when the frame never arrived
+
+`write_frame` is a single `write_all`: it returns only when every byte was accepted, so a timeout means
+an incomplete frame, and the agent's `FrameReader` will not touch the upstream before it has read the
+full length prefix and payload. Therefore **open-stream and write-request-frame failures can safely be
+replayed on another connection**.
+
+A **response-head timeout cannot be retried**: the request may already be executing on the model, and a
+replay would double-bill and double-generate (with `temperature > 0` the results would even differ).
+Making that safely retryable needs protocol-level deduplication (a globally unique `request_uid` plus a
+dedup table on the agent) — the full design is in [`EXACTLY_ONCE.md`](EXACTLY_ONCE.md), and it is
+**currently a proposal, not implemented**.
+→ `DESIGN.md` §5, `EXACTLY_ONCE.md`
+
+### 4. Three separate gates: rate, per-agent concurrency, global in-flight
+
+They do different jobs and cannot substitute for one another; conflating them yields wrong capacity
+conclusions:
+
+| Config | What it bounds | What it protects |
+|---|---|---|
+| `rate_limit_per_min` | **request rate** per API key (token bucket) | fairness / cost |
+| agent `max_concurrency` | in-flight requests **per edge** | the edge's GPU |
+| `max_concurrent_requests` | total in-flight requests **in the gateway** | the gateway itself |
+| `max_entry_connections` | concurrent public **connections** (pauses accept when full, does not reject) | file descriptors |
+
+`/healthz` and `/metrics` each get their own **separate, generous** budget so they never consume the
+gated one — otherwise a 429 on the probe would make a load balancer evict a **healthy** instance,
+turning "slow" into "all down".
+→ `REBUILD.md` §4.1, `DESIGN.md` §5
+
+### 5. argon2 is memory-hard, so it cannot run once per request
+
+Each `argon2id` verification holds **19 MiB** of working memory (`m=19456 KiB`), and that adds up
+linearly with concurrency — "verify once per request" means gateway memory equals
+`in-flight requests × 19 MiB`. Controlled A/B measurement at 64 concurrency: **1 236.5 MB vs 27.1 MB**
+(cache off vs on).
+
+It now goes through a **verified-identity cache with single-flight**: `sha256(token)` locates the record
+in O(1), and a hit skips argon2 entirely (just two comparisons, `enabled` and `cred_version`); concurrent
+cold starts for the same token are serialized so argon2 runs once. **Revocation is still immediate** —
+it relies on the credential version, not a TTL.
+→ `DESIGN.md` §5 ("verified-identity cache"), `OPTIMIZATION.md` §8
+
+### 6. Every ending of a streaming relay needs an explicit "this is incomplete" signal
+
+Once the response body starts streaming, **the HTTP status has already gone out (200)**. Everything that
+fails after that (upstream disconnect, per-frame idle timeout, client stall, a panicking forwarding task)
+is invisible in the access log. So every relay ending funnels into an explicit outcome enum (9 normal
+exits plus `panicked`), counted per class; the panic class also **aborts the response body**, so a client
+cannot mistake a truncated answer for a complete one.
+
+When the gateway shuts down, the terminating event sent to in-flight SSE clients is `event: error`, and
+**never `data: [DONE]`** — the latter is OpenAI's "finished normally" marker, and using it would be lying
+about the model having finished.
+→ `DESIGN.md` §12
+
+### 7. Documentation organized by information hierarchy, not dumped into the README
+
+The Markdown in this repo has a clear division of labour: the README answers "what is this / how do I run
+it", and the other documents go deep. If you want the evidence behind a number while reading the README,
+it is most likely in `OPTIMIZATION.md`; if you want protocol detail, it is in `DESIGN.md`. **The README
+deliberately does not duplicate them.**
+
+---
+
+## Testing
 
 ```bash
-# Create a key (returns the plaintext secret, shown only once)
-curl -X POST http://127.0.0.1:8080/admin/keys \
-  -H "Authorization: Bearer <admin-token>" -H "Content-Type: application/json" \
-  -d '{"name":"dsh-client"}'
-# → {"id":"ab99de40","key":"sk-…","name":"dsh-client","created_at":…,"enabled":true}
-
-# List keys (masked — only a prefix, never the full secret)
-curl http://127.0.0.1:8080/admin/keys -H "Authorization: Bearer <admin-token>"
-
-# Revoke a key (takes effect immediately)
-curl -X DELETE http://127.0.0.1:8080/admin/keys/<id> -H "Authorization: Bearer <admin-token>"
+make test                              # cargo test (serialization via #[serial])
+cargo nextest run --workspace          # what CI uses
+make check                             # the full gate: see below
 ```
 
-> Security: use a strong random value for `admin_token` (`openssl rand -hex 32`); `keys.db` (SQLite) stores argon2 hashes only — **no plaintext keys** — and is git-ignored; in production, restrict `/admin/*` to your management network via the security group.
+Coverage: protocol frame round-trips, streaming and cancellation, auth and rate limiting, model routing,
+admission and concurrency, graceful shutdown, real-process startup/signal/log behaviour, and end-to-end
+full-chain tests (certificates generated in memory, a complete QUIC + mTLS stack, no external services).
 
-## Security Model
+`make check` is the one-command local equivalent of CI:
 
-| Surface | Measure |
+```
+fmt · clippy -D warnings · cargo deny · nextest · web-format · web-lint · web-test ·
+web-build · toolchain-check · check-records
+```
+
+> **The test count is not hard-coded** — it changes per commit; trust the actual run output.
+> Two behaviours differ from `cargo test` and are worth knowing: **nextest runs one process per test**,
+> so `serial_test`'s `#[serial]` (an in-process lock) stops working under it — e2e serialization is
+> instead guaranteed by a `test-group` in `.config/nextest.toml`; and **nextest does not run doctests**.
+
+---
+
+## Performance
+
+The repository carries two kinds of performance evidence, and **the full data with its measurement
+preconditions does not live here**:
+
+- **Criterion micro-benchmarks** (function level): `cargo bench` (frame codec, keystore hot path)
+- **System-level load tests**: k6 scripts under `scripts/bench-k6/` (SSE long streams + non-streaming
+  throughput, with built-in success-rate and latency-percentile assertions); `oha` works for a quick check
+
+```bash
+cargo bench                   # or: make bench
+make dev && make bench-k6 KEY=<sk-...> VUS=20 DUR=30s
+```
+
+**The README keeps only two conclusions, because they change how you deploy**:
+
+1. **Gateway memory tracks "in-flight", not "request count"** — provided the verified-identity cache is on
+   (`verified_cache_max`, the default). Setting it to `0` makes every in-flight request cost ~19 MiB, in
+   which case `max_concurrent_requests` must stay under `MemoryMax / 20MB`, or the thing you hit first is
+   an OOM kill rather than a graceful 429.
+2. **When load testing, identify whose bottleneck it is first**: the order is **agent event rate → link
+   bandwidth → gateway**. At the 20–100 token/s of a real model none of these are close; the numbers below
+   only matter when you "make the model fast" or "use the gateway to relay small non-LLM requests".
+
+→ **Full measurements** (memory A/B table, per-event agent CPU, throughput ceilings, cloud egress
+bandwidth, request-size ladder, loopback, 768-concurrency run) are in
+**[`OPTIMIZATION.md`](OPTIMIZATION.md) §8**
+
+---
+
+## Deployment
+
+Production deployment (certificate issuance, security groups, systemd / Docker, verification,
+troubleshooting) is in **[`DEPLOY.md`](DEPLOY.md)**. The essentials:
+
+1. **Gateway on a public server**: allow **UDP 4433** (QUIC tunnel) and **TCP 8443** (HTTPS API) in your
+   security group. UDP is easy to forget — QUIC runs over UDP. If it is blocked, you can fall back to
+   TCP+TLS (the frame protocol is unchanged, see [`DESIGN.md`](DESIGN.md) §10).
+2. **Agent on the model host**: set `cloud_addr` to `<public-ip>:4433` and `server_name` to a name in the
+   certificate's SAN.
+3. **mTLS is the critical security line**: keep the CA private key to yourself and issue a **separate
+   client certificate per agent**.
+4. Deployment forms: a single static binary (Linux musl / macOS) with systemd units, or Docker Compose
+   (`crates/gateway/Dockerfile` already bakes the dashboard into the image, so you do not build the
+   frontend yourself).
+5. **Multiple edges (heterogeneous models)**: give each machine its own `agent-config.yml` declaring its
+   `models`. A config example and the `agent_id`-must-be-unique trap are in
+   [`MODEL_ROUTING.md`](MODEL_ROUTING.md) §7.
+
+> On startup the gateway raises its own `RLIMIT_NOFILE` soft limit to `min(hard, 16384)` — systemd's
+> default of 1024 is uncomfortably close at production levels (768 concurrent connections → fd peak 785).
+> The rationale and the split of responsibilities with the unit file are in `DESIGN.md` §14.
+
+---
+
+## Repository Structure
+
+```
+crates/
+├── proto/      tunnel frame protocol + shared primitives (frame codec, mTLS material loading,
+│               hop-by-hop / credential header filtering, path guard)
+├── gateway/    cloud-gateway binary (axum + s2n-quic server + SQLite keystore)
+├── agent/      edge-agent binary (s2n-quic client + reqwest)
+└── mock-llm/   fake OpenAI-compatible LLM (to bring up the chain without a real model)
+web/            React + TS admin dashboard (Vite + React 19 + Tailwind; served by the gateway)
+certs/          dev certificate generation script
+deploy/         systemd units (gateway.service / agent.service)
+scripts/        release packaging · k6 load tests · toolchain consistency check · git pre-commit hook
+gateway_config.example.yml / agent_config.example.yml   both config templates (all parameters documented)
+deny.toml       cargo-deny policy (dependency licenses / advisories)
+```
+
+> Config file names are fixed: `gateway-config.yml` for the gateway and `agent-config.yml` for the agent
+> (identical locally and in production; both contain secrets and are gitignored).
+
+---
+
+## Documentation
+
+| Document | Contents |
 |---|---|
-| Public entry | TLS 1.3 (HTTPS once `tls_cert`/`tls_key` are set; plaintext HTTP otherwise), API-key auth (sha256 index + argon2 verify), token-bucket rate limiting, request body size cap |
-| Tunnel | QUIC built-in TLS 1.3 + mTLS (agent certs issued by your CA); unregistered agents cannot connect |
-| Concurrency | Atomic slot reservation against the agent's `max_concurrency`; 429 when full |
-| Credential boundary | Caller credentials (`Authorization` / `Cookie`) stay on the client-to-gateway hop and are **not** forwarded to the edge or the upstream in tunnel frames (if your upstream needs auth, configure its credentials on the agent side) |
-| Secrets | The CA private key never leaves your hands; a separate client cert per agent; `certs/out/` is git-ignored |
+| [`DESIGN.md`](DESIGN.md) | **Architecture & protocol**: why QUIC, frame protocol, timeout matrix, retry and eviction semantics, security checklist, observability spec, NOFILE |
+| [`MODEL_ROUTING.md`](MODEL_ROUTING.md) | **Model routing**: filtering candidates by model, exact-over-wildcard, `/v1/models` aggregation |
+| [`OPTIMIZATION.md`](OPTIMIZATION.md) | **Optimization plan + measurement record**: what was changed, and the full memory / CPU / throughput data with preconditions |
+| [`DEPLOY.md`](DEPLOY.md) | **Deployment**: certificate issuance, security groups, systemd / Docker, upgrades, troubleshooting |
+| [`REBUILD.md`](REBUILD.md) | **Rebuild blueprint**: irreversible decisions, traffic and concurrency specs, 12 acceptance assertions |
+| [`EXACTLY_ONCE.md`](EXACTLY_ONCE.md) | **Proposal (not implemented)**: protocol-level dedup so response-head timeouts can be retried safely |
+| [`CODE_READING.md`](CODE_READING.md) | **Code reading guide**: where to start, anchor files, verification-driven learning |
+| [`TODO.md`](TODO.md) | **Development status and roadmap** (also the register of known issues) |
 
-## Design Document
+*(The documents above are written in Chinese; this README is the English entry point.)*
 
-Architecture, frame protocol details and milestones live in [`DESIGN.md`](DESIGN.md).
+---
+
+## Roadmap
+
+See **[`TODO.md`](TODO.md)** — current development status, known issues and priorities.
+
+Two items are directly relevant to users and their status should be stated plainly:
+
+- **`EXACTLY_ONCE.md` is a proposal, not implemented.** As of today a response-head timeout (504) is
+  **not** retried automatically.
+- **Multiple CA trust roots** and **finer-grained usage metering** are likewise registered in `TODO.md`
+  and not yet implemented.
+
+---
+
+## License
+
+MIT, see [`LICENSE`](LICENSE).

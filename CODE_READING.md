@@ -100,6 +100,18 @@ scripts/check-toolchain.sh  工具链三处一致（rust-toolchain.toml / 所有
 
 > 验证：`make check`（fmt + clippy + test + web build）全绿。
 
+**两处容易踩的测试约定**（2026-10 从 README 迁出）：
+
+- **e2e 自己也按同一套口径上界**：HTTP 一律用 `common::test_client()`（整条请求含读响应体的总超时
+  = `STEP_TIMEOUT`），原始帧 / channel 等待用 `common::bounded(step, ..)` —— 卡住会变成**带步骤名**的
+  失败，而不是 nextest 的 180s TIMEOUT、或 `make test`（e2e 是 `#[serial]`）下整个套件无限期挂起。
+  **故意让客户端卡住的用例豁免**（`stalls.rs`、`write_backpressure.rs`、
+  `https::e2e_proxy_protocol_edge_cases`），理由见 `common.rs` 的 `test_client` 文档。
+- **改这几处要跑的红检**：`tests/e2e/stalls.rs`（请求体停滞、响应体停滞各一条；判据是
+  `max_concurrent_requests: 1` 下**后续请求不得 429** —— 槽位一泄漏就必然 429）、
+  `tests/e2e/entry_limits.rs`（半开握手、半个请求头、额度满时排队各一条）与 `io_stall` 的单测
+  （写不动必须 `TimedOut`、持续有进展绝不断开）。
+
 ### 第 5 步：部署与运维（30 分钟）
 
 ```

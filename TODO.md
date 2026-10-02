@@ -101,7 +101,7 @@
       （同样已验证过红）。**仍可选的加强**：unit 里写 `LimitNOFILE=65536` 抬高天花板——
       不写也不会再撞那个 1024，但日志里 `limited_by_hard=true` 表示天花板比目标值低。
 - [ ] **缺"768 并发档"修复后的可信读数（口径：只数 `status="200"` + 记 200 占比）**：
-      README《网关自身的吞吐上限》里那张表 768 行是**修复前**的旧读数（51–73 QPS / 3.6–5.4%），
+      `OPTIMIZATION.md` §8《网关自身的吞吐上限》里那张表 768 行是**修复前**的旧读数（51–73 QPS / 3.6–5.4%），
       而它当初不可用的机制（agent 心跳零余量 → `select!` 当致命 → 重连撞 10s 握手 → 1s 重试风暴）
       已经在代码里修掉了三处：心跳等待 `3 × interval` + 连续 2 次才断、握手 30s、
       网关连续 3 次隧道超时才摘除且延迟关闭。**修复后那次复测的原始输出没有归档**，
@@ -444,7 +444,7 @@
 4. **指标口径要一起改**：`hlmg_key_verify_misses_total` 现在的含义是"真跑了 argon2 的次数"
    （**2026-09 已把自增点从 `put` 挪到"将要跑 argon2"那一处，口径与 HELP 对齐**；在那之前
    `verified_cache_max: 0` 时它恒为 0，而每请求都在烧 19MiB），去掉 argon2 后变成"缓存未命中
-   次数"——HELP 文案与 README《可观测性》《并发上限与内存（实测）》里的表述必须同步，
+   次数"——HELP 文案与 `DESIGN.md` §12《可观测性》、`OPTIMIZATION.md` §8《并发上限与内存》里的表述必须同步，
    否则又是一处口径漂移。
 
 ### 基线数字（改动前，均已实测）
@@ -1182,7 +1182,7 @@
         ——8MiB 帧、`tunnel_op_timeout=300ms`、对端只读 64 字节就停（客户端拿到
         `502 tunnel write timed out`，`hlmg_tunnel_write_failures_total{class="backpressure"}≥1`），
         放行后对端报告 `EofMidFrame("early eof", saw_eof=true)`：**只拿到前缀 + 干净的 FIN**，
-        从未解出完整 `ProxyRequest`。README 的《能重试什么》那一行按实测补齐了这两条依据。
+        从未解出完整 `ProxyRequest`。`DESIGN.md` §5《能重试什么》那一行按实测补齐了这两条依据。
       - 过程小坑（写进测试注释）：对端"先读的那 64 字节"必须留在手里再接后续——丢掉就字节流错位，
         `FrameReader` 会把垃圾当长度前缀（实测报 `frame too large`），断言会因错误的原因变绿。
 
