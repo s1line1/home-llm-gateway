@@ -82,3 +82,38 @@ Bearer 认证 + 限流）；`["*"]` 不贡献条目。✅
 - edge 模型**热插拔增量上报**（模型变更需 agent 重连重新 Register；heartbeat 不刷新 models）
 - 多租户 / quota / 地域 / 成本调度
 - 大 body 流式 model 提取微优化
+
+## 7. 运维：多 edge 配置示例（2026-10 从 README 迁出）
+
+多个 agent 指向同一个网关即可。网关按**请求的 model 路由到能服务它的 edge**：精确声明该模型的
+edge 优先，其次才轮到 `models: ["*"]` 的通配 edge；同组内按**最少负载**（在途请求最少者优先）
+自动路由。每台机器各写一份 `agent-config.yml`：
+
+```yaml
+# --- edge 节点 1（家庭，跑 qwen2.5）---
+cloud_addr: "<网关>:4433"
+ca/cert/key: /etc/home-llm-gateway/*.crt
+agent_id: edge-1                 # ⚠️ 必须全网关唯一，见下
+upstream: "http://127.0.0.1:11434"
+models: [qwen2.5]                # 声明能力：网关据此路由
+max_concurrency: 2
+
+# --- 机器 2（云上 GPU，跑 llama3）---
+cloud_addr: "<网关>:4433"
+ca/cert/key: /etc/home-llm-gateway/*.crt
+agent_id: edge-2
+upstream: "http://127.0.0.1:8000"
+models: [llama3]
+max_concurrency: 4
+```
+
+- 客户端请求体必须带 `model`（缺失 → 400）；没有 edge 能服务该模型 → 404
+- `/v1/models` 由网关**聚合**所有健康 edge 声明的模型（`*` 通配不列入）
+- 每个 agent 单独签发客户端证书，`agent_id` 用于区分
+- ⚠️ **每台机器的 `agent_id` 必须唯一**：同名 agent 会让网关踢掉旧连接（本意是同一台机器重连接管），
+  两台机器互踢会让**活得比踢连接周期长的请求全部失败**。表象很有迷惑性：`/admin/agents` 恒显示
+  1 个 agent 在线，只有 `hlmg_agent_connections_total` 在飞涨（详见 `TODO.md` P1）
+- 超过 `agent_stale_secs`（网关配置，默认 15s）未心跳的 agent **不再参与路由**（503/404）；
+  但注册表条目要等连接真正关闭才摘除，所以失联期间 `/metrics hlmg_agents` 与 `/admin/agents`
+  仍会把它算作在线——判"现在能不能路由"要看 `hlmg_agents_healthy`
+- 候选全部占满时返回 429（成因见 `DESIGN.md` §5 的忙/死判据）
