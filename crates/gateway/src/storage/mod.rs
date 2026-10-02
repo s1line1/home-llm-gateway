@@ -345,7 +345,7 @@ impl Storage {
     /// 热路径（有缓存时）只做三件事：`sha256(token)` → O(1) 查表 → 比对凭据版本，
     /// **不跑 argon2**；只有缓存未命中（首次见到该 token、版本变了、或缓存关闭）才校验。
     ///
-    /// 记录以**值**交给协议（`load` 里 `.cloned()`），于是 `runtime` 的读锁在 argon2
+    /// 记录以**值**交给协议（`load_record` 里 `.cloned()`），于是 `runtime` 的读锁在 argon2
     /// 之前就放开了：建/吊销（写锁）不会再被一次 10–30ms 的冷校验堵住（评估 §5 N1）。
     /// 这不是"记得 drop"，是接口形状决定的——闭包没法把守卫借出去。
     pub fn authorize_record(&self, token: &str) -> Option<KeyRecord> {

@@ -128,7 +128,7 @@ impl VerifiedCache {
 
     /// 认证的**三段协议**（快路径 → 单飞 → 双检 → 校验 → 写缓存），全仓库只此一处。
     ///
-    /// - `load`：按 lookup 取**当前记录**（`Storage` 从 `runtime` 读）；`None` = 这个
+    /// - `load_record`：按 lookup 取**当前记录**（`Storage` 从 `runtime` 读）；`None` = 这个
     ///   lookup 根本不存在（未知 token / 已吊销）→ 直接拒绝。
     /// - `probe`：真跑一次 argon2，回答"这个 token 与这条记录的哈希匹配吗"。
     ///
@@ -142,7 +142,7 @@ impl VerifiedCache {
     pub(crate) fn verify_or_cached<L, P>(
         &self,
         lookup: &str,
-        load: L,
+        load_record: L,
         probe: P,
     ) -> Option<KeyRecord>
     where
@@ -152,7 +152,7 @@ impl VerifiedCache {
         // ① 缓存关闭：每次请求都完整校验（与改造前语义一致），刻意不做单飞——
         //    这一档的目的就是"每次都真校验"。
         if self.max_entries == 0 {
-            let rec = load()?;
+            let rec = load_record()?;
             return if rec.enabled && self.probe_once(probe, &rec) {
                 Some(rec)
             } else {
@@ -162,7 +162,7 @@ impl VerifiedCache {
 
         // ② 快路径：记录在、启用中，且缓存里有同版本未过期的一条 → 直接放行（不跑 argon2，
         //    也不碰单飞表）。
-        let fresh = load()?;
+        let fresh = load_record()?;
         if !fresh.enabled {
             return None;
         }
@@ -192,7 +192,7 @@ impl VerifiedCache {
                 slot: &slot,
             };
             // 双检：等锁期间可能已被同 token 的并发请求填好了
-            let rec = load()?;
+            let rec = load_record()?;
             if !rec.enabled {
                 return None;
             }
@@ -220,7 +220,7 @@ impl VerifiedCache {
     /// 缓存里是否有一条**同版本、启用中、未过期**的条目；命中即累加 `hits`。
     ///
     /// 只回答"能不能放行"，不返回记录本身——记录由调用方交给 [`Self::verify_or_cached`]
-    /// 的 `load` 提供，所以这里不需要克隆，调用方也拿不到过期的副本。
+    /// 的 `load_record` 提供，所以这里不需要克隆，调用方也拿不到过期的副本。
     fn is_cached(&self, lookup: &str, cred_version: u64) -> bool {
         let entries = lock_or_recover(&self.entries);
         let Some(hit) = entries.get(lookup) else {
