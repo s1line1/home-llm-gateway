@@ -25,7 +25,7 @@
 # 运行网关（云服务器）：
 #   ⚠️ ENTRYPOINT 已经是 gateway 二进制，命令行里**不要再写一个 "gateway"**——那会被 clap
 #      当成未声明的位置参数，容器以退出码 2 立刻退出（配 restart 就是崩溃重启循环）。
-#   ⚠️ 挂载点必须与配置里的路径对齐：`gateway_config.example.yml` 用的是绝对路径
+#   ⚠️ 挂载点必须与配置里的路径对齐：`gateway-config.example.yml` 用的是绝对路径
 #      `/etc/home-llm-gateway/...`，所以这里做**同路径挂载**，配置可原样使用。
 #      若改用 `-v /etc/home-llm-gateway:/config`，则 YAML 里的 cert/key/ca/keys_file
 #      都要一起改成 `/config/...`，否则容器内找不到文件（见 DEPLOY.md §11）。

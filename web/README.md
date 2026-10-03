@@ -47,7 +47,7 @@ cd web && pnpm install && pnpm build
 # 2. 启动网关（项目根目录，默认 ui_dir=web/dist 自动生效）
 cd .. && gateway --config gateway-config.yml
 
-# 或显式配置（gateway_config.example.yml）
+# 或显式配置（gateway-config.example.yml）
 # ui_dir: web/dist
 ```
 

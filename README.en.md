@@ -425,7 +425,7 @@ web/            React + TS admin dashboard (Vite + React 19 + Tailwind; served b
 certs/          dev certificate generation script
 deploy/         systemd units (gateway.service / agent.service)
 scripts/        release packaging · k6 load tests · toolchain consistency check · git pre-commit hook
-gateway_config.example.yml / agent_config.example.yml   both config templates (all parameters documented)
+gateway-config.example.yml / agent-config.example.yml   both config templates (all parameters documented)
 deny.toml       cargo-deny policy (dependency licenses / advisories)
 ```
 

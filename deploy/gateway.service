@@ -2,7 +2,7 @@
 # 安装：
 #   1. 把二进制放到 /usr/local/bin/gateway
 #   2. 把证书与 gateway-config.yml 放到 /etc/home-llm-gateway/
-#      （基于 gateway_config.example.yml 修改：证书路径、admin_token、tls、ui_dir 等）
+#      （基于 gateway-config.example.yml 修改：证书路径、admin_token、tls、ui_dir 等）
 #   3. Web UI（可选）：本机 cd web && pnpm install && pnpm build 后，
 #      把 web/dist 整个上传到 /etc/home-llm-gateway/web/，gateway-config.yml 配 ui_dir: web
 #      （WorkingDirectory=/etc/home-llm-gateway，相对路径即可；不配 = `/` 显示构建提示页）
@@ -19,7 +19,7 @@ Wants=network-online.target
 Type=simple
 # 工作目录 = 配置目录：ui_dir / keys.db 等相对路径都以此为准
 WorkingDirectory=/etc/home-llm-gateway
-# 所有参数都在 /etc/home-llm-gateway/gateway-config.yml 中配置（见 gateway_config.example.yml）
+# 所有参数都在 /etc/home-llm-gateway/gateway-config.yml 中配置（见 gateway-config.example.yml）
 ExecStart=/usr/local/bin/gateway --config /etc/home-llm-gateway/gateway-config.yml
 Restart=on-failure
 RestartSec=3

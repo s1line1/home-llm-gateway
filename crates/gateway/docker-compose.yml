@@ -13,7 +13,7 @@
 #   ① 镜像的 ENTRYPOINT 是 gateway 二进制 → command 里**不要**再写一个 "gateway"，
 #      那是未声明的位置参数，clap 会以退出码 2 让容器立刻退出；
 #   ② 配置里的路径**按容器内 CWD 解析**（不按配置文件所在目录），而镜像的 WORKDIR 是
-#      /etc/home-llm-gateway → 这里做**同路径挂载**，`gateway_config.example.yml` 里的
+#      /etc/home-llm-gateway → 这里做**同路径挂载**，`gateway-config.example.yml` 里的
 #      绝对路径 /etc/home-llm-gateway/... 可以原样使用，不必改配置；
 #   ③ `keys.db` 是 SQLite **WAL** 模式，会额外生成 `keys.db-wal` / `keys.db-shm`
 #      → 必须挂**目录**（不能只挂那个文件），并且**目录**要可写；

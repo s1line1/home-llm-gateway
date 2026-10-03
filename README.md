@@ -372,7 +372,7 @@ web/            React + TS 管理面板（Vite + React 19 + Tailwind；网关启
 certs/          开发证书生成脚本
 deploy/         systemd 单元（gateway.service / agent.service）
 scripts/        release 打包 · k6 压测 · 工具链一致性检查 · git pre-commit hook
-gateway_config.example.yml / agent_config.example.yml   两份配置模板（含全部参数注释）
+gateway-config.example.yml / agent-config.example.yml   两份配置模板（含全部参数注释）
 deny.toml       cargo-deny 策略（依赖许可证 / 公告）
 ```
 
