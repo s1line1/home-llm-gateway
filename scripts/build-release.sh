@@ -198,7 +198,7 @@ package() {
   cp "target/${target}/release/gateway" "target/${target}/release/agent" \
     "target/${target}/release/mock-llm" "${stage}/${name}/bin/"
   cp deploy/agent.service deploy/gateway.service deploy/logrotate.example "${stage}/${name}/deploy/"
-  cp gateway_config.example.yml agent_config.example.yml "${stage}/${name}/"
+  cp gateway-config.example.yml agent-config.example.yml "${stage}/${name}/"
   (
     cd "${stage}/${name}"
     sha256_lines bin/* >SHA256SUMS

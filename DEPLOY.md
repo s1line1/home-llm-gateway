@@ -123,7 +123,7 @@ rustup target add aarch64-apple-darwin
 home-llm-gateway-<版本>-<平台>/
   bin/{gateway,agent,mock-llm}
   deploy/{gateway.service,agent.service,logrotate.example}
-  gateway_config.example.yml  agent_config.example.yml
+  gateway-config.example.yml  agent-config.example.yml
   SHA256SUMS            # 对 bin/ 下三个二进制的校验和
 ```
 
@@ -154,7 +154,7 @@ home-llm-gateway-<版本>-<平台>/
 sudo mkdir -p /etc/home-llm-gateway
 # 二进制（方案 A 构建后在 home-llm-gateway/target/release/ 下，方案 B 解包 dist/）
 sudo cp target/release/gateway /usr/local/bin/gateway
-# 证书：**直接放配置目录**——`gateway_config.example.yml` 里的 cert/key/ca 就是
+# 证书：**直接放配置目录**——`gateway-config.example.yml` 里的 cert/key/ca 就是
 # /etc/home-llm-gateway/{server.crt,server.key,ca.crt}（没有 certs/ 子目录，别自建一层，
 # 否则示例配置"零改动"启动时读不到证书）
 sudo cp server.crt server.key ca.crt /etc/home-llm-gateway/
@@ -176,7 +176,7 @@ sudo chmod 600 /etc/home-llm-gateway/server.key
 openssl rand -hex 32        # Admin Token（记下来，登录管理页 / 调 /admin/* 用）
 
 # 2) 基于模板生成网关配置（所有参数都在这里）
-sudo cp gateway_config.example.yml /etc/home-llm-gateway/gateway-config.yml
+sudo cp gateway-config.example.yml /etc/home-llm-gateway/gateway-config.yml
 sudo vi /etc/home-llm-gateway/gateway-config.yml
 
 # 3) 安装并启动（systemd 单元只负责 --config 指向配置文件）
@@ -190,7 +190,7 @@ sudo systemctl enable --now gateway
 sudo tail -f /var/log/home-llm-gateway/gateway.log
 ```
 
-`gateway-config.yml` 关键参数（按需修改，完整示例见 `gateway_config.example.yml`）：
+`gateway-config.yml` 关键参数（按需修改，完整示例见 `gateway-config.example.yml`）：
 
 ```yaml
 listen_addr: "0.0.0.0:8443"        # HTTPS API 入口
@@ -244,22 +244,22 @@ curl -s http://127.0.0.1:11434/v1/models          # 本机确认 OpenAI 兼容�
 sudo mkdir -p /etc/home-llm-gateway
 # 二进制（agent.service 的 ExecStart 是 /usr/local/bin/agent）
 sudo cp target/release/agent /usr/local/bin/agent
-# 证书：与 agent_config.example.yml 的路径一致（/etc/home-llm-gateway/{ca.crt,client.crt,client.key}）
+# 证书：与 agent-config.example.yml 的路径一致（/etc/home-llm-gateway/{ca.crt,client.crt,client.key}）
 sudo cp ca.crt /etc/home-llm-gateway/ca.crt
 sudo cp client-edge1.crt /etc/home-llm-gateway/client.crt
 sudo cp client-edge1.key /etc/home-llm-gateway/client.key
 sudo chmod 600 /etc/home-llm-gateway/client.key
 
-# 基于 agent_config.example.yml 生成 agent 配置：
+# 基于 agent-config.example.yml 生成 agent 配置：
 #   cloud_addr: <公网IP>:4433
 #   server_name: <与网关 server 证书 SAN 一致的域名或 IP>   ← 关键！不一致会 TLS 握手失败
 #   agent_id: <每台机器唯一！>                              ← 关键！同名会让两台机器互踢（见下方警告）
 #   upstream: http://127.0.0.1:11434
-sudo cp agent_config.example.yml /etc/home-llm-gateway/agent-config.yml
+sudo cp agent-config.example.yml /etc/home-llm-gateway/agent-config.yml
 sudo vi /etc/home-llm-gateway/agent-config.yml
 ```
 
-> ⚠️ **`agent_id` 必须每台机器唯一**：`agent_config.example.yml` 与 `Makefile` 生成的默认值都是
+> ⚠️ **`agent_id` 必须每台机器唯一**：`agent-config.example.yml` 与 `Makefile` 生成的默认值都是
 > `edge-1`，**多台机器直接照抄就会撞车**。同名时网关会关掉旧连接（本意是同一台机器重连接管），
 > 两台机器于是轮流接管——**凡活得比接管周期长的请求都可能失败（502）**，而两侧进程都健康、
 > `/admin/agents` 恒显示"1 个 agent 在线"，信号只有 `hlmg_agent_connections_total` 在飞涨。
@@ -385,7 +385,7 @@ docker build -f crates/gateway/Dockerfile -t home-llm-gateway .
 
 ### 11.2 挂载点必须与配置里的路径对齐（二选一）
 
-`gateway_config.example.yml` 和 `agent_config.example.yml` 用的都是绝对路径
+`gateway-config.example.yml` 和 `agent-config.example.yml` 用的都是绝对路径
 `/etc/home-llm-gateway/...`，所以：
 
 | 方案 | 挂载 | 配置文件 |

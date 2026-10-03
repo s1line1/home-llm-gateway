@@ -767,7 +767,7 @@
 - **《并发上限与内存》整节重写**：原文把"每在途请求 15–20MB"当常态，而那是**缓存关闭**时的 argon2 成本。
   现改为两笔账（冷启动 19MiB/凭据 vs 转发缓冲 ~0.2MB/请求），并补同一台机器只改 `verified_cache_max`
   的对照实测（8 并发：172.8MB vs 31.6MB；64 并发：1236.5MB vs 27.1MB；128 并发关闭时 +1416MB 且 45% 失败）。
-  同一旧公式还散落在 README 两处（压测小节、admission control 小节）与 `gateway_config.example.yml`，
+  同一旧公式还散落在 README 两处（压测小节、admission control 小节）与 `gateway-config.example.yml`，
   一并改为"仅缓存关闭时适用"。
 - **`/metrics` 的坑**：`verified_cache_max: 0` 时 `hlmg_key_verify_{hits,misses}_total` 恒为 0（旧路径不加计数），
   已在《可观测性》写明，避免运维误判为"没有校验"。
@@ -1353,7 +1353,7 @@ proto+mock-llm、storage+用量、web+部署+文档），随后**由我逐条复
       判据退化）。把替身改成两个不同的数（如 prompt>completion）即可让这类归属错误可观测。
       **复核**：我自己读了替身与断言两侧。
 - [ ] **`S2-15`（本轮 A3/A8 的漏改）配置侧文档仍写"只有 `/metrics` 豁免"**：
-      `crates/gateway/src/config.rs:87` 与 `gateway_config.example.yml:129` 都没跟上 A3（`/healthz`
+      `crates/gateway/src/config.rs:87` 与 `gateway-config.example.yml:129` 都没跟上 A3（`/healthz`
       进探针域）与 A8（`/metrics` 进抓取域）——真实语义是"两条无认证路径**各有独立额度**、都不吃
       受限预算"。`README.md:482` 已是对的。**复核**：我自己读了这三处。
 - [ ] **`S2-16`（本轮 G6 的漏）`clearAdminToken` 丢弃 `removeItem` 失败并把内存态置 `null`**：

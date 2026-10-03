@@ -275,7 +275,7 @@ s2n-quic 的 `initial_max_streams_bidi` 默认只有 **100**（`InitialMaxStream
 
 - **云端**：编译为单二进制，`systemd` 或 Docker 运行；证书由自家 CA 签发脚本管理。
 - **edge 节点**：单二进制，支持 Linux / macOS / Windows / WSL2（各节点系统可能不同）。
-- **配置**：网关侧固定 `gateway-config.yml`、边缘端固定 `agent-config.yml`（均 YAML，模板见 `gateway_config.example.yml` 与 `agent_config.example.yml`；两份配置都含密钥类信息，已 gitignore，不提交）。
+- **配置**：网关侧固定 `gateway-config.yml`、边缘端固定 `agent-config.yml`（均 YAML，模板见 `gateway-config.example.yml` 与 `agent-config.example.yml`；两份配置都含密钥类信息，已 gitignore，不提交）。
 - **开机自启**：边缘端注册为 systemd/launchd 服务。
 
 ## 9. 里程碑

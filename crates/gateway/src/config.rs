@@ -89,7 +89,7 @@ pub struct ConfigFile {
     ///
     /// **该值应按网关内存倒推**：每个在途流式请求约吃 **19 MiB，但只在缓存关闭时成立**
     /// （缓存打开时命中即不再跑 argon2；见 README《并发上限与内存》与
-    /// `gateway_config.example.yml` 的同一处限定）—— 旧版本这里写"15–20MB ⇒ ≈ MemoryMax/20MB"
+    /// `gateway-config.example.yml` 的同一处限定）—— 旧版本这里写"15–20MB ⇒ ≈ MemoryMax/20MB"
     /// 且**没有**这个限定，会让运维把闸门设小约 75 倍（P3-11）。
     /// 给得过大的话，先撞的是 cgroup 的 `MemoryMax`——网关被 OOM 杀掉、连接被中断，
     /// 而不是在这里优雅地返回 429，那道闸就形同虚设。
@@ -170,7 +170,7 @@ fn default_keys_file() -> Option<PathBuf> {
 /// 而相对路径按**进程 CWD** 解析 —— 镜像的 CWD 是 `/etc/home-llm-gateway`，正是配置/证书/
 /// `keys.db` 的**挂载点**，镜像里放那儿的东西会被宿主目录遮住 ⇒ 曾经的默认值在容器里必然
 /// 降级成"UI 未构建"。换成绝对路径后：**有配置用配置，没配置就用镜像内这份**。
-/// （原生部署因此要显式写自己的目录，`gateway_config.example.yml` 里给的就是那种写法。）
+/// （原生部署因此要显式写自己的目录，`gateway-config.example.yml` 里给的就是那种写法。）
 fn default_ui_dir() -> Option<PathBuf> {
     Some(PathBuf::from("/usr/local/share/home-llm-gateway/web"))
 }
@@ -449,7 +449,7 @@ rate_limit_per_min: 60
         assert!(serde_yaml_ng::from_str::<ConfigFile>("nonsense_field: 1").is_err());
     }
 
-    /// `gateway_config.example.yml` 必须始终能解析，并且**覆盖到新增的字段**。
+    /// `gateway-config.example.yml` 必须始终能解析，并且**覆盖到新增的字段**。
     ///
     /// 为什么值得一条测试：`ConfigFile` 开了 `deny_unknown_fields`，示例文件写错字段名
     /// 会直接导致「照抄示例 → 网关起不来」；反过来新增字段若忘了写进示例，用户也看不到
@@ -457,7 +457,7 @@ rate_limit_per_min: 60
     #[test]
     fn example_config_parses_and_documents_knobs() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../gateway_config.example.yml");
+            .join("../../gateway-config.example.yml");
         let text = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("读不到 {}: {e}", path.display()));
         let cfg: ConfigFile = serde_yaml_ng::from_str(&text)
@@ -477,7 +477,7 @@ rate_limit_per_min: 60
         ] {
             assert!(
                 text.contains(key),
-                "gateway_config.example.yml 缺少配置项说明：{key}"
+                "gateway-config.example.yml 缺少配置项说明：{key}"
             );
         }
         assert_eq!(cfg.tunnel_op_secs, default_tunnel_op_secs());
