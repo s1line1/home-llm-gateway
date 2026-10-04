@@ -252,7 +252,7 @@ pub(super) async fn forward_body<R>(
     op_timeout: Duration,
     _slot: crate::registry::SlotGuard,
     metrics: crate::metrics::Metrics,
-    key_store: crate::storage::Storage,
+    store: crate::storage::Storage,
     key_id: String,
     key_name: String,
     prompt_est: u64,
@@ -262,7 +262,7 @@ pub(super) async fn forward_body<R>(
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    let mut usage = UsageCollector::new(key_store, key_id, key_name, prompt_est, is_stream);
+    let mut usage = UsageCollector::new(store, key_id, key_name, prompt_est, is_stream);
     // reader 由调用方（`proxy::mod` 的响应编排）创建并**贯穿响应头与响应体两个阶段**
     // （记录 R3）：所以下面这个 `select!` 里 `shutdown.changed()` 分支的 `continue`
     // （复用同一条流）不会丢半帧，`Draining` 阶段"在途响应照常跑完"的承诺也靠它。
