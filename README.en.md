@@ -444,6 +444,7 @@ deny.toml       cargo-deny policy (dependency licenses / advisories)
 | [`DEPLOY.md`](DEPLOY.md) | **Deployment**: certificate issuance, security groups, systemd / Docker, upgrades, troubleshooting |
 | [`REBUILD.md`](REBUILD.md) | **Rebuild blueprint**: irreversible decisions, traffic and concurrency specs, 12 acceptance assertions |
 | [`EXACTLY_ONCE.md`](EXACTLY_ONCE.md) | **Proposal (not implemented)**: protocol-level dedup so response-head timeouts can be retried safely |
+| [`CERT_MANAGEMENT.md`](CERT_MANAGEMENT.md) | **Design (not implemented)**: dynamic certificate and trust-root management -- adding an agent without restarting the gateway, the CSR route (private key never leaves the machine), trust semantics and the identity problem |
 | [`CODE_READING.md`](CODE_READING.md) | **Code reading guide**: where to start, anchor files, verification-driven learning |
 | [`TODO.md`](TODO.md) | **Development status and roadmap** (also the register of known issues) |
 

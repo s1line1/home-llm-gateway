@@ -267,9 +267,24 @@ s2n-quic 的 `initial_max_streams_bidi` 默认只有 **100**（`InitialMaxStream
 | 面 | 措施 |
 |---|---|
 | 公网入口 | TLS 1.3（配置 `tls_cert`/`tls_key` 后启用 HTTPS；**未配置就是明文 HTTP**，生产必须配）；API Key 认证；限流；请求体大小上限（16 MiB，当前硬编码）；访问日志（`request_id` / method / path / status / TTFB）；per-key token 用量计量（上游 `usage` 优先，缺失时估算并标记）。**尚未包含来源 IP 与 key id**（见 TODO 审查登记） |
-| 隧道 | QUIC 内建 TLS 1.3 + mTLS（云端 CA 签发 agent 证书）；连接级空闲超时；证书轮换 |
+| 隧道 | QUIC 内建 TLS 1.3 + mTLS（云端 CA 签发 agent 证书）；连接级空闲超时。⚠️ **证书轮换尚未实现**——证书在启动时读一次，换/加证书要重启网关（设计与现状见 §7.1 与 `CERT_MANAGEMENT.md`）|
 | 数据 | 全链路加密；日志脱敏（不记录 prompt 内容，或可配置） |
 | 密钥 | API Key 以 **argon2 哈希**存储（Argon2id，明文仅创建时返回一次），另存 sha256 快速索引用于授权 O(1) 定位；agent 私钥只存 edge 节点本地 |
+
+### 7.1 证书与信任根的动态管理（设计，⛔ 未实现）
+
+**触发问题**：目前**加一个 agent 必须重启网关**——信任根在 `Gateway::start` 里构建一次、
+没有热重载（`SIGHUP` 在本进程是**关闭信号**，`main.rs:87`）。
+
+要解决它必须拆成**两个正交的子问题**——**只把材料从本地文件搬到远端服务器并不解决它**
+（*来源*变了，*生效时机*没变）：**① 信任根怎么在运行时生效**（网关侧）：自定义
+`ClientCertVerifier`——rustls **每次握手**都调用它，故 `ArcSwap` 一个实时信任集即"下一次握手
+生效"，`ServerConfig` 与 endpoint 都不用重建；**② agent 的证书从哪来**（agent 侧）：走
+**PKCS#10 CSR**，私钥本机生成、不落盘也不上网——但**真正的难点是身份证明**（CSR 的自签名只证
+"持有私钥"，不证"你是谁"）。
+
+完整设计（含四张图：总体数据流、路线 A 八步时序、网关侧机制、两种信任语义）与取舍见
+[`CERT_MANAGEMENT.md`](CERT_MANAGEMENT.md)，当前状态为**设计已定、未实现**。
 
 ## 8. 部署形态
 
