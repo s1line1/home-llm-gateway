@@ -296,8 +296,9 @@
       `Gateway::start` 里构建一次、**没有热重载**（`gateway.rs:96`；`SIGHUP` 在本进程是
       **关闭信号**，见 `main.rs:87`）。要拆成**两个正交的子问题**，否则容易把"材料从哪来"
       与"改完在哪生效"混为一谈——**只把材料从本地文件搬到远端服务器，重启问题依然存在**。
-      📐 **完整设计图见 `DESIGN.md` §7.1《证书与信任根的动态管理》**（四张图：总体数据流、
-      路线 A 的八步时序含私钥边界、网关侧"为什么不用重启"的机制图、两种信任语义对比）。
+      📐 **完整设计见 [`CERT_MANAGEMENT.md`](CERT_MANAGEMENT.md)**（四张图：总体数据流、
+      路线 A 的八步时序含私钥边界、网关侧"为什么不用重启"的机制图、两种信任语义对比）；
+      `DESIGN.md` §7.1 只留一句指针。
 
       **设计原则（2026-10-05 定）：信任根是安全边界，不得放在业务库里**
       信任根**不进 `keys.db`**、也**不走 Admin API**。理由：业务库是**业务资产**，它的迁移、
@@ -342,14 +343,14 @@
         **现场生成密钥对**（内存）→ `rcgen::CertificateParams::serialize_request` 出 CSR
         （rcgen **自动用私钥自签名** = RFC 2986 的持有性证明）→ 只把**公钥**发出去 → CA 只回
         **签好的短命证书**。同属此路的实现（**ACME** / K8s **cert-manager** /
-        **Vault `pki/sign`**）与 Vault `pki/issue`（= 路线 B）的对照表见 **`DESIGN.md` §7.1.2**
-        ——**实现例子统一放那里**，本条目不再重复罗列。
+        **Vault `pki/sign`**）与 Vault `pki/issue`（= 路线 B）的对照表见
+        **`CERT_MANAGEMENT.md` §2**——**实现例子统一放那里**，本条目不再重复罗列。
         **工具已就位**：`rcgen` 已是 workspace 依赖且**已在 `crates/agent`**（其 `Cargo.toml:32`）；
         但 **CA 侧要加 `x509-parser` feature** 才能用 `CertificateSigningRequestParams::from_pem`
         （现 feature 为 `["crypto","pem","aws_lc_rs"]`，不含它）。
       - **路线 B：服务端生成密钥再下发**——**不推荐裸用**：私钥要在网络上走一趟。
         （SPIFFE/SPIRE 现状即如此，它靠**本地 Unix socket** 收缩信任边界；机制与其
-        issue #317 的讨论见 `DESIGN.md` §7.1.2。）
+        issue #317 的讨论见 `CERT_MANAGEMENT.md` §2。）
       - **⚠️ 真正的难点不在密钥，在身份**：CSR 里的自签名**只证明"我持有这把私钥"**，
         **不证明"我是 edge-2"**——`subject` 谁都能填。必须有**独立的身份证明**：域名控制
         （ACME 做法）/ 云实例身份（IMDS）/ TPM / **一次性注册令牌**。本地自建建议最后一种，
