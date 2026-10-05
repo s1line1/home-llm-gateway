@@ -341,14 +341,15 @@
       - **路线 A（推荐）：PKCS#10 CSR——私钥本机生成，既不落盘也不上网**。agent 每次启动
         **现场生成密钥对**（内存）→ `rcgen::CertificateParams::serialize_request` 出 CSR
         （rcgen **自动用私钥自签名** = RFC 2986 的持有性证明）→ 只把**公钥**发出去 → CA 只回
-        **签好的短命证书**。最著名的实现是 **ACME**（Let's Encrypt），规矩就是"私钥永不离开
-        你的机器"；K8s 的 cert-manager、Vault 的 `pki/sign/<role>` 同属此路。
+        **签好的短命证书**。同属此路的实现（**ACME** / K8s **cert-manager** /
+        **Vault `pki/sign`**）与 Vault `pki/issue`（= 路线 B）的对照表见 **`DESIGN.md` §7.1.2**
+        ——**实现例子统一放那里**，本条目不再重复罗列。
         **工具已就位**：`rcgen` 已是 workspace 依赖且**已在 `crates/agent`**（其 `Cargo.toml:32`）；
         但 **CA 侧要加 `x509-parser` feature** 才能用 `CertificateSigningRequestParams::from_pem`
         （现 feature 为 `["crypto","pem","aws_lc_rs"]`，不含它）。
-      - **路线 B：服务端生成密钥再下发**（= SPIFFE/SPIRE 的现状，其 issue #317 仍在讨论要不要
-        改成 workload 侧生成）。**不推荐裸用**：私钥要在网络上走一趟。SPIRE 之所以可接受，
-        是因为 SVID 走**本地 Unix socket**（把信任边界收缩到本机），不走公网。
+      - **路线 B：服务端生成密钥再下发**——**不推荐裸用**：私钥要在网络上走一趟。
+        （SPIFFE/SPIRE 现状即如此，它靠**本地 Unix socket** 收缩信任边界；机制与其
+        issue #317 的讨论见 `DESIGN.md` §7.1.2。）
       - **⚠️ 真正的难点不在密钥，在身份**：CSR 里的自签名**只证明"我持有这把私钥"**，
         **不证明"我是 edge-2"**——`subject` 谁都能填。必须有**独立的身份证明**：域名控制
         （ACME 做法）/ 云实例身份（IMDS）/ TPM / **一次性注册令牌**。本地自建建议最后一种，

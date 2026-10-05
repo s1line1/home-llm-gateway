@@ -310,10 +310,14 @@ s2n-quic 的 `initial_max_streams_bidi` 默认只有 **100**（`InitialMaxStream
                              （QUIC 隧道；agent 出示 client cert）
 ```
 
-#### 7.1.2 子问题 ②：agent 的证书从哪来 —— 路线 A（PKCS#10 CSR）
+#### 7.1.2 子问题 ②：agent 的证书从哪来
 
-**核心思想**：私钥在本机生成且**只把公钥**发出去，CA 从不需要看到私钥。
-最著名的实现是 **ACME**（Let's Encrypt），规矩就是"私钥永不离开你的机器"。
+两条路线，**推荐路线 A**——它让私钥**既不出机器、也不落盘**。
+
+**路线 A（推荐）：PKCS#10 CSR —— 私钥不出机器**
+
+**核心思想**：私钥在本机生成且**只把公钥**发出去，CA 从不需要看到私钥。机制是
+**PKCS#10 CSR**（RFC 2986）——请求里装的是**公钥**，且整个请求**用私钥自签名**。
 
 ```
 ┌──────────────────── edge-agent 机器 ─────────────────────┐
@@ -351,6 +355,14 @@ s2n-quic 的 `initial_max_streams_bidi` 默认只有 **100**（`InitialMaxStream
 └──────────────────────────────────────────────────────────┘
 ```
 
+**同属此路（都是"私钥不出机器"）的实现**：
+
+| 实现 | 靠什么证明身份 | 备注 |
+|---|---|---|
+| **ACME**（Let's Encrypt） | 域名控制（HTTP-01 / DNS-01） | 最著名；规矩就是"私钥永不离开你的机器" |
+| **K8s cert-manager** | K8s ServiceAccount / issuer 凭证 | 私钥在 Pod 内生成，对外只发 CSR |
+| **Vault PKI 的 `pki/sign/<role>`** | 先认证到 Vault（token / AppRole / 云 IAM） | 端点文档原话：*"signs a new certificate based upon the **provided CSR**"*，且 `csr` 参数必填 |
+
 **⚠️ 路线 A 的真正难点不在密钥，在身份。** CSR 里的自签名**只证明"我持有这把私钥"**，
 **不证明"我是 edge-2"**——`subject` 谁都能填。所以第 ④ 步必须由**独立的身份证明**解决：
 
@@ -363,9 +375,14 @@ s2n-quic 的 `initial_max_streams_bidi` 默认只有 **100**（`InitialMaxStream
 
 注意代价：用令牌 = 把"分发证书"换成"分发令牌"，**问题换形态而非消失**。
 
-**路线 B（服务端生成密钥再下发）不推荐裸用**：私钥要在网络上走一趟。SPIFFE/SPIRE 之所以
-可接受，是因为 SVID 走**本地 Unix socket**（把信任边界收缩到本机），不走公网——而 SPIFFE
-现状本身就是服务端生成（其 issue #317 仍在讨论是否改为 workload 侧生成）。
+**路线 B（不推荐裸用）：服务端生成密钥再下发**
+
+私钥要在网络上走一趟。**Vault 就同时提供这条路**——`pki/issue/<role>`，其文档标题就是
+*"**Generate** Certificate and Key"*（服务端生成密钥对）；SPIFFE/SPIRE 现状亦如此，
+它靠 **SVID 走本地 Unix socket**（把信任边界收缩到本机）而非公网来收窄暴露面，
+其 issue #317 仍在讨论是否改为 workload 侧生成。
+
+**一个成熟产品把两条路线并存提供，正说明"要不要让私钥上网"是真实的取舍点**，不是本设计的臆想。
 
 #### 7.1.3 子问题 ①：信任根怎么在运行时生效（网关侧）
 
