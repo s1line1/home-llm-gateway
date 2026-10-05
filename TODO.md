@@ -291,27 +291,92 @@
       覆盖 systemd stop、Ctrl+C、harness job_kill 场景（对应 OPTIMIZATION.md A1 ✅）。
       网关侧现在是**两阶段有界关闭**（先停 accept 并排空，宽限期后才带明确事件切断），见下方
       R12 drain 式关闭；**agent 侧仍是立即 abort（无排空）**。
-- [ ] **⛔ 多 CA 信任根 + 动态增删（新功能——按顶部范围约定先不做，仅登记）**：
-      目标：每个 agent 用独立 CA 签发证书，gateway 维护全部 CA 的信任根集合；
-      运行时热添加/移除单个 CA——移除即吊销该 CA 下所有 agent（新连接被拒，
-      已建立连接不受影响，其他 agent 零影响）；重启后动态配置不丢。
-      **设计要点（已定稿）**：
-      1. 新模块 `ca_store.rs`：`TrustStore { cas: RwLock<HashMap<指纹, TrustedCa>>, roots: RwLock<RootCertStore> }`，
-         指纹 = sha256(cert DER) 十六进制（标识/防重/吊销定位）；add/remove 同步更新 roots
-      2. 自定义 rustls `ClientCertVerifier`（参考官方 dynamic-certs 示例）：verify_client_cert 时
-         读 TrustStore 当前信任根验证——每次握手走最新信任根；quinn Endpoint 构建一次，无需重建
-      3. Admin API（受 admin_token 保护，与 /admin/keys 同层）：
-         `GET /admin/ca` 列表；`POST /admin/ca {pem, name}` 添加（校验 X.509、≤64KB、
-         重复指纹 409、非法 400 → 201）；`DELETE /admin/ca/{fp}` 移除（204/404）；
-         可选 `POST /admin/ca/{fp}/disable` 禁用不删除
-      4. 持久化：SQLite 新表 `trust_cas(fingerprint PK, name, pem, added_at, enabled)`，
-         写穿模式（复用 keystore）；启动时加载全部 CA
-      5. 兼容性：现有 `ca:` 配置文件 = 初始信任根（行为不变），动态 CA 走 API
-      6. 测试：单测（指纹/add/list/remove/409/持久化 roundtrip）；
-         e2e：① 双 CA 双 agent 接入 → DELETE 其一 → 该 agent 重连被拒（agent_count 回落）
-         另一 agent 不受影响；② POST 新 CA → 新 agent 热接入；③ 重启后动态 CA 仍生效
-      7. 分步：TrustStore+verifier → Admin API → SQLite 持久化 → e2e + 文档
-         （README/DEPLOY/DESIGN 安全章节更新：每 agent 独立 CA 的管理模型与吊销语义）
+- [ ] **⛔ 证书 / 信任根的动态管理（新功能——按顶部范围约定先不做，仅登记）**：
+      起因（2026-10-05 讨论）：**加一个 agent 目前必须重启网关**——因为网关的信任根在
+      `Gateway::start` 里构建一次、**没有热重载**（`gateway.rs:96`；`SIGHUP` 在本进程是
+      **关闭信号**，见 `main.rs:87`）。要拆成**两个正交的子问题**，否则容易把"材料从哪来"
+      与"改完在哪生效"混为一谈——**只把材料从本地文件搬到远端服务器，重启问题依然存在**。
+      📐 **完整设计图见 `DESIGN.md` §7.1《证书与信任根的动态管理》**（四张图：总体数据流、
+      路线 A 的八步时序含私钥边界、网关侧"为什么不用重启"的机制图、两种信任语义对比）。
+
+      **设计原则（2026-10-05 定）：信任根是安全边界，不得放在业务库里**
+      信任根**不进 `keys.db`**、也**不走 Admin API**。理由：业务库是**业务资产**，它的迁移、
+      备份回滚、以及"库被写坏/被攻破"都不该连带影响 PKI；反过来把安全边界混进业务库，也让
+      两者的故障域纠缠不清。**材料只来自部署侧**——外部密钥服务器（主）或本地 PEM 文件（备）。
+
+      > ⚠️ **已废弃方案（留痕，勿再捡起）**：本条目早期版本（2026-09 定稿）设计为
+      > **Admin API + SQLite 复用 `keys.db`**——新模块 `ca_store.rs` 的
+      > `TrustStore { cas: RwLock<HashMap<指纹, TrustedCa>>, roots: RwLock<RootCertStore> }`，
+      > 新增 SQLite 表 `trust_cas(fingerprint PK, name, pem, added_at, enabled)`（写穿模式），
+      > 配套 `GET /admin/ca`、`POST /admin/ca {pem, name}`、`DELETE /admin/ca/{fp}`、
+      > 可选 `POST /admin/ca/{fp}/disable` 四个管理端点，以及"持久化 roundtrip"测试项。
+      > **2026-10-05 否决**，理由见上面的设计原则：**信任根是安全边界，不得由业务库承载**
+      > （业务库的迁移 / 备份回滚 / 被写坏或被攻破，都不该连带影响 PKI，反之亦然）。
+      > 取而代之的是：材料只来自**部署侧**——外部密钥服务器（主）或本地 PEM 文件 watch（备）。
+      > **日后若从 git 历史或旧文档里翻出 `ca_store.rs` / `trust_cas` / `/admin/ca` 这一套，
+      > 按本声明作废，不要再实现。**
+
+      **子问题 ①：信任根怎么在运行时生效（网关侧）—— 核心**
+      - **机制根据**：rustls **每次握手**都调用 `verify_client_cert`，所以只要该函数读的是
+        **可替换的实时状态**，改动就在**下一次握手**生效——`ServerConfig` 与 QUIC endpoint
+        **一行都不用改**（`quic.rs:221` 把 `Arc<rustls::ServerConfig>` 交给 s2n-quic）。
+      - **不要自己写 X.509 验证**：用**委托型** verifier + `ArcSwap` 包住
+        `WebPkiClientVerifier`（或指纹集合），只做"转发给当前那个"。需实现/覆盖的 trait
+        方法（rustls 0.23）：`root_hint_subjects`、`verify_client_cert`、
+        `verify_tls12_signature`、`verify_tls13_signature`、`supported_verify_schemes`；
+        另**必须覆盖 `client_auth_mandatory() -> true`**（默认 `false`）。
+      - **刷新源（同一块 verifier，二者择一）**：
+        ① **外部密钥服务器（主）**：HTTPS 拉取当前的 agent 公钥 / CA 集合，轮询或长连接推送
+           均可。公钥是**公开信息**，所以这个方向**几乎没有引导难题**——但仍须走 HTTPS
+           **防篡改**（信任根被改 = 任意人可接入）。
+        ② **本地 PEM 文件 watch（备，零外部服务）**：kqueue/inotify，**零空闲开销**，
+           运维改文件即生效——适合自建小规模；文件不是数据库，不触犯上面的原则。
+      - **成本与边界**：轮询 30s ≈ 14 MB/天，对网关 43 GB/天 是 **0.03%**，CPU 微秒级
+        （仓库本已有同类周期任务 `usage_flush`）；在意空闲开销就用文件 watch。
+        **拉取失败必须保留 last-good、绝不清空**（否则一次网络抖动 = 全部 agent 被拒）。
+        **已建立连接不受影响**，只有新握手走新集合——正好满足"吊销单个 agent 不打扰其他"。
+      - **配置兼容**：现有 `ca:` 配置文件 = **初始/兜底**信任根（行为不变），动态来源叠加其上。
+
+      **子问题 ②：agent 的客户端证书从哪来（agent 侧）—— 独立问题，推荐路线 A**
+      - **路线 A（推荐）：PKCS#10 CSR——私钥本机生成，既不落盘也不上网**。agent 每次启动
+        **现场生成密钥对**（内存）→ `rcgen::CertificateParams::serialize_request` 出 CSR
+        （rcgen **自动用私钥自签名** = RFC 2986 的持有性证明）→ 只把**公钥**发出去 → CA 只回
+        **签好的短命证书**。最著名的实现是 **ACME**（Let's Encrypt），规矩就是"私钥永不离开
+        你的机器"；K8s 的 cert-manager、Vault 的 `pki/sign/<role>` 同属此路。
+        **工具已就位**：`rcgen` 已是 workspace 依赖且**已在 `crates/agent`**（其 `Cargo.toml:32`）；
+        但 **CA 侧要加 `x509-parser` feature** 才能用 `CertificateSigningRequestParams::from_pem`
+        （现 feature 为 `["crypto","pem","aws_lc_rs"]`，不含它）。
+      - **路线 B：服务端生成密钥再下发**（= SPIFFE/SPIRE 的现状，其 issue #317 仍在讨论要不要
+        改成 workload 侧生成）。**不推荐裸用**：私钥要在网络上走一趟。SPIRE 之所以可接受，
+        是因为 SVID 走**本地 Unix socket**（把信任边界收缩到本机），不走公网。
+      - **⚠️ 真正的难点不在密钥，在身份**：CSR 里的自签名**只证明"我持有这把私钥"**，
+        **不证明"我是 edge-2"**——`subject` 谁都能填。必须有**独立的身份证明**：域名控制
+        （ACME 做法）/ 云实例身份（IMDS）/ TPM / **一次性注册令牌**。本地自建建议最后一种，
+        并**把令牌限定到单个 `agent_id`**（泄露也只能冒充那一台）。注意：用令牌 = 把
+        "分发证书"换成"分发令牌"，**问题换形态而非消失**。
+      - **短命证书的配套**：轮换在 2/3 TTL 重跑流程；**短 TTL 让吊销不再关键**（证书自己会死）；
+        ⚠️ 短 TTL 对**时钟偏移**敏感（本机场景要留意）。
+
+      **信任语义二选一（建议后者）**：**CA 链** —— 信任根 = CA 集合，**吊销的最小单位是 CA**
+      （所以"每 agent 独立 CA"才能单独吊销）；或**指纹固定（pinning）** —— 直接比对
+      `sha256(agent 证书 DER)` 是否在集合里，**更简单也更强**（不用构建证书链、免掉 X.509
+      那堆坑、**吊销精确到单个 agent**）。
+      ⚠️ 另注：**证书身份与 `agent_id` 无绑定**——网关只看"能否链到信任根"，不读 CN/SAN
+      （`quic.rs`/`registry.rs` 里搜 `subject`/`common_name`/`peer_certificate` 一处都没有），
+      于是**任何持有合法证书的 agent 都能冒用别人的 `agent_id`**（含顶掉其连接）。
+      **做本条目时建议顺带把 SAN/CN 与 `agent_id` 绑定**，否则"每 agent 一个身份"并不成立
+      （这也正是 SL-P2-10 那条缺陷的后半句）。
+
+      **测试**（沿用并扩充原计划）：单测（指纹集合 add/remove、
+      **verifier 替换后下一次握手即生效**）；e2e：① 双 CA 双 agent 接入 → 移除其一 →
+      该 agent 重连被拒（agent_count 回落）而另一 agent 不受影响；② 新增一个 CA/公钥 →
+      新 agent **热接入**（**不重启网关**）；③ 重启后从配置/服务器加载的信任根仍生效；
+      ④ **刷新源失败时保留 last-good**（不清空）。
+      **分步**：DynamicVerifier + 可变信任集 → 先用**文件 watch** 跑通"不重启生效" →
+      接**外部密钥服务器**刷新源 → （可选）切指纹固定 → （可选）agent 侧路线 A + 身份证明
+      → 文档（README/DEPLOY/DESIGN 安全章节：信任根刷新语义、每 agent 身份与吊销粒度）。
+      注：原文写的是"quinn Endpoint"，本项目实际用 **s2n-quic**（`Cargo.toml:40`），此处订正；
+      被否决的 Admin API + SQLite 方案另见上面的《已废弃方案》留痕。
 - [ ] **⛔ UDP 被封时的 TCP+TLS fallback（新功能——按顶部范围约定先不做）**（DESIGN.md §10）：帧协议不变，仅替换 QUIC 传输层
 - [x] **per-API-key token 用量计量（2026-09 实施）**：
       按 API key 统计 token 消耗（prompt/completion/total + 请求数 + 最后使用时间），
