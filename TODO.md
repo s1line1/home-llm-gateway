@@ -195,6 +195,25 @@
       每请求至少一行 INFO，实测单日 **652MB**（`tail -c 6000000` 只覆盖约 20 秒，
       排查时按时间 grep 会误以为"日志里什么都没有"）。修法：`logrotate` + 降级为
       `RUST_LOG=info,gateway::access=debug` 之类的分级，或按请求采样。
+- [ ] **日志按级别分流到不同文件（info / warn / error 各一份）**（2026-10-03 人工指示）：
+      目的是排查时"错误不被 info 淹没"。**硬约束：进程目前只写 stdout**——
+      `crates/gateway/src/main.rs:48` 的 `tracing_subscriber::fmt().try_init()` **没有**
+      `with_writer`，落盘是部署侧做的（`deploy/gateway.service:35` 的
+      `StandardOutput=append:/var/log/home-llm-gateway/gateway.log`，或 docker 的 stdout 采集）。
+      而 **systemd / docker 只能把 stdout 重定向到"一个"文件，无法按级别分流** ⇒ 要分流就得让
+      **进程自己开文件**。可选修法：① 进程内多 layer——`tracing_subscriber::registry()` +
+      每级一个 `fmt::Layer`，各自 `with_writer(..)` 与 `with_filter(LevelFilter::…)`；writer 用
+      `std::sync::Mutex<File>`（`&File` 已实现 `MakeWriter`）或引入 `tracing-appender`；
+      ② 保持 stdout 单流、由外部按级别分流（管道给脚本 / 集中式采集）——**脆弱，不建议**。
+      代价与待决：**a)** 属"新增依赖 / 新配置旋钮"，按顶部范围约定**只登记、不排期**；
+      **b)** 分成 3 份后**字节总量不变**，上一条《网关日志无轮转、体量失控》（实测单日 652MB）
+      仍然必须做，两条要一起落地；**c) `SIGHUP` 已被占用**——进程把 SIGHUP 当**关闭请求**
+      （`crates/gateway/src/main.rs:87`，P3-9），与"logrotate 发 SIGHUP 让进程重新打开日志文件"
+      的惯例**直接冲突**：若走进程自持文件句柄，轮转后无法用 SIGHUP 换句柄，只能退回
+      `copytruncate`（有丢行窗口）或先改信号语义；**d)** 分轴还有另一种选法，是**按 target**
+      （`gateway::access` 访问日志 vs 其它运维日志）而不是按级别——注意当前**成功的请求落在
+      debug 级**（`crates/gateway/src/http/observability.rs:153`），所以"按级别分"并不能把访问
+      日志从运维日志里分出来；**按 target 分轴 + 访问日志单独降级**可能更贴合真实需求，开工前先定。
 
 - [ ] **同名 `agent_id` 会让网关静默不可用（2026-09 发现，已实测；修法已验证但代码已撤回）**：
       两台 edge 用同一个 `agent_id` 时，网关对同名注册会**关掉旧连接**（`registry.rs`，本意是
