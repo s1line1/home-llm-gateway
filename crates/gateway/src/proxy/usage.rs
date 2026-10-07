@@ -25,7 +25,7 @@ const MAX_NON_STREAM_BUFFER: usize = 32 * 1024 * 1024;
 /// 请求级 usage 收集：SSE 流式逐块预过滤提取；非流式缓冲到 End 后整包解析；
 /// 均拿不到 usage（上游未提供 / 取消 / 断流）→ 估算并标记。
 pub(super) struct UsageCollector {
-    key_store: crate::storage::Storage,
+    store: crate::storage::Storage,
     key_id: String,
     key_name: String,
     /// 请求 body 的 prompt 估算（无 usage 时的 prompt 降级）。
@@ -44,14 +44,14 @@ pub(super) struct UsageCollector {
 
 impl UsageCollector {
     pub(super) fn new(
-        key_store: crate::storage::Storage,
+        store: crate::storage::Storage,
         key_id: String,
         key_name: String,
         prompt_est: u64,
         is_stream: bool,
     ) -> Self {
         Self {
-            key_store,
+            store,
             key_id,
             key_name,
             prompt_est,
@@ -102,7 +102,7 @@ impl UsageCollector {
         }
         self.settled = true;
         let delta = self.resolve_delta();
-        self.key_store
+        self.store
             .accumulate_usage(&self.key_id, &self.key_name, &delta);
     }
 
