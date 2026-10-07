@@ -184,7 +184,7 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
     let op_timeout = state.tunnel_op_timeout;
     let state_client_stall = state.client_stall;
     let metrics = state.metrics.clone();
-    let key_store = state.store.clone();
+    let store = state.store.clone();
     // 关闭阶段的接收端：`Terminating` 时这条流要带一个明确事件收尾（见 `forward.rs`）。
     let shutdown = state.subscribe_shutdown();
     // SSE 响应是流式（usage 在每个 chunk 尾部，逐块预过滤）；非 SSE 为整包 JSON
@@ -205,7 +205,7 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Response {
             op_timeout,
             slot,
             metrics,
-            key_store,
+            store,
             key.key_id,
             key.key_name,
             prompt_est,
