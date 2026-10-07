@@ -51,7 +51,7 @@ pub struct Gateway {
     metrics: Metrics,
     registry: Registry,
     /// 用量落库需要在关闭前强制 flush 一次（见 [`Gateway::shutdown`]）。
-    key_store: Storage,
+    store: Storage,
     tasks: Vec<tokio::task::JoinHandle<()>>,
     /// 「启动时抬过 NOFILE 额度」的凭证，见 [`nofile::Raised`] 与 [`nofile::install`]。
     ///
@@ -139,7 +139,7 @@ impl Gateway {
         // ④ 进程内状态
         let registry = Registry::default();
         let metrics = Metrics::default();
-        let key_store = Storage::with_verified(
+        let store = Storage::with_verified(
             opts.keys_file.clone(),
             opts.verified_cache_max,
             Storage::default_verified_ttl(),
@@ -150,14 +150,14 @@ impl Gateway {
         //     （"不留一个看起来启动了的空壳进程"）。位置在**绑端口之后、起任何任务之前**：
         //     返回 Err 时④之前绑好的 socket 随局部变量一起 drop（这正是"全有或全无"）。
         //     `keys_file: None`（内存模式，测试/开发）不受影响——那不是故障。
-        if let Some(Err(why)) = key_store.persistence_state() {
+        if let Some(Err(why)) = store.persistence_state() {
             return Err(GatewayError::Config(format!(
                 "config: keys_file is configured but unusable ({why}); refusing to start with an \
                  empty key store (every request would 401 while the gateway looks healthy)"
             )));
         }
         let mut app_state =
-            state::AppState::new(registry.clone(), key_store.clone(), metrics.clone(), &opts);
+            state::AppState::new(registry.clone(), store.clone(), metrics.clone(), &opts);
         // 关闭阶段的发送端留在 `Gateway`；接收端给 accept 循环，在途响应各自 `subscribe()`。
         // **取走（而不是克隆）是复扫 D5 的要害**：发送端全仓只有一份，"通道关闭"才真正等于
         // "`Gateway` 没了"——每连接任务据此硬停，在途转发任务据此收尾（见 `Drop` 的文档）。
@@ -171,7 +171,7 @@ impl Gateway {
         // ⑤ 起任务。入列顺序有意义：用量 flusher 必须在 serve 任务之前就位（它按周期
         //    批量写库，见 `proxy::UsageCollector::finish`；关闭时由 `shutdown` 补最后一刀）。
         let tasks = vec![
-            usage_flush::spawn(key_store.clone()),
+            usage_flush::spawn(store.clone()),
             http::spawn_entry(
                 sockets.http,
                 app,
@@ -209,7 +209,7 @@ impl Gateway {
             shutdown,
             metrics,
             registry,
-            key_store,
+            store,
             tasks,
             nofile,
         })
@@ -292,7 +292,7 @@ impl Gateway {
         }
         // ④ 有界强制落库：阻塞池 + 超时（见 [`Options::shutdown_flush_timeout`]）。
         //    超时**不取消**那个阻塞任务（同步代码取消不了），只是不再等它。
-        let store = self.key_store.clone();
+        let store = self.store.clone();
         match run_bounded(self.shutdown_flush_timeout, move || {
             store.flush_usage_blocking()
         })
