@@ -20,8 +20,8 @@
 | 文件 | 现状 | 改为 |
 |---|---|---|
 | `crates/gateway/src/main.rs:13` | `cloud-gateway: 家庭 LLM 远程访问网关（公网入口 + QUIC 隧道服务端）` | `cloud-gateway: Edge LLM 网关（公网入口 + QUIC 隧道服务端）` |
-| `crates/gateway/src/proxy/mod.rs:91` | API 错误 `no home agent available` | `no edge available`（客户端可见） |
-| `crates/gateway/src/quic.rs:31` | 日志 `home agent connected` | `edge connected` |
+| `crates/gateway/src/proxy/routing.rs:275` | API 错误 `no home agent available` | `no edge available`（客户端可见） |
+| `crates/gateway/src/quic.rs:69` | 日志 `home agent connected` | `edge connected` |
 | `crates/agent/src/main.rs:13` | `home-agent: 常驻 LLM 所在机器，通过 QUIC 隧道接入云端网关` | `edge-agent: 常驻 LLM 所在机器（edge），通过 QUIC 隧道接入云端网关` |
 | `crates/agent/src/lib.rs:1` | 模块注释 `home-agent：常驻家里...` | edge-agent 表述 |
 
@@ -32,7 +32,7 @@
 | `crates/proto/src/frame.rs:1` | "网关与家端 agent 之间" → "网关与 edge-agent 之间" |
 | `crates/gateway/src/registry.rs:1` | "家端 agent 注册表" → "edge-agent 注册表" |
 | `crates/gateway/src/quic.rs:1` | "接受家端 agent 连接" → "接受 edge-agent 连接" |
-| `crates/gateway/src/tls.rs:15` | "校验家端 agent 的客户端证书" → "校验 edge-agent" |
+| `crates/gateway/src/tls.rs:109-116` | "校验家端 agent 的客户端证书" → "校验 edge-agent"（原在 `:15`；**该注释已被 `6c16f8e` 拆 s2n-quic 时移除**，等价的 mTLS 说明现见此处）|
 | `crates/gateway/src/storage/mod.rs:14` | "家庭网关低 QPS 下" → "edge 网关低 QPS 下" |
 | `crates/agent/src/config.rs:52` | `default_agent_id()` 返回 `home-agent-1` → `edge-1`（**仅默认值**；已有配置不受影响） |
 

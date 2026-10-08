@@ -165,7 +165,7 @@ pub struct FrameReader<R> {
    这类 API 不存在，而不是靠注释警告。
 5. **流即会话可断言**：每条请求流的首帧必须是 `ProxyRequest`，其后所有帧的 `request_id`
    必须等于该流的值。不符即错（可日志、可告警、可测）。现有项目把 `request_id` 在读响应时
-   全用 `..` 丢弃（`proxy/mod.rs:418/431/444`），这个不变量完全没有护栏。
+   全用 `..` 丢弃（`proxy/head.rs:66/69/72`），这个不变量完全没有护栏。
 
 ### 3.3 取消安全（规格 + 测试范式）
 
@@ -511,7 +511,7 @@ quinn 的名字抄进来**：s2n-quic 全在 `Limits` 上用 `with_*` setter，�
 | **R3** | 唯一读路径可取消安全；不存在 `read_exact` 包装的公开读帧 API | `read_frame` 不可取消却仍在 `timeout` 中使用（`io.rs:32`, `proxy/mod.rs:194/262/416`） | `DribbleReader` + `select!{biased}` 范式（`io.rs:331-355`）；API 层面审查 |
 | **R4** | EOF 四格分明：帧边界 / 载荷中途 / **头部中途** / 超上限 | 头部 1–3 字节截断被误判为正常关闭（`io.rs:37-41`），且注释谎称与 `FrameReader` 一致 | 四格各一条断言 |
 | **R5** | 解码/方向/`request_id` 错误 → **只 reset 该流**，不摘连接 | 控制面 `?` 直接退出循环 → 整台 edge 被摘除（`quic.rs:63` + `46-48`），且被 e2e 固化为期望 | e2e：发坏帧后该 agent 仍在册、其他请求正常 |
-| **R6** | "流即会话"可断言：首帧必须 `ProxyRequest`，后续帧 `request_id` 一致 | `request_id` 被 `..` 丢弃（`proxy/mod.rs:418/431/444`），无断言无日志 | 不一致时错误可观测 + 该流被 reset |
+| **R6** | "流即会话"可断言：首帧必须 `ProxyRequest`，后续帧 `request_id` 一致 | `request_id` 被 `..` 丢弃（`proxy/head.rs:66/69/72`），无断言无日志 | 不一致时错误可观测 + 该流被 reset |
 | **R7** | 计数一律 RAII 释放，且票据绑到**响应 body** 生命周期 | ✅ 已做对（`metrics.rs` 的 `Admission`、`registry.rs` 的 `SlotGuard`、`http/admission.rs:81` 的 `map_frame`）——**照搬** | e2e：客户端中断 + **上游静默**场景下，槽位须在秒级归零（现有实现会拖到 120 s，见 §4.7） |
 | **R8** | 原子占位用 CAS，无 check-then-act | ✅ 已做对——**照搬**：`registry.rs` 的 `try_acquire` 一直是 CAS；HTTP 侧 `metrics.rs::try_enter` 原先的 `fetch_add`+回滚有"幽灵占位 ⇒ 连锁误拒"，**2026-09-22 已改成 CAS 循环** | 并发 N 请求恰好 limit 通过、零误拒（新增 `try_enter_never_inflates_the_counter_above_the_limit`） |
 | **R9** | 背压端到端有界，且**按字节**而非按条数 | ✅ 2026-09-22 已修：`mpsc(32)` 之外新增**单块字节上限** `proto::frame::MAX_RESPONSE_CHUNK`（64 KiB，agent 侧切块 + 网关侧拒绝超标块）⇒ 每请求 ≈ 2 MiB 上界 | 慢客户端压测下进程 RSS 有上界（e2e `chain::e2e_an_oversized_response_chunk_is_refused`） |

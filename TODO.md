@@ -132,10 +132,10 @@
       **原因分两层（写清楚，避免以后两半混着读）**：
         · **链路层（代码解决不了）**：出口 ≈0.40 MB/s，超出的字节必然来不及时 → 只能调带宽
           或减少字节（别整包回吐、压缩、把大请求拆小）。
-        · **网关行为层（代码能解决）**：响应头超时**被当成"隧道已死"**——`proxy/mod.rs:530`
-          的 head 超时分支**无条件**调 `registry.evict()`；而摘除计数与开流超时**共用**
-          （`registry.rs:148` 的 `TUNNEL_TIMEOUTS_BEFORE_EVICT = 3`），且**只在收到响应头时清零**
-          （`registry.rs:151` 的 `note_tunnel_op_ok`，唯一调用点 `proxy/mod.rs:507` 的
+        · **网关行为层（代码能解决，2026-09-18 已修）**：响应头超时**曾被当成"隧道已死"**——`proxy/head.rs:154`
+          的 head 超时分支**修复前无条件**调 `registry.evict()`（现按"最近是否还在回响应头"分慢/死）；而摘除计数与开流超时**共用**
+          （`registry.rs:514` 的 `TUNNEL_TIMEOUTS_BEFORE_EVICT = 3`），且**只在收到响应头时清零**
+          （`registry.rs:527` 的 `note_tunnel_op_ok`，唯一调用点 `proxy/head.rs:120` 的
           `HeadOutcome::Head` 分支）。链路饱和时"一个响应头都收不到" → 计数必然涨到 3 →
           摘除 + 关连接 → 重连期间注册表为空 → **全量 503**。**这条放大是行为问题，不是链路的
           必然结果。**
@@ -245,7 +245,7 @@
       **撤回原因 / 待决**：每进程随机会导致**进程重启后 id 变化**（断链重连不变，只有重启变）。
       当前影响有限——**没有任何指标带 `agent_id` 标签**（`hlmg_requests_total` 唯一的 label 是
       `status`，其余 metrics 都是无标签标量），`/admin/agents` 是实时视图——但将来加"按 agent 的
-      容量/负载指标"（见本文件"容量感知路由"那条）时会咬人。三个候选改法（择一）：
+      容量/负载指标"（见本文件《⛔ 健康上报驱动的更精细路由》那条）时会咬人。三个候选改法（择一）：
         1. **主机名后缀**（`home-1-mac-mini`）：跨重启稳定且最可读；需加安全小依赖
            `gethostname`（workspace lints 禁 `unsafe`，不能直接用 libc）；两台机器主机名
            相同（克隆 VM/容器）时仍会撞
@@ -502,7 +502,7 @@
 | 存储 | `storage/mod.rs:374` | 同时存 `lookup = sha256(明文)`（O(1) 索引）与 `key_hash = argon2id(明文)`（PHC 串，`m=19456 KiB / t=2 / p=1`） |
 | 校验 | `storage/mod.rs:350` → `hash.rs:94` | 按 sha256 索引命中记录后，**再跑一次 19 MiB 的 argon2id 校验**（在 `spawn_blocking` 里，`proxy/mod.rs:81`） |
 | 缓存 | `storage/verified.rs:55` | `(lookup, cred_version)` 命中即跳过校验；有 TTL 与上限（`verified_cache_max: 1650`） |
-| 单飞 | `storage/verified.rs:57` | `inflight: HashMap<lookup, FlightSlot>`——**只对同一个 token 串行；不同 token 完全并行且无上界** |
+| 单飞 | `storage/verified.rs:73` | `inflight: HashMap<lookup, FlightSlot>`——**只对同一个 token 串行；不同 token 完全并行且无上界** |
 
 ### 问题
 
@@ -646,7 +646,7 @@
 ### P1 — 正确性 / 健壮性
 
 - [x] **usage 内存累加竞态（少报用量）（2026-09-22 复核：已修）**：现在是
-      `usage.entry(key_id).or_default()` **就地累加**（`storage/usage.rs:128`），不存在"孤儿 cell"
+      `usage.entry(key_id).or_default()` **就地累加**（`storage/usage.rs:146`），不存在"孤儿 cell"
       导致少报。原记录：`gateway/src/storage/mod.rs:318-335` 在 map 无 cell 时
       新建 `c` 再 `or_insert_with(|| c.clone())`，然后**返回本地 `c`**——若并发请求先插入成功，
       `or_insert_with` 保留的是别人的 cell，本次增量就记进了不在 map 里的孤儿 cell。
@@ -756,8 +756,8 @@
       本次用 `rustup toolchain install 1.97.1 --profile minimal -c rustfmt,clippy` 装好（顺带被 rustup
       自己升级到 1.29.1），本地/CI/镜像三处现在都是 1.97.1（同一 commit `8bab26f4f`，验证基座不变）。
 
-- [ ] **Heartbeat 载荷空洞**：`Frame::Heartbeat { inflight }` 恒为 0（`agent/src/lib.rs:136-140`），
-      网关只打 debug 日志（`quic.rs:76-84`）。它是"容量感知路由"的前置数据：要么实现上报，
+- [ ] **Heartbeat 载荷空洞**：`Frame::Heartbeat { inflight }` 恒为 0（`crates/agent/src/lib.rs:573-575`），
+      网关只打 debug 日志（`quic.rs:76-84`）。它是《⛔ 健康上报驱动的更精细路由》的前置数据：要么实现上报，
       要么删掉该字段（现在是死载荷，容易误导）。
 - [x] **重连退避无抖动（2026-09-22 已修）**：`run()` 现在给退避加 **±20% 抖动**
       （熵取时钟纳秒，不引入 `rand` 依赖），并顺手修掉更靠前的根因——**退避被重置**
@@ -990,7 +990,7 @@
 - [ ] **R10 总时长上限**：`timeout_secs`（120s）是响应体**逐帧空闲**超时，没有整请求总时限
       （`DESIGN.md` §5 自认）。SSE 长流不能被总时限误杀，动之前要先把语义想清楚。
 - [ ] **R11 延迟分位数**：`hlmg_request_duration_ms` 只有 sum，没有直方图
-      （`crates/gateway/src/metrics.rs:316`）——"p99 变差"从求和值里看不出来。
+      （`crates/gateway/src/metrics.rs:529-533`）——"p99 变差"从求和值里看不出来。
 - [x] **R12 healthz 深度检查（2026-09-22 完成）**：`/healthz` 现在是真探针——
       **200 ⇔ 隧道入口仍在接受新 agent**（`hlmg_quic_accepting`），否则 `503` + `status:"degraded"`
       + `detail`（处置：重启网关）；body 改成 JSON，同时报 `agents.registered` /
@@ -1617,7 +1617,7 @@ proto+mock-llm、storage+用量、web+部署+文档），随后**由我逐条复
   所以 vLLM `/metrics`（`gpu_cache_usage_perc`、`num_requests_running` / `num_requests_waiting`）
   只能由 **agent 拉本机上游**，再经心跳（或新帧）上报。于是 B 与《Heartbeat 载荷空洞》
   （`TODO.md:759`）是**同一条前置工作**，`TODO.md:423`（健康上报驱动的更精细路由）
-  与 `TODO.md:248` 引用的"容量感知路由那条"指的也是这一条——**开工前先把三处合并成一件事**。
+  与 `TODO.md:248`（已改指本条目）指的是同一条——**开工前先把三处合并成一件事**。
 - **退路必须存在**：引擎没有 `/metrics`（Ollama / llama.cpp）或 agent 是老版本不带新字段时，
   必须**回落到 `inflight` 排序**——不能让"拿不到指标"变成"不可路由"。
 - **别踩的坑**：① GPU 指标是**滞后快照**（陈旧度 = 拉取周期），要明确打分用的是"上界"还是
@@ -1714,10 +1714,99 @@ proto+mock-llm、storage+用量、web+部署+文档），随后**由我逐条复
   一起定，避免两个月后两套 token 口径。
 - **D 与 E 应一起做**：别名表与权重表是同一张路由表的两个字段，分两次做等于把配置结构改两遍。
 
-### 顺手记下的文档漂移（本次**未**改动，避免与上面条目抢同一批编辑）
+### 顺手记下的文档漂移（本次一并修掉）
 
-- `TODO.md:759` 的指针已失效：说 `Heartbeat` 载荷空洞在 `agent/src/lib.rs:136-140`，
-  而构造点在 **`crates/agent/src/lib.rs:573-575`**（`:136-140` 现在是 `wait_for_abnormal_exit`）。
-- `TODO.md:248` 引用的"本文件**「容量感知路由」那条**"在 TODO 里**没有同名条目**——语义上指的
-  是 `TODO.md:423`（健康上报驱动的更精细路由）与本节 **B**；三者合并时应顺手把引用改成单一指针。
+- `TODO.md:759` 的指针原写 `agent/src/lib.rs:136-140`，构造点其实在 **`crates/agent/src/lib.rs:573-575`**
+  （`:136-140` 现为 `wait_for_abnormal_exit`）。**成因**：该条写于 `a410472`（2026-09-11），当时
+  `:136` 确实是构造点；此后这个文件从 570 行长到 2935 行，指针原地不动就漂了。
+- `TODO.md:248` 原引用"本文件**「容量感知路由」那条**"，而 TODO 里没有同名条目——已改指真实条目
+  《⛔ 健康上报驱动的更精细路由》（本节 **B** 是它的能力对账版本）。
 
+
+## 2026-10-07 存储层多库抽象：换个库不该重写一遍
+
+> **本节性质**：不是"能力缺口"，而是**为对接 MySQL / PostgreSQL 做的持久化层重构**。
+> 按顶部范围约定**切两半**：**P0–P2 属"不改变对外行为的重构"（明确可做）**，
+> **P3/P4 属"新增依赖"与"多实例无状态化"（明令 ⛔，只登记）**。
+> **口径**：以现状为准逐条核对，基线 `2c7a309`。
+
+- [ ] **P0–P2 存储层方言层 + 声明式表（重构——现在就做）**：
+      起因（2026-10-07 讨论）：后续要对接 MySQL / PostgreSQL，而**持久化层写死了 SQLite**——
+      方言（DDL 类型、upsert 语法、加列探测）散在**生产路径 10 处 SQL** 里
+      （`storage/mod.rs` 8 处 + `storage/usage.rs` 2 处），加一张新表要写
+      DDL 常量 + 装载 `SELECT` + upsert + 删除 + 加列迁移 + 结构体 + codec。
+      目标：**换库只换一个实现；加表只声明表本身 + 写业务查询**。
+      📐 **完整设计见 [`STORAGE.md`](STORAGE.md)**（边界图、现状盘点与方言对照表、
+      两个语义陷阱、`Dialect`/`table!` 方案、同步异步取舍、阶段表与验收）。
+
+      **为什么这算"重构"而不是"新功能"**：P0–P2 **零行为变化、零新增依赖、零调用点改动**——
+      抽 `Dialect` + `TableSpec`、两张表改声明式、抽 `Database` 端口但**只有 SQLite 实现**。
+      顺带还的债：10 处 SQL 散在两个文件、加列迁移手写（`table_has_column` + `PRAGMA`）、
+      **没有任何 schema 版本机制**（无 `user_version`、无版本表）。
+
+      **地基事实：端口只有 4 个方法，不是 20 个**（详见 `STORAGE.md` §4.1）。
+      实测——DB 只被 `create`（INSERT）、`delete`（DELETE）、用量 flush（批量 UPSERT）、
+      构造期装载（SELECT）碰；其余 15+ 个方法（`authorize`、`authorize_record`、`list`、
+      `usage_of`、`usage_snapshot`、`record_usage`、`accumulate_usage`…）**全纯内存零 IO**。
+      所以这不是"给 ORM 换驱动"，而是"把 10 处散落 SQL 收成 4 个操作 × 3 个方言"。
+
+      **因此不需要 async**（这一点上一版方案判断错了，已纠正）：只有那 4 个方法碰 DB，
+      而它们**今天就已经在阻塞池上**（`admin.rs:127,177`、`usage_flush.rs:39`、`gateway.rs:408`）。
+      服务器库也有同步客户端（`postgres` 是 `tokio-postgres` 的同步封装），配连接池即可。
+      **端口保持同步 ⇒ P2 的调用点改动 = 0**；改成 `async fn` 则 20 个签名全变、
+      连带动 `admin.rs` 9 处 / `auth.rs` 7 处 / `proxy/usage.rs` 6 处…**而收益为零**。
+      ⚠️ `auth.rs:111` 的 `spawn_blocking` **不能删**——那里阻塞的是 argon2（10–30ms + 19MiB），
+      不是 SQL。
+
+      **P0 的第一件事是定死 `create()` 的语义**（详见 `STORAGE.md` §2.1①）：
+      它今天写的是 `INSERT OR REPLACE`（`storage/mod.rs:388`），而它在 SQLite 是**删+插**不是更新——
+      未列出的列会**退回默认值**（插入列清单里没有 `cred_version`）。**但结论不是"换个 upsert 写法"，
+      而是 `create()` 根本不该是 upsert**：它的语义是"造一把新 key"，冲突该报错而不是覆盖。
+      主键冲突**不是天文概率**——`generate_id_key()` 的 id 只有 **4 随机字节 = 32 位**
+      （`hash.rs:120-124`；192 位的是明文 key，不是 id）：5000 把 key 时约 **0.29%** 会撞，
+      2 万把时约 **4.5%**。命中时 `OR REPLACE` 会**静默顶掉别人那一行**（受害者那把 key 直接失效），
+      而管理员收到 **201**，全程无提示；更糟的是它对**任何**唯一索引冲突都靠"删掉那一行"解决。
+      **改普通 `INSERT` → 冲突返回 `Conflict` → admin 回 500 → 重试。**
+      **代价已核实为零**：全仓只有 `mod.rs:388` 一处出现 `OR REPLACE`，**没有任何测试依赖它的冲突语义**，
+      现有错误路径测试（`dbg_reject_insert` 触发器）也照样成立。
+      **用量 flush 不动**——它已经是真 upsert（`usage.rs:233` 的 `ON CONFLICT(key_id) DO UPDATE`）；
+      所以端口有**两个**写操作：`insert`（冲突即错）与 `upsert_batch`（幂等），**刻意不合并**。
+      另两处：`u64` 时间戳映射到 PG `bigint` 是**收窄**，`as i64` 现散在多处
+      （`storage/mod.rs:395`、`storage/usage.rs:246-250`），应收敛到一处类型映射；
+      还有一条不要带错结论——放弃"每请求写库"的那个 **~190 QPS** 是被**单连接 + Mutex** 摁住的，
+      不是被数据库摁住的，换带连接池的服务器库后**必须重测**。
+
+      **验收**：`storage` 现有 **31 个测试全绿且一个都不改**（重构若要求改测试语义＝动错了地方；
+      唯一例外是为 `create()` 的冲突语义**新增**一个测试）；
+      `Dialect` 用纯字符串单测覆盖三个方言，不需要起数据库。
+
+- [ ] **⛔ `api_keys.cred_version` 这一列是死重（前置登记——留给 P4）**：
+      独立发现，与多库无关但同一片代码。它不只"没被写对"——**它的值跨进程没有意义**：
+      `cred_generation` 每次启动都是 `AtomicU64::new(1)`（`storage/mod.rs:316`），**不从库里的最大值
+      播种**（`bump_cred_generation()`，`storage/mod.rs:324`）⇒ 库里恒为 1、内存里是 2/3/4…，
+      重启后两者又都回到 1；而缓存比对的是**内存那份记录**，**没有任何东西读这一列的实际值**。
+      两个方向（详见 `STORAGE.md` §2.1④）：**(A) 让它成真**（从库里 `MAX(cred_version)` 播种 +
+      `create()` 真正写入）——这才是**跨副本吊销传播**的天然载体；**(B) 删列**。
+      **都留到 P4，P0 不碰**：对多库抽象毫无必要，却会改变重启后的内存状态（正是"别在换方言时
+      顺手改语义"那条）。**P4 之前不要依赖这一列。**
+
+- [ ] **⛔ P3 第二个数据库后端（新增依赖——按顶部范围约定先不做，仅登记）**：
+      加 PostgreSQL / MySQL 实现。**它会引入一个数据库驱动依赖**（同步客户端 `postgres` /
+      `mysql`，或异步的 `tokio-postgres` / `sqlx` / `mysql_async`），与顶部"不新增依赖"直接冲突，
+      故只登记。建议先做 **PostgreSQL**：它的 `ON CONFLICT … DO UPDATE SET` 与现状最接近、移植最省；
+      MySQL 还要额外处理 `ON DUPLICATE KEY UPDATE` + `VALUES()`、布尔表示、标识符大小写。
+      见 `STORAGE.md` §4.1 的方言对照表。
+
+- [ ] **⛔ P4 多副本共享状态（"多实例无状态化"——按顶部范围约定先不做，仅登记）**：
+      后端一旦是服务器库，部署形态几乎必然变成**多网关副本共库**，而今天的实现是**明确单写者**：
+      ① 用量按**绝对累计值**周期覆盖写（`usage.rs:233-243` 写 `prompt_tokens = excluded.prompt_tokens`），
+      多副本会**后写覆盖先写**→账目少算（这是钱）；而累加写路径被标了 `#[cfg(test)]`
+      （`usage.rs:292`，注释写明每请求写库把 2 vCPU 摁在 **~190 QPS**），
+      **加回去＝性能回退，不加＝多副本账目错**；
+      ② 吊销靠**进程内**凭据代数（`cred_generation`，`storage/mod.rs:107`）+ 30 分钟 TTL 的
+      `verified` 缓存 → 在副本 A 上吊销，**B 最长 30 分钟仍放行**；
+      ③ key 索引是**进程内** HashMap（`storage/mod.rs:95`，启动装载一次）→ 在 A 上建 key，
+      **B 不认识**，直到重启。
+      **所以这一条要先定产品形态**：单副本 + 外置库（只做 P0–P2 即可）/ 多副本共库（必须重做
+      用量与吊销语义）。**不要**在换方言的同时顺手把并发模型也换了——两件事一起改，出问题分不清是谁的。
+      详见 `STORAGE.md` §3 与 §9（待定决策第 2 条）。
