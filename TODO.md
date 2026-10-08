@@ -1596,7 +1596,7 @@ proto+mock-llm、storage+用量、web+部署+文档），随后**由我逐条复
   4. 必须定清楚的三件小事：并发下的预扣-结算竞态（同一 key 多请求同时预扣）；
      流式场景 `usage` 只在末尾到达（`stream_options.include_usage`）时结算落在哪一帧；
      取消/断流的请求怎么算（已转发的输出 token 要不要计费）。
-- **与既有条目的关系（别写重）**：**不与**《计量与治理延伸》（`TODO.md:403`）的 per-key quota
+- **与既有条目的关系（别写重）**：**不与**《计量与治理延伸》（`TODO.md:405`）的 per-key quota
   重复——那条是**总量配额**（月度 / 滚动窗口），本条是**速率**（每分钟），是两个正交的轴；
   但两者共用同一套 token 计数与 `key_usage` 落库，顺序上应是"先精确计量（已有）→ 再加速度闸"。
 - **验收**：单测（连续请求累计 token 撞桶 → 429；预扣-结算后余额不为负；`per_minute == 0`
@@ -1608,7 +1608,7 @@ proto+mock-llm、storage+用量、web+部署+文档），随后**由我逐条复
 - **现状（代码事实）**：`pick()`（`crates/gateway/src/registry.rs:346-383`）的候选排序是
   **精确声明 model 优先 → `inflight` 最少 → 心跳最新**，其中唯一的"负载"信号是**网关自己数的
   在途请求数**（`Entry.inflight`）。协议里留了位置但**恒为 0**：`Frame::Heartbeat { inflight }`
-  的构造点写死 `inflight: 0`（`crates/agent/src/lib.rs:573-575`，`TODO.md:757` 已登记该空洞）。
+  的构造点写死 `inflight: 0`（`crates/agent/src/lib.rs:573-575`，`TODO.md:759` 已登记该空洞）。
 - **为什么不够**：等长请求下 `inflight` 是"最少负载"的合理近似；一旦长短混合（agentic /
   长上下文），两个副本的 `inflight` 可以相同而 KV 池余量天差地别——此时"最少 inflight"会把
   新请求送到**最可能触发抢占 / 重算**的那个副本，TTFT 反而更差（这正是"模型网关"与
@@ -1616,8 +1616,8 @@ proto+mock-llm、storage+用量、web+部署+文档），随后**由我逐条复
 - **关键约束（它决定谁去采集）**：本项目的上游引擎在 **NAT 后**，网关**够不着**上游端口——
   所以 vLLM `/metrics`（`gpu_cache_usage_perc`、`num_requests_running` / `num_requests_waiting`）
   只能由 **agent 拉本机上游**，再经心跳（或新帧）上报。于是 B 与《Heartbeat 载荷空洞》
-  （`TODO.md:757`）是**同一条前置工作**，`TODO.md:421`（健康上报驱动的更精细路由）
-  与 `TODO.md:246` 引用的"容量感知路由那条"指的也是这一条——**开工前先把三处合并成一件事**。
+  （`TODO.md:759`）是**同一条前置工作**，`TODO.md:423`（健康上报驱动的更精细路由）
+  与 `TODO.md:248` 引用的"容量感知路由那条"指的也是这一条——**开工前先把三处合并成一件事**。
 - **退路必须存在**：引擎没有 `/metrics`（Ollama / llama.cpp）或 agent 是老版本不带新字段时，
   必须**回落到 `inflight` 排序**——不能让"拿不到指标"变成"不可路由"。
 - **别踩的坑**：① GPU 指标是**滞后快照**（陈旧度 = 拉取周期），要明确打分用的是"上界"还是
@@ -1639,7 +1639,7 @@ proto+mock-llm、storage+用量、web+部署+文档），随后**由我逐条复
   严格区分——4xx 是请求的问题，不能熔断副本）；② 熔断窗口内该副本降权或临时剔除；
   ③ **跨副本 fallback 必须有**（同一 model 多副本时）；**跨 model fallback 只走显式配置的
   降级链**（默默换模型会改输出语义与计费口径，是产品事故）。
-- **边界（沿用已有教训）**：**别把"慢"当"死"**——`head_timeout` 那条已经踩过（`TODO.md:114`，
+- **边界（沿用已有教训）**：**别把"慢"当"死"**——`head_timeout` 那条已经踩过（`TODO.md:116`，
   `Entry::head_timeout_is_fatal` 的"忙≠死"判据），熔断判据同样不能用"单次超时"。
   另需决定熔断状态是否跨重启保留（**建议不保留**：冷启动宁可选错一个副本，也别把整池判死）。
 - **验收**：注入"副本拒连 / 5xx"→ 路由在 N 次内避开它、且另一副本承接；副本恢复后自动回归；
@@ -1677,20 +1677,20 @@ proto+mock-llm、storage+用量、web+部署+文档），随后**由我逐条复
 ### F. 成本口径（token → 钱）与报表 ⛔
 
 - **现状**：`key_usage(key_id, name, prompt_tokens, completion_tokens, requests,
-  estimated_requests, last_used_at)` 只有**用量**、没有**钱**；无 model 维度（`TODO.md:409`
+  estimated_requests, last_used_at)` 只有**用量**、没有**钱**；无 model 维度（`TODO.md:411`
   已登记主键升级 `(key_id, model)`，连带暂缓）；无任何导出面。
 - **缺口三件**：① **单价表**（per model：输入 / 输出 / 缓存命中三档价）→ 用量折算成本；
   ② **报表导出**（CSV 或 Prometheus gauge 或 Admin API），供 showback / chargeback；
-  ③ 与 `TODO.md:414`（`cached_tokens` 命中率）联动才能算准"缓存省下的钱"。
+  ③ 与 `TODO.md:416`（`cached_tokens` 命中率）联动才能算准"缓存省下的钱"。
 - **口径提醒**：**单价会变**（厂商调价）⇒ 报表必须记"当时生效的单价版本"，否则历史报表无法
-  复现；自建 vLLM 场景**没有 token 单价**，成本要按 GPU 时长摊销（`TODO.md:518` 的两条计量链路），
+  复现；自建 vLLM 场景**没有 token 单价**，成本要按 GPU 时长摊销（`TODO.md:520` 的两条计量链路），
   这是**两套成本模型，别混成一张表**。
 - **验收**：给定用量与单价表能算出与手算一致的成本；单价表变更后历史报表不变；
   导出列名稳定且有测试。
 
 ### G. 推理侧可观测：TTFT / TPOT / model 维度 ⛔
 
-- **现状**：`hlmg_request_duration_ms` **只有求和值、没有直方图**（`TODO.md:990` R11），
+- **现状**：`hlmg_request_duration_ms` **只有求和值、没有直方图**（`TODO.md:992` R11），
   `hlmg_requests_total` 唯一的 label 是 `status`；**没有首字时间（TTFT）与每输出 token 时间
   （TPOT）**，agent 侧也没有首字打点（`crates/gateway/src/metrics.rs` 里只有 `total_duration_ms`）。
 - **要做**：TTFT **在网关转发路径上就能测**（"响应头之后第一个非空 delta / 首块"），
@@ -1708,16 +1708,16 @@ proto+mock-llm、storage+用量、web+部署+文档），随后**由我逐条复
 
 - 无依赖、可独立做：**G**（纯网关侧，最便宜，且能立刻给 B 提供对照数据）、**F**（数据已有，
   缺单价与导出）。
-- **B → C 有共同前置**：先让 `Heartbeat` 有真数据（`TODO.md:757`），再谈"用指标打分"（B）
+- **B → C 有共同前置**：先让 `Heartbeat` 有真数据（`TODO.md:759`），再谈"用指标打分"（B）
   与"按指标熔断"（C）；B 的验收需要真实 vLLM 环境。
-- **A 依赖已有计量**（已完成），但"预扣-结算"的口径要与《计量与治理延伸》（`TODO.md:403`）
+- **A 依赖已有计量**（已完成），但"预扣-结算"的口径要与《计量与治理延伸》（`TODO.md:405`）
   一起定，避免两个月后两套 token 口径。
 - **D 与 E 应一起做**：别名表与权重表是同一张路由表的两个字段，分两次做等于把配置结构改两遍。
 
 ### 顺手记下的文档漂移（本次**未**改动，避免与上面条目抢同一批编辑）
 
-- `TODO.md:757` 的指针已失效：说 `Heartbeat` 载荷空洞在 `agent/src/lib.rs:136-140`，
+- `TODO.md:759` 的指针已失效：说 `Heartbeat` 载荷空洞在 `agent/src/lib.rs:136-140`，
   而构造点在 **`crates/agent/src/lib.rs:573-575`**（`:136-140` 现在是 `wait_for_abnormal_exit`）。
-- `TODO.md:246` 引用的"本文件**「容量感知路由」那条**"在 TODO 里**没有同名条目**——语义上指的
-  是 `TODO.md:421`（健康上报驱动的更精细路由）与本节 **B**；三者合并时应顺手把引用改成单一指针。
+- `TODO.md:248` 引用的"本文件**「容量感知路由」那条**"在 TODO 里**没有同名条目**——语义上指的
+  是 `TODO.md:423`（健康上报驱动的更精细路由）与本节 **B**；三者合并时应顺手把引用改成单一指针。
 
