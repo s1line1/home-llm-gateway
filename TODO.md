@@ -132,10 +132,10 @@
       **原因分两层（写清楚，避免以后两半混着读）**：
         · **链路层（代码解决不了）**：出口 ≈0.40 MB/s，超出的字节必然来不及时 → 只能调带宽
           或减少字节（别整包回吐、压缩、把大请求拆小）。
-        · **网关行为层（代码能解决）**：响应头超时**被当成"隧道已死"**——`proxy/mod.rs:530`
-          的 head 超时分支**无条件**调 `registry.evict()`；而摘除计数与开流超时**共用**
-          （`registry.rs:148` 的 `TUNNEL_TIMEOUTS_BEFORE_EVICT = 3`），且**只在收到响应头时清零**
-          （`registry.rs:151` 的 `note_tunnel_op_ok`，唯一调用点 `proxy/mod.rs:507` 的
+        · **网关行为层（代码能解决，2026-09-18 已修）**：响应头超时**曾被当成"隧道已死"**——`proxy/head.rs:154`
+          的 head 超时分支**修复前无条件**调 `registry.evict()`（现按"最近是否还在回响应头"分慢/死）；而摘除计数与开流超时**共用**
+          （`registry.rs:514` 的 `TUNNEL_TIMEOUTS_BEFORE_EVICT = 3`），且**只在收到响应头时清零**
+          （`registry.rs:527` 的 `note_tunnel_op_ok`，唯一调用点 `proxy/head.rs:120` 的
           `HeadOutcome::Head` 分支）。链路饱和时"一个响应头都收不到" → 计数必然涨到 3 →
           摘除 + 关连接 → 重连期间注册表为空 → **全量 503**。**这条放大是行为问题，不是链路的
           必然结果。**
@@ -245,7 +245,7 @@
       **撤回原因 / 待决**：每进程随机会导致**进程重启后 id 变化**（断链重连不变，只有重启变）。
       当前影响有限——**没有任何指标带 `agent_id` 标签**（`hlmg_requests_total` 唯一的 label 是
       `status`，其余 metrics 都是无标签标量），`/admin/agents` 是实时视图——但将来加"按 agent 的
-      容量/负载指标"（见本文件"容量感知路由"那条）时会咬人。三个候选改法（择一）：
+      容量/负载指标"（见本文件《⛔ 健康上报驱动的更精细路由》那条）时会咬人。三个候选改法（择一）：
         1. **主机名后缀**（`home-1-mac-mini`）：跨重启稳定且最可读；需加安全小依赖
            `gethostname`（workspace lints 禁 `unsafe`，不能直接用 libc）；两台机器主机名
            相同（克隆 VM/容器）时仍会撞
@@ -502,7 +502,7 @@
 | 存储 | `storage/mod.rs:374` | 同时存 `lookup = sha256(明文)`（O(1) 索引）与 `key_hash = argon2id(明文)`（PHC 串，`m=19456 KiB / t=2 / p=1`） |
 | 校验 | `storage/mod.rs:350` → `hash.rs:94` | 按 sha256 索引命中记录后，**再跑一次 19 MiB 的 argon2id 校验**（在 `spawn_blocking` 里，`proxy/mod.rs:81`） |
 | 缓存 | `storage/verified.rs:55` | `(lookup, cred_version)` 命中即跳过校验；有 TTL 与上限（`verified_cache_max: 1650`） |
-| 单飞 | `storage/verified.rs:57` | `inflight: HashMap<lookup, FlightSlot>`——**只对同一个 token 串行；不同 token 完全并行且无上界** |
+| 单飞 | `storage/verified.rs:73` | `inflight: HashMap<lookup, FlightSlot>`——**只对同一个 token 串行；不同 token 完全并行且无上界** |
 
 ### 问题
 
@@ -646,7 +646,7 @@
 ### P1 — 正确性 / 健壮性
 
 - [x] **usage 内存累加竞态（少报用量）（2026-09-22 复核：已修）**：现在是
-      `usage.entry(key_id).or_default()` **就地累加**（`storage/usage.rs:128`），不存在"孤儿 cell"
+      `usage.entry(key_id).or_default()` **就地累加**（`storage/usage.rs:146`），不存在"孤儿 cell"
       导致少报。原记录：`gateway/src/storage/mod.rs:318-335` 在 map 无 cell 时
       新建 `c` 再 `or_insert_with(|| c.clone())`，然后**返回本地 `c`**——若并发请求先插入成功，
       `or_insert_with` 保留的是别人的 cell，本次增量就记进了不在 map 里的孤儿 cell。
@@ -756,8 +756,8 @@
       本次用 `rustup toolchain install 1.97.1 --profile minimal -c rustfmt,clippy` 装好（顺带被 rustup
       自己升级到 1.29.1），本地/CI/镜像三处现在都是 1.97.1（同一 commit `8bab26f4f`，验证基座不变）。
 
-- [ ] **Heartbeat 载荷空洞**：`Frame::Heartbeat { inflight }` 恒为 0（`agent/src/lib.rs:136-140`），
-      网关只打 debug 日志（`quic.rs:76-84`）。它是"容量感知路由"的前置数据：要么实现上报，
+- [ ] **Heartbeat 载荷空洞**：`Frame::Heartbeat { inflight }` 恒为 0（`crates/agent/src/lib.rs:573-575`），
+      网关只打 debug 日志（`quic.rs:76-84`）。它是《⛔ 健康上报驱动的更精细路由》的前置数据：要么实现上报，
       要么删掉该字段（现在是死载荷，容易误导）。
 - [x] **重连退避无抖动（2026-09-22 已修）**：`run()` 现在给退避加 **±20% 抖动**
       （熵取时钟纳秒，不引入 `rand` 依赖），并顺手修掉更靠前的根因——**退避被重置**
@@ -990,7 +990,7 @@
 - [ ] **R10 总时长上限**：`timeout_secs`（120s）是响应体**逐帧空闲**超时，没有整请求总时限
       （`DESIGN.md` §5 自认）。SSE 长流不能被总时限误杀，动之前要先把语义想清楚。
 - [ ] **R11 延迟分位数**：`hlmg_request_duration_ms` 只有 sum，没有直方图
-      （`crates/gateway/src/metrics.rs:316`）——"p99 变差"从求和值里看不出来。
+      （`crates/gateway/src/metrics.rs:529-533`）——"p99 变差"从求和值里看不出来。
 - [x] **R12 healthz 深度检查（2026-09-22 完成）**：`/healthz` 现在是真探针——
       **200 ⇔ 隧道入口仍在接受新 agent**（`hlmg_quic_accepting`），否则 `503` + `status:"degraded"`
       + `detail`（处置：重启网关）；body 改成 JSON，同时报 `agents.registered` /
@@ -1617,7 +1617,7 @@ proto+mock-llm、storage+用量、web+部署+文档），随后**由我逐条复
   所以 vLLM `/metrics`（`gpu_cache_usage_perc`、`num_requests_running` / `num_requests_waiting`）
   只能由 **agent 拉本机上游**，再经心跳（或新帧）上报。于是 B 与《Heartbeat 载荷空洞》
   （`TODO.md:759`）是**同一条前置工作**，`TODO.md:423`（健康上报驱动的更精细路由）
-  与 `TODO.md:248` 引用的"容量感知路由那条"指的也是这一条——**开工前先把三处合并成一件事**。
+  与 `TODO.md:248`（已改指本条目）指的是同一条——**开工前先把三处合并成一件事**。
 - **退路必须存在**：引擎没有 `/metrics`（Ollama / llama.cpp）或 agent 是老版本不带新字段时，
   必须**回落到 `inflight` 排序**——不能让"拿不到指标"变成"不可路由"。
 - **别踩的坑**：① GPU 指标是**滞后快照**（陈旧度 = 拉取周期），要明确打分用的是"上界"还是
@@ -1714,10 +1714,12 @@ proto+mock-llm、storage+用量、web+部署+文档），随后**由我逐条复
   一起定，避免两个月后两套 token 口径。
 - **D 与 E 应一起做**：别名表与权重表是同一张路由表的两个字段，分两次做等于把配置结构改两遍。
 
-### 顺手记下的文档漂移（本次**未**改动，避免与上面条目抢同一批编辑）
+### 顺手记下的文档漂移（本次一并修掉）
 
-- `TODO.md:759` 的指针已失效：说 `Heartbeat` 载荷空洞在 `agent/src/lib.rs:136-140`，
-  而构造点在 **`crates/agent/src/lib.rs:573-575`**（`:136-140` 现在是 `wait_for_abnormal_exit`）。
-- `TODO.md:248` 引用的"本文件**「容量感知路由」那条**"在 TODO 里**没有同名条目**——语义上指的
-  是 `TODO.md:423`（健康上报驱动的更精细路由）与本节 **B**；三者合并时应顺手把引用改成单一指针。
+- `TODO.md:759` 的指针原写 `agent/src/lib.rs:136-140`，构造点其实在 **`crates/agent/src/lib.rs:573-575`**
+  （`:136-140` 现为 `wait_for_abnormal_exit`）。**成因**：该条写于 `a410472`（2026-09-11），当时
+  `:136` 确实是构造点；此后这个文件从 570 行长到 2935 行，指针原地不动就漂了。
+- `TODO.md:248` 原引用"本文件**「容量感知路由」那条**"，而 TODO 里没有同名条目——已改指真实条目
+  《⛔ 健康上报驱动的更精细路由》（本节 **B** 是它的能力对账版本）。
+
 
