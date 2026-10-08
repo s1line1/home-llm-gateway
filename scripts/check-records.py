@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """记录↔代码一致性检查（可复跑）。
 
-为什么需要它：本仓库的登记表（`docs/PROJECT_SCAN.md`、`docs/SUPPORT_LAYER_RAW_FINDINGS.md`）
-是**手写的**，条目里大量写着 `path:line` 指针与「已修(<commit>)」声明。2026-09-23 的全量审计
-发现两类漂移是**机械可查**的：
+为什么需要它：本仓库的登记表是**手写的**，条目里大量写着 `path:line` 指针与
+「已修(<commit>)」声明。2026-09-23 的全量审计发现两类漂移是**机械可查**的：
 
   ① 指针漂移：文件被重命名/搬走，或行号越界（重构后 PR 里最常见）；
   ② 提交声明不实：写「已修(abc1234)」而那个 hash 根本不存在（或不是提交）。
@@ -12,25 +11,22 @@
 （2026-09-24 二轮审计实测：`P1-5` 的 `storage/mod.rs:572` 现在是段无关代码，`P3-1` 的
 `proto/src/lib.rs:11` 落在注释里而常量已被顶到 `:21`）。所以"0 漂移"只保证指针能解析、行号不越界。
 
-**唯一的内容检查是一条廉价的启发式**（2026-10-07 加）：**已跟踪**记录里 `.rs` 的**单行**指针
-若落在空行或纯 `})];,` 上，直接判漂——这种指针指的显然不是一句可读代码。（范围指针不查：它的
-结束行天然常是 `}`。）它能抓到"文件存在、行号也不越界、但指的已是别处"的一大类，实测一次抓出
-16 处：7 处在已跟踪文档，9 处在 `docs/` 草稿。
-**它只对仓库里的记录生效**（见 `tracked_paths`）：`docs/*` 是维护者本机的草稿，别人改不到，
-不该让一份草稿把所有 PR 的 hook 判红。存在性与行号越界两项则照旧扫整个 `DOCS`。
+**唯一的内容检查是一条廉价的启发式**（2026-10-07 加）：`.rs` 的**单行**指针若落在空行或纯
+`})];,` 上，直接判漂——这种指针指的显然不是一句可读代码。（范围指针不查：它的结束行天然常是
+`}`。）它能抓到"文件存在、行号也不越界、但指的已是别处"的一大类，实测一次抓出 16 处。
 
-这个脚本也**不判断"是否真的修好了"**（那要人读代码）。扫描范围就是下面 `DOCS` 列出的文件。
+这个脚本也**不判断"是否真的修好了"**（那要人读代码）。
+
+**扫描范围**：`DOCS` 里列出的文件，**但被 `.gitignore` 忽略的一律整个跳过**
+（2026-10-07 定，见 `is_ignored`）——存在性、行号、内容都不查。理由：被忽略的记录进不了
+仓库，别人看不到、改不了、甚至无法确认它存在；拿它判失败，只会让所有人红在一个自己改不到
+的文件上，把"本机草稿没跟上"变成所有人的阻塞。`DOCS` 里那两份 `docs/*` 属于这一类，会被
+跳过；真正生效的是四份**已跟踪**的登记表：`TODO.md`、`OPTIMIZATION.md`、`REBUILD.md`、
+`EDGE_REBRAND.md`。
 
 **谁在跑它**（重扫 H1-5 补齐）：`make check-records`（已挂进 `make check` 的前置）与
-`.git/hooks/pre-commit`。**CI 上没有它。**
-
-⚠️ **扫描范围决定它在哪里生效**（2026-10-07 厘清）：`DOCS` 原先只有
-`docs/PROJECT_SCAN.md` 与 `docs/SUPPORT_LAYER_RAW_FINDINGS.md`，而这两份**不在仓库里**
-（`.gitignore` 的 `/docs/*`）⇒ 任何**新检出**（CI 或新同学）里脚本只会打印"跳过（不存在）"
-然后 exit 0，**等于空转**。现在 `DOCS` 另加了四份**已跟踪**的登记表——`TODO.md`、
-`OPTIMIZATION.md`、`REBUILD.md`、`EDGE_REBRAND.md`——它们在新检出里也**存在**，
-所以这几份是这套检查里**唯一能在任何工作树上真正生效**的覆盖（挂不挂进 CI 都成立）。
-没有 python3 时 hook 会明确打印"跳过"而不是静默通过。
+`.git/hooks/pre-commit`。**CI 上没有它**；但没有 python3 时 hook 会明确打印"跳过"而不是
+静默通过。
 
 用法：
     python3 scripts/check-records.py            # 检查并打印摘要；有漂移则 exit 1
@@ -96,14 +92,14 @@ def commit_exists(sha: str) -> bool:
     return git("cat-file", "-e", f"{sha}^{{commit}}").returncode == 0
 
 
-def tracked_paths() -> set[str]:
-    """仓库里被跟踪的文件（相对 POSIX 路径）。
+def is_ignored(path: Path) -> bool:
+    """该路径是否被 `.gitignore` 忽略。
 
-    内容检查只对它们生效。`docs/*` 在 `.gitignore` 里，那是**维护者本机的审计草稿**：
-    它漂不漂由维护者自己看着办，而且任何人都改不到（进不了提交），所以不该在这里判失败——
-    否则一份本机草稿就能让所有 PR 的 hook 变红。
+    被忽略的记录**整个跳过**——存在性、行号、内容都不查。理由：它们进不了仓库，
+    别人既看不到、也修不了、甚至无法确认它存在；拿它们判失败，只会让所有人红在一个
+    自己改不到的文件上。真正该守的是**仓库里的**记录。
     """
-    return set(git("ls-files").stdout.splitlines())
+    return git("check-ignore", "-q", path.relative_to(ROOT).as_posix()).returncode == 0
 
 
 def repo_index() -> dict[str, list[Path]]:
@@ -159,14 +155,14 @@ def main() -> int:
     commit_drift: list[str] = []
     checked_pointers = checked_commits = external_refs = 0
     index = repo_index()
-    tracked = tracked_paths()
 
     for doc in DOCS:
         if not doc.exists():
             print(f"跳过（不存在）：{doc}")
             continue
-        # 内容检查只对**仓库里**的记录生效；见 `tracked_paths` 的说明。
-        content_check = doc.relative_to(ROOT).as_posix() in tracked
+        if is_ignored(doc):
+            print(f"跳过（被 .gitignore 忽略，不进仓库的记录不查）：{doc.relative_to(ROOT)}")
+            continue
         skip_section = SKIP_SECTION.get(doc.name)
         in_skip_section = False
         for lineno, line in enumerate(doc.read_text().splitlines(), start=1):
@@ -204,7 +200,7 @@ def main() -> int:
                     pointer_drift.append(
                         f"{doc.name}:{lineno} → `{raw_path}:{want}` 越界（该文件只有 {total} 行）"
                     )
-                elif content_check and not last and target.suffix == ".rs":
+                elif not last and target.suffix == ".rs":
                     # 廉价的内容检查：**单行**指针落到空行或纯括号上，说明它指的显然不是
                     # 一句可读的代码（多半是重构后漂了）。范围指针（`a-b`）不查——它的结束行
                     # 天然常是 `}`。这条能抓到"文件在、行号也不越界、但指错了"的一大类。
