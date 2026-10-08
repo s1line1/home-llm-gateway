@@ -445,6 +445,7 @@ deny.toml       cargo-deny policy (dependency licenses / advisories)
 | [`REBUILD.md`](REBUILD.md) | **Rebuild blueprint**: irreversible decisions, traffic and concurrency specs, 12 acceptance assertions |
 | [`EXACTLY_ONCE.md`](EXACTLY_ONCE.md) | **Proposal (not implemented)**: protocol-level dedup so response-head timeouts can be retried safely |
 | [`CERT_MANAGEMENT.md`](CERT_MANAGEMENT.md) | **Design (not implemented)**: dynamic certificate and trust-root management -- adding an agent without restarting the gateway, the CSR route (private key never leaves the machine), trust semantics and the identity problem |
+| [`STORAGE.md`](STORAGE.md) | **Design (phased)**: multi-database storage abstraction -- swap in a backend behind one port, add a table by declaring only the table; P0-P2 are refactors, P3+ not implemented |
 | [`CODE_READING.md`](CODE_READING.md) | **Code reading guide**: where to start, anchor files, verification-driven learning |
 | [`TODO.md`](TODO.md) | **Development status and roadmap** (also the register of known issues) |
 

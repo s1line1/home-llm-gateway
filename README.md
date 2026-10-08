@@ -392,6 +392,7 @@ deny.toml       cargo-deny 策略（依赖许可证 / 公告）
 | [`REBUILD.md`](REBUILD.md) | **重建蓝图**：不可逆决策清单、流量与并发规格、12 条验收断言 |
 | [`EXACTLY_ONCE.md`](EXACTLY_ONCE.md) | **提案（未实现）**：协议级去重，让响应头超时也能安全重试 |
 | [`CERT_MANAGEMENT.md`](CERT_MANAGEMENT.md) | **设计（未实现）**：证书与信任根的动态管理——加 agent 不重启网关、CSR 路线（私钥不出机器）、信任语义与身份难点 |
+| [`STORAGE.md`](STORAGE.md) | **设计（分阶段）**：存储层多库抽象——换库只换一个实现、加新表只声明表本身；P0–P2 属重构可做，P3+ 未实现 |
 | [`CODE_READING.md`](CODE_READING.md) | **源码阅读指南**：从哪开始读、锚点文件、验证式学习法 |
 | [`TODO.md`](TODO.md) | **开发状态与 roadmap**（同时是已知问题登记表） |
 
