@@ -288,6 +288,10 @@
       `the_per_connection_cap_allows_refresh_but_rejects_new_ids`（把 `accepts()` 变异成恒 true ⇒ 红）。
       **未做**：记录建议的第三条 —— 周期 stale 清扫器；它只能摘『连接已经不在』的条目（否则会摘掉活着但
       心跳慢的 agent），需要单独设计，属兜底而非主要修复。
+      **重做本条时注意**（2026-10-09，`922e228`）：`Registration` 现在多了 `registered()`；
+      `agent` 改成 `Vec` 之后 `registered()` 要变成**查表**，而且**心跳校验必须按
+      `(agent_id, stable_id)` 逐条判断**——否则一条持多 id 的连接只能给**最后一个** id 发
+      有效心跳，正好抵消本条修法①的效果。
 - [x] **进程级优雅关闭（网关侧已补齐 drain）**：gateway/agent 注册 SIGTERM/SIGINT（`tokio::signal`），
       收到后打 INFO 日志 → 调用 `Gateway::shutdown()` / `Agent::shutdown()` 退出；
       覆盖 systemd stop、Ctrl+C、harness job_kill 场景（对应 OPTIMIZATION.md A1 ✅）。
@@ -368,6 +372,9 @@
       ⚠️ 另注：**证书身份与 `agent_id` 无绑定**——网关只看"能否链到信任根"，不读 CN/SAN
       （`quic.rs`/`registry.rs` 里搜 `subject`/`common_name`/`peer_certificate` 一处都没有），
       于是**任何持有合法证书的 agent 都能冒用别人的 `agent_id`**（含顶掉其连接）。
+      ⚠️ **2026-10-09 订正**：**心跳那条路已关**（`已修(922e228)`）——心跳现在只对"本连接注册
+      成功的那条条目"生效（比对 `stable_id`），别人的 id **无法再替一条已经死掉的条目续命**；
+      按 `agent_id` 查表的 3 处**现已全部比对 `stable_id`**。**但"冒用顶掉连接"仍然成立**。
       **做本条目时建议顺带把 SAN/CN 与 `agent_id` 绑定**，否则"每 agent 一个身份"并不成立
       （这也正是 SL-P2-10 那条缺陷的后半句）。
 
