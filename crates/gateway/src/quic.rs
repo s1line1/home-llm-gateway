@@ -155,6 +155,8 @@ async fn handle_conn_inner(
                                  otherwise tunnel opens will queue and time out before capacity is reached"
                             );
                         }
+                        // 顺序不能反：`register()` 插表、`note()` 上膛，中间 Drop 是空操作
+                        // ——其间不得有可失败或可 `await` 的操作，否则会留下没人摘的条目。
                         let stable_id =
                             registry.register(id.clone(), models, max_concurrency, handle.clone());
                         registration.note(id.clone(), stable_id);
