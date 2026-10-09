@@ -411,6 +411,13 @@ impl<'a> Registration<'a> {
     pub fn note(&mut self, agent_id: String, stable_id: usize) {
         self.agent = Some((agent_id, stable_id));
     }
+
+    /// 本连接注册成的 `(agent_id, stable_id)`；`None` = 还没注册成功。
+    ///
+    /// 心跳要靠它把"这条连接是谁"与"帧里自报的 id"对上——见 [`Registry::heartbeat_if_same`]。
+    pub fn registered(&self) -> Option<(&str, usize)> {
+        self.agent.as_ref().map(|(id, sid)| (id.as_str(), *sid))
+    }
 }
 
 impl Drop for Registration<'_> {
@@ -476,19 +483,29 @@ impl Registry {
         stable_id
     }
 
-    /// 刷新某条条目的心跳时刻。
+    /// 刷新某条条目的心跳时刻 —— **仅当它仍对应给定连接**（`stable_id`）；返回是否真的刷新了。
+    ///
+    /// **为什么必须比对连接**：`agent_id` 是帧里自报的（证书没有绑定它，见 `CERT_MANAGEMENT.md`），
+    /// 而每条心跳都是一条独立的控制流。不加这层绑定的话，任何持合法证书的 agent 都能用**别人的**
+    /// `agent_id` 发心跳，替一条已经死掉的条目**永久续命**——网关于是持续把请求路由到那台机器，
+    /// 而且日志里毫无痕迹（不像顶替会打 `duplicate agent connection`）。
+    /// 与 [`Self::remove_if_same`] 同一条纪律：**帧里的 id 不足以确定"你是谁"**。
     ///
     /// **只取读锁**：刷新心跳只是往一个原子量里写毫秒数，不需要独占整张表。以前这里用
     /// `write()` + `get_mut()`，因为 `Instant` 不是原子类型、只能靠可变借用来写——代价是
     /// 每来一帧心跳（agent 侧每 5s 一帧，多 agent 时叠加）就把**所有正在选路的读锁**挡在门外。
     /// 换成原子毫秒后，这个热点不再与路由争锁。
-    pub fn heartbeat(&self, agent_id: &str) {
+    pub fn heartbeat_if_same(&self, agent_id: &str, stable_id: usize) -> bool {
         if let Some(e) = read_or_recover(&self.inner).get(agent_id) {
-            let now = now_millis();
-            e.last_seen_millis.store(now, Ordering::Relaxed);
-            // 同时也是"对端说过话"的证据：响应头静默判据的第二层靠它（见 `Entry::peer_alive`）。
-            e.last_heartbeat_millis.store(now, Ordering::Relaxed);
+            if e.stable_id == stable_id {
+                let now = now_millis();
+                e.last_seen_millis.store(now, Ordering::Relaxed);
+                // 同时也是"对端说过话"的证据：响应头静默判据的第二层靠它（见 `Entry::peer_alive`）。
+                e.last_heartbeat_millis.store(now, Ordering::Relaxed);
+                return true;
+            }
         }
+        false
     }
 
     /// 仅当条目仍对应给定连接（stable_id）时才移除，防止误删新连接的同名条目。
@@ -1379,7 +1396,7 @@ mod tests {
         let reg = Registry::default();
         let c1 = test_connection().await;
         let c2 = test_connection().await;
-        reg.register("fresh".into(), vec!["*".into()], 4, c1.clone());
+        let fresh = reg.register("fresh".into(), vec!["*".into()], 4, c1.clone());
         reg.register("stale".into(), vec!["*".into()], 4, c2.clone());
 
         let stale_after = Duration::from_millis(30);
@@ -1396,7 +1413,7 @@ mod tests {
         ));
 
         // 一条心跳恢复 → 只有它可路由
-        reg.heartbeat("fresh");
+        assert!(reg.heartbeat_if_same("fresh", fresh));
         assert_eq!(reg.len(), 2);
         assert_eq!(reg.healthy_count(stale_after), 1);
         assert_eq!(reg.status(stale_after).healthy, 1);
@@ -1413,7 +1430,7 @@ mod tests {
     async fn heartbeat_refreshes_stale_entry() {
         let reg = Registry::default();
         let conn = test_connection().await;
-        reg.register("h".into(), vec!["*".into()], 4, conn.clone());
+        let h = reg.register("h".into(), vec!["*".into()], 4, conn.clone());
         // 30ms 后仍按 10ms 判定失联
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(matches!(
@@ -1421,12 +1438,48 @@ mod tests {
             Err(AcquireError::NoAgent)
         ));
         // 心跳刷新 last_seen → 恢复可用
-        reg.heartbeat("h");
+        assert!(reg.heartbeat_if_same("h", h));
         assert!(reg
             .try_acquire(Duration::from_millis(100), "qwen2.5")
             .is_ok());
         // 对不存在的 agent 心跳 → 无害
-        reg.heartbeat("ghost");
+        assert!(!reg.heartbeat_if_same("ghost", 0));
+
+        // 别的连接的 stable_id → 也不刷新（这就是本次修的那条：帧里的 id 不足以证明"你是谁"）
+        assert!(!reg.heartbeat_if_same("h", h.wrapping_add(1)));
+    }
+
+    /// 规格（2026-10-07 修复）：**心跳只对"本连接注册的那条条目"生效**。
+    ///
+    /// 修复前 `heartbeat(agent_id)` 只按帧里自报的 id 查全表，于是任何持合法证书的 agent 都能用
+    /// 别人的 id 替一条**已经死掉**的条目续命——网关会持续把请求路由到那台机器，而且日志里没有
+    /// 任何痕迹（不像顶替会打 `duplicate agent connection`）。
+    #[tokio::test]
+    async fn a_heartbeat_only_refreshes_the_connection_that_registered_the_agent() {
+        let reg = Registry::default();
+        let c1 = test_connection().await;
+        let c2 = test_connection().await;
+        let victim = reg.register("victim".into(), vec!["*".into()], 4, c1.clone());
+        let attacker = reg.register("attacker".into(), vec!["*".into()], 4, c2.clone());
+        assert_ne!(victim, attacker, "前提：两条连接拿到不同的 stable_id");
+
+        let stale_after = Duration::from_millis(10);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(reg.healthy_count(stale_after), 0, "前提：两条都已过期");
+
+        // 攻击者用自己的连接、发 victim 的 id 的心跳 → **不得**刷新（stable_id 对不上）
+        assert!(
+            !reg.heartbeat_if_same("victim", attacker),
+            "另一条连接的 stable_id 不该刷新 victim"
+        );
+        assert_eq!(reg.healthy_count(stale_after), 0, "victim 应仍是 stale");
+
+        // victim 自己的连接发心跳 → 刷新
+        assert!(
+            reg.heartbeat_if_same("victim", victim),
+            "本连接的 stable_id 应当刷新"
+        );
+        assert_eq!(reg.healthy_count(stale_after), 1, "victim 恢复可路由");
     }
 
     #[tokio::test]
@@ -1781,7 +1834,7 @@ mod tests {
     async fn head_silence_is_tolerated_while_the_peer_keeps_heartbeating() {
         let reg = Registry::default();
         let conn = test_connection().await;
-        reg.register("slow-but-alive".into(), vec!["*".into()], 4, conn);
+        let alive_id = reg.register("slow-but-alive".into(), vec!["*".into()], 4, conn);
         let (entry, _guard) = reg.try_acquire(Duration::from_secs(10), "qwen2.5").unwrap();
 
         // 先让它"回过一次响应头"，然后沉默 50ms（把窗口压到 1ms 来跨过边界，同上面的技巧）。
@@ -1799,7 +1852,7 @@ mod tests {
         );
 
         // ② 收到心跳 → 对端还活着 → 沉默没超过 stuck_after → **不判死**（H2 要的就是这一格）
-        reg.heartbeat("slow-but-alive");
+        assert!(reg.heartbeat_if_same("slow-but-alive", alive_id));
         let alive = HeadSilence {
             window: Duration::from_millis(1),
             peer_alive_window: Duration::from_secs(15),
