@@ -155,6 +155,8 @@ async fn handle_conn_inner(
                                  otherwise tunnel opens will queue and time out before capacity is reached"
                             );
                         }
+                        // 顺序不能反：`register()` 插表、`note()` 上膛，中间 Drop 是空操作
+                        // ——其间不得有可失败或可 `await` 的操作，否则会留下没人摘的条目。
                         let stable_id =
                             registry.register(id.clone(), models, max_concurrency, handle.clone());
                         registration.note(id.clone(), stable_id);
@@ -166,8 +168,27 @@ async fn handle_conn_inner(
                         inflight,
                         ..
                     }) => {
-                        registry.heartbeat(&id);
-                        debug!(agent = %id, inflight, "heartbeat");
+                        // 心跳必须**绑定到本连接注册成功的那条条目**：`agent_id` 是帧里自报的，
+                        // 不比对的话，任何持合法证书的 agent 都能用别人的 id 发心跳，替一条已经
+                        // **死掉**的条目永久续命——网关于是持续把请求路由到那台机器，而且日志里
+                        // 毫无痕迹（不像顶替会打 `duplicate agent connection`）。
+                        // 见 `Registry::heartbeat_if_same`。
+                        match registration.registered() {
+                            Some((own_id, stable_id)) if own_id == id.as_str() => {
+                                let _ = registry.heartbeat_if_same(&id, stable_id);
+                                debug!(agent = %id, inflight, "heartbeat");
+                            }
+                            // 帧里的 id 不是本连接注册的那个：只可能是坏掉的或恶意的对端。
+                            // 静默忽略会让这种越权完全无痕，所以这里必须出声。
+                            Some((own_id, _)) => warn!(
+                                frame_agent = %id,
+                                connection_agent = %own_id,
+                                "heartbeat names a different agent than this connection registered; ignored"
+                            ),
+                            // 还没注册成功就收到心跳：**容忍**。注册与心跳是两条独立的 QUIC 流，
+                            // 可能乱序到达；改动前这里也是静默忽略（查不到条目即 no-op）。
+                            None => debug!(agent = %id, "heartbeat before registration; ignored"),
+                        }
                         let _ = send.finish();
                     }
                     Some(other) => {
