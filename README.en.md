@@ -446,6 +446,7 @@ deny.toml       cargo-deny policy (dependency licenses / advisories)
 | [`EXACTLY_ONCE.md`](EXACTLY_ONCE.md) | **Proposal (not implemented)**: protocol-level dedup so response-head timeouts can be retried safely |
 | [`CERT_MANAGEMENT.md`](CERT_MANAGEMENT.md) | **Design (not implemented)**: dynamic certificate and trust-root management -- adding an agent without restarting the gateway, the CSR route (private key never leaves the machine), trust semantics and the identity problem |
 | [`STORAGE.md`](STORAGE.md) | **Design (phased)**: multi-database storage abstraction -- swap in a backend behind one port, add a table by declaring only the table; P0-P2 are refactors, P3+ not implemented |
+| [`EDGE_MULTI_BACKEND.md`](EDGE_MULTI_BACKEND.md) | **Design (not implemented, blocked)**: one edge-agent in front of several vLLM instances -- pick a local backend by `model` and forward again; protocol and gateway unchanged |
 | [`CODE_READING.md`](CODE_READING.md) | **Code reading guide**: where to start, anchor files, verification-driven learning |
 | [`TODO.md`](TODO.md) | **Development status and roadmap** (also the register of known issues) |
 
