@@ -21,6 +21,7 @@
 # 墙内构建**不要**关掉下面的镜像源：实测同一台阿里云 ECS 上，crates 包体走阿里云
 # 1.17 MB/s、直连 static.crates.io 只有 21 KB/s（本项目要下 338 个 crate ≈ 74 MB）。
 # 想回到官方源：--build-arg CRATES_MIRROR= --build-arg APT_MIRROR= --build-arg NPM_MIRROR=
+# 国内 用 mirrors.ustc.edu.cn(实测最快)
 #
 # 运行网关（云服务器）：
 #   ⚠️ ENTRYPOINT 已经是 gateway 二进制，命令行里**不要再写一个 "gateway"**——那会被 clap
